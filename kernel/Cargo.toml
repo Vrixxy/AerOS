@@ -1,0 +1,14 @@
+[package]
+name = "aeros-kernel"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+boot-test = []
+linux-guest = []
+
+[[bin]]
+name = "aeros-kernel"
+path = "src/main.rs"
+

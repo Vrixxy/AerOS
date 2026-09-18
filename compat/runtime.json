@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "distribution": "Debian",
+  "release": "13",
+  "build": "20260831-2587",
+  "architecture": "amd64",
+  "image": "debian-13-generic-amd64.qcow2",
+  "source_image": "debian-13-generic-amd64-20260831-2587.qcow2",
+  "source": "https://cloud.debian.org/images/cloud/trixie/20260831-2587/debian-13-generic-amd64-20260831-2587.qcow2",
+  "checksums": "https://cloud.debian.org/images/cloud/trixie/20260831-2587/SHA512SUMS",
+  "sha512": "5a069019420fb9441ad4f8004c661fadb747edd5662ca54a17c8f923dee7d717e21dbdaa4ba72d6fce7f920e0217f0a9af382298a7d46ed4bc9dc33ac19181b6",
+  "virtual_disk_gib": 64,
+  "initial_memory_mib": 512,
+  "maximum_memory_mib": 4096,
+  "maximum_vcpus": 4,
+  "hardware_acceleration_required": true,
+  "software_emulation_allowed": false,
+  "base_image_read_only": true,
+  "overlay_per_application": true,
+  "host_files_default_deny": true,
+  "devices_default_deny": true,
+  "clipboard_default_deny": true,
+  "network_default_deny": true,
+  "devices": [
+    "virtio-blk",
+    "virtio-gpu",
+    "virtio-net",
+    "virtio-input",
+    "virtio-vsock"
+  ]
+}
