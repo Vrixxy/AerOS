@@ -1,3 +1,4 @@
+![AerOS desktop](v3.png)
 # AerOS Kernel
 
 AerOS is an independent x86-64 operating-system kernel written in Rust. The current foundation boots through UEFI, exits firmware services, discovers ACPI and CPU security capabilities, normalizes the firmware memory map, verifies a reusable physical-frame allocator, initializes a volatile framebuffer, renders with the two bundled typefaces, and exposes deterministic serial diagnostics.
