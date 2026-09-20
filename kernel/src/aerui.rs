@@ -581,6 +581,25 @@ pub struct FrostReport {
     pub clipped: bool,
 }
 
+/// The largest wxh-aspect rectangle that fits inside dest, centred.
+pub fn fit_rect(dest: Rect, source_width: usize, source_height: usize) -> Rect {
+    if source_width == 0 || source_height == 0 {
+        return Rect::new(dest.x, dest.y, 0, 0);
+    }
+    let fit_width = dest
+        .width
+        .min((dest.height as i64 * source_width as i64 / source_height as i64) as i32);
+    let fit_height = dest
+        .height
+        .min((dest.width as i64 * source_height as i64 / source_width as i64) as i32);
+    Rect::new(
+        dest.x + (dest.width - fit_width) / 2,
+        dest.y + (dest.height - fit_height) / 2,
+        fit_width,
+        fit_height,
+    )
+}
+
 pub struct Painter<'a> {
     frame: &'a mut FrameBuffer,
     clip: Rect,
@@ -607,6 +626,64 @@ impl<'a> Painter<'a> {
 
     pub fn reset_clip(&mut self) {
         self.clip = Rect::new(0, 0, self.frame.width() as i32, self.frame.height() as i32);
+    }
+
+    /// Draws an XRGB8888 image (another machine's framebuffer) into `dest`,
+    /// scaled to fit while keeping its aspect ratio and centred. Shrinking
+    /// averages each 2x2 source block so small text stays legible.
+    ///
+    /// # Safety
+    /// source must point to at least source_stride * source_height`n    /// readable u32s.
+    pub unsafe fn blit_scaled(
+        &mut self,
+        dest: Rect,
+        source: *const u32,
+        source_width: usize,
+        source_height: usize,
+        source_stride: usize,
+    ) {
+        if source.is_null() || source_width == 0 || source_height == 0 {
+            return;
+        }
+        let fitted = fit_rect(dest, source_width, source_height);
+        if fitted.width <= 0 || fitted.height <= 0 {
+            return;
+        }
+        let Some(area) = fitted.intersect(self.clip) else {
+            return;
+        };
+        // Near 1:1 (or enlarging): plain sampling keeps text sharp; only a real
+        // reduction needs the 2x2 average.
+        let smooth = (fitted.width as usize) * 10 < source_width * 9;
+        let read = |x: usize, y: usize| -> u32 {
+            let x = x.min(source_width - 1);
+            let y = y.min(source_height - 1);
+            unsafe { core::ptr::read_volatile(source.add(y * source_stride + x)) }
+        };
+        for y in area.y..area.bottom() {
+            let sy = (y - fitted.y) as usize * source_height / fitted.height as usize;
+            for x in area.x..area.right() {
+                let sx = (x - fitted.x) as usize * source_width / fitted.width as usize;
+                let taps: &[(usize, usize)] = if smooth {
+                    &[(0, 0), (1, 0), (0, 1), (1, 1)]
+                } else {
+                    &[(0, 0)]
+                };
+                let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+                for &(dx, dy) in taps {
+                    let pixel = read(sx + dx, sy + dy);
+                    r += (pixel >> 16) & 0xff;
+                    g += (pixel >> 8) & 0xff;
+                    b += pixel & 0xff;
+                }
+                let count = taps.len() as u32;
+                self.frame.pixel(
+                    x,
+                    y,
+                    Color::rgb((r / count) as u8, (g / count) as u8, (b / count) as u8),
+                );
+            }
+        }
     }
 
     pub fn fill_rounded_rect(&mut self, bounds: Rect, radii: CornerRadii, color: Rgba) {

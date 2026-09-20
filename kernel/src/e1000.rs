@@ -94,6 +94,7 @@ struct NetworkState {
     transmit_tail: usize,
     receive_head: usize,
     ready: bool,
+    mac: [u8; 6],
 }
 
 impl NetworkState {
@@ -106,6 +107,7 @@ impl NetworkState {
         transmit_tail: 0,
         receive_head: 0,
         ready: false,
+        mac: [0; 6],
     };
 }
 
@@ -293,6 +295,7 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> NetworkRep
             transmit_tail: 1,
             receive_head: 1,
             ready: true,
+            mac,
         };
     }
     NetworkReport {
@@ -368,6 +371,54 @@ pub fn transmit(packet: &[u8]) -> bool {
         spin_loop();
     }
     false
+}
+
+/// The NIC's own MAC address, once the driver is up.
+#[cfg_attr(not(feature = "linux-guest"), allow(dead_code))]
+pub fn mac_address() -> Option<[u8; 6]> {
+    let network = NETWORK.lock();
+    network.ready.then_some(network.mac)
+}
+
+/// Non-blocking `receive`: looks at the next RX descriptor once and returns
+/// immediately when nothing has arrived (the blocking variant spins for tens
+/// of millions of iterations on an idle link, which would stall a guest).
+#[cfg_attr(not(feature = "linux-guest"), allow(dead_code))]
+pub fn try_receive(destination: &mut [u8]) -> Option<usize> {
+    let mut network = NETWORK.lock();
+    if !network.ready {
+        return None;
+    }
+    let index = network.receive_head;
+    let descriptor_address = network.receive_ring + index as u64 * 16;
+    let descriptor = unsafe {
+        core::ptr::read_volatile(descriptor_address as usize as *const ReceiveDescriptor)
+    };
+    if descriptor.status & 1 == 0 {
+        return None;
+    }
+    let count = descriptor.length as usize;
+    let usable = descriptor.errors == 0 && count <= destination.len();
+    if usable {
+        let buffer = network.receive_buffers + (index * BUFFER_SIZE) as u64;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                buffer as usize as *const u8,
+                destination.as_mut_ptr(),
+                count,
+            );
+        }
+    }
+    // Consume the descriptor either way so a bad frame can't wedge the ring.
+    unsafe {
+        (*(descriptor_address as usize as *mut ReceiveDescriptor)).status = 0;
+    }
+    compiler_fence(Ordering::SeqCst);
+    unsafe {
+        write_register(network.mmio, RDT, index as u32);
+    }
+    network.receive_head = (index + 1) % DESCRIPTORS;
+    usable.then_some(count)
 }
 
 pub fn receive(destination: &mut [u8]) -> Option<usize> {

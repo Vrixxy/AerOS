@@ -645,6 +645,7 @@ extern "C" fn forked_task_trampoline() -> ! {
     let exit_code = arch::user::resume_forked_child(&snapshot, user_start, user_end);
     let current = unsafe { (*SCHEDULER.0.get()).current };
     USER_TASK_EXIT[current].store(exit_code, Ordering::Release);
+    crate::syscall::close_all_process_fds();
     exit_current()
 }
 
@@ -916,6 +917,7 @@ extern "C" fn user_task_trampoline() -> ! {
     );
     let current = unsafe { (*SCHEDULER.0.get()).current };
     USER_TASK_EXIT[current].store(exit_code, Ordering::Release);
+    crate::syscall::close_all_process_fds();
     exit_current()
 }
 

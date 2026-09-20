@@ -265,6 +265,31 @@ fn submit(logical: usize, function: fn(u64), argument: u64) -> bool {
     true
 }
 
+/// Starts `function(argument)` on logical CPU `logical` if it is idle. The job
+/// runs to completion from the work IPI handler on that CPU.
+#[cfg_attr(not(feature = "linux-guest"), allow(dead_code))]
+pub fn start_job(logical: usize, function: fn(u64), argument: u64) -> bool {
+    submit(logical, function, argument)
+}
+
+/// Frees the CPU's job slot once its last job has finished (true if it had).
+#[cfg_attr(not(feature = "linux-guest"), allow(dead_code))]
+pub fn reap_job(logical: usize) -> bool {
+    let Some(job) = JOBS.get(logical) else {
+        return false;
+    };
+    if job
+        .state
+        .compare_exchange(2, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    job.function.store(0, Ordering::Release);
+    job.argument.store(0, Ordering::Release);
+    true
+}
+
 fn wait_job(logical: usize) -> bool {
     if !wait_for(
         || JOBS[logical].state.load(Ordering::Acquire) == 2,

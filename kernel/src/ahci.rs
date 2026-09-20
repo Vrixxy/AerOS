@@ -92,6 +92,10 @@ impl AhciState {
 }
 
 static CONTROLLER: TicketLock<AhciState> = TicketLock::new(AhciState::EMPTY);
+/// The command list/table of a port is shared, so only one command may be in
+/// flight: the Linux guest's disk reads run on another CPU (see svm.rs) while
+/// this CPU can still touch the disk (file saves), and they must not overlap.
+static IO_LOCK: TicketLock<()> = TicketLock::new(());
 
 impl AhciReport {
     const EMPTY: Self = Self {
@@ -432,6 +436,7 @@ fn disk_write_sector_state(disk: &Disk, lba: u64, source: &[u8; 512]) -> bool {
 }
 
 fn dma_command(disk: &Disk, lba: u64, sectors: u32, buffer_phys: u64, write: bool) -> bool {
+    let _io = IO_LOCK.lock();
     let port = disk.port;
     let command_list = disk.command_list;
     let command_table = disk.command_table;
@@ -545,6 +550,7 @@ fn issue_command(
     extended: bool,
     lba: u64,
 ) -> bool {
+    let _io = IO_LOCK.lock();
     if !wait_clear(port, PORT_TFD, 0x88) {
         return false;
     }

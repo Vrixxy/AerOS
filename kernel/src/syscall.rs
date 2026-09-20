@@ -450,6 +450,21 @@ pub fn restore_process_state(state: &ProcessState) {
 /// underlying vfs handles open (a bounded, documented leak on exit, not a
 /// correctness hazard - and now safe to close explicitly if a future
 /// change wires real per-fd cleanup into the exit path).
+/// Releases every descriptor the current (exiting) user process still holds:
+/// real vfs handles, sockets and pipe ends whose last reference this is go
+/// back to their pools, while ones a forked relative still shares are left
+/// alone (`remove_process_fd` checks the other live tasks). Deliberately
+/// doesn't touch the CLOSES statistic - these aren't close() syscalls.
+pub fn close_all_process_fds() {
+    for descriptor in 0..PROCESS_FD_COUNT as u64 {
+        if let Some((process_fd, last_reference)) = remove_process_fd(descriptor)
+            && last_reference
+        {
+            let _ = release_process_fd(process_fd);
+        }
+    }
+}
+
 pub fn reset_scheduled_process_state() {
     *SIGNAL_ACTIONS.lock() = [SignalAction::EMPTY; 64];
     SIGNAL_MASK.store(0, Ordering::Release);

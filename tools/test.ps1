@@ -287,6 +287,9 @@ if ($output -notmatch "AEROS_UI_RENDER pixels=1536 captured=true changed=true co
 if ($output -notmatch "AEROS_DESKTOP wallpaper=true dock=true app_switcher=true quick_settings=true window=true button=true input=true verified=true") {
     throw "AerOS desktop compositor validation failed`n$output"
 }
+if ($output -notmatch "AEROS_WINDOW_ANIMATION mirror=true monotonic=true centered=true verified=true") {
+    throw "AerOS window open/close animation validation failed`n$output"
+}
 if ($output -notmatch "AEROS_TEXT_WRAP verified=true") {
     throw "AerOS browser text-processing validation failed`n$output"
 }

@@ -7,6 +7,18 @@ const MAX_CHAIN: usize = 4096;
 
 static MOUNTED: TicketLock<Option<Volume>> = TicketLock::new(None);
 
+/// The last FAT sector `next_cluster` read. Chain walks are sequential, so
+/// one cached sector turns 128 (FAT32) consecutive lookups into one AHCI
+/// read. `write_fat_entry` invalidates it.
+static FAT_CACHE: TicketLock<Option<(u64, [u8; 512])>> = TicketLock::new(None);
+
+/// Where the last `load_root_file` chain walk stopped: (first cluster of the
+/// file, cluster index reached, cluster at that index). A later read at the
+/// same or a further offset resumes here instead of re-walking the whole
+/// chain from the file start - which is what made every random virtio-blk
+/// read into a large ROOTFS cost tens of thousands of FAT lookups.
+static CHAIN_HINT: TicketLock<Option<(u32, u64, u32)>> = TicketLock::new(None);
+
 #[cfg_attr(not(feature = "linux-guest"), allow(dead_code))]
 pub fn root_file_size(name: &[u8; 11]) -> Option<u64> {
     let volume = (*MOUNTED.lock())?;
@@ -36,8 +48,16 @@ pub fn load_root_file(name: &[u8; 11], skip: u64, dest_phys: u64, capacity: u64)
     let cluster_bytes = spc * SECTOR_BYTES;
     let want = (size - skip).min(capacity);
 
+    let target_index = skip / cluster_bytes;
     let mut cluster = entry.cluster;
-    let mut skip_clusters = skip / cluster_bytes;
+    let mut skip_clusters = target_index;
+    if let Some((first, index, hinted)) = *CHAIN_HINT.lock()
+        && first == entry.cluster
+        && index <= target_index
+    {
+        cluster = hinted;
+        skip_clusters = target_index - index;
+    }
     while skip_clusters > 0 {
         cluster = match next_cluster(&volume, cluster)? {
             Some(next) if next >= 2 && (next as u64) < volume.clusters + 2 => next,
@@ -45,6 +65,7 @@ pub fn load_root_file(name: &[u8; 11], skip: u64, dest_phys: u64, capacity: u64)
         };
         skip_clusters -= 1;
     }
+    *CHAIN_HINT.lock() = Some((entry.cluster, target_index, cluster));
     let mut sector_skip = (skip % cluster_bytes) / SECTOR_BYTES;
 
     let mut written = 0u64;
@@ -57,10 +78,17 @@ pub fn load_root_file(name: &[u8; 11], skip: u64, dest_phys: u64, capacity: u64)
         let run_start = cluster;
         let mut run = 1u64;
         let mut ended = false;
+        // Only walk as far as this request needs; a 4 KiB read must not chase
+        // 512 clusters of FAT entries.
+        let max_run = (sector_skip * SECTOR_BYTES + (want - written))
+            .div_ceil(cluster_bytes)
+            .clamp(1, 512);
         loop {
             match next_cluster(&volume, cluster)? {
                 Some(next)
-                    if next == cluster + 1 && (next as u64) < volume.clusters + 2 && run < 512 =>
+                    if next == cluster + 1
+                        && (next as u64) < volume.clusters + 2
+                        && run < max_run =>
                 {
                     cluster = next;
                     run += 1;
@@ -1172,6 +1200,8 @@ fn write_fat_entry(volume: &Volume, cluster: u32, value: u32) -> bool {
     let sector_index = byte_offset / SECTOR_BYTES;
     let offset = (byte_offset % SECTOR_BYTES) as usize;
     let mut sector = [0u8; 512];
+    *FAT_CACHE.lock() = None;
+    *CHAIN_HINT.lock() = None;
     for copy in 0..volume.fats {
         let lba = volume.first_fat + copy * volume.fat_sectors + sector_index;
         if !ahci::read_sector(lba, &mut sector) {
@@ -1219,9 +1249,17 @@ fn next_cluster(volume: &Volume, cluster: u32) -> Option<Option<u32>> {
         32 => cluster as u64 * 4,
         _ => return None,
     };
+    let lba = volume.first_fat + byte_offset / SECTOR_BYTES;
     let mut sector = [0u8; 512];
-    if !ahci::read_sector(volume.first_fat + byte_offset / SECTOR_BYTES, &mut sector) {
-        return None;
+    let cached = *FAT_CACHE.lock();
+    match cached {
+        Some((cached_lba, data)) if cached_lba == lba => sector = data,
+        _ => {
+            if !ahci::read_sector(lba, &mut sector) {
+                return None;
+            }
+            *FAT_CACHE.lock() = Some((lba, sector));
+        }
     }
     let offset = (byte_offset % SECTOR_BYTES) as usize;
     let value = if volume.fat_bits == 16 {

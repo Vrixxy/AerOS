@@ -7,6 +7,12 @@ publish = false
 [features]
 boot-test = []
 linux-guest = []
+# With linux-guest: run the VM to completion at boot and log to serial
+# (tools/boot-linux.ps1) instead of waiting for the desktop's Linux window.
+linux-headless = ["linux-guest"]
+# Two virtual CPUs (local APIC, MP table, INIT/SIPI) instead of the
+# single-CPU guest that runs with the local APIC and SMP switched off.
+linux-smp = ["linux-guest"]
 
 [[bin]]
 name = "aeros-kernel"

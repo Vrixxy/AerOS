@@ -30,6 +30,9 @@ static BUTTONS: AtomicU8 = AtomicU8::new(0);
 static BOUNDS: AtomicU32 = AtomicU32::new((1280 << 16) | 800);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static PACKETS: AtomicU64 = AtomicU64::new(0);
+/// Wheel movement not yet consumed (positive = scroll down), accumulated
+/// from the absolute (vmmouse) packets' z field.
+static WHEEL: AtomicI32 = AtomicI32::new(0);
 
 static mut PACKET: [u8; 4] = [0; 4];
 static PACKET_INDEX: AtomicU8 = AtomicU8::new(0);
@@ -48,6 +51,8 @@ pub struct MouseState {
     pub x: i32,
     pub y: i32,
     pub left: bool,
+    pub right: bool,
+    pub middle: bool,
     pub generation: u64,
 }
 
@@ -93,8 +98,15 @@ pub fn state() -> MouseState {
         x: POS_X.load(Ordering::Acquire),
         y: POS_Y.load(Ordering::Acquire),
         left: buttons & 1 != 0,
+        right: buttons & 2 != 0,
+        middle: buttons & 4 != 0,
         generation: GENERATION.load(Ordering::Acquire),
     }
+}
+
+/// Returns (and clears) the wheel movement accumulated since the last call.
+pub fn take_wheel() -> i32 {
+    WHEEL.swap(0, Ordering::AcqRel)
 }
 
 pub fn ready() -> bool {
@@ -212,7 +224,10 @@ fn drain_vmmouse() {
         if status & 0xffff < 4 {
             return;
         }
-        let (flags, x, y, _z) = vmmouse_backdoor(VMMOUSE_DATA, 4);
+        let (flags, x, y, z) = vmmouse_backdoor(VMMOUSE_DATA, 4);
+        if z != 0 {
+            WHEEL.fetch_add((z as i32).clamp(-8, 8), Ordering::AcqRel);
+        }
         apply_vmmouse_packet(flags, x, y);
     }
 }

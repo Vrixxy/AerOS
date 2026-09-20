@@ -155,10 +155,16 @@ pub fn install(frames: &mut FrameAllocator) -> InstallReport {
 
     let mut head = [0u8; 512];
     let mut tail = [0u8; 512];
+    // Sector 2 matters: an ext4 filesystem (e.g. the Linux guest's root disk)
+    // starts with 1024 zero bytes, so sectors 0-1 alone would make it look
+    // blank; its superblock sits in sector 2.
+    let mut superblock = [0u8; 512];
     let blank = ahci::read_disk_sector(target, 0, &mut head)
         && ahci::read_disk_sector(target, 1, &mut tail)
+        && ahci::read_disk_sector(target, 2, &mut superblock)
         && head.iter().all(|byte| *byte == 0)
-        && tail.iter().all(|byte| *byte == 0);
+        && tail.iter().all(|byte| *byte == 0)
+        && superblock.iter().all(|byte| *byte == 0);
     report.target_blank = blank;
     if !blank {
         return report;

@@ -2,7 +2,9 @@ use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::aerui::{CornerRadii, FrostReport, FrostStyle, Painter, Point, Rect, Rgba, Scale};
+use crate::aerui::{
+    CornerRadii, FrostReport, FrostStyle, Painter, Point, Rect, Rgba, Scale, fit_rect,
+};
 use crate::arch;
 use crate::button::{self, Button, ButtonStyles};
 use crate::font::{FontCatalog, RasterFont};
@@ -23,6 +25,25 @@ const MAX_PATH: usize = 96;
 const DEFAULT_URL: &str = "example.com";
 const DOCK_HOLD_NS: u64 = 90_000_000;
 const MOTION_TICK_HZ: u32 = 240;
+/// How many TSC cycles the Linux guest runs per desktop loop iteration.
+const LINUX_SLICE_TSC: u64 = 6_000_000;
+
+/// F9 in the full Linux window: show the guest screen 1:1 (readable text)
+/// instead of shrunk to fit; the view pans with the pointer.
+static LINUX_ZOOM: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static LINUX_PAN_X: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+static LINUX_PAN_Y: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
+fn linux_zoomed() -> bool {
+    LINUX_ZOOM.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+fn linux_pan() -> (i32, i32) {
+    (
+        LINUX_PAN_X.load(core::sync::atomic::Ordering::Relaxed),
+        LINUX_PAN_Y.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
 const OVERLAY_TRANSITION_NS: u64 = 450_000_000;
 const OVERLAY_SLIDE_PX: i32 = 350;
 const APP_ICON_FALL_NS: u64 = 140_000_000;
@@ -64,7 +85,7 @@ const DOCK_NAMES: [&str; 7] = [
     "Trash",
 ];
 const APP_LABELS: [&str; 20] = [
-    "", "", "", "", "", "C", "M", "P", "E", "I", "D", "V", "R", "L", "H", "W", "G", "K", "U", "X",
+    "", "", "", "", "", "L", "M", "P", "E", "I", "D", "V", "R", "L", "H", "W", "G", "K", "U", "X",
 ];
 const APP_NAMES: [&str; 20] = [
     "Terminal",
@@ -72,7 +93,7 @@ const APP_NAMES: [&str; 20] = [
     "Browser",
     "Notes",
     "Settings",
-    "Calculator",
+    "Linux",
     "Mail",
     "Photos",
     "Editor",
@@ -117,11 +138,13 @@ enum DesktopApp {
     Notes,
     Trash,
     Terminal,
+    Linux,
 }
 
 impl DesktopApp {
     const fn name(self) -> &'static str {
         match self {
+            Self::Linux => "linux",
             Self::None => "none",
             Self::Browser => "browser",
             Self::Settings => "settings",
@@ -684,6 +707,11 @@ struct DesktopState {
     terminal_history_index: usize,
     terminal_draft: [u8; SHELL_LINE_MAX],
     terminal_draft_len: usize,
+    seamless: Seamless,
+    clip_open: bool,
+    clip_selected: usize,
+    /// Clipboard generation last handed to the guest (MAX = never).
+    clip_synced: u32,
     dock_entrance_at_ns: u64,
     window_open_at_ns: u64,
     previous_screen: Screen,
@@ -765,6 +793,10 @@ impl DesktopState {
             terminal_history_index: 0,
             terminal_draft: [0; SHELL_LINE_MAX],
             terminal_draft_len: 0,
+            seamless: Seamless::new(),
+            clip_open: false,
+            clip_selected: 0,
+            clip_synced: u32::MAX,
             dock_entrance_at_ns: 0,
             window_open_at_ns: 0,
             previous_screen: Screen::Language,
@@ -1014,6 +1046,16 @@ impl DesktopState {
                 self.set_overlay(Overlay::None);
                 self.set_app(DesktopApp::Settings);
             }
+            DesktopKey::Linux => {
+                self.set_overlay(Overlay::None);
+                self.seamless.enabled = false;
+                self.set_app(DesktopApp::Linux);
+            }
+            DesktopKey::Seamless => {
+                self.set_overlay(Overlay::None);
+                self.set_app(DesktopApp::None);
+                self.seamless.enabled = true;
+            }
             DesktopKey::Apps => {
                 self.set_overlay(if self.overlay == Overlay::Apps {
                     Overlay::None
@@ -1111,6 +1153,7 @@ impl DesktopState {
                         2 => self.open_browser(),
                         3 => self.open_notes(),
                         4 => self.set_app(DesktopApp::Settings),
+                        5 => self.set_app(DesktopApp::Linux),
                         _ => self.open_files(),
                     }
                 } else if self.overlay == Overlay::Quick {
@@ -1312,7 +1355,7 @@ impl DesktopState {
             }
         }
         if self.overlay == Overlay::Apps {
-            for index in 0..APP_LABELS.len().min(5) {
+            for index in 0..APP_LABELS.len().min(6) {
                 let bounds = Rect::new(58 + index as i32 * 64, 48, 50, 50);
                 if bounds.contains(point) {
                     self.app_focus = index;
@@ -1742,6 +1785,63 @@ impl DesktopState {
         DesktopAction::Redraw
     }
 
+    /// The text field that owns the keyboard right now (Notes editor, name
+    /// prompts, terminal line, browser address), if any. Passwords never
+    /// take part in copy and paste.
+    fn clip_field(&self) -> Option<ClipField> {
+        if self.screen != Screen::Desktop {
+            return None;
+        }
+        match self.app {
+            DesktopApp::Notes if self.notes_mode == NotesMode::Editing => Some(ClipField::Note),
+            DesktopApp::Notes if self.notes_mode == NotesMode::Naming => Some(ClipField::Name),
+            DesktopApp::Files if self.files_mode == FilesMode::NamingFolder => {
+                Some(ClipField::Name)
+            }
+            DesktopApp::Terminal => Some(ClipField::Terminal),
+            DesktopApp::Browser if self.url_active => Some(ClipField::Url),
+            _ => None,
+        }
+    }
+
+    fn clip_field_bytes(&self, field: ClipField) -> &[u8] {
+        match field {
+            ClipField::Note => self.notes_content.as_str().as_bytes(),
+            ClipField::Name => self.name_input.as_str().as_bytes(),
+            ClipField::Terminal => &self.terminal_input[..self.terminal_input_len],
+            ClipField::Url => &self.url_input[..self.url_len],
+        }
+    }
+
+    fn clip_field_clear(&mut self, field: ClipField) {
+        match field {
+            ClipField::Note => self.notes_content.clear(),
+            ClipField::Name => self.name_input.clear(),
+            ClipField::Terminal => self.terminal_input_len = 0,
+            ClipField::Url => self.url_len = 0,
+        }
+    }
+
+    /// Types `bytes` into the field (characters the field wouldn't accept
+    /// from the keyboard are skipped). Returns whether anything changed.
+    fn clip_field_paste(&mut self, field: ClipField, bytes: &[u8]) -> bool {
+        let mut changed = false;
+        for &byte in bytes {
+            let byte = if byte == b'\n' && field != ClipField::Note {
+                b' '
+            } else {
+                byte
+            };
+            changed |= match field {
+                ClipField::Note => self.push_notes_byte(byte),
+                ClipField::Name => self.push_name_byte(byte),
+                ClipField::Terminal => self.push_terminal_input_byte(byte),
+                ClipField::Url => self.push_url_byte(byte),
+            };
+        }
+        changed
+    }
+
     fn push_terminal_input_byte(&mut self, byte: u8) -> bool {
         if self.terminal_input_len >= SHELL_LINE_MAX || !byte.is_ascii_graphic() && byte != b' ' {
             return false;
@@ -1827,8 +1927,18 @@ enum DesktopKey {
     Terminal,
     Browser,
     Settings,
+    Linux,
+    Seamless,
     Backspace,
     Character(u8),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClipField {
+    Note,
+    Name,
+    Terminal,
+    Url,
 }
 
 struct KeyDecoder {
@@ -1902,6 +2012,8 @@ impl KeyDecoder {
             0x14 => Some(DesktopKey::Terminal),
             0x30 => Some(DesktopKey::Browser),
             0x1f => Some(DesktopKey::Settings),
+            0x26 => Some(DesktopKey::Linux),
+            0x25 => Some(DesktopKey::Seamless),
             _ => None,
         }
     }
@@ -1974,6 +2086,37 @@ pub struct DesktopReport {
     pub button: bool,
     pub input: bool,
     pub verified: bool,
+}
+
+/// Checks the window open/close animation curves frame by frame (a
+/// screenshot can't catch a 150 ms animation mid-flight): the close is the
+/// exact mirror of the open (920 -> 1000 permille and back), both move
+/// monotonically, both stay centred, and "no close time" means no animation.
+pub fn window_animation_self_test() -> bool {
+    let base = Rect::new(100, 100, 1000, 500);
+    let start = 1_000_000u64;
+    let mut ok = true;
+    let mut last_open = 0;
+    let mut last_close = i32::MAX;
+    for step in 0..=8u64 {
+        let now = start + WINDOW_OPEN_NS * step / 8;
+        let open = window_open_scale(base, start, now);
+        let close = window_close_scale(base, start, now);
+        ok &= (open.width + close.width - 1920).abs() <= 2;
+        ok &= open.width >= last_open && close.width <= last_close;
+        ok &= (open.x * 2 + open.width - (base.x * 2 + base.width)).abs() <= 1;
+        ok &= (close.y * 2 + close.height - (base.y * 2 + base.height)).abs() <= 1;
+        if step == 0 {
+            ok &= open.width == 920 && close.width == 1000;
+        }
+        if step == 8 {
+            ok &= open.width == 1000 && close.width == 920;
+        }
+        last_open = open.width;
+        last_close = close.width;
+    }
+    ok &= window_close_scale(base, 0, start).width == 1000;
+    ok
 }
 
 pub fn render_self_test(real_frame: &mut FrameBuffer, fonts: &FontCatalog) -> DesktopReport {
@@ -2107,9 +2250,209 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
     let mut settle_repaints: u32 = 12;
     let mut motion_animating = false;
     let mut blink_phase = true;
+    let mut linux_screen_hash = 0u64;
+    let mut linux_last_paint_ns = 0u64;
+    let mut guest_ptr = GuestPointer::new();
+    let mut seam_generation_seen = 0u32;
+    // Clipboard shortcuts: modifier state, the guest's clipboard sequence we
+    // last took, a scratch buffer, and a paste to replay into the guest once
+    // its agent has taken over the new clipboard text.
+    let mut ext_pending = false;
+    let mut ctrl_down = false;
+    let mut meta_down = false;
+    let mut swallow_v = false;
+    let mut meta_used = false;
+    let mut guest_clip_seen = 0u32;
+    let clip_buf = crate::clipboard::scratch();
+    let mut guest_paste_at: Option<u64> = None;
     loop {
         let mut redraw = false;
         while let Some(scancode) = keyboard::pop_scancode() {
+            let was_extended = ext_pending;
+            ext_pending = scancode == 0xe0;
+            let code = scancode & 0x7f;
+            let released = scancode & 0x80 != 0;
+            if scancode != 0xe0 {
+                if code == 0x1d {
+                    ctrl_down = !released;
+                }
+                if was_extended && (code == 0x5b || code == 0x5c) {
+                    meta_down = !released;
+                } else if meta_down && !released {
+                    // Super was used as a modifier: releasing it later must
+                    // not also open the app switcher.
+                    meta_used = true;
+                }
+            }
+            if state.screen == Screen::Desktop {
+                // Super+V: clipboard history.
+                if scancode != 0xe0 && code == 0x2f && !was_extended {
+                    if !released && meta_down {
+                        state.clip_open = !state.clip_open;
+                        state.clip_selected = 0;
+                        state.set_overlay(Overlay::None);
+                        meta_used = true;
+                        swallow_v = true;
+                        redraw = true;
+                        continue;
+                    }
+                    if released && swallow_v {
+                        swallow_v = false;
+                        continue;
+                    }
+                }
+                if state.clip_open {
+                    // The popup owns the keyboard: nothing reaches the guest
+                    // or the desktop until it closes.
+                    if scancode != 0xe0 && !released {
+                        match (was_extended, code) {
+                            (_, 0x01) => state.clip_open = false,
+                            (true, 0x48) => {
+                                state.clip_selected = state.clip_selected.saturating_sub(1)
+                            }
+                            (true, 0x50)
+                                if state.clip_selected + 1 < crate::clipboard::get().len() =>
+                            {
+                                state.clip_selected += 1;
+                            }
+                            (true, 0x53) => {
+                                crate::clipboard::get().clear();
+                                state.clip_selected = 0;
+                            }
+                            (false, 0x1c) | (false, 0x02..=0x0a) => {
+                                let index = if code == 0x1c {
+                                    state.clip_selected
+                                } else {
+                                    (code - 0x02) as usize
+                                };
+                                if index < crate::clipboard::get().len() {
+                                    crate::clipboard::get().select(index);
+                                    // Hand the pick to the guest even when it
+                                    // was already the newest entry.
+                                    state.clip_synced = u32::MAX;
+                                    state.clip_open = false;
+                                    if guest_has_keyboard(&state) {
+                                        guest_paste_at = Some(
+                                            crate::time::monotonic_nanoseconds() + 150_000_000,
+                                        );
+                                    } else if let Some(field) = state.clip_field() {
+                                        let len = crate::clipboard::get().entry(0).len();
+                                        clip_buf[..len]
+                                            .copy_from_slice(crate::clipboard::get().entry(0));
+                                        state.clip_field_paste(field, &clip_buf[..len]);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        redraw = true;
+                    }
+                    continue;
+                }
+            }
+            // With the Linux window up, the keyboard belongs to the guest:
+            // every scancode byte goes to its emulated PS/2 controller
+            // untouched, except F10, which is the way back to AerOS.
+            if state.screen == Screen::Desktop
+                && crate::svm::linux_ready()
+                && (state.app == DesktopApp::Linux
+                    || (state.seamless.enabled && state.seamless.focus != 0))
+            {
+                if scancode == 0x43 && state.app == DesktopApp::Linux {
+                    // F9: 1:1 / fit-to-window.
+                    LINUX_ZOOM.fetch_xor(true, core::sync::atomic::Ordering::Relaxed);
+                    redraw = true;
+                } else if scancode == 0x44 {
+                    if state.seamless.enabled {
+                        state.seamless.focus = 0;
+                    } else {
+                        state.set_app(DesktopApp::None);
+                    }
+                    redraw = true;
+                } else {
+                    crate::svm::linux_feed_scancode(scancode);
+                }
+                continue;
+            }
+            // Seamless mode with no guest window focused: single-key launchers
+            // (k = leave seamless mode, x = terminal, n = browser).
+            if state.seamless.enabled
+                && state.screen == Screen::Desktop
+                && state.overlay == Overlay::None
+                && scancode < 0x80
+            {
+                match scancode {
+                    0x25 => {
+                        state.seamless.enabled = false;
+                        redraw = true;
+                        continue;
+                    }
+                    0x2d => {
+                        crate::svm::linux_command(
+                            3,
+                            [0; 4],
+                            b"xterm -geometry 58x20 -fa 'DejaVu Sans Mono' -fs 10 -bg '#0d1117' -fg '#d7dee6'",
+                        );
+                        continue;
+                    }
+                    0x31 => {
+                        crate::svm::linux_command(3, [0; 4], b"netsurf-gtk");
+                        continue;
+                    }
+                    0x14 => {
+                        // Network self-test inside the guest; the result shows
+                        // up in the guest's status line on the serial log.
+                        crate::svm::linux_command(
+                            3,
+                            [0; 4],
+                            b"busybox nslookup example.com 2>&1|tail -n 2;busybox wget -T 12 -qO- http://example.com 2>&1|head -c 160",
+                        );
+                        continue;
+                    }
+                    0x21 => {
+                        // Only present in the full image; a no-op otherwise.
+                        crate::svm::linux_command(3, [0; 4], b"aeros-firefox");
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            // Ctrl+C / Ctrl+X / Ctrl+V in AerOS's own text fields (a focused
+            // Linux window got the keys above and handles them itself).
+            if ctrl_down
+                && !was_extended
+                && !released
+                && matches!(code, 0x2d..=0x2f)
+                && let Some(field) = state.clip_field()
+            {
+                if code == 0x2f {
+                    if let Some(current) = crate::clipboard::get().current() {
+                        let len = current.len();
+                        clip_buf[..len].copy_from_slice(current);
+                        state.clip_field_paste(field, &clip_buf[..len]);
+                    }
+                } else {
+                    let len = state.clip_field_bytes(field).len().min(clip_buf.len());
+                    clip_buf[..len].copy_from_slice(&state.clip_field_bytes(field)[..len]);
+                    crate::clipboard::get().push(&clip_buf[..len]);
+                    if code == 0x2d {
+                        state.clip_field_clear(field);
+                    }
+                }
+                redraw = true;
+                continue;
+            }
+            if was_extended && (code == 0x5b || code == 0x5c) {
+                // Super alone (press and release with nothing in between)
+                // opens the app switcher; Super+key is a shortcut.
+                let _ = decoder.feed(scancode);
+                if !released {
+                    meta_used = false;
+                } else if !meta_used {
+                    redraw |= matches!(state.handle(DesktopKey::Apps), DesktopAction::Redraw);
+                }
+                continue;
+            }
             decoder.set_text_mode(
                 (state.app == DesktopApp::Browser && state.url_active)
                     || state.app == DesktopApp::Terminal
@@ -2211,10 +2554,58 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 DesktopAction::Idle => {}
             }
         }
+        if let Some(at) = guest_paste_at
+            && crate::time::monotonic_nanoseconds() >= at
+        {
+            guest_paste_at = None;
+            // Ctrl+V into whatever the guest has focused.
+            for code in [0x1d, 0x2f, 0xaf, 0x9d] {
+                crate::svm::linux_feed_scancode(code);
+            }
+        }
+        if crate::svm::linux_ready() {
+            if let Some(len) = crate::svm::linux_clipboard_take(&mut guest_clip_seen, clip_buf)
+                && crate::clipboard::get().push(&clip_buf[..len])
+            {
+                state.clip_synced = crate::clipboard::get().generation;
+                redraw |= state.clip_open;
+            }
+            if crate::clipboard::get().generation != state.clip_synced {
+                let generation = crate::clipboard::get().generation;
+                if let Some(current) = crate::clipboard::get().current() {
+                    crate::svm::linux_clipboard_set(current);
+                }
+                state.clip_synced = generation;
+            }
+        }
         let pointer = crate::mouse::state();
         let pointer_moved = pointer.generation != pointer_generation;
         pointer_generation = pointer.generation;
-        if pointer.left && !pointer_down {
+        if state.app == DesktopApp::Linux && linux_zoomed() {
+            let before = linux_pan();
+            update_linux_pan(frame, &pointer);
+            redraw |= linux_pan() != before;
+        }
+        let press_edge = pointer.left && !pointer_down;
+        if state.seamless.enabled
+            && crate::svm::linux_ready()
+            && let Some(windows) = crate::svm::linux_windows()
+            && windows.generation != seam_generation_seen
+        {
+            seam_generation_seen = windows.generation;
+            if state.seamless.sync(&windows) {
+                redraw = true;
+            }
+        }
+        let mut seam_consumed = false;
+        let mut seam_over = false;
+        if state.seamless.enabled {
+            let outcome = seamless_pointer(frame, &mut state, &pointer, press_edge, &mut guest_ptr);
+            seam_consumed = outcome.consumed;
+            seam_over = outcome.over;
+            redraw |= outcome.redraw;
+        }
+        if press_edge && !seam_consumed {
             let layout = Layout::new(frame);
             let logical = layout.to_logical(Point::new(pointer.x, pointer.y));
             match state.click(logical) {
@@ -2223,6 +2614,22 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
             }
         }
         pointer_down = pointer.left;
+        let over_linux =
+            seam_over || forward_pointer_to_linux(frame, &state, &pointer, &mut guest_ptr);
+        // Scroll wheel: only when it is over guest content, else discard it so
+        // stale motion doesn't fire later.
+        let wheel = crate::mouse::take_wheel();
+        if wheel != 0 && over_linux {
+            crate::svm::linux_mouse_wheel(pointer_buttons(&pointer), wheel);
+        }
+        if over_linux != guest_ptr.over {
+            cursor.erase(frame);
+            cursor.hidden = over_linux;
+            if !over_linux {
+                cursor.paint(frame, cursor_target(frame));
+            }
+            guest_ptr.over = over_linux;
+        }
         let current_minute = crate::rtc::unix_seconds() / 60;
         if current_minute != minute {
             minute = current_minute;
@@ -2336,8 +2743,910 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 verified
             ));
         }
-        arch::wait_for_interrupt();
+        if (state.app == DesktopApp::Linux || state.seamless.enabled) && crate::svm::linux_ready() {
+            let started = tsc();
+            crate::svm::linux_pump(LINUX_SLICE_TSC);
+            // Repaint when the guest's screen changed, at most ~15 times a
+            // second, so a busy console doesn't starve input handling.
+            let now_ns = crate::time::monotonic_nanoseconds();
+            if now_ns.saturating_sub(linux_last_paint_ns) >= 66_000_000 {
+                let signature = linux_screen_signature(state.seamless.enabled);
+                if signature != linux_screen_hash {
+                    linux_screen_hash = signature;
+                    linux_last_paint_ns = now_ns;
+                    cursor.erase(frame);
+                    present_desktop(frame, fonts, &state);
+                    cursor.paint(frame, cursor_target(frame));
+                }
+            }
+            // A guest that used its whole slice is busy: go straight back
+            // to it. One that idled in HLT gets to sleep until the next tick.
+            if tsc().wrapping_sub(started) < LINUX_SLICE_TSC / 2 {
+                arch::wait_for_interrupt();
+            }
+        } else {
+            arch::wait_for_interrupt();
+        }
     }
+}
+
+/// Where the guest's screen sits on the physical display right now.
+fn linux_screen_rect(frame: &FrameBuffer, guest_width: usize, guest_height: usize) -> Rect {
+    let layout = Layout::new(frame);
+    let base = window_base_rect(DesktopApp::Linux);
+    let screen = Rect::new(base.x + 10, base.y + 34, base.width - 20, base.height - 44);
+    let full = layout.rect(screen);
+    if linux_zoomed() {
+        // 1:1: the view is as big as the window (or the guest screen).
+        Rect::new(
+            full.x,
+            full.y,
+            full.width.min(guest_width as i32),
+            full.height.min(guest_height as i32),
+        )
+    } else {
+        fit_rect(full, guest_width, guest_height)
+    }
+}
+
+/// Zoomed view: pans so the pointer's position inside the window maps to the
+/// same relative position on the guest screen (left edge = left of the guest
+/// screen, right edge = right).
+fn update_linux_pan(frame: &FrameBuffer, pointer: &crate::mouse::MouseState) {
+    if !linux_zoomed() {
+        return;
+    }
+    let Some((_, width, height, _)) = crate::svm::linux_framebuffer() else {
+        return;
+    };
+    let rect = linux_screen_rect(frame, width, height);
+    let layout = Layout::new(frame);
+    let base = window_base_rect(DesktopApp::Linux);
+    let area = layout.rect(Rect::new(
+        base.x + 10,
+        base.y + 34,
+        base.width - 20,
+        base.height - 44,
+    ));
+    let spare_x = (width as i32 - rect.width).max(0);
+    let spare_y = (height as i32 - rect.height).max(0);
+    let fx = ((pointer.x - area.x).clamp(0, area.width) as i64 * spare_x as i64
+        / area.width.max(1) as i64) as i32;
+    let fy = ((pointer.y - area.y).clamp(0, area.height) as i64 * spare_y as i64
+        / area.height.max(1) as i64) as i32;
+    LINUX_PAN_X.store(fx, core::sync::atomic::Ordering::Relaxed);
+    LINUX_PAN_Y.store(fy, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Where the pointer we last fed the guest is believed to be, and whether it
+/// was over guest content on the previous frame.
+#[derive(Clone, Copy)]
+struct GuestPointer {
+    pos: (i32, i32),
+    buttons: u8,
+    epoch: u32,
+    over: bool,
+}
+
+impl GuestPointer {
+    const fn new() -> Self {
+        Self {
+            pos: (0, 0),
+            buttons: 0,
+            epoch: 0,
+            over: false,
+        }
+    }
+}
+
+fn pointer_buttons(pointer: &crate::mouse::MouseState) -> u8 {
+    pointer.left as u8 | ((pointer.right as u8) << 1) | ((pointer.middle as u8) << 2)
+}
+
+fn release_guest_buttons(guest: &mut GuestPointer) {
+    if guest.over && guest.buttons != 0 {
+        crate::svm::linux_mouse_feed(0, 0, 0);
+        guest.buttons = 0;
+    }
+}
+
+/// Feeds one pointer position (guest-screen pixels) and button state to the
+/// guest's PS/2 mouse. The guest only understands relative motion and its
+/// cursor's real position is unknowable from here (its driver may not have
+/// been listening yet, X may re-centre it during start-up, packets can be
+/// dropped), so a movement that starts after a pause - or on entry, or after
+/// the guest re-enabled its mouse - first slams the guest cursor into the
+/// top-left corner (it clamps there) and then moves it to the target: an
+/// absolute placement built from relative motion. Within a continuous
+/// movement plain deltas keep it in step.
+fn send_guest_pointer(
+    guest: &mut GuestPointer,
+    target: (i32, i32),
+    buttons: u8,
+    screen: (i32, i32),
+    host: (i32, i32),
+) {
+    if target == guest.pos && buttons == guest.buttons {
+        return;
+    }
+    static LAST_EVENT_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let now = crate::time::monotonic_nanoseconds();
+    let idle = now.saturating_sub(LAST_EVENT_NS.swap(now, core::sync::atomic::Ordering::Relaxed))
+        > 400_000_000;
+    let epoch = crate::svm::linux_mouse_epoch();
+    let resync = !guest.over || idle || epoch != guest.epoch;
+    guest.epoch = epoch;
+    let held = guest.buttons;
+    if resync {
+        // Moves happen with the previous button state, the new state is
+        // applied at the destination, so a click never lands in the corner.
+        crate::svm::linux_mouse_feed(-screen.0 - 64, -screen.1 - 64, held);
+        guest.pos = (0, 0);
+    }
+    let (dx, dy) = (target.0 - guest.pos.0, target.1 - guest.pos.1);
+    static SENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let sent = SENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if sent.is_multiple_of(40) {
+        serial::format(format_args!(
+            "AEROS_LINUX_POINTER host=({},{}) guest=({},{}) buttons={} sent={}\n",
+            host.0, host.1, target.0, target.1, buttons, sent
+        ));
+    }
+    if dx != 0 || dy != 0 {
+        crate::svm::linux_mouse_feed(dx, dy, held);
+        guest.pos = target;
+    }
+    // A click shorter than the guest can notice (press and release inside one
+    // input slice, e.g. a synthetic click) is stretched: the button stays down
+    // for a minimum time so the pointer move that precedes it is processed
+    // first and X sees a real press.
+    static PRESSED_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    if buttons != held {
+        if held == 0 {
+            PRESSED_NS.store(now, core::sync::atomic::Ordering::Relaxed);
+        } else if buttons == 0
+            && now.saturating_sub(PRESSED_NS.load(core::sync::atomic::Ordering::Relaxed))
+                < 80_000_000
+        {
+            return;
+        }
+        crate::svm::linux_mouse_feed(0, 0, buttons);
+        guest.buttons = buttons;
+    }
+}
+
+/// Turns the AerOS pointer into PS/2 mouse packets for the guest while it is
+/// over the full-desktop Linux screen. Returns whether the pointer is over
+/// the guest screen.
+fn forward_pointer_to_linux(
+    frame: &FrameBuffer,
+    state: &DesktopState,
+    pointer: &crate::mouse::MouseState,
+    guest: &mut GuestPointer,
+) -> bool {
+    let active = state.app == DesktopApp::Linux
+        && state.screen == Screen::Desktop
+        && state.overlay == Overlay::None
+        && crate::svm::linux_ready();
+    let geometry = if active {
+        crate::svm::linux_framebuffer()
+    } else {
+        None
+    };
+    let Some((_, width, height, _)) = geometry else {
+        release_guest_buttons(guest);
+        return false;
+    };
+    let rect = linux_screen_rect(frame, width, height);
+    if !rect.contains(Point::new(pointer.x, pointer.y)) {
+        release_guest_buttons(guest);
+        return false;
+    }
+    let target = if linux_zoomed() {
+        let (pan_x, pan_y) = linux_pan();
+        (
+            (pan_x + pointer.x - rect.x).clamp(0, width as i32 - 1),
+            (pan_y + pointer.y - rect.y).clamp(0, height as i32 - 1),
+        )
+    } else {
+        (
+            (((pointer.x - rect.x) as i64 * width as i64 / rect.width as i64) as i32)
+                .clamp(0, width as i32 - 1),
+            (((pointer.y - rect.y) as i64 * height as i64 / rect.height as i64) as i32)
+                .clamp(0, height as i32 - 1),
+        )
+    };
+    send_guest_pointer(
+        guest,
+        target,
+        pointer_buttons(pointer),
+        (width as i32, height as i32),
+        (pointer.x, pointer.y),
+    );
+    true
+}
+
+// ---- Seamless mode: each guest X window as its own AerOS window ----------
+
+const SEAM_SLOTS: usize = 16;
+
+#[derive(Clone, Copy)]
+struct SeamSlot {
+    id: u32,
+    /// Top-left of the AerOS frame, in logical desktop coordinates.
+    x: i32,
+    y: i32,
+}
+
+/// Host-side bookkeeping for the guest's windows: where each AerOS frame
+/// sits, the stacking order, which one has keyboard focus, and a drag in
+/// progress. The windows' contents/geometry come from the guest agent's
+/// table (`svm::linux_windows`).
+#[derive(Clone, Copy)]
+struct Seamless {
+    enabled: bool,
+    slots: [SeamSlot; SEAM_SLOTS],
+    /// Window ids back to front; 0 = unused entry.
+    order: [u32; SEAM_SLOTS],
+    focus: u32,
+    drag: u32,
+    grab: (i32, i32),
+    /// Window being resized from its bottom-right grip, the pointer and the
+    /// window size when the drag began, and the last size sent to the guest.
+    resize: u32,
+    resize_from: (i32, i32, u32, u32),
+    resize_sent: (u32, u32, u64),
+}
+
+impl Seamless {
+    const fn new() -> Self {
+        Self {
+            enabled: false,
+            slots: [SeamSlot { id: 0, x: 0, y: 0 }; SEAM_SLOTS],
+            order: [0; SEAM_SLOTS],
+            focus: 0,
+            drag: 0,
+            grab: (0, 0),
+            resize: 0,
+            resize_from: (0, 0, 0, 0),
+            resize_sent: (0, 0, 0),
+        }
+    }
+
+    fn slot(&self, id: u32) -> Option<SeamSlot> {
+        self.slots
+            .iter()
+            .copied()
+            .find(|slot| slot.id == id && id != 0)
+    }
+
+    fn remove_from_order(&mut self, id: u32) {
+        let mut kept = 0;
+        for index in 0..SEAM_SLOTS {
+            if self.order[index] != id {
+                self.order[kept] = self.order[index];
+                kept += 1;
+            }
+        }
+        for entry in &mut self.order[kept..] {
+            *entry = 0;
+        }
+    }
+
+    fn raise(&mut self, id: u32) {
+        self.remove_from_order(id);
+        if let Some(entry) = self.order.iter_mut().find(|entry| **entry == 0) {
+            *entry = id;
+        }
+    }
+
+    /// Reconciles the slots with the guest's current window list: new windows
+    /// get a cascaded position and the keyboard, vanished ones are dropped.
+    /// Returns whether anything changed.
+    fn sync(&mut self, windows: &crate::svm::GuestWindows) -> bool {
+        let live = &windows.windows[..windows.count];
+        let mut changed = false;
+        for index in 0..SEAM_SLOTS {
+            let id = self.slots[index].id;
+            if id != 0 && !live.iter().any(|window| window.id == id) {
+                self.remove_from_order(id);
+                if self.focus == id {
+                    self.focus = 0;
+                }
+                if self.drag == id {
+                    self.drag = 0;
+                }
+                if self.resize == id {
+                    self.resize = 0;
+                }
+                self.slots[index].id = 0;
+                changed = true;
+            }
+        }
+        for window in live {
+            if self.slot(window.id).is_some() {
+                continue;
+            }
+            // Cascade new windows inside the visible desktop: the guest's own
+            // layout can be far bigger than the AerOS display, so its
+            // coordinates say nothing about where a window fits here.
+            let used = self.slots.iter().filter(|slot| slot.id != 0).count() as i32;
+            let step = used % 8;
+            let origin = Point::new(10 + step * 34, 14 + step * 28);
+            if let Some(free) = self.slots.iter_mut().find(|slot| slot.id == 0) {
+                *free = SeamSlot {
+                    id: window.id,
+                    x: origin.x,
+                    y: origin.y,
+                };
+                self.raise(window.id);
+                self.focus = window.id;
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+struct SeamGeometry {
+    chrome: Rect,
+    content: Rect,
+    close: Rect,
+    grip: Rect,
+}
+
+/// Physical-pixel layout of one guest window's AerOS frame. The content area
+/// is the guest window's own size, 1:1, so text stays sharp.
+fn seam_geometry(layout: Layout, slot: SeamSlot, window: &crate::svm::GuestWindow) -> SeamGeometry {
+    let margin = layout.scale.logical(6);
+    let title_height = layout.scale.logical(30);
+    let bottom = layout.scale.logical(12);
+    let origin = layout.point(Point::new(slot.x, slot.y));
+    let (width, height) = (window.width as i32, window.height as i32);
+    let chrome = Rect::new(
+        origin.x,
+        origin.y,
+        width + 2 * margin,
+        height + title_height + bottom,
+    );
+    SeamGeometry {
+        chrome,
+        content: Rect::new(origin.x + margin, origin.y + title_height, width, height),
+        close: Rect::new(
+            chrome.right() - layout.scale.logical(26),
+            origin.y + layout.scale.logical(8),
+            layout.scale.logical(16),
+            layout.scale.logical(16),
+        ),
+        grip: Rect::new(
+            chrome.right() - layout.scale.logical(22),
+            chrome.bottom() - bottom - layout.scale.logical(4),
+            layout.scale.logical(22),
+            bottom + layout.scale.logical(4),
+        ),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SeamHit {
+    Close(u32),
+    Grip(u32),
+    Title(u32),
+    Content(u32),
+}
+
+/// The top-most guest window under `point` (physical pixels), and the part.
+fn seam_hit(
+    layout: Layout,
+    seam: &Seamless,
+    windows: &crate::svm::GuestWindows,
+    point: Point,
+) -> Option<SeamHit> {
+    for &id in seam.order.iter().rev().filter(|id| **id != 0) {
+        let (Some(slot), Some(window)) = (
+            seam.slot(id),
+            windows.windows[..windows.count]
+                .iter()
+                .find(|window| window.id == id),
+        ) else {
+            continue;
+        };
+        let geometry = seam_geometry(layout, slot, window);
+        if geometry.close.contains(point) {
+            return Some(SeamHit::Close(id));
+        }
+        if geometry.grip.contains(point) && !geometry.content.contains(point) {
+            return Some(SeamHit::Grip(id));
+        }
+        if geometry.content.contains(point) {
+            return Some(SeamHit::Content(id));
+        }
+        if geometry.chrome.contains(point) {
+            return Some(SeamHit::Title(id));
+        }
+    }
+    None
+}
+
+/// Whether keystrokes currently go to a Linux guest window.
+fn guest_has_keyboard(state: &DesktopState) -> bool {
+    state.screen == Screen::Desktop
+        && crate::svm::linux_ready()
+        && (state.app == DesktopApp::Linux || (state.seamless.enabled && state.seamless.focus != 0))
+}
+
+/// The Super+V clipboard history popup.
+fn draw_clipboard(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    ui_font: RasterFont,
+    state: &DesktopState,
+) {
+    let count = crate::clipboard::get().len();
+    let rows = count.max(1) as i32;
+    let panel = Rect::new(176, 60, 400, 78 + rows * 26);
+    let radii = layout.radii(CornerRadii::all(16));
+    painter.fill_rounded_rect(layout.rect(panel), radii, Rgba::new(244, 246, 248, 246));
+    painter.stroke_rounded_rect(layout.rect(panel), radii, 2, Rgba::new(64, 140, 205, 255));
+    text(
+        painter,
+        layout,
+        ui_font,
+        Point::new(panel.x + 18, panel.y + 12),
+        "Clipboard",
+        16,
+        Color::rgb(18, 23, 26),
+    );
+    if count == 0 {
+        text(
+            painter,
+            layout,
+            ui_font,
+            Point::new(panel.x + 18, panel.y + 46),
+            "Nothing copied yet",
+            13,
+            Color::rgb(90, 100, 110),
+        );
+    }
+    for index in 0..count {
+        let row = Rect::new(
+            panel.x + 10,
+            panel.y + 40 + index as i32 * 26,
+            panel.width - 20,
+            24,
+        );
+        if index == state.clip_selected {
+            painter.fill_rounded_rect(
+                layout.rect(row),
+                layout.radii(CornerRadii::all(8)),
+                Rgba::new(64, 140, 205, 70),
+            );
+        }
+        // One line: the first ~48 characters, newlines shown as spaces.
+        let mut label = [b' '; 56];
+        label[0] = b'1' + index as u8;
+        let mut used = 3;
+        for &byte in crate::clipboard::get().entry(index) {
+            if used == label.len() {
+                break;
+            }
+            if byte.is_ascii_graphic() || byte == b' ' {
+                label[used] = byte;
+                used += 1;
+            } else if byte == b'\n' || byte == b'\r' || byte == b'\t' {
+                used += 1;
+            }
+        }
+        let label = core::str::from_utf8(&label[..used]).unwrap_or("");
+        text(
+            painter,
+            layout,
+            ui_font,
+            Point::new(row.x + 8, row.y + 4),
+            label,
+            13,
+            Color::rgb(18, 23, 26),
+        );
+    }
+    text(
+        painter,
+        layout,
+        ui_font,
+        Point::new(panel.x + 18, panel.y + panel.height - 22),
+        "Up/Down or 1-9 choose   Enter paste   Del clear   Esc close",
+        11,
+        Color::rgb(90, 100, 110),
+    );
+}
+
+/// The loading screen: the frosted card, the AerOS logo in a rounded frame,
+/// a tip line and a pill progress bar. `view` says what is loading and how far
+/// along it is.
+fn draw_loading(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    ui_font: RasterFont,
+    mono_font: RasterFont,
+    view: &crate::loading::LoadingView,
+) {
+    draw_login_card(painter, layout, 0xae5e_0030, false);
+    // Logo frame.
+    let frame = Rect::new(236, 24, 282, 226);
+    let radii = layout.radii(CornerRadii::all(44));
+    painter.fill_rounded_rect(layout.rect(frame), radii, Rgba::new(255, 255, 255, 34));
+    painter.stroke_rounded_rect(layout.rect(frame), radii, 1, Rgba::new(235, 246, 250, 120));
+    text(
+        painter,
+        layout,
+        mono_font,
+        Point::new(frame.x + 8, frame.y + 28),
+        AEROS_LOGO,
+        4,
+        Color::rgb(10, 62, 84),
+    );
+    // Tip line.
+    centered_text(
+        painter,
+        layout,
+        ui_font,
+        Rect::new(LOGIN_CARD.x, 270, LOGIN_CARD.width, 26),
+        crate::loading::tip(view.elapsed_secs),
+        19,
+        Color::rgb(22, 30, 38),
+    );
+    // Progress pill.
+    let track = Rect::new(204, 314, 344, 46);
+    let pill = layout.radii(CornerRadii::all(23));
+    painter.fill_rounded_rect(layout.rect(track), pill, Rgba::new(255, 255, 255, 46));
+    let fill_width = (track.width * view.progress_permille as i32 / 1000).max(track.height);
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(track.x, track.y, fill_width, track.height)),
+        pill,
+        Rgba::new(255, 255, 255, 120),
+    );
+    painter.stroke_rounded_rect(layout.rect(track), pill, 1, Rgba::new(235, 246, 250, 130));
+    if view.is_slow() {
+        centered_text(
+            painter,
+            layout,
+            ui_font,
+            Rect::new(LOGIN_CARD.x, 372, LOGIN_CARD.width, 20),
+            "Taking longer than usual...",
+            13,
+            Color::rgb(60, 72, 84),
+        );
+    }
+}
+
+fn draw_seamless(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    ui_font: RasterFont,
+    mono_font: RasterFont,
+    state: &DesktopState,
+) {
+    let seam = &state.seamless;
+    let Some(windows) = crate::svm::linux_windows() else {
+        // The guest's desktop isn't up yet: show the loading screen.
+        static LOADING_SINCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let now = crate::time::monotonic_nanoseconds();
+        let mut since = LOADING_SINCE.load(core::sync::atomic::Ordering::Relaxed);
+        if since == 0 {
+            since = now;
+            LOADING_SINCE.store(now, core::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(view) = crate::loading::linux_view(since, now) {
+            draw_loading(painter, layout, ui_font, mono_font, &view);
+        }
+        return;
+    };
+    let framebuffer = crate::svm::linux_framebuffer();
+    for &id in seam.order.iter().filter(|id| **id != 0) {
+        let (Some(slot), Some(window)) = (
+            seam.slot(id),
+            windows.windows[..windows.count]
+                .iter()
+                .find(|window| window.id == id),
+        ) else {
+            continue;
+        };
+        let geometry = seam_geometry(layout, slot, window);
+        let radii = layout.radii(CornerRadii::all(12));
+        painter.fill_rounded_rect(geometry.chrome, radii, Rgba::new(244, 246, 248, 248));
+        let border = if id == seam.focus {
+            Rgba::new(64, 140, 205, 255)
+        } else {
+            Rgba::new(188, 197, 206, 230)
+        };
+        painter.stroke_rounded_rect(geometry.chrome, radii, 2, border);
+        let length = window.title.iter().position(|b| *b == 0).unwrap_or(64);
+        let title = core::str::from_utf8(&window.title[..length]).unwrap_or("");
+        let fit = (geometry.chrome.width / layout.scale.logical(8).max(1)).max(4) as usize;
+        let title = title
+            .get(..title.len().min(fit.saturating_sub(4)))
+            .unwrap_or(title);
+        text(
+            painter,
+            layout,
+            ui_font,
+            Point::new(slot.x + 14, slot.y + 8),
+            title,
+            13,
+            Color::rgb(18, 23, 26),
+        );
+        painter.fill_rounded_rect(
+            geometry.close,
+            layout.radii(CornerRadii::all(7)),
+            Rgba::opaque(198, 31, 18),
+        );
+        // Resize grip: two short diagonal ticks in the bottom-right corner.
+        for step in [4, 9] {
+            painter.fill_rounded_rect(
+                Rect::new(
+                    geometry.chrome.right() - layout.scale.logical(step + 4),
+                    geometry.chrome.bottom() - layout.scale.logical(4),
+                    layout.scale.logical(step),
+                    layout.scale.logical(2).max(1),
+                ),
+                layout.radii(CornerRadii::all(0)),
+                Rgba::new(120, 132, 144, 220),
+            );
+        }
+        painter.fill_rounded_rect(
+            geometry.content,
+            layout.radii(CornerRadii::all(0)),
+            Rgba::opaque(0, 0, 0),
+        );
+        if let Some((pixels, screen_width, screen_height, stride)) = framebuffer {
+            let crop_x = window.x.clamp(0, screen_width as i32);
+            let crop_y = window.y.clamp(0, screen_height as i32);
+            let crop_w = (window.width as i32)
+                .min(screen_width as i32 - crop_x)
+                .max(0);
+            let crop_h = (window.height as i32)
+                .min(screen_height as i32 - crop_y)
+                .max(0);
+            if crop_w > 0 && crop_h > 0 {
+                let dest = Rect::new(geometry.content.x, geometry.content.y, crop_w, crop_h);
+                // SAFETY: the crop is clamped to the guest screen, whose
+                // pixels the hypervisor guarantees for FB_PITCH * FB_HEIGHT.
+                unsafe {
+                    painter.blit_scaled(
+                        dest,
+                        pixels.add(crop_y as usize * stride + crop_x as usize),
+                        crop_w as usize,
+                        crop_h as usize,
+                        stride,
+                    );
+                }
+            }
+        }
+    }
+    if seam.focus == 0 {
+        text(
+            painter,
+            layout,
+            ui_font,
+            Point::new(28, 4),
+            "Linux apps    X terminal    N NetSurf    F Firefox    K back    Super+V clipboard    click a window to type",
+            11,
+            Color::rgb(240, 244, 248),
+        );
+    }
+}
+
+struct SeamOutcome {
+    /// The press belonged to a guest window: don't also treat it as a click
+    /// on whatever AerOS element is underneath.
+    consumed: bool,
+    /// The pointer is over guest window content (the host cursor steps aside).
+    over: bool,
+    redraw: bool,
+}
+
+/// Pointer handling for seamless mode: focus, raise, drag by the frame,
+/// close, and forwarding to the guest while over a window's content.
+fn seamless_pointer(
+    frame: &FrameBuffer,
+    state: &mut DesktopState,
+    pointer: &crate::mouse::MouseState,
+    press_edge: bool,
+    guest: &mut GuestPointer,
+) -> SeamOutcome {
+    let mut outcome = SeamOutcome {
+        consumed: false,
+        over: false,
+        redraw: false,
+    };
+    let active = state.screen == Screen::Desktop
+        && state.overlay == Overlay::None
+        && crate::svm::linux_ready();
+    let windows = if active {
+        crate::svm::linux_windows()
+    } else {
+        None
+    };
+    let Some(windows) = windows else {
+        release_guest_buttons(guest);
+        return outcome;
+    };
+    let layout = Layout::new(frame);
+    let point = Point::new(pointer.x, pointer.y);
+    if state.seamless.drag != 0 {
+        if pointer.left {
+            let origin = layout.to_logical(Point::new(
+                point.x - state.seamless.grab.0,
+                point.y - state.seamless.grab.1,
+            ));
+            let id = state.seamless.drag;
+            if let Some(slot) = state.seamless.slots.iter_mut().find(|slot| slot.id == id) {
+                slot.x = origin.x;
+                slot.y = origin.y.max(0);
+            }
+            outcome.consumed = true;
+            outcome.redraw = true;
+            return outcome;
+        }
+        state.seamless.drag = 0;
+    }
+    if state.seamless.resize != 0 {
+        let id = state.seamless.resize;
+        if let Some(window) = windows.windows[..windows.count]
+            .iter()
+            .find(|window| window.id == id)
+        {
+            let (start_x, start_y, start_w, start_h) = state.seamless.resize_from;
+            // Physical pixels on the host are 1:1 with guest pixels here.
+            let max_w = (windows.screen_width as i32 - window.x).max(120);
+            let max_h = (windows.screen_height as i32 - window.y).max(80);
+            let width = (start_w as i32 + point.x - start_x).clamp(120, max_w) as u32;
+            let height = (start_h as i32 + point.y - start_y).clamp(80, max_h) as u32;
+            let (sent_w, sent_h, sent_at) = state.seamless.resize_sent;
+            let now = tsc();
+            let released = !pointer.left;
+            // Throttled while dragging (one command slot), exact on release.
+            if (width, height) != (sent_w, sent_h)
+                && (released || now.saturating_sub(sent_at) > 150_000_000)
+            {
+                crate::svm::linux_command(5, [id, width, height, 0], b"");
+                state.seamless.resize_sent = (width, height, now);
+            }
+        }
+        if !pointer.left {
+            state.seamless.resize = 0;
+        }
+        outcome.consumed = true;
+        outcome.redraw = true;
+        return outcome;
+    }
+    let hit = seam_hit(layout, &state.seamless, &windows, point);
+    if press_edge {
+        match hit {
+            Some(SeamHit::Grip(id)) => {
+                state.seamless.raise(id);
+                state.seamless.focus = id;
+                crate::svm::linux_command(2, [id, 0, 0, 0], b"");
+                if let Some(window) = windows.windows[..windows.count]
+                    .iter()
+                    .find(|window| window.id == id)
+                {
+                    state.seamless.resize = id;
+                    state.seamless.resize_from = (point.x, point.y, window.width, window.height);
+                    state.seamless.resize_sent = (window.width, window.height, tsc());
+                }
+                outcome.consumed = true;
+                outcome.redraw = true;
+            }
+            Some(SeamHit::Close(id)) => {
+                crate::svm::linux_command(1, [id, 0, 0, 0], b"");
+                outcome.consumed = true;
+            }
+            Some(SeamHit::Title(id)) => {
+                state.seamless.raise(id);
+                state.seamless.focus = id;
+                crate::svm::linux_command(2, [id, 0, 0, 0], b"");
+                if let (Some(slot), Some(window)) = (
+                    state.seamless.slot(id),
+                    windows.windows[..windows.count]
+                        .iter()
+                        .find(|window| window.id == id),
+                ) {
+                    let geometry = seam_geometry(layout, slot, window);
+                    state.seamless.drag = id;
+                    state.seamless.grab =
+                        (point.x - geometry.chrome.x, point.y - geometry.chrome.y);
+                }
+                outcome.consumed = true;
+                outcome.redraw = true;
+            }
+            Some(SeamHit::Content(id)) => {
+                state.seamless.raise(id);
+                state.seamless.focus = id;
+                outcome.consumed = true;
+                outcome.redraw = true;
+            }
+            None => {
+                if state.seamless.focus != 0 {
+                    state.seamless.focus = 0;
+                    outcome.redraw = true;
+                }
+            }
+        }
+    }
+    if let Some(SeamHit::Content(id)) = hit
+        && let (Some(slot), Some(window)) = (
+            state.seamless.slot(id),
+            windows.windows[..windows.count]
+                .iter()
+                .find(|window| window.id == id),
+        )
+    {
+        let geometry = seam_geometry(layout, slot, window);
+        let (screen_w, screen_h) = (windows.screen_width as i32, windows.screen_height as i32);
+        let target = (
+            (window.x + point.x - geometry.content.x).clamp(0, screen_w - 1),
+            (window.y + point.y - geometry.content.y).clamp(0, screen_h - 1),
+        );
+        send_guest_pointer(
+            guest,
+            target,
+            pointer_buttons(pointer),
+            (screen_w, screen_h),
+            (point.x, point.y),
+        );
+        outcome.over = true;
+    } else {
+        release_guest_buttons(guest);
+    }
+    outcome
+}
+
+fn tsc() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// Cheap change detector for the guest framebuffer: a sparse sample of its
+/// pixels, so an idle console costs almost nothing to check. In seamless mode
+/// only the pixels inside the guest windows are sampled - changes anywhere
+/// else on the (large) guest screen are invisible on the host anyway and must
+/// not trigger repaints.
+fn linux_screen_signature(seamless: bool) -> u64 {
+    let Some((pixels, width, height, stride)) = crate::svm::linux_framebuffer() else {
+        return 0;
+    };
+    let windows = crate::svm::linux_windows();
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut sample = |x0: usize, y0: usize, x1: usize, y1: usize| {
+        let mut y = y0;
+        while y < y1.min(height) {
+            let mut x = x0;
+            while x < x1.min(width) {
+                let pixel = unsafe { core::ptr::read_volatile(pixels.add(y * stride + x)) };
+                hash = (hash ^ pixel as u64).wrapping_mul(0x0000_0100_0000_01b3);
+                x += 3;
+            }
+            y += 2;
+        }
+    };
+    match (&windows, seamless) {
+        (Some(windows), true) => {
+            for window in &windows.windows[..windows.count] {
+                let x0 = window.x.max(0) as usize;
+                let y0 = window.y.max(0) as usize;
+                sample(
+                    x0,
+                    y0,
+                    x0.saturating_add(window.width as usize),
+                    y0.saturating_add(window.height as usize),
+                );
+            }
+        }
+        _ => sample(0, 0, width, height),
+    }
+    if let Some(windows) = windows {
+        hash = (hash ^ windows.generation as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn present_desktop(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &DesktopState) -> bool {
@@ -2473,6 +3782,9 @@ fn draw_desktop(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &DesktopSta
         }
         return wallpaper && session;
     }
+    if state.seamless.enabled {
+        draw_seamless(&mut painter, layout, ui_font, mono_font, state);
+    }
     if state.app != DesktopApp::None {
         let _ = draw_window(&mut painter, layout, ui_font, mono_font, state, now, false);
     } else if window_closing {
@@ -2519,6 +3831,9 @@ fn draw_desktop(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &DesktopSta
         };
         let panel_layout = overlay_slide_layout(layout, opening, at_ns, now);
         let _ = draw_quick_settings(&mut painter, panel_layout, ui_font, state, now);
+    }
+    if state.clip_open {
+        draw_clipboard(&mut painter, layout, ui_font, state);
     }
     let outer_dock = !apps_active;
     let (dock, controls) = draw_dock(&mut painter, layout, ui_font, state, outer_dock, now);
@@ -3024,6 +4339,8 @@ fn window_base_rect(app: DesktopApp) -> Rect {
         DesktopApp::Files => Rect::new(70, 36, 610, 300),
         DesktopApp::Notes => Rect::new(232, 18, 360, 356),
         DesktopApp::Trash => Rect::new(256, 90, 336, 260),
+        // 602x320 of content: the guest screen is scaled down to fit.
+        DesktopApp::Linux => Rect::new(65, 10, 622, 364),
         _ => Rect::new(113, 32, 531, 303),
     }
 }
@@ -3118,6 +4435,7 @@ fn draw_window(
             DesktopApp::Notes => "Notes",
             DesktopApp::Trash => "Trash",
             DesktopApp::Terminal => "Shell",
+            DesktopApp::Linux => "Linux",
             DesktopApp::None => "AerOS",
         },
         13,
@@ -3160,6 +4478,10 @@ fn draw_window(
     }
     if state.app == DesktopApp::Trash {
         draw_trash(painter, layout, ui_font, mono_font, state, outer);
+        return captured;
+    }
+    if state.app == DesktopApp::Linux {
+        draw_linux(painter, layout, ui_font, outer);
         return captured;
     }
     text(
@@ -3249,6 +4571,87 @@ const AEROS_LOGO: &str = r"                                                 .-+%
                                     :#@@%:  :%@@@@@@@@@@@@@@@@@@:
                                        ...  .=@@@@@@@@@@@@@%%*=:
                                               ...::::::..";
+
+/// The Linux guest as an ordinary AerOS window: same chrome as every other
+/// app, with the guest's framebuffer drawn straight into the content area.
+fn draw_linux(painter: &mut Painter<'_>, layout: Layout, ui_font: RasterFont, outer: Rect) {
+    let screen = Rect::new(
+        outer.x + 10,
+        outer.y + 34,
+        outer.width - 20,
+        outer.height - 44,
+    );
+    painter.fill_rounded_rect(
+        layout.rect(screen),
+        layout.radii(CornerRadii::all(8)),
+        Rgba::opaque(10, 12, 16),
+    );
+    // Key hints in the title bar, next to the window buttons' left edge.
+    text(
+        painter,
+        layout,
+        ui_font,
+        Point::new(outer.x + 90, outer.y + 8),
+        "F10 back   F9 zoom 1:1",
+        11,
+        Color::rgb(90, 100, 110),
+    );
+    match crate::svm::linux_framebuffer() {
+        Some((pixels, width, height, stride)) if crate::svm::linux_ready() => {
+            // SAFETY: the pointer/geometry come straight from the hypervisor's
+            // framebuffer region, which is always FB_PITCH * FB_HEIGHT bytes.
+            unsafe {
+                if linux_zoomed() {
+                    let area = layout.rect(screen);
+                    let view_w = (area.width as usize).min(width);
+                    let view_h = (area.height as usize).min(height);
+                    let (pan_x, pan_y) = linux_pan();
+                    let pan_x = (pan_x.max(0) as usize).min(width - view_w);
+                    let pan_y = (pan_y.max(0) as usize).min(height - view_h);
+                    painter.blit_scaled(
+                        Rect::new(area.x, area.y, view_w as i32, view_h as i32),
+                        pixels.add(pan_y * stride + pan_x),
+                        view_w,
+                        view_h,
+                        stride,
+                    );
+                } else {
+                    painter.blit_scaled(layout.rect(screen), pixels, width, height, stride);
+                }
+            }
+        }
+        _ => {
+            let light = Color::rgb(214, 222, 230);
+            text(
+                painter,
+                layout,
+                ui_font,
+                Point::new(screen.x + 20, screen.y + 22),
+                "Linux is not running",
+                15,
+                light,
+            );
+            text(
+                painter,
+                layout,
+                ui_font,
+                Point::new(screen.x + 20, screen.y + 50),
+                "Build with --features linux-guest and put VMLINUZ,",
+                11,
+                Color::rgb(150, 162, 174),
+            );
+            text(
+                painter,
+                layout,
+                ui_font,
+                Point::new(screen.x + 20, screen.y + 68),
+                "INITRD and ROOTFS on the boot volume.",
+                11,
+                Color::rgb(150, 162, 174),
+            );
+        }
+    }
+}
 
 fn draw_shell_window(
     painter: &mut Painter<'_>,
@@ -4727,6 +6130,9 @@ struct CursorSprite {
     x: i32,
     y: i32,
     visible: bool,
+    /// Set while the pointer is over the Linux screen: the guest draws its
+    /// own cursor there, so the host one steps aside.
+    hidden: bool,
 }
 
 impl CursorSprite {
@@ -4735,6 +6141,7 @@ impl CursorSprite {
             x: 0,
             y: 0,
             visible: false,
+            hidden: false,
         }
     }
 
@@ -4755,6 +6162,9 @@ impl CursorSprite {
     }
 
     fn paint(&mut self, frame: &mut FrameBuffer, at: Point) {
+        if self.hidden {
+            return;
+        }
         self.x = at.x;
         self.y = at.y;
         draw_cursor_at(frame, at.x, at.y);

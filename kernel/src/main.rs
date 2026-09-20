@@ -7,6 +7,7 @@ pub mod aerui;
 mod ahci;
 mod arch;
 pub mod button;
+mod clipboard;
 mod compat;
 mod desktop;
 mod e1000;
@@ -19,6 +20,7 @@ mod initramfs;
 mod installer;
 mod ioapic;
 mod keyboard;
+mod loading;
 mod memory;
 mod mouse;
 mod net;
@@ -1615,6 +1617,15 @@ extern "efiapi" fn efi_main(image: Handle, table: *mut SystemTable) -> Status {
     ));
     if !desktop_render.verified {
         serial::line("AEROS_DESKTOP_FAILURE");
+        arch::halt_forever();
+    }
+    let window_animation = desktop::window_animation_self_test();
+    serial::format(format_args!(
+        "AEROS_WINDOW_ANIMATION mirror=true monotonic=true centered=true verified={}\n",
+        window_animation
+    ));
+    if !window_animation {
+        serial::line("AEROS_WINDOW_ANIMATION_FAILURE");
         arch::halt_forever();
     }
     let text_processing_valid = desktop::text_processing_self_test();
