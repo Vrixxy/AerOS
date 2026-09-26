@@ -395,7 +395,17 @@ pub fn linux_ready() -> bool {
 
 #[cfg(feature = "linux-guest")]
 pub fn linux_pump(budget_tsc: u64) -> bool {
-    linux::pump(budget_tsc)
+    let start = crate::time::monotonic_nanoseconds();
+    let alive = linux::pump(budget_tsc);
+    crate::sysmon::add_guest(crate::time::monotonic_nanoseconds().saturating_sub(start));
+    alive
+}
+
+/// Bytes of RAM the Linux guest owns.
+#[cfg(feature = "linux-guest")]
+#[allow(dead_code)]
+pub fn linux_memory_bytes() -> u64 {
+    GUEST_RAM_PAGES * PAGE_SIZE
 }
 
 #[cfg(feature = "linux-guest")]
@@ -434,6 +444,89 @@ pub fn linux_command(op: u32, args: [u32; 4], text: &[u8]) {
     linux::command(op, args, text);
 }
 
+/// One installed Linux application, as the guest agent found it in the
+/// .desktop files (NUL-terminated strings).
+#[derive(Clone, Copy)]
+pub struct LinuxApp {
+    pub name: [u8; 48],
+    pub exec: [u8; 112],
+    pub category: [u8; 24],
+}
+
+impl LinuxApp {
+    pub const EMPTY: Self = Self {
+        name: [0; 48],
+        exec: [0; 112],
+        category: [0; 24],
+    };
+
+    fn text(bytes: &[u8]) -> &str {
+        let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+        core::str::from_utf8(&bytes[..end]).unwrap_or("")
+    }
+
+    pub fn name_str(&self) -> &str {
+        Self::text(&self.name)
+    }
+
+    pub fn exec_str(&self) -> &str {
+        Self::text(&self.exec)
+    }
+
+    pub fn category_str(&self) -> &str {
+        Self::text(&self.category)
+    }
+}
+
+pub const LINUX_MAX_APPS: usize = 96;
+
+/// Asks the guest to fetch `url` and render it as text `cols` characters wide.
+#[cfg(feature = "linux-guest")]
+pub fn linux_web_request(url: &[u8], cols: u32) -> bool {
+    linux::web_request(url, cols)
+}
+
+/// The fetched page: `(status, length)` when the guest published something
+/// new since `seen` (status 0 done, 1 failed, 2 still fetching); the text is
+/// copied into `out`.
+#[cfg(feature = "linux-guest")]
+pub fn linux_web_take(seen: &mut u32, out: &mut [u8]) -> Option<(u32, usize)> {
+    linux::web_take(seen, out)
+}
+
+/// The guest's installed applications, when the list changed since `seen`:
+/// `(count, install_state)` (0 idle, 1 installing, 2 done, 3 failed).
+#[cfg(feature = "linux-guest")]
+pub fn linux_apps(seen: &mut u32, out: &mut [LinuxApp; LINUX_MAX_APPS]) -> Option<(usize, u32)> {
+    linux::apps_take(seen, out)
+}
+
+/// Whether the guest's agent (web fetch, app list, ...) is up.
+#[cfg(feature = "linux-guest")]
+pub fn linux_agent_ready() -> bool {
+    linux::agent_ready()
+}
+
+#[cfg(not(feature = "linux-guest"))]
+pub fn linux_web_request(_url: &[u8], _cols: u32) -> bool {
+    false
+}
+
+#[cfg(not(feature = "linux-guest"))]
+pub fn linux_web_take(_seen: &mut u32, _out: &mut [u8]) -> Option<(u32, usize)> {
+    None
+}
+
+#[cfg(not(feature = "linux-guest"))]
+pub fn linux_apps(_seen: &mut u32, _out: &mut [LinuxApp; LINUX_MAX_APPS]) -> Option<(usize, u32)> {
+    None
+}
+
+#[cfg(not(feature = "linux-guest"))]
+pub fn linux_agent_ready() -> bool {
+    false
+}
+
 /// Puts `text` on the guest's X clipboard (the agent takes it over).
 #[cfg(feature = "linux-guest")]
 pub fn linux_clipboard_set(text: &[u8]) {
@@ -462,6 +555,12 @@ pub fn linux_windows() -> Option<GuestWindows> {
 
 #[cfg(not(feature = "linux-guest"))]
 pub fn linux_command(_op: u32, _args: [u32; 4], _text: &[u8]) {}
+#[cfg(not(feature = "linux-guest"))]
+#[allow(dead_code)]
+pub fn linux_memory_bytes() -> u64 {
+    0
+}
+
 #[cfg(not(feature = "linux-guest"))]
 pub fn linux_ready() -> bool {
     false
@@ -581,6 +680,8 @@ mod linux {
         len: u32,
         /// False for a request that failed validation: not sent to the disk.
         valid: bool,
+        /// A write to the data area (else a read).
+        write: bool,
     }
 
     #[derive(Clone, Copy)]
@@ -588,6 +689,7 @@ mod linux {
         head: u16,
         status_addr: u64,
         data_len: u32,
+        write: bool,
     }
 
     struct BlkRing(core::cell::UnsafeCell<[BlkJob; BLK_SLOTS]>);
@@ -601,8 +703,12 @@ mod linux {
             dest_phys: 0,
             len: 0,
             valid: false,
+            write: false,
         }; BLK_SLOTS],
     ));
+    /// Byte offset where the writable data area of the root disk begins
+    /// (just past the read-only ext4 root); u64::MAX = the disk is read-only.
+    static DATA_START: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
     static BLK_PRODUCED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     static BLK_DONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     static BLK_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -630,12 +736,14 @@ mod linux {
                     let mut sent = 0u32;
                     while sent < total {
                         let batch = (total - sent).min(8192);
-                        if !crate::ahci::read_disk(
-                            disk,
-                            job.sector + sent as u64,
-                            batch,
-                            job.dest_phys + sent as u64 * 512,
-                        ) {
+                        let lba = job.sector + sent as u64;
+                        let phys = job.dest_phys + sent as u64 * 512;
+                        let done = if job.write {
+                            crate::ahci::write_disk(disk, lba, batch, phys)
+                        } else {
+                            crate::ahci::read_disk(disk, lba, batch, phys)
+                        };
+                        if !done {
                             ok = false;
                             break;
                         }
@@ -677,6 +785,7 @@ mod linux {
     // offered, so the guest builds complete frames the NIC can send as-is.
     const NET_HOST_FEATURES: u32 = (1 << 5) | (1 << 16);
     const VIRTIO_BLK_T_IN: u32 = 0;
+    const VIRTIO_BLK_T_OUT: u32 = 1;
     const VIRTIO_BLK_S_OK: u8 = 0;
     const VIRTIO_BLK_S_IOERR: u8 = 1;
 
@@ -997,6 +1106,102 @@ mod linux {
         unsafe { core::ptr::write_volatile((base + 4) as *mut u32, queued.wrapping_add(1)) };
     }
 
+    const WEB_REQ_OFFSET: u64 = 0xA3_0000;
+    const WEB_RES_OFFSET: u64 = 0xA4_0000;
+    const APPS_OFFSET: u64 = 0xA5_0000;
+    const WEB_REQ_MAGIC: u32 = 0x5157_4541;
+    const WEB_RES_MAGIC: u32 = 0x5357_4541;
+    const APPS_MAGIC: u32 = 0x5041_4541;
+    const WEB_MAX: usize = 64_000;
+
+    /// The agent has created its mailboxes (it is running).
+    pub fn agent_ready() -> bool {
+        let Some(machine) = guest() else {
+            return false;
+        };
+        let base = machine.ram + FB_BASE + WEB_REQ_OFFSET;
+        unsafe { core::ptr::read_volatile(base as *const u32) == WEB_REQ_MAGIC }
+    }
+
+    pub fn web_request(url: &[u8], cols: u32) -> bool {
+        let Some(machine) = guest() else {
+            return false;
+        };
+        let base = machine.ram + FB_BASE + WEB_REQ_OFFSET;
+        if unsafe { core::ptr::read_volatile(base as *const u32) } != WEB_REQ_MAGIC {
+            return false;
+        }
+        let mut padded = [0u8; 512];
+        let len = url.len().min(511);
+        padded[..len].copy_from_slice(&url[..len]);
+        for (i, byte) in padded.iter().enumerate() {
+            unsafe { core::ptr::write_volatile((base + 16 + i as u64) as *mut u8, *byte) };
+        }
+        unsafe { core::ptr::write_volatile((base + 12) as *mut u32, cols) };
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        let seq = unsafe { core::ptr::read_volatile((base + 4) as *const u32) };
+        unsafe { core::ptr::write_volatile((base + 4) as *mut u32, seq.wrapping_add(1)) };
+        true
+    }
+
+    pub fn web_take(seen: &mut u32, out: &mut [u8]) -> Option<(u32, usize)> {
+        let machine = guest()?;
+        let base = machine.ram + FB_BASE + WEB_RES_OFFSET;
+        let word = |offset: u64| unsafe { core::ptr::read_volatile((base + offset) as *const u32) };
+        if word(0) != WEB_RES_MAGIC {
+            return None;
+        }
+        let before = word(4);
+        if before & 1 != 0 || before == *seen {
+            return None;
+        }
+        let status = word(8);
+        let len = (word(12) as usize).min(WEB_MAX).min(out.len());
+        for (i, slot) in out[..len].iter_mut().enumerate() {
+            *slot = unsafe { core::ptr::read_volatile((base + 16 + i as u64) as *const u8) };
+        }
+        if word(4) != before {
+            return None;
+        }
+        *seen = before;
+        Some((status, len))
+    }
+
+    pub fn apps_take(
+        seen: &mut u32,
+        out: &mut [super::LinuxApp; super::LINUX_MAX_APPS],
+    ) -> Option<(usize, u32)> {
+        let machine = guest()?;
+        let base = machine.ram + FB_BASE + APPS_OFFSET;
+        let word = |offset: u64| unsafe { core::ptr::read_volatile((base + offset) as *const u32) };
+        if word(0) != APPS_MAGIC {
+            return None;
+        }
+        let before = word(4);
+        if before & 1 != 0 || before == *seen {
+            return None;
+        }
+        let count = (word(8) as usize).min(super::LINUX_MAX_APPS);
+        let state = word(12);
+        for (index, app) in out.iter_mut().take(count).enumerate() {
+            let at = base + 16 + index as u64 * 184;
+            for (i, byte) in app.name.iter_mut().enumerate() {
+                *byte = unsafe { core::ptr::read_volatile((at + i as u64) as *const u8) };
+            }
+            for (i, byte) in app.exec.iter_mut().enumerate() {
+                *byte = unsafe { core::ptr::read_volatile((at + 48 + i as u64) as *const u8) };
+            }
+            for (i, byte) in app.category.iter_mut().enumerate() {
+                *byte = unsafe { core::ptr::read_volatile((at + 160 + i as u64) as *const u8) };
+            }
+        }
+        if word(4) != before {
+            return None;
+        }
+        *seen = before;
+        Some((count, state))
+    }
+
     const CLIP_IN_OFFSET: u64 = 0xA1_0000;
     const CLIP_OUT_OFFSET: u64 = 0xA2_0000;
     const CLIP_IN_MAGIC: u32 = 0x4943_4541;
@@ -1112,6 +1317,19 @@ mod linux {
                 continue;
             }
             if block[56] == 0x53 && block[57] == 0xef && block[120..130] == *b"aeros-root" {
+                // The ext4 root's own size (blocks * block size); anything
+                // after it on the disk is a writable data area.
+                let blocks = u32::from_le_bytes([block[4], block[5], block[6], block[7]]) as u64;
+                let log = u32::from_le_bytes([block[24], block[25], block[26], block[27]]) & 7;
+                let root_bytes = blocks * (1024u64 << log);
+                if root_bytes + 1024 * 1024 <= sectors * 512 {
+                    DATA_START.store(root_bytes, core::sync::atomic::Ordering::Release);
+                    crate::serial::format(format_args!(
+                        "AEROS_VM_LINUX_DATA start_bytes={} data_bytes={}\n",
+                        root_bytes,
+                        sectors * 512 - root_bytes
+                    ));
+                }
                 return Some((disk, sectors * 512));
             }
         }
@@ -1351,6 +1569,7 @@ mod linux {
                 head: 0,
                 status_addr: 0,
                 data_len: 0,
+                write: false,
             }; BLK_SLOTS],
             blk_finalized: 0,
             kbd_irq_injected: false,
@@ -1374,7 +1593,7 @@ mod linux {
             net_last_avail: [0; 2],
             net_used_idx: [0; 2],
             net_irq_pending: false,
-            net_mac: crate::e1000::mac_address().unwrap_or([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]),
+            net_mac: crate::nic::mac_address().unwrap_or([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]),
             net_rx_frames: 0,
             net_tx_frames: 0,
             net_tx_dropped: 0,
@@ -3058,7 +3277,7 @@ mod linux {
                     }
                     cur = next as u64;
                 }
-                if len >= 14 && crate::e1000::transmit(&frame[..len]) {
+                if len >= 14 && crate::nic::transmit(&frame[..len]) {
                     self.net_tx_frames += 1;
                 } else {
                     self.net_tx_dropped += 1;
@@ -3088,7 +3307,7 @@ mod linux {
                     break; // no receive buffer posted: leave the frame in the NIC
                 }
                 let mut frame = [0u8; 1600];
-                let Some(len) = crate::e1000::try_receive(&mut frame) else {
+                let Some(len) = crate::nic::try_receive(&mut frame) else {
                     break;
                 };
                 let slot = (self.net_last_avail[0] % NET_QUEUE_SIZE) as u64;
@@ -3286,10 +3505,14 @@ mod linux {
                 self.blk_errors += 1;
                 return 0;
             };
-            let ok = req_type == VIRTIO_BLK_T_IN
-                && data_write
-                && data_len > 0
-                && self.blk_read_sectors(sector, data_addr, data_len);
+            let ok = if req_type == VIRTIO_BLK_T_OUT {
+                !data_write && data_len > 0 && self.blk_write_sectors(sector, data_addr, data_len)
+            } else {
+                req_type == VIRTIO_BLK_T_IN
+                    && data_write
+                    && data_len > 0
+                    && self.blk_read_sectors(sector, data_addr, data_len)
+            };
             if !ok {
                 self.blk_errors += 1;
             }
@@ -3331,17 +3554,25 @@ mod linux {
                             .checked_add(data_len as u64)
                             .is_some_and(|end| end <= self.ram_bytes)
                         && dest_phys.is_multiple_of(512);
+                    let write = req_type == VIRTIO_BLK_T_OUT;
+                    let allowed = if write {
+                        !data_write && sector.saturating_mul(512) >= DATA_START.load(Relaxed)
+                    } else {
+                        req_type == VIRTIO_BLK_T_IN && data_write
+                    };
                     (
                         BlkJob {
                             sector,
                             dest_phys,
                             len: data_len,
-                            valid: req_type == VIRTIO_BLK_T_IN && data_write && in_range,
+                            valid: allowed && in_range,
+                            write,
                         },
                         BlkMeta {
                             head,
                             status_addr,
                             data_len,
+                            write,
                         },
                     )
                 }
@@ -3351,11 +3582,13 @@ mod linux {
                         dest_phys: 0,
                         len: 0,
                         valid: false,
+                        write: false,
                     },
                     BlkMeta {
                         head,
                         status_addr: 0,
                         data_len: 0,
+                        write: false,
                     },
                 ),
             };
@@ -3413,7 +3646,7 @@ mod linux {
                     );
                 }
                 let written = if ok {
-                    meta.data_len + 1
+                    if meta.write { 1 } else { meta.data_len + 1 }
                 } else if meta.status_addr != 0 {
                     1
                 } else {
@@ -3484,6 +3717,49 @@ mod linux {
                 return true;
             }
             fat::load_root_file(ROOTFS_NAME, skip, dest_phys, len as u64) == Some(len as u64)
+        }
+
+        /// A write into the disk's data area (never the read-only root).
+        fn blk_write_sectors(&mut self, sector: u64, src_gpa: u64, len: u32) -> bool {
+            use core::sync::atomic::Ordering::Relaxed;
+            if self.rootfs_disk == usize::MAX
+                || len == 0
+                || !(len as u64).is_multiple_of(512)
+                || sector.saturating_mul(512) < DATA_START.load(Relaxed)
+            {
+                return false;
+            }
+            let Some(end) = sector
+                .checked_mul(512)
+                .and_then(|start| start.checked_add(len as u64))
+            else {
+                return false;
+            };
+            let Some(gpa_end) = src_gpa.checked_add(len as u64) else {
+                return false;
+            };
+            if end > self.rootfs_bytes || gpa_end > self.ram_bytes {
+                return false;
+            }
+            let src_phys = self.ram + src_gpa;
+            if !src_phys.is_multiple_of(512) {
+                return false;
+            }
+            let total = len / 512;
+            let mut done = 0u32;
+            while done < total {
+                let batch = (total - done).min(8192);
+                if !crate::ahci::write_disk(
+                    self.rootfs_disk,
+                    sector + done as u64,
+                    batch,
+                    src_phys + done as u64 * 512,
+                ) {
+                    return false;
+                }
+                done += batch;
+            }
+            true
         }
 
         fn pit_ticks(&self) -> u64 {

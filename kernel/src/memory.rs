@@ -157,9 +157,34 @@ pub struct FrameAllocator {
     free_count: usize,
     free_pages: u64,
     allocated_pages: u64,
+    /// Mirrors its free-page count into `TRACKED_FREE_PAGES` (the main allocator).
+    tracked: bool,
 }
 
+/// Free pages of the tracked (main) allocator, readable from anywhere.
+pub static TRACKED_FREE_PAGES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 impl FrameAllocator {
+    /// Makes this allocator the one the system monitor reports on.
+    pub fn track(&mut self) {
+        self.tracked = true;
+        self.publish();
+    }
+
+    fn publish(&self) {
+        if self.tracked {
+            TRACKED_FREE_PAGES.store(self.free_pages, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The (start, end) byte ranges of RAM this allocator manages.
+    pub fn managed_ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.managed[..self.managed_count]
+            .iter()
+            .map(|range| (range.start, range.end))
+    }
+
     pub fn from_range(start: u64, pages: u64) -> Option<Self> {
         if pages == 0 || start & (PAGE_SIZE - 1) != 0 {
             return None;
@@ -173,6 +198,7 @@ impl FrameAllocator {
             free_count: 1,
             free_pages: pages,
             allocated_pages: 0,
+            tracked: false,
         };
         allocator.managed[0] = range;
         allocator.free[0] = range;
@@ -187,6 +213,7 @@ impl FrameAllocator {
             free_count: 0,
             free_pages: 0,
             allocated_pages: 0,
+            tracked: false,
         };
         for region in map.regions() {
             if region.kind != MemoryKind::Usable {
@@ -239,6 +266,7 @@ impl FrameAllocator {
             self.consume_range(index, range, start, end);
             self.free_pages = self.free_pages.saturating_sub(pages);
             self.allocated_pages = self.allocated_pages.saturating_add(pages);
+            self.publish();
             return Some(PhysFrame(start));
         }
         None
@@ -296,6 +324,7 @@ impl FrameAllocator {
         }
         self.free_pages = free_pages;
         self.allocated_pages = allocated_pages;
+        self.publish();
         self.sort_free();
         self.coalesce_free();
         true
@@ -433,4 +462,73 @@ pub fn release_global_contiguous(address: u64, pages: u64) -> bool {
 
 pub fn global_stats() -> Option<AllocatorStats> {
     with_frames(|frames| frames.stats())
+}
+
+/// The main allocator, installed once boot setup is done, for big buffers
+/// (image decoding, screenshots, ...).
+static PRIMARY_FRAMES: TicketLock<Option<FrameAllocator>> = TicketLock::new(None);
+
+pub fn install_primary(allocator: FrameAllocator) {
+    *PRIMARY_FRAMES.lock() = Some(allocator);
+}
+
+/// A run of physical pages (identity-mapped) freed when dropped. Comes from
+/// the primary allocator when installed, else from the global demand pool.
+pub struct PageBuffer {
+    address: u64,
+    pages: u64,
+    bytes: usize,
+    from_primary: bool,
+}
+
+impl PageBuffer {
+    /// Allocates at least `bytes` zeroed bytes.
+    pub fn new(bytes: usize) -> Option<Self> {
+        let pages = (bytes as u64).div_ceil(PAGE_SIZE).max(1);
+        let primary = PRIMARY_FRAMES
+            .lock()
+            .as_mut()
+            .and_then(|frames| frames.allocate_contiguous(pages, 1));
+        let (frame, from_primary) = match primary {
+            Some(frame) => (frame, true),
+            None => (allocate_global_contiguous(pages, 1)?, false),
+        };
+        let address = frame.address();
+        // SAFETY: the pages were just allocated and are identity-mapped RAM.
+        unsafe {
+            core::ptr::write_bytes(address as usize as *mut u8, 0, (pages * PAGE_SIZE) as usize)
+        };
+        Some(Self {
+            address,
+            pages,
+            bytes,
+            from_primary,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: owned, allocated pages.
+        unsafe { core::slice::from_raw_parts(self.address as usize as *const u8, self.bytes) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: owned, allocated pages.
+        unsafe { core::slice::from_raw_parts_mut(self.address as usize as *mut u8, self.bytes) }
+    }
+}
+
+impl Drop for PageBuffer {
+    fn drop(&mut self) {
+        if self.from_primary {
+            if let Some(frames) = PRIMARY_FRAMES.lock().as_mut() {
+                frames.release_contiguous(self.address, self.pages);
+            }
+        } else {
+            release_global_contiguous(self.address, self.pages);
+        }
+    }
 }

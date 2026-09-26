@@ -61,6 +61,10 @@ pub fn push_scancode(byte: u8) {
     WRITE.store(next, Ordering::Release);
 }
 
+pub fn has_pending() -> bool {
+    READY.load(Ordering::Acquire) && READ.load(Ordering::Relaxed) != WRITE.load(Ordering::Acquire)
+}
+
 pub fn pop_scancode() -> Option<u8> {
     if !READY.load(Ordering::Acquire) {
         return None;

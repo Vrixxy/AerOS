@@ -1,4 +1,3 @@
-use crate::ahci;
 use crate::partition::{Partition, PartitionReport};
 use crate::sync::TicketLock;
 
@@ -110,7 +109,7 @@ pub fn load_root_file(name: &[u8; 11], skip: u64, dest_phys: u64, capacity: u64)
         let mut done = 0u64;
         while done < need_sectors {
             let batch = (need_sectors - done).min(8192) as u32;
-            if !ahci::read_into(
+            if !crate::blockdev::read_into(
                 first_lba + done,
                 batch,
                 dest_phys + written + done * SECTOR_BYTES,
@@ -221,7 +220,7 @@ fn list_directory_chain(
     'outer: for _ in 0..MAX_CHAIN {
         let base = cluster_lba(volume, cluster);
         for s in 0..volume.sectors_per_cluster as u64 {
-            if !ahci::read_sector(base + s, &mut sector) {
+            if !crate::blockdev::read_sector(base + s, &mut sector) {
                 break 'outer;
             }
             for entry in sector.chunks_exact(32) {
@@ -256,7 +255,7 @@ fn list_fixed_root(volume: &Volume, out: &mut [FatFileEntry], want_directory: bo
     let mut count = 0;
     let mut sector = [0u8; 512];
     for offset in 0..root_sectors {
-        if !ahci::read_sector(volume.first_root + offset, &mut sector) {
+        if !crate::blockdev::read_sector(volume.first_root + offset, &mut sector) {
             break;
         }
         for entry in sector.chunks_exact(32) {
@@ -324,11 +323,11 @@ fn delete_root_entry(name: &[u8; 11], expect_directory: bool) -> bool {
         return false;
     }
     let mut sector = [0u8; 512];
-    if !ahci::read_sector(lba, &mut sector) {
+    if !crate::blockdev::read_sector(lba, &mut sector) {
         return false;
     }
     sector[offset] = 0xe5;
-    ahci::write_disk_sector(ahci::boot_disk(), lba, &sector)
+    crate::blockdev::write_boot_sector(lba, &sector)
 }
 
 pub fn stream_clusters(
@@ -394,7 +393,7 @@ fn stream_entry(
         let mut done = 0u64;
         while done < need {
             let batch = (need - done).min(8192) as u32;
-            if !ahci::read_into(
+            if !crate::blockdev::read_into(
                 first_lba + done,
                 batch,
                 dest_phys + written + done * SECTOR_BYTES,
@@ -503,7 +502,8 @@ pub fn inspect(partitions: &PartitionReport) -> FatReport {
         if report.boot_file && file.cluster >= 2 {
             let mut sector = [0u8; 512];
             let lba = cluster_lba(&volume, file.cluster);
-            report.pe_image = ahci::read_sector(lba, &mut sector) && sector[..2] == *b"MZ";
+            report.pe_image =
+                crate::blockdev::read_sector(lba, &mut sector) && sector[..2] == *b"MZ";
         }
         report.verified = report.mounted
             && report.efi_directory
@@ -531,7 +531,7 @@ fn base_report(volume: Volume) -> FatReport {
 
 fn read_volume(partition: Partition) -> Option<Volume> {
     let mut sector = [0u8; 512];
-    if !ahci::read_sector(partition.first_lba, &mut sector)
+    if !crate::blockdev::read_sector(partition.first_lba, &mut sector)
         || sector[510] != 0x55
         || sector[511] != 0xaa
         || !matches!(sector[0], 0xeb | 0xe9)
@@ -642,7 +642,7 @@ fn find_cluster_directory(
 fn find_in_sectors(first_lba: u64, count: u64, name: &[u8; 11]) -> Option<DirectoryEntry> {
     let mut sector = [0u8; 512];
     for offset in 0..count {
-        if !ahci::read_sector(first_lba + offset, &mut sector) {
+        if !crate::blockdev::read_sector(first_lba + offset, &mut sector) {
             return None;
         }
         for entry in sector.chunks_exact(32) {
@@ -751,7 +751,7 @@ fn write_dot_entries(volume: &Volume, cluster: u32, dotdot_cluster: u32) -> bool
     }
     let lba = cluster_lba(volume, cluster);
     let mut sector = [0u8; 512];
-    if !ahci::read_sector(lba, &mut sector) {
+    if !crate::blockdev::read_sector(lba, &mut sector) {
         return false;
     }
     sector[..11].copy_from_slice(b".          ");
@@ -766,7 +766,7 @@ fn write_dot_entries(volume: &Volume, cluster: u32, dotdot_cluster: u32) -> bool
     sector[53] = (dotdot_cluster >> 24) as u8;
     sector[58] = dotdot_cluster as u8;
     sector[59] = (dotdot_cluster >> 8) as u8;
-    ahci::write_disk_sector(ahci::boot_disk(), lba, &sector)
+    crate::blockdev::write_boot_sector(lba, &sector)
 }
 
 /// Reads back a file previously written with [`write_root_file`] into a
@@ -797,7 +797,7 @@ pub fn read_root_file(name: &[u8; 11], buffer: &mut [u8]) -> Option<usize> {
         let mut offset_in_cluster = 0usize;
         while offset_in_cluster < cluster_bytes && copied < want {
             let lba = cluster_lba(&volume, cluster) + (offset_in_cluster as u64 / SECTOR_BYTES);
-            if !ahci::read_sector(lba, &mut sector) {
+            if !crate::blockdev::read_sector(lba, &mut sector) {
                 return None;
             }
             let take = (want - copied).min(SECTOR_BYTES as usize);
@@ -909,7 +909,7 @@ fn find_in_sectors_located_fixed(
     let mut sector = [0u8; 512];
     for offset in 0..count {
         let lba = first_lba + offset;
-        if !ahci::read_sector(lba, &mut sector) {
+        if !crate::blockdev::read_sector(lba, &mut sector) {
             return None;
         }
         for (slot, entry) in sector.chunks_exact(32).enumerate() {
@@ -939,7 +939,7 @@ fn find_free_slot_fixed(first_lba: u64, count: u64, name: &[u8; 11]) -> Option<(
     let mut sector = [0u8; 512];
     for offset in 0..count {
         let lba = first_lba + offset;
-        if !ahci::read_sector(lba, &mut sector) {
+        if !crate::blockdev::read_sector(lba, &mut sector) {
             return None;
         }
         for (slot, entry) in sector.chunks_exact(32).enumerate() {
@@ -961,7 +961,7 @@ fn find_in_sectors_located(
     for _ in 0..MAX_CHAIN {
         let base = cluster_lba(volume, cluster);
         for s in 0..volume.sectors_per_cluster as u64 {
-            if !ahci::read_sector(base + s, &mut sector) {
+            if !crate::blockdev::read_sector(base + s, &mut sector) {
                 return None;
             }
             for (slot, entry) in sector.chunks_exact(32).enumerate() {
@@ -1006,7 +1006,7 @@ fn find_or_extend_free_slot(
         let base = cluster_lba(volume, cluster);
         for s in 0..volume.sectors_per_cluster as u64 {
             let lba = base + s;
-            if !ahci::read_sector(lba, &mut sector) {
+            if !crate::blockdev::read_sector(lba, &mut sector) {
                 return None;
             }
             for (slot, entry) in sector.chunks_exact(32).enumerate() {
@@ -1056,7 +1056,7 @@ fn write_directory_entry_attr(
     attributes: u8,
 ) -> bool {
     let mut sector = [0u8; 512];
-    if !ahci::read_sector(lba, &mut sector) {
+    if !crate::blockdev::read_sector(lba, &mut sector) {
         return false;
     }
     let entry = &mut sector[offset..offset + 32];
@@ -1068,7 +1068,7 @@ fn write_directory_entry_attr(
     entry[26] = cluster as u8;
     entry[27] = (cluster >> 8) as u8;
     entry[28..32].copy_from_slice(&size.to_le_bytes());
-    ahci::write_disk_sector(ahci::boot_disk(), lba, &sector)
+    crate::blockdev::write_boot_sector(lba, &sector)
 }
 
 /// Allocates and links a `clusters_needed`-long chain, writing `data` into
@@ -1133,7 +1133,7 @@ fn write_cluster_data(volume: &Volume, cluster: u32, chunk: &[u8]) -> bool {
         if take > 0 {
             sector[..take].copy_from_slice(&chunk[offset..offset + take]);
         }
-        if !ahci::write_disk_sector(ahci::boot_disk(), base + s, &sector) {
+        if !crate::blockdev::write_boot_sector(base + s, &sector) {
             return false;
         }
         offset += take;
@@ -1148,7 +1148,7 @@ fn zero_cluster(volume: &Volume, cluster: u32) -> bool {
     let sector = [0u8; 512];
     let base = cluster_lba(volume, cluster);
     for s in 0..volume.sectors_per_cluster as u64 {
-        if !ahci::write_disk_sector(ahci::boot_disk(), base + s, &sector) {
+        if !crate::blockdev::write_boot_sector(base + s, &sector) {
             return false;
         }
     }
@@ -1171,7 +1171,7 @@ fn allocate_cluster(volume: &Volume) -> Option<u32> {
     for cluster in 2..max_cluster {
         let byte_offset = cluster as u64 * entry_bytes;
         let lba = volume.first_fat + byte_offset / SECTOR_BYTES;
-        if !ahci::read_sector(lba, &mut sector) {
+        if !crate::blockdev::read_sector(lba, &mut sector) {
             return None;
         }
         let offset = (byte_offset % SECTOR_BYTES) as usize;
@@ -1204,7 +1204,7 @@ fn write_fat_entry(volume: &Volume, cluster: u32, value: u32) -> bool {
     *CHAIN_HINT.lock() = None;
     for copy in 0..volume.fats {
         let lba = volume.first_fat + copy * volume.fat_sectors + sector_index;
-        if !ahci::read_sector(lba, &mut sector) {
+        if !crate::blockdev::read_sector(lba, &mut sector) {
             return false;
         }
         if volume.fat_bits == 16 {
@@ -1215,7 +1215,7 @@ fn write_fat_entry(volume: &Volume, cluster: u32, value: u32) -> bool {
             let stored = (value & 0x0fff_ffff) | preserved;
             sector[offset..offset + 4].copy_from_slice(&stored.to_le_bytes());
         }
-        if !ahci::write_disk_sector(ahci::boot_disk(), lba, &sector) {
+        if !crate::blockdev::write_boot_sector(lba, &sector) {
             return false;
         }
     }
@@ -1255,7 +1255,7 @@ fn next_cluster(volume: &Volume, cluster: u32) -> Option<Option<u32>> {
     match cached {
         Some((cached_lba, data)) if cached_lba == lba => sector = data,
         _ => {
-            if !ahci::read_sector(lba, &mut sector) {
+            if !crate::blockdev::read_sector(lba, &mut sector) {
                 return None;
             }
             *FAT_CACHE.lock() = Some((lba, sector));

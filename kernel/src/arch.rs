@@ -94,9 +94,11 @@ pub fn enable_interrupts() {
 }
 
 pub fn wait_for_interrupt() {
+    let start = crate::time::monotonic_nanoseconds();
     unsafe {
         asm!("sti; hlt", options(nomem, nostack));
     }
+    crate::sysmon::add_idle(crate::time::monotonic_nanoseconds().saturating_sub(start));
 }
 
 pub fn reboot() -> ! {

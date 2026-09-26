@@ -1,4 +1,4 @@
-use crate::e1000::{self, NetworkReport};
+use crate::e1000::NetworkReport;
 use crate::sync::TicketLock;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -161,7 +161,7 @@ pub fn self_test(link: &NetworkReport) -> InternetReport {
     packet[42..].copy_from_slice(PAYLOAD);
     let icmp_checksum = checksum(&packet[34..]);
     packet[36..38].copy_from_slice(&icmp_checksum.to_be_bytes());
-    let ipv4_tx = e1000::transmit(&packet);
+    let ipv4_tx = crate::nic::transmit(&packet);
     let mut ipv4_rx = false;
     let mut header_checksum = false;
     let mut icmp_valid = false;
@@ -170,7 +170,7 @@ pub fn self_test(link: &NetworkReport) -> InternetReport {
     let mut received = [0u8; 2048];
     if ipv4_tx {
         for _ in 0..8 {
-            let Some(length) = e1000::receive(&mut received) else {
+            let Some(length) = crate::nic::receive(&mut received) else {
                 break;
             };
             reply_bytes = length;
@@ -365,13 +365,13 @@ fn send_dhcp(message: &[u8; 300], identity: u16) -> bool {
     packet[42..].copy_from_slice(message);
     let computed = udp_checksum([0; 4], [255; 4], &packet[34..]);
     packet[40..42].copy_from_slice(&if computed == 0 { u16::MAX } else { computed }.to_be_bytes());
-    e1000::transmit(&packet)
+    crate::nic::transmit(&packet)
 }
 
 fn receive_dhcp(mac: [u8; 6], transaction: u32, expected_kind: u8) -> Option<DhcpReply> {
     let mut packet = [0u8; 2048];
     for _ in 0..12 {
-        let length = e1000::receive(&mut packet)?;
+        let length = crate::nic::receive(&mut packet)?;
         if length < 282
             || packet[..6] != mac && packet[..6] != [0xff; 6]
             || packet[12..14] != [0x08, 0x00]
@@ -458,6 +458,11 @@ fn valid_unicast(address: [u8; 4]) -> bool {
     address != [0; 4] && address != [255; 4] && address[0] < 224
 }
 
+/// Whether the interface is configured (link up, address leased).
+pub fn is_ready() -> bool {
+    CONFIG.lock().ready
+}
+
 pub fn send_udp(
     destination: [u8; 4],
     source_port: u16,
@@ -493,7 +498,7 @@ pub fn send_udp(
     packet[42..packet_bytes].copy_from_slice(payload);
     let computed = udp_checksum(config.local_ip, destination, &packet[34..packet_bytes]);
     packet[40..42].copy_from_slice(&if computed == 0 { u16::MAX } else { computed }.to_be_bytes());
-    e1000::transmit(&packet[..packet_bytes])
+    crate::nic::transmit(&packet[..packet_bytes])
 }
 
 pub fn receive_udp(
@@ -511,7 +516,7 @@ pub fn receive_udp(
     }
     let mut packet = [0u8; 2048];
     for _ in 0..12 {
-        let length = e1000::receive(&mut packet)?;
+        let length = crate::nic::receive(&mut packet)?;
         if length < 42
             || packet[..6] != config.mac
             || packet[12..14] != [0x08, 0x00]
@@ -632,7 +637,7 @@ pub fn ping(destination: [u8; 4]) -> PingReport {
     let icmp_checksum = checksum(&packet[34..]);
     packet[36..38].copy_from_slice(&icmp_checksum.to_be_bytes());
     let start = crate::time::monotonic_nanoseconds();
-    if !e1000::transmit(&packet) {
+    if !crate::nic::transmit(&packet) {
         return PingReport {
             destination,
             bytes: 0,
@@ -642,7 +647,7 @@ pub fn ping(destination: [u8; 4]) -> PingReport {
     }
     let mut received = [0u8; 2048];
     for _ in 0..32 {
-        let Some(length) = e1000::receive(&mut received) else {
+        let Some(length) = crate::nic::receive(&mut received) else {
             core::hint::spin_loop();
             continue;
         };
@@ -884,7 +889,7 @@ fn send_tcp(
     let calculated =
         transport_checksum(config.local_ip, destination, 6, &packet[34..packet_length]);
     packet[50..52].copy_from_slice(&calculated.to_be_bytes());
-    e1000::transmit(&packet[..packet_length])
+    crate::nic::transmit(&packet[..packet_length])
 }
 
 fn wait_tcp(
@@ -898,7 +903,7 @@ fn wait_tcp(
     let deadline = crate::time::monotonic_nanoseconds().saturating_add(timeout_ns);
     let mut packet = [0u8; 2048];
     while crate::time::monotonic_nanoseconds() < deadline {
-        let Some(length) = e1000::receive(&mut packet) else {
+        let Some(length) = crate::nic::receive(&mut packet) else {
             core::hint::spin_loop();
             continue;
         };

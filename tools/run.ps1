@@ -2,7 +2,8 @@ param(
     [ValidateSet("gtk", "sdl", "vnc", "none")][string]$Display = "gtk",
     [switch]$Gl,
     [int]$Cpus = 2,
-    [switch]$Monitor
+    [switch]$Monitor,
+    [switch]$Foreground
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,6 +20,18 @@ if (-not (Test-Path -LiteralPath $qemu)) {
 
 Copy-Item -Force -LiteralPath $variablesTemplate -Destination $variables
 $disk = "format=raw,file=fat:rw:$esp"
+
+# The persistent home volume (/home): a 64 MiB disk image the kernel formats
+# the first time it sees the marker in sector 0. Keep build\home.img to keep
+# your files between runs; delete it to start with an empty home.
+$homeImage = Join-Path $root "build\home.img"
+if (-not (Test-Path -LiteralPath $homeImage)) {
+    $stream = [System.IO.File]::Create($homeImage)
+    $stream.SetLength(64MB)
+    $marker = [System.Text.Encoding]::ASCII.GetBytes("AEROS-DATA-BLANK")
+    $stream.Write($marker, 0, $marker.Length)
+    $stream.Close()
+}
 $codeFlash = "if=pflash,format=raw,unit=0,readonly=on,file=$firmware"
 $variableFlash = "if=pflash,format=raw,unit=1,file=$variables"
 
@@ -37,16 +50,32 @@ Write-Host "AerOS booting. Serial log: $serial  (watch with: Get-Content '$seria
 
 $monitorArgs = if ($Monitor) { @("-monitor", "tcp:127.0.0.1:45511,server,nowait") } else { @() }
 
-& $qemu `
-    -machine q35,accel=whpx:tcg `
-    -m 512M `
-    -smp $Cpus `
-    -cpu "qemu64,+nx,+smep,+smap,+xsave,+xsaveopt,+rdrand,+rdtscp,+pdpe1gb" `
-    -drive $codeFlash `
-    -drive $variableFlash `
-    -drive $disk `
-    -device virtio-vga `
-    -display $displayArg `
-    -serial "file:$serial" `
-    @monitorArgs `
-    -no-reboot
+$qemuArgs = @(
+    "-machine", "q35,accel=whpx:tcg",
+    "-m", "512M",
+    "-smp", "$Cpus",
+    "-cpu", "qemu64,+nx,+smep,+smap,+xsave,+xsaveopt,+rdrand,+rdtscp,+pdpe1gb",
+    "-drive", $codeFlash,
+    "-drive", $variableFlash,
+    "-drive", $disk,
+    "-drive", "file=$homeImage,format=raw,if=ide,index=1",
+    "-device", "virtio-vga",
+    "-audiodev", "dsound,id=snd0",
+    "-device", "AC97,audiodev=snd0",
+    "-device", "qemu-xhci,id=xhci",
+    "-device", "usb-tablet,bus=xhci.0",
+    "-display", $displayArg,
+    "-serial", "file:$serial"
+) + $monitorArgs + @("-no-reboot")
+
+# No mouse grab: the USB tablet (and vmmouse) give an absolute pointer, so the
+# host cursor just works inside the window. The window opens minimized so it
+# doesn't steal focus, and this script returns immediately. -Foreground
+# restores the old blocking behavior.
+if ($Foreground) {
+    & $qemu @qemuArgs
+} else {
+    $quoted = $qemuArgs | ForEach-Object { if ($_ -match "\s") { '"' + $_ + '"' } else { $_ } }
+    $process = Start-Process -FilePath $qemu -ArgumentList ($quoted -join " ") -WindowStyle Minimized -PassThru
+    Write-Host "QEMU started minimized (pid $($process.Id)); no mouse grab needed - restore it from the taskbar." -ForegroundColor Cyan
+}

@@ -37,6 +37,25 @@ pub struct FrameBuffer {
     format: PixelFormat,
 }
 
+/// Screen brightness in percent, applied as pixels are copied to the screen.
+static BRIGHTNESS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(100);
+static BRIGHTNESS_SHOWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(100);
+
+pub fn set_brightness(percent: u8) {
+    BRIGHTNESS.store(
+        percent.clamp(5, 100) as u32,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn dim_pixel(value: u32, percent: u32) -> u32 {
+    if percent >= 100 {
+        return value;
+    }
+    let scale = |shift: u32| (((value >> shift) & 0xff) * percent / 100) << shift;
+    (value & 0xff00_0000) | scale(16) | scale(8) | scale(0)
+}
+
 impl FrameBuffer {
     pub unsafe fn new(info: FrameBufferInfo) -> Self {
         Self {
@@ -149,12 +168,15 @@ impl FrameBuffer {
         {
             return false;
         }
+        let percent = BRIGHTNESS.load(core::sync::atomic::Ordering::Relaxed);
+        let changed =
+            BRIGHTNESS_SHOWN.swap(percent, core::sync::atomic::Ordering::Relaxed) != percent;
         for (index, slot) in shadow.iter_mut().enumerate().take(active_pixels) {
             let value = unsafe { core::ptr::read(source.address.add(index)) };
-            if *slot != value {
+            if changed || *slot != value {
                 *slot = value;
                 unsafe {
-                    core::ptr::write_volatile(self.address.add(index), value);
+                    core::ptr::write_volatile(self.address.add(index), dim_pixel(value, percent));
                 }
             }
         }
@@ -174,7 +196,8 @@ impl FrameBuffer {
                 }
                 let index = py as usize * self.stride + px as usize;
                 if index < shadow.len() {
-                    self.write(px as usize, py as usize, shadow[index]);
+                    let percent = BRIGHTNESS.load(core::sync::atomic::Ordering::Relaxed);
+                    self.write(px as usize, py as usize, dim_pixel(shadow[index], percent));
                 }
             }
         }

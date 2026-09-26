@@ -67,6 +67,38 @@ umount "$CLOUD"
 chroot "$WORK" depmod -a "$KVER"
 fi
 
+# ---- extras added after the first full build (safe to re-run) ---------------
+# w3m fetches and renders web pages for AerOS's browser (real TLS through
+# libssl + the CA bundle); the overlay kernel module lets the store's apt
+# installs write into a RAM layer over the read-only root.
+EXTRAS="w3m ca-certificates gpgv sqv debian-archive-keyring"
+NEED=""
+for pkg in $EXTRAS; do chroot "$WORK" dpkg -s $pkg >/dev/null 2>&1 || NEED="$NEED $pkg"; done
+if [ -n "$NEED" ]; then
+  mountpoint -q "$WORK/proc" || mount -t proc proc "$WORK/proc"
+  mountpoint -q "$WORK/dev" || mount --bind /dev "$WORK/dev"
+  mkdir -p "$WORK/run"
+  cp /etc/resolv.conf "$WORK/run/resolv.conf"
+  chroot "$WORK" apt-get update -qq
+  chroot "$WORK" apt-get install -y -qq --no-install-recommends $NEED
+  chroot "$WORK" apt-get clean
+  rm -rf "$WORK"/var/lib/apt/lists/* "$WORK/run/resolv.conf"
+  umount "$WORK/dev" "$WORK/proc" 2>/dev/null || true
+fi
+if [ ! -e "$WORK/usr/lib/modules/$KVER/kernel/fs/overlayfs/overlay.ko.xz" ] \
+   || [ ! -e "$WORK/usr/lib/modules/$KVER/kernel/drivers/block/loop.ko.xz" ]; then
+  CLOUD=/mnt/aeros-cloud
+  mkdir -p "$CLOUD"
+  mount -o loop,ro "$WIN/build/linux-extract/0.img" "$CLOUD"
+  SRC=$(ls -d "$CLOUD"/usr/lib/modules/$KVER "$CLOUD"/lib/modules/$KVER 2>/dev/null | head -n 1)
+  mkdir -p "$WORK/usr/lib/modules/$KVER/kernel/fs/overlayfs"
+  cp "$SRC/kernel/fs/overlayfs/overlay.ko.xz" "$WORK/usr/lib/modules/$KVER/kernel/fs/overlayfs/"
+  mkdir -p "$WORK/usr/lib/modules/$KVER/kernel/drivers/block"
+  cp "$SRC/kernel/drivers/block/loop.ko.xz" "$WORK/usr/lib/modules/$KVER/kernel/drivers/block/"
+  umount "$CLOUD"
+  chroot "$WORK" depmod -a "$KVER"
+fi
+
 # ---- static configuration -------------------------------------------------
 mkdir -p "$WORK/etc/aeros" "$WORK/usr/share/udhcpc"
 ln -sf /run/resolv.conf "$WORK/etc/resolv.conf"
@@ -148,6 +180,42 @@ done
 exec firefox-esr --no-remote --profile $P "$@"
 FFOX
 chmod 755 "$WORK/usr/local/bin/aeros-firefox"
+cat > "$WORK/usr/local/bin/aeros-install" <<'INSTALL'
+#!/bin/sh
+# Installs Debian packages for the AerOS store (into the RAM overlay).
+# The agent reads the last line of the log: DONE / FAILED / anything = running.
+LOG=/tmp/aeros-install.log
+echo "starting $*" > $LOG
+export DEBIAN_FRONTEND=noninteractive
+# Run apt as root (no _apt sandbox user in this tiny system) and verify
+# signatures with gpgv.
+# (The guest clock can be a few days off the mirror's: skip the date checks.)
+APT="-o APT::Sandbox::User=root -o APT::Key::GPGVCommand=/usr/bin/gpgv -o Acquire::Check-Date=false -o Acquire::Check-Valid-Until=false"
+if [ ! -f /var/lib/apt/aeros-updated ]; then
+  echo "updating package lists" >> $LOG
+  apt-get $APT update -o Acquire::Languages=none >> $LOG 2>&1 || { echo FAILED >> $LOG; exit 1; }
+  : > /var/lib/apt/aeros-updated
+fi
+case "$1" in
+flathub:*)
+  # A Flathub app: needs flatpak itself first (installed on demand).
+  ID=${1#flathub:}
+  if ! command -v flatpak >/dev/null 2>&1; then
+    echo "setting up flatpak" >> $LOG
+    apt-get $APT install -y --no-install-recommends flatpak >> $LOG 2>&1 || { echo FAILED >> $LOG; exit 1; }
+  fi
+  echo "adding Flathub" >> $LOG
+  flatpak remote-add --system --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo >> $LOG 2>&1 || { echo FAILED >> $LOG; exit 1; }
+  echo "installing $ID" >> $LOG
+  if flatpak install --system -y --noninteractive flathub "$ID" >> $LOG 2>&1; then echo DONE >> $LOG; else echo FAILED >> $LOG; fi
+  ;;
+*)
+  echo "installing $*" >> $LOG
+  if apt-get $APT install -y --no-install-recommends "$@" >> $LOG 2>&1; then echo DONE >> $LOG; else echo FAILED >> $LOG; fi
+  ;;
+esac
+INSTALL
+chmod 755 "$WORK/usr/local/bin/aeros-install"
 gcc -O2 -Wall -o "$WORK/usr/local/bin/aeros-agent" "$WIN/tools/aeros-agent.c" -lX11 -lXfixes
 gcc -O2 -Wall -o "$WORK/usr/local/bin/aeros-mmap-test" "$WIN/tools/mmap-test.c"
 
@@ -188,7 +256,7 @@ $BB mkdir -p /dev/pts /dev/shm
 $BB mount -t devpts devpts /dev/pts
 $BB mount -t tmpfs tmpfs /dev/shm
 # The root disk is read-only: every directory something writes to is a tmpfs.
-for d in /tmp /run /var/log /var/tmp /var/lib/xkb /var/lib/dbus; do
+for d in /tmp /run /var/log /var/tmp; do
   $BB mkdir -p $d 2>/dev/null
   $BB mount -t tmpfs tmpfs $d
 done
@@ -200,6 +268,55 @@ echo "AEROS_LINUX_INIT_OK pid=$$"
 echo "AEROS_LINUX_UNAME $(uname -a)"
 echo "AEROS_LINUX_CPUS $($BB grep -c '^processor' /proc/cpuinfo)"
 /usr/local/bin/aeros-mmap-test
+# A RAM layer over the read-only root for the store's installs: apt writes
+# into overlays on the directories it touches (gone after a reboot).
+# The writable data area behind the root on the same disk (a loop device at
+# an offset): the layers and Flatpak live there and so persist across boots.
+DATA=""
+if [ -f /etc/aeros-data-offset ] && modprobe loop 2>/dev/null; then
+  read DATA_OFF < /etc/aeros-data-offset
+  $BB mkdir -p /run/data
+  if $BB losetup -o $DATA_OFF /dev/loop0 /dev/vda 2>/dev/null; then
+    /sbin/e2fsck -p /dev/loop0 >/dev/null 2>&1
+    if $BB mount -t ext4 /dev/loop0 /run/data 2>/dev/null; then
+      DATA=1
+      echo "AEROS_LINUX_DATA_OK $($BB df -k /run/data | $BB tail -n 1 | $BB tr -s ' ')"
+      # Push dirty data to the disk regularly (there is no clean shutdown).
+      ( while $BB sleep 10; do $BB sync; done ) &
+    fi
+  fi
+fi
+if modprobe overlay 2>/dev/null; then
+  # (The root is read-only, so the layers live under /run.)
+  $BB mkdir -p /run/ov
+  if [ -n "$DATA" ]; then
+    $BB mkdir -p /run/data/ov
+    $BB mount --bind /run/data/ov /run/ov
+  else
+    $BB mount -t tmpfs -o size=420m tmpfs /run/ov
+  fi
+  for d in /usr /etc /var/lib /var/cache /opt; do
+    [ -d $d ] || continue
+    n=$(echo $d | $BB tr '/' '_')
+    $BB mkdir -p /run/ov/$n /run/ov/$n.w
+    $BB mount -t overlay overlay -o lowerdir=$d,upperdir=/run/ov/$n,workdir=/run/ov/$n.w $d 2>/dev/null
+  done
+  echo "AEROS_LINUX_OVERLAY_OK $($BB mount | $BB grep -c '^overlay')"
+fi
+# Directories X needs writable inside /var/lib (mounted after the overlay,
+# which would otherwise hide them).
+for d in /var/lib/xkb /var/lib/dbus; do
+  $BB mkdir -p $d 2>/dev/null
+  $BB mount -t tmpfs tmpfs $d
+done
+# Flatpak's store (Flathub runtimes are big): its own roomy RAM disk.
+$BB mkdir -p /var/lib/flatpak 2>/dev/null
+if [ -n "$DATA" ]; then
+  $BB mkdir -p /run/data/flatpak
+  $BB mount --bind /run/data/flatpak /var/lib/flatpak
+else
+  $BB mount -t tmpfs -o size=1200m tmpfs /var/lib/flatpak
+fi
 # Big readahead on the virtio disk: demand-paging a large program (Firefox)
 # otherwise turns into thousands of small requests through the emulated disk.
 echo 1024 > /sys/block/vda/queue/read_ahead_kb 2>/dev/null
@@ -325,6 +442,7 @@ setsid -c xinit /etc/aeros/xinitrc -- /usr/bin/Xorg :0 vt1 -config /tmp/xorg.con
     $BB sleep 20
     echo "AEROS_LINUX_STATUS pids: $($BB pidof Xorg openbox xterm netsurf-gtk aeros-agent firefox-esr firefox-bin | $BB tr '\n' ' ') mem: $($BB grep -E 'MemAvailable' /proc/meminfo | $BB tr -s ' ')"
     $BB tail -n 4 /tmp/aeros-spawn.log 2>/dev/null | $BB cut -c1-160
+    $BB tail -n 3 /tmp/aeros-install.log 2>/dev/null | $BB cut -c1-160
     $BB grep -a '(EE)' /tmp/Xorg.log 2>/dev/null | $BB tail -n 2
     $BB tail -n 2 /tmp/xinit.log 2>/dev/null
     $BB grep -E 'i8042' /proc/interrupts 2>/dev/null | $BB tr -s ' '
@@ -368,6 +486,18 @@ OUT="$WIN/build/$OUT_NAME"
 IMG="${WORK}.img"
 rm -f "$IMG"
 truncate -s "${SIZE_MB}M" "$IMG"
+echo $((SIZE_MB * 1048576)) > "$WORK/etc/aeros-data-offset"
 mkfs.ext4 -q -F -m 0 -O ^has_journal -L aeros-root -d "$WORK" "$IMG"
-cp -f "$IMG" "$OUT"
+if [ -n "${FULL:-}" ]; then
+  # A writable data area after the read-only root (ext4, mounted by the guest
+  # through a loop device): the store's installs live there and persist.
+  DATA_MB=${DATA_MB:-15360}
+  DATA="${WORK}.data"
+  rm -f "$DATA"
+  truncate -s "${DATA_MB}M" "$DATA"
+  mkfs.ext4 -q -F -m 0 -O ^has_journal -E lazy_itable_init=1 -L aeros-data "$DATA"
+  dd if="$DATA" of="$IMG" bs=1M seek="$SIZE_MB" conv=notrunc,sparse status=none
+  rm -f "$DATA"
+fi
+cp --sparse=always -f "$IMG" "$OUT"
 ls -la "$OUT"

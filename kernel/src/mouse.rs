@@ -29,6 +29,13 @@ static POS_Y: AtomicI32 = AtomicI32::new(250);
 static BUTTONS: AtomicU8 = AtomicU8::new(0);
 static BOUNDS: AtomicU32 = AtomicU32::new((1280 << 16) | 800);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Where each recent left-button press happened, so a tap that begins and
+/// ends between two frames is still seen (a fingertip is often that short).
+const PRESS_SLOTS: usize = 8;
+static PRESS_X: [AtomicI32; PRESS_SLOTS] = [const { AtomicI32::new(0) }; PRESS_SLOTS];
+static PRESS_Y: [AtomicI32; PRESS_SLOTS] = [const { AtomicI32::new(0) }; PRESS_SLOTS];
+static PRESS_WRITE: AtomicU32 = AtomicU32::new(0);
+static PRESS_READ: AtomicU32 = AtomicU32::new(0);
 static PACKETS: AtomicU64 = AtomicU64::new(0);
 /// Wheel movement not yet consumed (positive = scroll down), accumulated
 /// from the absolute (vmmouse) packets' z field.
@@ -109,6 +116,34 @@ pub fn take_wheel() -> i32 {
     WHEEL.swap(0, Ordering::AcqRel)
 }
 
+fn record_press(x: i32, y: i32) {
+    let write = PRESS_WRITE.load(Ordering::Relaxed);
+    let slot = write as usize % PRESS_SLOTS;
+    PRESS_X[slot].store(x, Ordering::Relaxed);
+    PRESS_Y[slot].store(y, Ordering::Relaxed);
+    PRESS_WRITE.store(write.wrapping_add(1), Ordering::Release);
+}
+
+/// The next left-button press since the last call (oldest first), as the
+/// pointer position where it happened.
+pub fn take_press() -> Option<(i32, i32)> {
+    let write = PRESS_WRITE.load(Ordering::Acquire);
+    let mut read = PRESS_READ.load(Ordering::Relaxed);
+    if write.wrapping_sub(read) as usize > PRESS_SLOTS {
+        read = write.wrapping_sub(PRESS_SLOTS as u32);
+    }
+    if read == write {
+        return None;
+    }
+    let slot = read as usize % PRESS_SLOTS;
+    let point = (
+        PRESS_X[slot].load(Ordering::Relaxed),
+        PRESS_Y[slot].load(Ordering::Relaxed),
+    );
+    PRESS_READ.store(read.wrapping_add(1), Ordering::Relaxed);
+    Some(point)
+}
+
 pub fn ready() -> bool {
     READY.load(Ordering::Acquire)
 }
@@ -153,18 +188,58 @@ pub fn feed_byte(byte: u8) {
     }
     let delta_x = sign_extend(raw_x, flags & 0x10 != 0);
     let delta_y = sign_extend(raw_y, flags & 0x20 != 0);
-    BUTTONS.store(flags & 0x07, Ordering::Release);
+    // PS/2 reports "up" as positive; the pointer math below wants "down".
+    inject_motion(flags & 0x07, delta_x, -delta_y, 0);
+}
+
+/// One relative pointer report (PS/2 or USB HID): `buttons` bit 0 = left,
+/// 1 = right, 2 = middle; `dy_down` positive moves the pointer down; a
+/// positive `wheel` is a scroll away from the user (up).
+pub fn inject_motion(buttons: u8, delta_x: i32, dy_down: i32, wheel: i32) {
+    let pressed = buttons & 0x01 != 0 && BUTTONS.load(Ordering::Relaxed) & 1 == 0;
+    BUTTONS.store(buttons & 0x07, Ordering::Release);
     PACKETS.fetch_add(1, Ordering::Relaxed);
-    if delta_x == 0 && delta_y == 0 {
+    if wheel != 0 {
+        WHEEL.fetch_add(-wheel, Ordering::AcqRel);
+    }
+    if delta_x == 0 && dy_down == 0 {
+        if pressed {
+            record_press(POS_X.load(Ordering::Relaxed), POS_Y.load(Ordering::Relaxed));
+        }
         return;
     }
     let packed = BOUNDS.load(Ordering::Acquire);
     let max_x = ((packed >> 16) as i32 - 1).max(0);
     let max_y = ((packed & 0xffff) as i32 - 1).max(0);
     let next_x = (POS_X.load(Ordering::Relaxed) + delta_x).clamp(0, max_x);
-    let next_y = (POS_Y.load(Ordering::Relaxed) - delta_y).clamp(0, max_y);
+    let next_y = (POS_Y.load(Ordering::Relaxed) + dy_down).clamp(0, max_y);
     POS_X.store(next_x, Ordering::Release);
     POS_Y.store(next_y, Ordering::Release);
+    if pressed {
+        record_press(next_x, next_y);
+    }
+    GENERATION.fetch_add(1, Ordering::Release);
+}
+
+/// One absolute pointer report (USB tablet): `x`/`y` are 0..=0xffff across the
+/// screen; buttons and wheel as in `inject_motion`.
+pub fn inject_absolute(buttons: u8, x: u32, y: u32, wheel: i32) {
+    let pressed = buttons & 0x01 != 0 && BUTTONS.load(Ordering::Relaxed) & 1 == 0;
+    BUTTONS.store(buttons & 0x07, Ordering::Release);
+    PACKETS.fetch_add(1, Ordering::Relaxed);
+    if wheel != 0 {
+        WHEEL.fetch_add(-wheel, Ordering::AcqRel);
+    }
+    let packed = BOUNDS.load(Ordering::Acquire);
+    let max_x = ((packed >> 16) as i32 - 1).max(0);
+    let max_y = ((packed & 0xffff) as i32 - 1).max(0);
+    let next_x = (x.min(0xffff) as u64 * max_x as u64 / 0xffff) as i32;
+    let next_y = (y.min(0xffff) as u64 * max_y as u64 / 0xffff) as i32;
+    POS_X.store(next_x, Ordering::Release);
+    POS_Y.store(next_y, Ordering::Release);
+    if pressed {
+        record_press(next_x, next_y);
+    }
     GENERATION.fetch_add(1, Ordering::Release);
 }
 
@@ -243,6 +318,7 @@ fn apply_vmmouse_packet(flags: u32, x: u32, y: u32) {
     if flags & VMMOUSE_MIDDLE != 0 {
         buttons |= 4;
     }
+    let pressed = buttons & 1 != 0 && BUTTONS.load(Ordering::Relaxed) & 1 == 0;
     BUTTONS.store(buttons, Ordering::Release);
 
     let packed = BOUNDS.load(Ordering::Acquire);
@@ -261,6 +337,9 @@ fn apply_vmmouse_packet(flags: u32, x: u32, y: u32) {
     };
     POS_X.store(next_x.clamp(0, max_x), Ordering::Release);
     POS_Y.store(next_y.clamp(0, max_y), Ordering::Release);
+    if pressed {
+        record_press(next_x.clamp(0, max_x), next_y.clamp(0, max_y));
+    }
     PACKETS.fetch_add(1, Ordering::Relaxed);
     GENERATION.fetch_add(1, Ordering::Release);
 }

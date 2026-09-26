@@ -4,7 +4,17 @@ use crate::aerui::{
 };
 use crate::font::RasterFont;
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 const PRESS_NS: u64 = 80_000_000;
+/// Colour-work block size for button glass; the desktop raises it while
+/// things are moving so animation frames stay fast.
+static PAINT_STEP: AtomicUsize = AtomicUsize::new(1);
+
+pub fn set_paint_step(step: usize) {
+    PAINT_STEP.store(step.max(1), Ordering::Relaxed);
+}
+
 pub const RELEASE_NS: u64 = 150_000_000;
 
 #[derive(Clone, Copy)]
@@ -230,7 +240,22 @@ impl<'a> Button<'a> {
         let noise_seed = (self.bounds.x as u32).wrapping_mul(0x9e37_79b9)
             ^ (self.bounds.y as u32).wrapping_mul(0x517c_c1b7);
         let surface = self.animated_surface(style, now_ns).scaled(scale);
-        let report = painter.frosted_rounded_rect(bounds, radii, surface, noise_seed);
+        let step = PAINT_STEP.load(Ordering::Relaxed);
+        let report = if step >= 4 {
+            // Mid-animation: flat glass tint, no blur.
+            painter.fill_rounded_rect(bounds, radii, surface.tint);
+            if surface.border_width > 0 {
+                painter.stroke_rounded_rect(bounds, radii, surface.border_width, surface.border);
+            }
+            FrostReport {
+                pixels: 0,
+                blur_radius: 0,
+                captured: true,
+                clipped: false,
+            }
+        } else {
+            painter.frosted_rounded_rect_stepped(bounds, radii, surface, noise_seed, step)
+        };
         if self.interaction.focused && !self.interaction.disabled {
             self.paint_focus_ring(painter, scale, bounds, radii);
         }

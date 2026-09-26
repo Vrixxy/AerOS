@@ -686,12 +686,158 @@ impl<'a> Painter<'a> {
         }
     }
 
+    /// Blends one pixel (respecting the clip).
+    pub fn blend_pixel(&mut self, x: i32, y: i32, color: Color, alpha: u8) {
+        if x >= self.clip.x && x < self.clip.right() && y >= self.clip.y && y < self.clip.bottom() {
+            self.frame.blend(x, y, color, alpha);
+        }
+    }
+
+    pub fn frame_width(&self) -> i32 {
+        self.frame.width() as i32
+    }
+
+    pub fn frame_height(&self) -> i32 {
+        self.frame.height() as i32
+    }
+
+    /// Draws an `sw` x `sh` straight-alpha RGBA bitmap scaled into `dest`
+    /// with bilinear sampling (alpha-weighted so transparent edges stay clean).
+    pub fn draw_rgba_scaled(&mut self, dest: Rect, src: &[u8], sw: usize, sh: usize) {
+        self.draw_rgba_scaled_alpha(dest, src, sw, sh, 255);
+    }
+
+    /// `draw_rgba_scaled` with an extra overall opacity (0..=255).
+    pub fn draw_rgba_scaled_alpha(
+        &mut self,
+        dest: Rect,
+        src: &[u8],
+        sw: usize,
+        sh: usize,
+        opacity: u8,
+    ) {
+        if opacity == 0 {
+            return;
+        }
+        if dest.width <= 0 || dest.height <= 0 || src.len() < sw * sh * 4 || sw < 2 || sh < 2 {
+            return;
+        }
+        let Some(area) = dest.intersect(self.clip) else {
+            return;
+        };
+        let max_x = (sw as i64 - 1) * 256;
+        let max_y = (sh as i64 - 1) * 256;
+        for y in area.y..area.bottom() {
+            let v = ((((y - dest.y) * 2 + 1) as i64 * sh as i64 * 128) / dest.height as i64 - 128)
+                .clamp(0, max_y);
+            let (y0, fy) = ((v >> 8) as usize, v & 255);
+            let y1 = (y0 + 1).min(sh - 1);
+            for x in area.x..area.right() {
+                let u = ((((x - dest.x) * 2 + 1) as i64 * sw as i64 * 128) / dest.width as i64
+                    - 128)
+                    .clamp(0, max_x);
+                let (x0, fx) = ((u >> 8) as usize, u & 255);
+                let x1 = (x0 + 1).min(sw - 1);
+                let taps = [
+                    (x0, y0, (256 - fx) * (256 - fy)),
+                    (x1, y0, fx * (256 - fy)),
+                    (x0, y1, (256 - fx) * fy),
+                    (x1, y1, fx * fy),
+                ];
+                let (mut sum_a, mut sum_r, mut sum_g, mut sum_b) = (0i64, 0i64, 0i64, 0i64);
+                for (tx, ty, weight) in taps {
+                    let pixel = &src[(ty * sw + tx) * 4..(ty * sw + tx) * 4 + 4];
+                    let wa = weight * pixel[3] as i64;
+                    sum_a += wa;
+                    sum_r += wa * pixel[0] as i64;
+                    sum_g += wa * pixel[1] as i64;
+                    sum_b += wa * pixel[2] as i64;
+                }
+                if sum_a == 0 {
+                    continue;
+                }
+                let alpha = ((sum_a / 65536).clamp(0, 255) * opacity as i64 / 255) as u8;
+                if alpha == 0 {
+                    continue;
+                }
+                let color = Color::rgb(
+                    (sum_r / sum_a) as u8,
+                    (sum_g / sum_a) as u8,
+                    (sum_b / sum_a) as u8,
+                );
+                self.frame.blend(x, y, color, alpha);
+            }
+        }
+    }
+
+    /// Copies a screen rectangle out to `dst` (row-major, `width * height`
+    /// pixels). Used to cache expensive, unchanging surfaces such as the dock.
+    pub fn read_region(&self, bounds: Rect, dst: &mut [u32]) -> bool {
+        let info = self.frame.info();
+        let (Ok(x), Ok(y), Ok(w), Ok(h)) = (
+            usize::try_from(bounds.x),
+            usize::try_from(bounds.y),
+            usize::try_from(bounds.width),
+            usize::try_from(bounds.height),
+        ) else {
+            return false;
+        };
+        if x + w > info.width || y + h > info.height || w * h > dst.len() {
+            return false;
+        }
+        for row in 0..h {
+            let start = (y + row) * info.stride + x;
+            for col in 0..w {
+                // SAFETY: bounds were checked against the framebuffer size.
+                dst[row * w + col] =
+                    unsafe { core::ptr::read_volatile(info.address.add(start + col)) };
+            }
+        }
+        true
+    }
+
+    /// Writes back a rectangle saved with `read_region`.
+    pub fn write_region(&mut self, bounds: Rect, src: &[u32]) -> bool {
+        let info = self.frame.info();
+        let (Ok(x), Ok(y), Ok(w), Ok(h)) = (
+            usize::try_from(bounds.x),
+            usize::try_from(bounds.y),
+            usize::try_from(bounds.width),
+            usize::try_from(bounds.height),
+        ) else {
+            return false;
+        };
+        if x + w > info.width || y + h > info.height || w * h > src.len() {
+            return false;
+        }
+        for row in 0..h {
+            let start = (y + row) * info.stride + x;
+            for col in 0..w {
+                // SAFETY: bounds were checked against the framebuffer size.
+                unsafe {
+                    core::ptr::write_volatile(info.address.add(start + col), src[row * w + col])
+                };
+            }
+        }
+        true
+    }
+
     pub fn fill_rounded_rect(&mut self, bounds: Rect, radii: CornerRadii, color: Rgba) {
         let Some(area) = bounds.intersect(self.clip) else {
             return;
         };
         let radii = radii.fit(bounds);
+        // Rows between the corner bands are fully covered, so they skip the
+        // per-pixel corner test (most of a large panel).
+        let band_top = bounds.y + radii.top_left.max(radii.top_right);
+        let band_bottom = bounds.bottom() - radii.bottom_left.max(radii.bottom_right);
         for y in area.y..area.bottom() {
+            if y >= band_top && y < band_bottom {
+                for x in area.x..area.right() {
+                    self.frame.blend(x, y, color.color(), color.alpha);
+                }
+                continue;
+            }
             for x in area.x..area.right() {
                 let coverage = rounded_coverage(bounds, radii, Point::new(x, y));
                 if coverage != 0 {
@@ -718,7 +864,20 @@ impl<'a> Painter<'a> {
         let radii = radii.fit(bounds);
         let inner = bounds.inset(Insets::all(width as i32));
         let inner_radii = radii.inset(width as i32);
+        let band_top = bounds.y + radii.top_left.max(radii.top_right);
+        let band_bottom = bounds.bottom() - radii.bottom_left.max(radii.bottom_right);
+        let edge = width as i32;
         for y in area.y..area.bottom() {
+            if y >= band_top && y < band_bottom {
+                // Straight sides: only the two edge strips are inked.
+                for x in area.x..area.right().min(bounds.x + edge) {
+                    self.frame.blend(x, y, color.color(), color.alpha);
+                }
+                for x in area.x.max(bounds.right() - edge)..area.right() {
+                    self.frame.blend(x, y, color.color(), color.alpha);
+                }
+                continue;
+            }
             for x in area.x..area.right() {
                 let point = Point::new(x, y);
                 let outer_coverage = rounded_coverage(bounds, radii, point);
@@ -752,6 +911,22 @@ impl<'a> Painter<'a> {
         style: FrostStyle,
         noise_seed: u32,
     ) -> FrostReport {
+        self.frosted_rounded_rect_stepped(bounds, radii, style, noise_seed, 1)
+    }
+
+    /// Like `frosted_rounded_rect`, but the per-pixel colour work (saturation,
+    /// noise, tint) is done once per `step` x `step` block. The blur itself is
+    /// smooth, so at 2-3 pixels the difference is hard to see, while the cost
+    /// drops by `step` squared: for panels that are moving.
+    pub fn frosted_rounded_rect_stepped(
+        &mut self,
+        bounds: Rect,
+        radii: CornerRadii,
+        style: FrostStyle,
+        noise_seed: u32,
+        step: usize,
+    ) -> FrostReport {
+        let step = step.max(1);
         let clipped = bounds.intersect(self.clip);
         let Some(area) = clipped else {
             return FrostReport {
@@ -781,7 +956,12 @@ impl<'a> Painter<'a> {
             };
         }
         let fitted = radii.fit(bounds);
-        self.paint_shadow(bounds, fitted, style);
+        // The drop shadow is up to 16 full-size blended layers - by far the
+        // costliest part for a big panel - so a moving panel (step > 1) goes
+        // without it and gets it back when it settles.
+        if step == 1 {
+            self.paint_shadow(bounds, fitted, style);
+        }
         let mut scratch = FROST_SCRATCH.lock();
         capture(self.frame, area, &mut scratch.source[..pixels]);
         {
@@ -797,7 +977,12 @@ impl<'a> Painter<'a> {
         let width = area.width as usize;
         let height = area.height as usize;
         let radius = style.blur_radius as usize;
-        for local_x in 0..width {
+        let corner = fitted
+            .top_left
+            .max(fitted.top_right)
+            .max(fitted.bottom_right)
+            .max(fitted.bottom_left);
+        for local_x in (0..width).step_by(step) {
             let mut start = 0usize;
             let mut end = radius.min(height - 1);
             let mut red = 0u32;
@@ -810,21 +995,40 @@ impl<'a> Painter<'a> {
                 blue += pixel.blue as u32;
             }
             for local_y in 0..height {
-                let x = area.x + local_x as i32;
-                let y = area.y + local_y as i32;
-                let coverage = rounded_coverage(bounds, fitted, Point::new(x, y));
-                if coverage != 0 {
+                if local_y % step == 0 {
+                    // One colour for the whole step x step block; each pixel
+                    // still gets its own edge coverage.
                     let samples = (end - start + 1) as u32;
-                    let pixel = FrostPixel {
-                        red: (red / samples) as u8,
-                        green: (green / samples) as u8,
-                        blue: (blue / samples) as u8,
-                    };
-                    let color = transform_frost(pixel, style, x, y, noise_seed).color();
-                    if coverage == 255 {
-                        self.frame.pixel(x, y, color);
-                    } else {
-                        self.frame.blend(x, y, color, coverage);
+                    let mut block_color = None;
+                    for offset_y in 0..step.min(height - local_y) {
+                        for offset_x in 0..step.min(width - local_x) {
+                            let x = area.x + (local_x + offset_x) as i32;
+                            let y = area.y + (local_y + offset_y) as i32;
+                            let coverage = if (x >= bounds.x + corner
+                                && x < bounds.right() - corner)
+                                || (y >= bounds.y + corner && y < bounds.bottom() - corner)
+                            {
+                                255 // inside the straight part of the shape
+                            } else {
+                                rounded_coverage(bounds, fitted, Point::new(x, y))
+                            };
+                            if coverage == 0 {
+                                continue;
+                            }
+                            let color = *block_color.get_or_insert_with(|| {
+                                let pixel = FrostPixel {
+                                    red: (red / samples) as u8,
+                                    green: (green / samples) as u8,
+                                    blue: (blue / samples) as u8,
+                                };
+                                transform_frost(pixel, style, x, y, noise_seed).color()
+                            });
+                            if coverage == 255 {
+                                self.frame.pixel(x, y, color);
+                            } else {
+                                self.frame.blend(x, y, color, coverage);
+                            }
+                        }
                     }
                 }
                 if local_y + 1 == height {
@@ -910,8 +1114,30 @@ impl<'a> Painter<'a> {
         self.clip = mask;
         let softness = style.inner_shadow_softness.clamp(1, 32) as i32;
         let denominator = (softness * softness) as u32;
+        // Only a band along the edges gets any shadow (a pixel whose shifted
+        // position is `softness` or more from every edge is skipped below), so
+        // the interior rectangle is not even visited.
+        // (Kept clear of the rounded corners too, where the distance to the
+        // arc can be smaller than the distance to the straight edges.)
+        let inset = softness
+            .max(radii.top_left)
+            .max(radii.top_right)
+            .max(radii.bottom_right)
+            .max(radii.bottom_left);
+        let interior_x0 = bounds.x + inset + style.inner_shadow_offset.x;
+        let interior_x1 = bounds.right() - inset + style.inner_shadow_offset.x;
+        let interior_y0 = bounds.y + inset + style.inner_shadow_offset.y;
+        let interior_y1 = bounds.bottom() - inset + style.inner_shadow_offset.y;
         for y in mask.y..mask.bottom() {
-            for x in mask.x..mask.right() {
+            let mut x = mask.x;
+            while x < mask.right() {
+                if y >= interior_y0 && y < interior_y1 && x >= interior_x0 && x < interior_x1 {
+                    x = interior_x1.min(mask.right());
+                    continue;
+                }
+                let px = x;
+                x += 1;
+                let x = px;
                 let point = Point::new(x, y);
                 let coverage = rounded_coverage(bounds, radii, point);
                 if coverage == 0 {

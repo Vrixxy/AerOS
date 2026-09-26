@@ -4,6 +4,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::CpuInfo;
 
+use super::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 use super::user;
 
 const EFER: u32 = 0xc000_0080;
@@ -28,6 +29,9 @@ struct CpuLocal {
     kernel_rsp: UnsafeCell<u64>,
     user_rsp: UnsafeCell<u64>,
     logical: UnsafeCell<u64>,
+    /// Registers for the `iretq` return (syscall return code 2): rcx, r11,
+    /// rip, rsp, rflags, at gs offsets 24..64.
+    iret: [UnsafeCell<u64>; 5],
 }
 
 unsafe impl Sync for SyscallStack {}
@@ -40,6 +44,7 @@ static CPU_LOCALS: [CpuLocal; MAX_CPUS] = [const {
         kernel_rsp: UnsafeCell::new(0),
         user_rsp: UnsafeCell::new(0),
         logical: UnsafeCell::new(0),
+        iret: [const { UnsafeCell::new(0) }; 5],
     }
 }; MAX_CPUS];
 static READY: AtomicU64 = AtomicU64::new(0);
@@ -121,6 +126,42 @@ pub fn init_for_cpu(logical: usize, cpu: &CpuInfo) -> SyscallEntryState {
     }
 }
 
+/// Points this CPU's `syscall` entry at a task-private kernel stack (or back
+/// at the default one for `None`), so a task that blocks inside a syscall
+/// keeps its saved frame intact while other tasks run their own syscalls.
+pub fn set_syscall_stack(logical: usize, top: Option<u64>) {
+    if logical >= MAX_CPUS {
+        return;
+    }
+    let top = top.unwrap_or_else(|| unsafe {
+        (*SYSCALL_STACKS[logical].0.get())
+            .as_ptr()
+            .add(SYSCALL_STACK_SIZE) as u64
+    }) & !15;
+    unsafe {
+        *CPU_LOCALS[logical].kernel_rsp.get() = top;
+    }
+}
+
+/// Queues a full-register return to user mode for the syscall that is
+/// finishing on this CPU (the dispatcher then returns 2): `sysret` can't
+/// restore rcx/r11, so an asynchronously interrupted context comes back
+/// through `iretq` instead. Only valid inside a syscall (kernel GS active).
+pub fn set_iret_return(rcx: u64, r11: u64, rip: u64, rsp: u64, rflags: u64) {
+    let logical: u64;
+    // SAFETY: inside the syscall entry, GS holds this CPU's `CpuLocal`, whose
+    // slot 2 is its logical index.
+    unsafe {
+        asm!("mov {}, gs:[16]", out(reg) logical, options(nostack, preserves_flags));
+    }
+    let Some(local) = CPU_LOCALS.get(logical as usize) else {
+        return;
+    };
+    for (slot, value) in local.iret.iter().zip([rcx, r11, rip, rsp, rflags]) {
+        unsafe { *slot.get() = value };
+    }
+}
+
 pub fn ready_mask() -> u64 {
     READY.load(Ordering::Acquire)
 }
@@ -168,6 +209,8 @@ unsafe extern "C" fn syscall_entry() -> ! {
         "and rsp, -16",
         "sub rsp, 32",
         "call {dispatch}",
+        "cmp rax, 2",
+        "je 2f",
         "test rax, rax",
         "jnz {process_exit}",
         "mov rsp, rbx",
@@ -189,6 +232,33 @@ unsafe extern "C" fn syscall_entry() -> ! {
         "mov rsp, qword ptr gs:[8]",
         "swapgs",
         "sysretq",
+        "2:",
+        "mov rsp, rbx",
+        "pop rax",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop r10",
+        "pop r8",
+        "pop r9",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbp",
+        "pop rbx",
+        "add rsp, 16",
+        "push {user_data}",
+        "push qword ptr gs:[48]",
+        "push qword ptr gs:[56]",
+        "push {user_code}",
+        "push qword ptr gs:[40]",
+        "mov rcx, qword ptr gs:[24]",
+        "mov r11, qword ptr gs:[32]",
+        "swapgs",
+        "iretq",
+        user_data = const USER_DATA_SELECTOR,
+        user_code = const USER_CODE_SELECTOR,
         dispatch = sym crate::syscall::aeros_linux_syscall_dispatch,
         process_exit = sym syscall_process_exit,
     )

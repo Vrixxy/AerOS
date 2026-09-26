@@ -22,6 +22,12 @@
  *                     {op, a0..a3, text[128]}; slot = counter % 16
  *                     ops: 1 close(id) 2 focus(id) 3 spawn(text) 4 move(id,x,y) 5 resize(id,w,h)
  */
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/extensions/Xfixes.h>
@@ -46,6 +52,14 @@
 #define MAGIC_CLIP_IN 0x49434541u  /* "AECI" */
 #define MAGIC_CLIP_OUT 0x4f434541u /* "AECO" */
 #define CMD_SLOTS 16
+#define WEB_REQ_OFF 0xA30000u /* host -> guest: page to fetch */
+#define WEB_RES_OFF 0xA40000u /* guest -> host: the page as text */
+#define APPS_OFF 0xA50000u    /* guest -> host: installed applications */
+#define WEB_MAX 64000u
+#define MAX_APPS 96
+#define MAGIC_WEB_REQ 0x51574541u /* "AEWQ" */
+#define MAGIC_WEB_RES 0x53574541u /* "AEWS" */
+#define MAGIC_APPS 0x50414541u    /* "AEAP" */
 
 struct gwin {
     uint32_t id;
@@ -82,6 +96,30 @@ struct clip_in {
 struct clip_out {
     uint32_t magic, seq, len, pad;
     char data[CLIP_MAX];
+};
+
+struct web_req {
+    uint32_t magic, seq_host, seq_ack, cols;
+    char url[512];
+};
+
+struct web_res {
+    uint32_t magic, seq;
+    uint32_t status; /* 0 done, 1 failed, 2 fetching */
+    uint32_t len;
+    char data[WEB_MAX];
+};
+
+struct app_ent {
+    char name[48];
+    char exec[112];
+    char cat[24];
+};
+
+struct apps_tab {
+    uint32_t magic, seq, count;
+    uint32_t install_state; /* 0 idle, 1 installing, 2 done, 3 failed */
+    struct app_ent app[MAX_APPS];
 };
 
 static Display *dpy;
@@ -296,6 +334,232 @@ static void clipboard_poll(volatile struct clip_in *in, volatile struct clip_out
     }
 }
 
+/* ---- Web fetch ----------------------------------------------------------
+ * The host's browser asks for a page by URL; w3m (with real TLS) fetches it and
+ * renders it as text, which is published back for the host to draw. The
+ * fetch runs as a child process and is polled, so the window table keeps
+ * updating meanwhile. */
+static int web_fd = -1;
+static pid_t web_pid;
+static size_t web_len;
+static time_t web_started;
+static char web_buf[WEB_MAX];
+
+static void web_publish(volatile struct web_res *res, uint32_t status, const char *data, size_t len) {
+    if (len > WEB_MAX) len = WEB_MAX;
+    res->seq++;
+    __sync_synchronize();
+    if (len) memcpy((void *)res->data, data, len);
+    res->status = status;
+    res->len = (uint32_t)len;
+    __sync_synchronize();
+    res->seq++;
+}
+
+static void web_finish(volatile struct web_res *res, int failed, const char *note) {
+    if (web_fd >= 0) close(web_fd);
+    web_fd = -1;
+    if (web_pid > 0) {
+        kill(web_pid, SIGKILL);
+        waitpid(web_pid, NULL, 0);
+    }
+    web_pid = 0;
+    if (web_len == 0 && note) {
+        snprintf(web_buf, sizeof web_buf, "%s", note);
+        web_len = strlen(web_buf);
+        failed = 1;
+    }
+    web_publish(res, failed ? 1 : 0, web_buf, web_len);
+}
+
+static void web_poll(volatile struct web_req *req, volatile struct web_res *res) {
+    if (req->seq_host != req->seq_ack) {
+        char url[512];
+        uint32_t cols = req->cols < 40 ? 40 : req->cols > 200 ? 200 : req->cols;
+        memcpy(url, (const void *)req->url, sizeof url);
+        url[sizeof url - 1] = 0;
+        req->seq_ack = req->seq_host;
+        if (web_fd >= 0) web_finish(res, 1, NULL); /* superseded */
+        int fds[2];
+        if (pipe(fds) == 0) {
+            pid_t pid = fork();
+            if (pid == 0) {
+                dup2(fds[1], 1);
+                dup2(fds[1], 2);
+                close(fds[0]);
+                close(fds[1]);
+                char colarg[16];
+                snprintf(colarg, sizeof colarg, "%u", cols);
+                setenv("HOME", "/tmp/home", 1);
+                execl("/usr/bin/w3m", "w3m", "-dump", "-cols", colarg, "-o", "display_link_number=1", "-o", "user_agent=Mozilla/5.0 (X11; Linux x86_64) AerOS",
+                      url, (char *)NULL);
+                printf("This system has no web fetcher (w3m) installed.\n");
+                _exit(127);
+            }
+            close(fds[1]);
+            if (pid > 0) {
+                fcntl(fds[0], F_SETFL, O_NONBLOCK);
+                web_fd = fds[0];
+                web_pid = pid;
+                web_len = 0;
+                web_started = time(NULL);
+                web_publish(res, 2, "", 0);
+            } else {
+                close(fds[0]);
+                web_publish(res, 1, "fork failed", 11);
+            }
+        }
+    }
+    if (web_fd < 0) return;
+    for (int i = 0; i < 8; i++) {
+        ssize_t n = read(web_fd, web_buf + web_len, WEB_MAX - web_len);
+        if (n > 0) {
+            web_len += (size_t)n;
+            if (web_len >= WEB_MAX) break;
+        } else if (n == 0) {
+            web_finish(res, 0, "The page returned nothing.");
+            return;
+        } else {
+            break; /* EAGAIN */
+        }
+    }
+    if (web_len >= WEB_MAX) {
+        web_finish(res, 0, NULL);
+        return;
+    }
+    if (time(NULL) - web_started > 45) web_finish(res, 1, "The page took too long to load.");
+}
+
+/* ---- Installed applications ---------------------------------------------
+ * The .desktop files under /usr/share/applications, as the host's store shows
+ * them; rescanned when the directory changes (an install adds files). */
+static struct app_ent apps_found[MAX_APPS];
+static int apps_count;
+
+static void trim(char *text) {
+    size_t n = strlen(text);
+    while (n && (text[n - 1] == '\n' || text[n - 1] == '\r' || text[n - 1] == ' ')) text[--n] = 0;
+}
+
+static int app_cmp(const void *a, const void *b) {
+    return strcasecmp(((const struct app_ent *)a)->name, ((const struct app_ent *)b)->name);
+}
+
+static void scan_dir(const char *dirpath) {
+    DIR *dir = opendir(dirpath);
+    if (!dir) return;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) && apps_count < MAX_APPS) {
+        size_t len = strlen(entry->d_name);
+        if (len < 9 || strcmp(entry->d_name + len - 8, ".desktop") != 0) continue;
+        char path[300];
+        snprintf(path, sizeof path, "%s/%s", dirpath, entry->d_name);
+        FILE *file = fopen(path, "r");
+        if (!file) continue;
+        struct app_ent app;
+        memset(&app, 0, sizeof app);
+        int in_entry = 0, hidden = 0, is_app = 0, has_name = 0, terminal = 0;
+        char line[512];
+        while (fgets(line, sizeof line, file)) {
+            trim(line);
+            if (line[0] == '[') {
+                in_entry = strcmp(line, "[Desktop Entry]") == 0;
+                continue;
+            }
+            if (!in_entry) continue;
+            if (strncmp(line, "Name=", 5) == 0 && !has_name) {
+                snprintf(app.name, sizeof app.name, "%s", line + 5);
+                has_name = 1;
+            } else if (strncmp(line, "Exec=", 5) == 0 && !app.exec[0]) {
+                snprintf(app.exec, sizeof app.exec, "%s", line + 5);
+            } else if (strcmp(line, "Type=Application") == 0) {
+                is_app = 1;
+            } else if (strcmp(line, "Terminal=true") == 0) {
+                terminal = 1;
+            } else if (strcmp(line, "NoDisplay=true") == 0 || strcmp(line, "Hidden=true") == 0) {
+                hidden = 1;
+            } else if (strncmp(line, "Categories=", 11) == 0) {
+                if (strstr(line + 11, "Settings")) hidden = 1; /* settings dialogs are not apps */
+                char *semi = strchr(line + 11, ';');
+                if (semi) *semi = 0;
+                snprintf(app.cat, sizeof app.cat, "%s", line + 11);
+            }
+        }
+        fclose(file);
+        if (hidden || !is_app || !has_name || !app.exec[0]) continue;
+        /* Drop the field codes (%U, %f ...) from the command line. */
+        for (char *at = app.exec; *at; at++) {
+            if (*at == '%' && at[1]) {
+                memmove(at, at + 2, strlen(at + 2) + 1);
+                at--;
+            }
+        }
+        /* Flatpak launchers wrap the file arguments in @@u ... @@. */
+        for (char *at; (at = strstr(app.exec, " @@u")) || (at = strstr(app.exec, " @@"));) {
+            memmove(at, at + (at[3] == 'u' ? 4 : 3), strlen(at + (at[3] == 'u' ? 4 : 3)) + 1);
+        }
+        trim(app.exec);
+        if (terminal) {
+            /* A terminal program: run it inside an xterm. */
+            char wrapped[112];
+            snprintf(wrapped, sizeof wrapped, "xterm -e %s", app.exec);
+            snprintf(app.exec, sizeof app.exec, "%s", wrapped);
+        }
+        int duplicate = 0;
+        for (int i = 0; i < apps_count; i++)
+            if (strcmp(apps_found[i].name, app.name) == 0) duplicate = 1;
+        if (!duplicate) apps_found[apps_count++] = app;
+    }
+    closedir(dir);
+}
+
+static void scan_apps(void) {
+    apps_count = 0;
+    scan_dir("/usr/share/applications");
+    scan_dir("/var/lib/flatpak/exports/share/applications");
+    qsort(apps_found, (size_t)apps_count, sizeof apps_found[0], app_cmp);
+}
+
+static uint32_t install_state(void) {
+    FILE *file = fopen("/tmp/aeros-install.log", "r");
+    if (!file) return 0;
+    char line[256], last[256] = "";
+    while (fgets(line, sizeof line, file)) {
+        trim(line);
+        if (line[0]) snprintf(last, sizeof last, "%s", line);
+    }
+    fclose(file);
+    if (strcmp(last, "DONE") == 0) return 2;
+    if (strcmp(last, "FAILED") == 0) return 3;
+    return 1;
+}
+
+static void apps_poll(volatile struct apps_tab *tab) {
+    static time_t last_check;
+    static time_t last_mtime;
+    static uint32_t last_state = 99;
+    time_t now = time(NULL);
+    if (now == last_check) return;
+    last_check = now;
+    struct stat st;
+    time_t mtime = 0;
+    if (stat("/usr/share/applications", &st) == 0) mtime = st.st_mtime > st.st_ctime ? st.st_mtime : st.st_ctime;
+    if (stat("/var/lib/flatpak/exports/share/applications", &st) == 0)
+        mtime += st.st_mtime > st.st_ctime ? st.st_mtime : st.st_ctime;
+    uint32_t state = install_state();
+    if (mtime == last_mtime && state == last_state && tab->seq != 0) return;
+    last_mtime = mtime;
+    last_state = state;
+    scan_apps();
+    tab->seq++;
+    __sync_synchronize();
+    tab->count = (uint32_t)apps_count;
+    tab->install_state = state;
+    memcpy((void *)tab->app, apps_found, sizeof apps_found[0] * (size_t)apps_count);
+    __sync_synchronize();
+    tab->seq++;
+}
+
 /* Windows vanish between listing and inspecting them; an X error there must
  * not kill the agent (Xlib's default handler exits the process). */
 static int ignore_x_error(Display *d, XErrorEvent *e) {
@@ -335,6 +599,15 @@ int main(void) {
     clip_out->magic = MAGIC_CLIP_OUT;
     clip_out->seq = 0;
     clipboard_init();
+    volatile struct web_req *web_req = (volatile struct web_req *)(map + WEB_REQ_OFF);
+    volatile struct web_res *web_res = (volatile struct web_res *)(map + WEB_RES_OFF);
+    volatile struct apps_tab *apps_tab = (volatile struct apps_tab *)(map + APPS_OFF);
+    web_req->magic = MAGIC_WEB_REQ;
+    web_req->seq_ack = web_req->seq_host;
+    web_res->magic = MAGIC_WEB_RES;
+    web_res->seq = 0;
+    apps_tab->magic = MAGIC_APPS;
+    apps_tab->seq = 0;
 
     XWindowAttributes rootat;
     XGetWindowAttributes(dpy, root, &rootat);
@@ -357,6 +630,8 @@ int main(void) {
             ring->seq_ack++;
         }
         clipboard_poll(clip_in, clip_out);
+        web_poll(web_req, web_res);
+        apps_poll(apps_tab);
 
         Atom type;
         int fmt;

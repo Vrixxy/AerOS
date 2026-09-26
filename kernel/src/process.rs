@@ -372,17 +372,20 @@ pub fn prepare_linux_stack(
 /// fine through `run` before this existed, `aeros-std-smoke` did not.
 /// The payload here is small (under 400 bytes), so the one-page stack
 /// these processes get is ample room, unlike the old path's two pages.
-pub fn prepare_scheduled_process_stack(
+/// Same, with an explicit argv and environment (each string without its NUL).
+pub fn prepare_scheduled_process_stack_with(
     space: &mut crate::arch::paging::ProcessAddressSpace,
     image: &ElfImage<'_>,
     executable: &str,
+    args: &[&[u8]],
+    env: &[&[u8]],
 ) -> bool {
-    if executable.is_empty() || executable.len() >= 256 {
+    if executable.is_empty() || executable.len() >= 256 || args.len() > 16 || env.len() > 16 {
         return false;
     }
     let stack_physical = space.stack_physical;
     let stack_virtual = crate::arch::paging::process_stack_base();
-    let mut cursor = PAGE_SIZE as usize - 16;
+    let mut cursor = crate::arch::paging::PROCESS_STACK_BYTES as usize - 16;
     let Some(executable_address) = push_bytes(
         stack_physical,
         stack_virtual,
@@ -407,12 +410,33 @@ pub fn prepare_scheduled_process_stack(
         return false;
     };
     random.fill(0);
+    let mut arg_addresses = [0u64; 16];
+    for (slot, arg) in args.iter().enumerate() {
+        let Some(address) = push_bytes(stack_physical, stack_virtual, &mut cursor, arg, true)
+        else {
+            return false;
+        };
+        arg_addresses[slot] = address;
+    }
+    let mut env_addresses = [0u64; 16];
+    for (slot, value) in env.iter().enumerate() {
+        let Some(address) = push_bytes(stack_physical, stack_virtual, &mut cursor, value, true)
+        else {
+            return false;
+        };
+        env_addresses[slot] = address;
+    }
     cursor &= !15;
-    let mut words = [0u64; 32];
+    let mut words = [0u64; 96];
     let mut count = 0;
-    push_word(&mut words, &mut count, 1);
-    push_word(&mut words, &mut count, executable_address);
+    push_word(&mut words, &mut count, args.len() as u64);
+    for address in &arg_addresses[..args.len()] {
+        push_word(&mut words, &mut count, *address);
+    }
     push_word(&mut words, &mut count, 0);
+    for address in &env_addresses[..env.len()] {
+        push_word(&mut words, &mut count, *address);
+    }
     push_word(&mut words, &mut count, 0);
     let virtual_base = crate::arch::paging::process_virtual_base();
     push_pair(&mut words, &mut count, AT_PHDR, virtual_base + 64);
@@ -473,12 +497,12 @@ fn push_bytes(
     Some(virtual_base + *cursor as u64)
 }
 
-fn push_pair(words: &mut [u64; 32], count: &mut usize, key: u64, value: u64) {
+fn push_pair(words: &mut [u64], count: &mut usize, key: u64, value: u64) {
     push_word(words, count, key);
     push_word(words, count, value);
 }
 
-fn push_word(words: &mut [u64; 32], count: &mut usize, value: u64) {
+fn push_word(words: &mut [u64], count: &mut usize, value: u64) {
     words[*count] = value;
     *count += 1;
 }

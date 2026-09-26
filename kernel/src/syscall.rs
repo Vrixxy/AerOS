@@ -15,6 +15,8 @@ pub const SYS_GETPPID: u64 = 7;
 pub const SYS_SBRK: u64 = 8;
 pub const SYS_WRITE: u64 = 9;
 pub const SYS_GETRANDOM: u64 = 10;
+/// execve by VFS path (rdi = length, path bytes packed in rsi..r9).
+pub const SYS_EXEC_PATH: u64 = 11;
 pub const ABI_VERSION: u64 = 0x0001_0000;
 pub const EXEC_PROGRAM_MAX: usize = 40;
 
@@ -45,7 +47,11 @@ const LINUX_ACCESS: u64 = 21;
 const LINUX_MSYNC: u64 = 26;
 const LINUX_MADVISE: u64 = 28;
 const LINUX_SCHED_YIELD: u64 = 24;
+const LINUX_PAUSE: u64 = 34;
 const LINUX_NANOSLEEP: u64 = 35;
+const LINUX_GETITIMER: u64 = 36;
+const LINUX_ALARM: u64 = 37;
+const LINUX_SETITIMER: u64 = 38;
 const LINUX_GETPID: u64 = 39;
 const LINUX_SOCKET: u64 = 41;
 const LINUX_CONNECT: u64 = 42;
@@ -273,6 +279,22 @@ static PIPES: TicketLock<[Pipe; PIPE_COUNT]> = TicketLock::new([Pipe::EMPTY; PIP
 /// would otherwise see a spurious EAGAIN, never hang or corrupt state.
 const PIPE_WAIT_ITERATIONS: u32 = 64;
 
+/// `yield_now` for code that may run inside a Linux syscall of a user process:
+/// other tasks must see the ring-3 GS layout (and not clobber the saved user
+/// rsp) while this one is switched out. Kernel-only tasks just yield.
+fn yield_in_syscall() {
+    if crate::scheduler::current_task_pid_for_linux().is_none() {
+        crate::scheduler::yield_now();
+        return;
+    }
+    let saved_user_rsp = user_stack_pointer();
+    // SAFETY: paired swapgs around the yield restore the in-syscall GS state.
+    unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
+    crate::scheduler::yield_now();
+    unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
+    set_user_stack_pointer(saved_user_rsp);
+}
+
 fn pipe_read(slot: usize, destination: &mut [u8]) -> Result<usize, u64> {
     for attempt in 0..PIPE_WAIT_ITERATIONS {
         {
@@ -297,7 +319,7 @@ fn pipe_read(slot: usize, destination: &mut [u8]) -> Result<usize, u64> {
             }
         }
         if attempt + 1 < PIPE_WAIT_ITERATIONS {
-            crate::scheduler::yield_now();
+            yield_in_syscall();
         }
     }
     Err(11)
@@ -335,7 +357,7 @@ fn pipe_write(slot: usize, source: &[u8]) -> Result<usize, u64> {
             }
         }
         if attempt + 1 < PIPE_WAIT_ITERATIONS {
-            crate::scheduler::yield_now();
+            yield_in_syscall();
         }
     }
     Err(11)
@@ -375,6 +397,13 @@ impl AlternateStack {
 
 static SIGNAL_ACTIONS: TicketLock<[SignalAction; 64]> = TicketLock::new([SignalAction::EMPTY; 64]);
 static SIGNAL_MASK: AtomicU64 = AtomicU64::new(0);
+/// Signals raised at this process that are waiting for their handler to run
+/// (delivered when the next syscall returns, once unblocked).
+static SIGNAL_PENDING: AtomicU64 = AtomicU64::new(0);
+/// ITIMER_REAL of this process: monotonic-ns deadline (0 = disarmed) and the
+/// reload interval. Expiry raises SIGALRM (see `check_itimer`).
+static ITIMER_DEADLINE: AtomicU64 = AtomicU64::new(0);
+static ITIMER_INTERVAL: AtomicU64 = AtomicU64::new(0);
 static ALTERNATE_STACK: TicketLock<AlternateStack> = TicketLock::new(AlternateStack::EMPTY);
 const DEFAULT_UMASK: u64 = 0o022;
 static UMASK: AtomicU64 = AtomicU64::new(DEFAULT_UMASK);
@@ -385,6 +414,9 @@ pub struct ProcessState {
     directory: CurrentDirectory,
     signal_actions: [SignalAction; 64],
     signal_mask: u64,
+    signal_pending: u64,
+    itimer_deadline: u64,
+    itimer_interval: u64,
     alternate_stack: AlternateStack,
     umask: u64,
 }
@@ -395,6 +427,9 @@ impl ProcessState {
         directory: CurrentDirectory::ROOT,
         signal_actions: [SignalAction::EMPTY; 64],
         signal_mask: 0,
+        signal_pending: 0,
+        itimer_deadline: 0,
+        itimer_interval: 0,
         alternate_stack: AlternateStack::EMPTY,
         umask: DEFAULT_UMASK,
     };
@@ -422,6 +457,9 @@ pub fn save_process_state() -> ProcessState {
         directory: *CURRENT_DIRECTORY.lock(),
         signal_actions: *SIGNAL_ACTIONS.lock(),
         signal_mask: SIGNAL_MASK.load(Ordering::Acquire),
+        signal_pending: SIGNAL_PENDING.load(Ordering::Acquire),
+        itimer_deadline: ITIMER_DEADLINE.load(Ordering::Acquire),
+        itimer_interval: ITIMER_INTERVAL.load(Ordering::Acquire),
         alternate_stack: *ALTERNATE_STACK.lock(),
         umask: UMASK.load(Ordering::Acquire),
     }
@@ -432,6 +470,9 @@ pub fn restore_process_state(state: &ProcessState) {
     *CURRENT_DIRECTORY.lock() = state.directory;
     *SIGNAL_ACTIONS.lock() = state.signal_actions;
     SIGNAL_MASK.store(state.signal_mask, Ordering::Release);
+    SIGNAL_PENDING.store(state.signal_pending, Ordering::Release);
+    ITIMER_DEADLINE.store(state.itimer_deadline, Ordering::Release);
+    ITIMER_INTERVAL.store(state.itimer_interval, Ordering::Release);
     UMASK.store(state.umask, Ordering::Release);
     *ALTERNATE_STACK.lock() = state.alternate_stack;
 }
@@ -468,6 +509,9 @@ pub fn close_all_process_fds() {
 pub fn reset_scheduled_process_state() {
     *SIGNAL_ACTIONS.lock() = [SignalAction::EMPTY; 64];
     SIGNAL_MASK.store(0, Ordering::Release);
+    SIGNAL_PENDING.store(0, Ordering::Release);
+    ITIMER_DEADLINE.store(0, Ordering::Release);
+    ITIMER_INTERVAL.store(0, Ordering::Release);
     *ALTERNATE_STACK.lock() = AlternateStack::EMPTY;
     *CURRENT_DIRECTORY.lock() = CurrentDirectory::ROOT;
     *PROCESS_FDS.lock() = initial_process_fds();
@@ -482,6 +526,7 @@ pub fn reset_scheduled_process_state() {
 /// alone.
 pub fn exec_reset_process_state() {
     *SIGNAL_ACTIONS.lock() = [SignalAction::EMPTY; 64];
+    SIGNAL_PENDING.store(0, Ordering::Release);
     *ALTERNATE_STACK.lock() = AlternateStack::EMPTY;
     let mut descriptors = PROCESS_FDS.lock();
     for descriptor in descriptors.iter_mut() {
@@ -554,6 +599,10 @@ pub enum BootstrapResult {
     Exit(u64),
     Fork,
     Exec {
+        bytes: [u8; EXEC_PROGRAM_MAX],
+        length: usize,
+    },
+    ExecPath {
         bytes: [u8; EXEC_PROGRAM_MAX],
         length: usize,
     },
@@ -636,6 +685,184 @@ pub struct LinuxSyscallFrame {
     argument3: u64,
     argument4: u64,
     argument5: u64,
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    rbp: u64,
+    rbx: u64,
+    user_rip: u64,
+    user_rflags: u64,
+}
+
+const LINUX_FORK: u64 = 57;
+const LINUX_VFORK: u64 = 58;
+const LINUX_EXECVE: u64 = 59;
+const LINUX_WAIT4: u64 = 61;
+const LINUX_KILL: u64 = 62;
+const LINUX_RT_SIGRETURN: u64 = 15;
+
+const EXEC_STRING_COUNT: usize = 16;
+const EXEC_STRING_MAX: usize = 96;
+
+/// Copies a NULL-terminated user array of C strings (argv/envp) into kernel
+/// buffers; a null array pointer means an empty list.
+fn copy_string_vector(
+    array: u64,
+    store: &mut [[u8; EXEC_STRING_MAX]; EXEC_STRING_COUNT],
+    lengths: &mut [usize; EXEC_STRING_COUNT],
+) -> Result<usize, u64> {
+    if array == 0 {
+        return Ok(0);
+    }
+    let mut count = 0;
+    loop {
+        let mut pointer = [0u8; 8];
+        let at = array
+            .checked_add(count as u64 * 8)
+            .ok_or_else(|| error(14))?;
+        if !user::copy_from_user(at, &mut pointer) {
+            return Err(error(14));
+        }
+        let pointer = u64::from_le_bytes(pointer);
+        if pointer == 0 {
+            return Ok(count);
+        }
+        if count == EXEC_STRING_COUNT {
+            return Err(error(7));
+        }
+        // One byte is kept for the terminator `copy_string` looks for.
+        let length = user::copy_string(pointer, &mut store[count][..EXEC_STRING_MAX - 1])
+            .ok_or_else(|| error(7))?;
+        lengths[count] = length;
+        count += 1;
+    }
+}
+
+/// The pid the current user process sees: the scheduler's task id for a
+/// scheduled process, else the legacy single-process pid.
+fn current_process_id() -> u64 {
+    crate::scheduler::current_task_pid_for_linux().unwrap_or_else(crate::process::current_pid)
+}
+
+fn user_stack_pointer() -> u64 {
+    let value: u64;
+    // SAFETY: inside the syscall entry, GS holds the kernel CPU-local block
+    // whose slot 1 is the saved user rsp.
+    unsafe {
+        core::arch::asm!("mov {}, gs:[8]", out(reg) value, options(nostack, preserves_flags))
+    };
+    value
+}
+
+fn set_user_stack_pointer(value: u64) {
+    // SAFETY: same slot as `user_stack_pointer`; restored by the sysret path.
+    unsafe { core::arch::asm!("mov gs:[8], {}", in(reg) value, options(nostack, preserves_flags)) };
+}
+
+fn linux_fork(frame: &LinuxSyscallFrame) -> u64 {
+    let snapshot = crate::arch::user::ForkSnapshot {
+        r15: frame.r15,
+        r14: frame.r14,
+        r13: frame.r13,
+        r12: frame.r12,
+        r11: frame.user_rflags,
+        r10: frame.argument3,
+        r9: frame.argument5,
+        r8: frame.argument4,
+        rdi: frame.argument0,
+        rsi: frame.argument1,
+        rbp: frame.rbp,
+        rdx: frame.argument2,
+        rbx: frame.rbx,
+        rcx: frame.user_rip,
+        rip: frame.user_rip,
+        rflags: frame.user_rflags,
+        rsp: user_stack_pointer(),
+    };
+    crate::scheduler::fork_current_user_task(&snapshot).unwrap_or_else(|| error(12))
+}
+
+fn linux_wait4(pid: u64, status_address: u64, options: u64) -> u64 {
+    let child = if pid as i64 == -1 {
+        crate::scheduler::any_child_id()
+    } else {
+        Some(pid)
+    };
+    let Some(child) = child else {
+        return error(10);
+    };
+    const WNOHANG: u64 = 1;
+    let waited = if options & WNOHANG != 0 {
+        match crate::scheduler::poll_child(child) {
+            None => None,
+            Some(None) => return 0,
+            Some(Some(code)) => Some(code),
+        }
+    } else {
+        // While blocked, other tasks must see the normal ring-3 GS layout,
+        // not the in-syscall (swapped) one, or their next `swapgs` would
+        // load a null CPU-local pointer.
+        // SAFETY: paired swapgs around the wait restore the in-syscall state.
+        unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
+        let waited = crate::scheduler::wait_for_child(child);
+        unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
+        waited
+    };
+    let Some(exit_code) = waited else {
+        return error(10);
+    };
+    if status_address != 0 {
+        // A death by signal is reported as WIFSIGNALED (the signal number in
+        // the low bits); everything else as a normal exit status.
+        let status = match exit_code {
+            129..=191 => (exit_code - 128) as u32,
+            _ => ((exit_code & 0xff) as u32) << 8,
+        };
+        if !user::copy_to_user(status_address, &status.to_le_bytes()) {
+            return error(14);
+        }
+    }
+    child
+}
+
+/// Returns true when the process image was replaced (frame now points at
+/// the new entry point and stack); the caller must not touch rax then.
+fn linux_execve(frame: &mut LinuxSyscallFrame) -> Result<(), u64> {
+    let mut buffer = [0u8; MAX_PATH];
+    let length = user::copy_string(frame.argument0, &mut buffer).ok_or_else(|| error(14))?;
+    let path = core::str::from_utf8(&buffer[..length]).map_err(|_| error(84))?;
+    let file = vfs::file(path).map_err(|_| error(2))?;
+    // argv/envp live in the image that is about to be replaced, so they are
+    // copied out first (up to 16 strings of 95 bytes each).
+    let mut arg_store = [[0u8; EXEC_STRING_MAX]; EXEC_STRING_COUNT];
+    let mut arg_len = [0usize; EXEC_STRING_COUNT];
+    let arg_count = copy_string_vector(frame.argument1, &mut arg_store, &mut arg_len)?;
+    let mut env_store = [[0u8; EXEC_STRING_MAX]; EXEC_STRING_COUNT];
+    let mut env_len = [0usize; EXEC_STRING_COUNT];
+    let env_count = copy_string_vector(frame.argument2, &mut env_store, &mut env_len)?;
+    let mut args: [&[u8]; EXEC_STRING_COUNT] = [&[]; EXEC_STRING_COUNT];
+    let mut env: [&[u8]; EXEC_STRING_COUNT] = [&[]; EXEC_STRING_COUNT];
+    for index in 0..arg_count {
+        args[index] = &arg_store[index][..arg_len[index]];
+    }
+    for index in 0..env_count {
+        env[index] = &env_store[index][..env_len[index]];
+    }
+    let (entry, stack_top) = if arg_count == 0 {
+        crate::scheduler::exec_current_user_task_path(file.data, path)
+    } else {
+        crate::scheduler::exec_current_user_task_path_with(
+            file.data,
+            path,
+            &args[..arg_count],
+            &env[..env_count],
+        )
+    }
+    .ok_or_else(|| error(8))?;
+    frame.user_rip = entry;
+    set_user_stack_pointer(stack_top);
+    Ok(())
 }
 
 fn unpack_register_bytes(arguments: &[u64; 6]) -> Option<([u8; EXEC_PROGRAM_MAX], usize)> {
@@ -673,6 +900,12 @@ pub fn dispatch(number: u64, arguments: [u64; 6]) -> BootstrapResult {
             };
             BootstrapResult::Exec { bytes, length }
         }
+        SYS_EXEC_PATH => {
+            let Some((bytes, length)) = unpack_register_bytes(&arguments) else {
+                return BootstrapResult::Return(error(22));
+            };
+            BootstrapResult::ExecPath { bytes, length }
+        }
         SYS_WAIT4 => BootstrapResult::Wait { pid: arguments[0] },
         SYS_KILL => BootstrapResult::Kill { pid: arguments[0] },
         SYS_GETPID => BootstrapResult::CurrentId,
@@ -707,10 +940,89 @@ pub extern "C" fn aeros_linux_syscall_dispatch(frame: *mut LinuxSyscallFrame) ->
         frame.argument4,
         frame.argument5,
     ];
+    let saved_user_rsp = user_stack_pointer();
+    match frame.number {
+        LINUX_FORK | LINUX_VFORK => {
+            frame.number = linux_fork(frame);
+            return finish_syscall(frame);
+        }
+        LINUX_KILL => {
+            let (pid, signal) = (arguments[0], arguments[1]);
+            let own = crate::scheduler::current_task_pid_for_linux()
+                .unwrap_or_else(crate::process::current_pid);
+            let exists = || {
+                if crate::scheduler::task_exists(pid) {
+                    0
+                } else {
+                    error(3)
+                }
+            };
+            if signal > 64 {
+                frame.number = error(22);
+            } else if pid == own {
+                SIGNAL_CALLS.fetch_add(1, Ordering::Relaxed);
+                if signal == 0 {
+                    frame.number = 0;
+                } else {
+                    match raise_signal(signal) {
+                        SyscallResult::Return(value) => frame.number = value,
+                        SyscallResult::Exit(code) => {
+                            EXITS.fetch_add(1, Ordering::Relaxed);
+                            user::set_exit_code(code);
+                            return 1;
+                        }
+                    }
+                }
+            } else if signal == 0 {
+                frame.number = exists();
+            } else {
+                frame.number = match crate::scheduler::signal_other_task(pid, signal) {
+                    Some(RemoteSignal::Ignored | RemoteSignal::Queued) => 0,
+                    Some(RemoteSignal::Fatal) => match crate::scheduler::kill_task(pid) {
+                        Ok(()) => 0,
+                        Err(()) => error(3),
+                    },
+                    None => error(3),
+                };
+            }
+            return finish_syscall(frame);
+        }
+        LINUX_SCHED_YIELD => {
+            yield_in_syscall();
+            RUNTIME_CALLS.fetch_add(1, Ordering::Relaxed);
+            COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
+            frame.number = 0;
+            return finish_syscall(frame);
+        }
+        LINUX_RT_SIGRETURN => {
+            return match signal_return(frame) {
+                Ok(SignalResume::Syscall) => 0,
+                Ok(SignalResume::Full) => 2,
+                Err(()) => {
+                    EXITS.fetch_add(1, Ordering::Relaxed);
+                    user::set_exit_code(128 + 11);
+                    1
+                }
+            };
+        }
+        LINUX_WAIT4 => {
+            frame.number = linux_wait4(arguments[0], arguments[1], arguments[2]);
+            set_user_stack_pointer(saved_user_rsp);
+            return finish_syscall(frame);
+        }
+        LINUX_EXECVE => {
+            match linux_execve(frame) {
+                Ok(()) => frame.number = 0,
+                Err(failure) => frame.number = failure,
+            }
+            return 0;
+        }
+        _ => {}
+    }
     match dispatch_linux(frame.number, arguments) {
         SyscallResult::Return(value) => {
             frame.number = value;
-            0
+            finish_syscall(frame)
         }
         SyscallResult::Exit(code) => {
             EXITS.fetch_add(1, Ordering::Relaxed);
@@ -718,6 +1030,16 @@ pub extern "C" fn aeros_linux_syscall_dispatch(frame: *mut LinuxSyscallFrame) ->
             1
         }
     }
+}
+
+/// Common syscall epilogue: hands a pending signal to its handler.
+fn finish_syscall(frame: &mut LinuxSyscallFrame) -> u64 {
+    if let Some(code) = deliver_signal(frame) {
+        EXITS.fetch_add(1, Ordering::Relaxed);
+        user::set_exit_code(code);
+        return 1;
+    }
+    0
 }
 
 fn dispatch_linux(number: u64, arguments: [u64; 6]) -> SyscallResult {
@@ -793,13 +1115,22 @@ fn dispatch_linux(number: u64, arguments: [u64; 6]) -> SyscallResult {
             SyscallResult::Return(linux_madvise(arguments[0], arguments[1], arguments[2]))
         }
         LINUX_NANOSLEEP => SyscallResult::Return(linux_nanosleep(arguments[0], arguments[1])),
+        LINUX_PAUSE => SyscallResult::Return(linux_pause()),
+        LINUX_ALARM => SyscallResult::Return(linux_alarm(arguments[0])),
+        LINUX_GETITIMER => SyscallResult::Return(linux_getitimer(arguments[0], arguments[1])),
+        LINUX_SETITIMER => {
+            SyscallResult::Return(linux_setitimer(arguments[0], arguments[1], arguments[2]))
+        }
         LINUX_SCHED_YIELD => {
             crate::scheduler::yield_now();
             RUNTIME_CALLS.fetch_add(1, Ordering::Relaxed);
             COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
             SyscallResult::Return(0)
         }
-        LINUX_GETPID => SyscallResult::Return(crate::process::current_pid()),
+        LINUX_GETPID => SyscallResult::Return(
+            crate::scheduler::current_task_pid_for_linux()
+                .unwrap_or_else(crate::process::current_pid),
+        ),
         LINUX_PIPE => SyscallResult::Return(linux_pipe2(arguments[0], 0)),
         LINUX_PIPE2 => SyscallResult::Return(linux_pipe2(arguments[0], arguments[1])),
         LINUX_SOCKET => {
@@ -811,7 +1142,10 @@ fn dispatch_linux(number: u64, arguments: [u64; 6]) -> SyscallResult {
         LINUX_SENDTO => SyscallResult::Return(linux_sendto(arguments)),
         LINUX_RECVFROM => SyscallResult::Return(linux_recvfrom(arguments)),
         LINUX_GETUID | LINUX_GETGID | LINUX_GETEUID | LINUX_GETEGID => SyscallResult::Return(0),
-        LINUX_GETPPID => SyscallResult::Return(crate::process::current_parent()),
+        LINUX_GETPPID => SyscallResult::Return(
+            crate::scheduler::current_parent_pid_for_linux()
+                .unwrap_or_else(crate::process::current_parent),
+        ),
         LINUX_UNAME => SyscallResult::Return(linux_uname(arguments[0])),
         LINUX_GETTIMEOFDAY => SyscallResult::Return(linux_gettimeofday(arguments[0], arguments[1])),
         LINUX_FCNTL => SyscallResult::Return(linux_fcntl(arguments[0], arguments[1], arguments[2])),
@@ -860,7 +1194,7 @@ fn dispatch_linux(number: u64, arguments: [u64; 6]) -> SyscallResult {
         LINUX_GETTID => {
             RUNTIME_CALLS.fetch_add(1, Ordering::Relaxed);
             COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
-            SyscallResult::Return(crate::process::current_pid())
+            SyscallResult::Return(current_process_id())
         }
         LINUX_TKILL => linux_tkill(arguments[0], arguments[1]),
         LINUX_FUTEX => SyscallResult::Return(linux_futex(arguments)),
@@ -1559,7 +1893,7 @@ fn linux_tkill(thread: u64, signal: u64) -> SyscallResult {
     if signal > 64 {
         return SyscallResult::Return(error(22));
     }
-    if thread == 0 || thread != crate::process::current_pid() {
+    if thread == 0 || thread != current_process_id() {
         return SyscallResult::Return(error(3));
     }
     SIGNAL_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -1567,12 +1901,326 @@ fn linux_tkill(thread: u64, signal: u64) -> SyscallResult {
     if signal == 0 {
         SyscallResult::Return(0)
     } else {
-        SyscallResult::Exit(128 + signal)
+        raise_signal(signal)
     }
 }
 
+/// What sending a signal to a task that is not running did.
+pub enum RemoteSignal {
+    Ignored,
+    Queued,
+    Fatal,
+}
+
+/// Applies a signal to a stored (not currently running) process: a handler
+/// gets it queued for its next syscall return, SIG_IGN and default-ignored
+/// signals vanish, anything else is fatal.
+pub fn signal_stored_state(state: &mut ProcessState, signal: u64) -> RemoteSignal {
+    let action = state.signal_actions[signal as usize - 1];
+    let catchable = signal != 9 && signal != 19;
+    if catchable && (action.handler == 1 || (action.handler == 0 && default_ignored(signal))) {
+        RemoteSignal::Ignored
+    } else if catchable && action.handler > 1 {
+        state.signal_pending |= 1 << (signal - 1);
+        RemoteSignal::Queued
+    } else {
+        RemoteSignal::Fatal
+    }
+}
+
+/// A forked child starts with no signals waiting and no interval timer.
+pub fn clear_pending_signals(state: &mut ProcessState) {
+    state.signal_pending = 0;
+    state.itimer_deadline = 0;
+    state.itimer_interval = 0;
+}
+
+/// Signals whose default action is to do nothing.
+fn default_ignored(signal: u64) -> bool {
+    matches!(signal, 17 | 18 | 23 | 28)
+}
+
+/// A signal sent to the running process: ignored, queued for its handler,
+/// or (default action) fatal with status 128 + signal.
+fn raise_signal(signal: u64) -> SyscallResult {
+    let action = SIGNAL_ACTIONS.lock()[signal as usize - 1];
+    let catchable = signal != 9 && signal != 19;
+    if catchable && action.handler == 1 {
+        return SyscallResult::Return(0);
+    }
+    if catchable && action.handler > 1 {
+        SIGNAL_PENDING.fetch_or(1 << (signal - 1), Ordering::AcqRel);
+        return SyscallResult::Return(0);
+    }
+    if catchable && default_ignored(signal) {
+        return SyscallResult::Return(0);
+    }
+    SyscallResult::Exit(128 + signal)
+}
+
+const SA_RESTORER: u64 = 0x0400_0000;
+const SA_NODEFER: u64 = 0x4000_0000;
+/// Words saved on the user stack for a signal handler (see `deliver_signal`).
+const SIGNAL_SAVED_WORDS: usize = 20;
+const SIGNAL_SIGINFO_BYTES: usize = 128;
+const SIGNAL_CONTEXT_BYTES: usize = 256;
+/// Frame saved at a syscall return (registers a syscall preserves).
+const SIGNAL_FRAME_MAGIC: u64 = 0x5349_4746_5241_4d45;
+/// Frame saved when a timer interrupt caught the process in user mode: every
+/// register is kept, and `rt_sigreturn` comes back through `iretq`.
+const SIGNAL_ASYNC_MAGIC: u64 = 0x5349_4741_5359_4e43;
+
+/// Lays the handler frame on the user stack below the red zone: the
+/// restorer address, the `saved` words (mask goes in word 16) and a zeroed
+/// siginfo with the signal number. Blocks the handler's signals and returns
+/// the new user stack pointer, or an exit status when the frame can't be
+/// written.
+fn push_signal_frame(
+    signal: u64,
+    action: SignalAction,
+    user_rsp: u64,
+    saved: &mut [u64; SIGNAL_SAVED_WORDS],
+) -> Result<u64, u64> {
+    if action.flags & SA_RESTORER == 0 || action.restorer == 0 {
+        return Err(128 + 11);
+    }
+    let block = 8 + SIGNAL_SAVED_WORDS * 8 + SIGNAL_SIGINFO_BYTES + SIGNAL_CONTEXT_BYTES;
+    let Some(base) = user_rsp.checked_sub(128 + block as u64) else {
+        return Err(128 + 11);
+    };
+    // Handler entry needs rsp = 8 (mod 16), as right after a `call`.
+    let sp = (base & !15) - 8;
+    let old_mask = SIGNAL_MASK.load(Ordering::Acquire);
+    saved[16] = old_mask;
+    let mut bytes = [0u8; 8 + SIGNAL_SAVED_WORDS * 8 + SIGNAL_SIGINFO_BYTES];
+    bytes[..8].copy_from_slice(&action.restorer.to_le_bytes());
+    for (index, word) in saved.iter().enumerate() {
+        bytes[8 + index * 8..16 + index * 8].copy_from_slice(&word.to_le_bytes());
+    }
+    let info_at = 8 + SIGNAL_SAVED_WORDS * 8;
+    bytes[info_at..info_at + 4].copy_from_slice(&(signal as u32).to_le_bytes());
+    if !user::copy_to_user(sp, &bytes) {
+        return Err(128 + 11);
+    }
+    let mut mask = old_mask | action.mask;
+    if action.flags & SA_NODEFER == 0 {
+        mask |= 1 << (signal - 1);
+    }
+    SIGNAL_MASK.store(mask & !unblockable_signals(), Ordering::Release);
+    Ok(sp)
+}
+
+/// Expires the ITIMER_REAL if it is due: SIGALRM is queued for its handler
+/// (or dropped when ignored); with the default action the process has to die,
+/// which the exit status says. Runs before every delivery attempt.
+fn check_itimer() -> Option<u64> {
+    let deadline = ITIMER_DEADLINE.load(Ordering::Acquire);
+    if deadline == 0 {
+        return None;
+    }
+    let now = crate::time::monotonic_nanoseconds();
+    if now < deadline {
+        return None;
+    }
+    let interval = ITIMER_INTERVAL.load(Ordering::Acquire);
+    let next = if interval == 0 {
+        0
+    } else {
+        deadline + interval * (1 + (now - deadline) / interval)
+    };
+    ITIMER_DEADLINE.store(next, Ordering::Release);
+    const SIGALRM: u64 = 14;
+    let action = SIGNAL_ACTIONS.lock()[SIGALRM as usize - 1];
+    match action.handler {
+        1 => None,
+        0 => (!default_ignored(SIGALRM)).then_some(128 + SIGALRM),
+        _ => {
+            SIGNAL_PENDING.fetch_or(1 << (SIGALRM - 1), Ordering::AcqRel);
+            None
+        }
+    }
+}
+
+/// The next pending, unblocked signal with a real handler (signals without
+/// one are consumed here: ignored or already handled).
+fn take_signal() -> Option<(u64, SignalAction)> {
+    let ready = SIGNAL_PENDING.load(Ordering::Acquire) & !SIGNAL_MASK.load(Ordering::Acquire);
+    if ready == 0 {
+        return None;
+    }
+    let signal = ready.trailing_zeros() as u64 + 1;
+    SIGNAL_PENDING.fetch_and(!(1 << (signal - 1)), Ordering::AcqRel);
+    let action = SIGNAL_ACTIONS.lock()[signal as usize - 1];
+    (action.handler > 1).then_some((signal, action))
+}
+
+/// Runs the handler of one pending, unblocked signal on return from a
+/// syscall: the user registers are saved on the user stack below the red
+/// zone and the frame is redirected to the handler; its `ret` lands on the
+/// `sa_restorer`, which calls rt_sigreturn. Returns an exit status when the
+/// process has to die instead (no usable handler frame).
+fn deliver_signal(frame: &mut LinuxSyscallFrame) -> Option<u64> {
+    if let Some(code) = check_itimer() {
+        return Some(code);
+    }
+    let (signal, action) = take_signal()?;
+    let user_rsp = user_stack_pointer();
+    let mut saved: [u64; SIGNAL_SAVED_WORDS] = [
+        frame.user_rip,
+        user_rsp,
+        frame.user_rflags,
+        frame.number,
+        frame.argument0,
+        frame.argument1,
+        frame.argument2,
+        frame.argument3,
+        frame.argument4,
+        frame.argument5,
+        frame.r15,
+        frame.r14,
+        frame.r13,
+        frame.r12,
+        frame.rbp,
+        frame.rbx,
+        0,
+        SIGNAL_FRAME_MAGIC,
+        0,
+        0,
+    ];
+    let sp = match push_signal_frame(signal, action, user_rsp, &mut saved) {
+        Ok(sp) => sp,
+        Err(code) => return Some(code),
+    };
+    frame.user_rip = action.handler;
+    frame.argument0 = signal;
+    frame.argument1 = sp + 8 + (SIGNAL_SAVED_WORDS * 8) as u64;
+    frame.argument2 = frame.argument1 + SIGNAL_SIGINFO_BYTES as u64;
+    frame.number = 0;
+    set_user_stack_pointer(sp);
+    None
+}
+
+/// Timer-interrupt counterpart of `deliver_signal`: a process spinning in
+/// user mode has no syscall return to carry its handler, so the tick that
+/// interrupted it redirects it instead. All registers are saved (the handler
+/// may clobber any of them) and `rt_sigreturn` restores them via `iretq`.
+/// Returns an exit status when the process has to die instead.
+pub fn deliver_async_signal(regs: &mut user::UserRegs) -> Option<u64> {
+    if let Some(code) = check_itimer() {
+        return Some(code);
+    }
+    if SIGNAL_PENDING.load(Ordering::Acquire) & !SIGNAL_MASK.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let (signal, action) = take_signal()?;
+    let mut saved: [u64; SIGNAL_SAVED_WORDS] = [
+        regs.rip,
+        regs.rsp,
+        regs.rflags,
+        regs.rax,
+        regs.rbx,
+        regs.rcx,
+        regs.rdx,
+        regs.rbp,
+        regs.rsi,
+        regs.rdi,
+        regs.r8,
+        regs.r9,
+        regs.r10,
+        regs.r11,
+        regs.r12,
+        regs.r13,
+        0,
+        SIGNAL_ASYNC_MAGIC,
+        regs.r14,
+        regs.r15,
+    ];
+    let sp = match push_signal_frame(signal, action, regs.rsp, &mut saved) {
+        Ok(sp) => sp,
+        Err(code) => return Some(code),
+    };
+    ASYNC_SIGNALS.fetch_add(1, Ordering::Relaxed);
+    regs.rip = action.handler;
+    regs.rsp = sp;
+    regs.rdi = signal;
+    regs.rsi = sp + 8 + (SIGNAL_SAVED_WORDS * 8) as u64;
+    regs.rdx = regs.rsi + SIGNAL_SIGINFO_BYTES as u64;
+    regs.rax = 0;
+    None
+}
+
+/// Handlers started by a timer tick instead of a syscall return.
+static ASYNC_SIGNALS: AtomicU64 = AtomicU64::new(0);
+
+pub fn async_signal_count() -> u64 {
+    ASYNC_SIGNALS.load(Ordering::Relaxed)
+}
+
+/// How `rt_sigreturn` has to resume the process.
+enum SignalResume {
+    /// Through the normal `sysret` path (a syscall-return frame).
+    Syscall,
+    /// Through `iretq` with every register restored (a timer-return frame).
+    Full,
+}
+
+/// rt_sigreturn: puts back the registers `deliver_signal` or
+/// `deliver_async_signal` saved (the stack pointer sits just past the
+/// restorer address the handler returned to).
+fn signal_return(frame: &mut LinuxSyscallFrame) -> Result<SignalResume, ()> {
+    let mut bytes = [0u8; SIGNAL_SAVED_WORDS * 8];
+    if !user::copy_from_user(user_stack_pointer(), &mut bytes) {
+        return Err(());
+    }
+    let word = |index: usize| {
+        u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap_or([0; 8]))
+    };
+    let magic = word(17);
+    if (magic != SIGNAL_FRAME_MAGIC && magic != SIGNAL_ASYNC_MAGIC)
+        || !user::range_accessible(word(0), 1, false)
+    {
+        return Err(());
+    }
+    SIGNAL_MASK.store(word(16) & !unblockable_signals(), Ordering::Release);
+    let flags = (word(2) & 0x0000_0cd5) | 0x202;
+    if magic == SIGNAL_ASYNC_MAGIC {
+        frame.number = word(3);
+        frame.rbx = word(4);
+        frame.argument2 = word(6);
+        frame.rbp = word(7);
+        frame.argument1 = word(8);
+        frame.argument0 = word(9);
+        frame.argument4 = word(10);
+        frame.argument5 = word(11);
+        frame.argument3 = word(12);
+        frame.r12 = word(14);
+        frame.r13 = word(15);
+        frame.r14 = word(18);
+        frame.r15 = word(19);
+        crate::arch::syscall_entry::set_iret_return(word(5), word(13), word(0), word(1), flags);
+        return Ok(SignalResume::Full);
+    }
+    frame.user_rip = word(0);
+    frame.user_rflags = flags;
+    frame.number = word(3);
+    frame.argument0 = word(4);
+    frame.argument1 = word(5);
+    frame.argument2 = word(6);
+    frame.argument3 = word(7);
+    frame.argument4 = word(8);
+    frame.argument5 = word(9);
+    frame.r15 = word(10);
+    frame.r14 = word(11);
+    frame.r13 = word(12);
+    frame.r12 = word(13);
+    frame.rbp = word(14);
+    frame.rbx = word(15);
+    set_user_stack_pointer(word(1));
+    Ok(SignalResume::Syscall)
+}
+
 fn linux_tgkill(group: u64, thread: u64, signal: u64) -> SyscallResult {
-    if group != crate::process::current_pid() {
+    if group != current_process_id() {
         return SyscallResult::Return(error(3));
     }
     linux_tkill(thread, signal)
@@ -1723,6 +2371,10 @@ fn linux_statx(arguments: [u64; 6]) -> u64 {
     statx[28..30].copy_from_slice(&(metadata.mode as u16).to_le_bytes());
     statx[32..40].copy_from_slice(&metadata.inode.to_le_bytes());
     statx[40..48].copy_from_slice(&metadata.size.to_le_bytes());
+    // atime, btime, ctime, mtime.
+    for at in [64usize, 80, 96, 112] {
+        statx[at..at + 8].copy_from_slice(&metadata.modified.to_le_bytes());
+    }
     statx[48..56].copy_from_slice(&metadata.size.div_ceil(512).to_le_bytes());
     if !user::copy_to_user(address, &statx) {
         return error(14);
@@ -2534,7 +3186,7 @@ fn append_path_components(
 }
 
 fn linux_sched_getaffinity(pid: u64, size: u64, address: u64) -> u64 {
-    if pid != 0 && pid != crate::process::current_pid() {
+    if pid != 0 && pid != current_process_id() {
         return error(3);
     }
     if size < 8 {
@@ -2632,7 +3284,7 @@ fn linux_set_tid_address(address: u64) -> u64 {
     }
     TID_ADDRESS.store(address, Ordering::Release);
     COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
-    crate::process::current_pid()
+    current_process_id()
 }
 
 fn linux_set_robust_list(address: u64, length: u64) -> u64 {
@@ -2712,7 +3364,7 @@ fn linux_futex(arguments: [u64; 6]) -> u64 {
 }
 
 fn linux_prlimit64(pid: u64, resource: u64, new_limit: u64, old_limit: u64) -> u64 {
-    if pid != 0 && pid != crate::process::current_pid() {
+    if pid != 0 && pid != current_process_id() {
         return error(3);
     }
     if new_limit != 0 {
@@ -2747,18 +3399,21 @@ fn linux_fstat(descriptor: u64, address: u64) -> u64 {
             inode: process_fd.standard as u64,
             mode: 0o020666,
             size: 0,
+            modified: 0,
         }
     } else if process_fd.socket {
         vfs::Metadata {
             inode: process_fd.handle as u64 + 0x1000,
             mode: 0o140777,
             size: 0,
+            modified: 0,
         }
     } else if process_fd.pipe {
         vfs::Metadata {
             inode: process_fd.handle as u64 + 0x2000,
             mode: 0o010666,
             size: 0,
+            modified: 0,
         }
     } else {
         match vfs::descriptor_metadata(process_fd.handle) {
@@ -2818,6 +3473,10 @@ fn write_linux_stat(address: u64, metadata: vfs::Metadata) -> u64 {
     stat[48..56].copy_from_slice(&metadata.size.to_le_bytes());
     stat[56..64].copy_from_slice(&4096u64.to_le_bytes());
     stat[64..72].copy_from_slice(&metadata.size.div_ceil(512).to_le_bytes());
+    // atime, mtime, ctime (seconds; the nanosecond fields stay zero).
+    for at in [72usize, 88, 104] {
+        stat[at..at + 8].copy_from_slice(&metadata.modified.to_le_bytes());
+    }
     if !user::copy_to_user(address, &stat) {
         return error(14);
     }
@@ -2968,6 +3627,97 @@ fn linux_gettimeofday(time_address: u64, zone_address: u64) -> u64 {
     0
 }
 
+/// Nanoseconds until the interval timer next fires (0 = disarmed).
+fn itimer_remaining() -> u64 {
+    let deadline = ITIMER_DEADLINE.load(Ordering::Acquire);
+    if deadline == 0 {
+        return 0;
+    }
+    // A timer that is due but not yet expired still reports a sliver left.
+    deadline
+        .saturating_sub(crate::time::monotonic_nanoseconds())
+        .max(1)
+}
+
+fn arm_itimer(value: u64, interval: u64) {
+    let deadline = if value == 0 {
+        0
+    } else {
+        crate::time::monotonic_nanoseconds().saturating_add(value)
+    };
+    ITIMER_INTERVAL.store(if value == 0 { 0 } else { interval }, Ordering::Release);
+    ITIMER_DEADLINE.store(deadline, Ordering::Release);
+}
+
+/// alarm(seconds): arms a one-shot SIGALRM, returns the seconds (rounded up)
+/// the previous alarm had left.
+fn linux_alarm(seconds: u64) -> u64 {
+    let previous = itimer_remaining().div_ceil(1_000_000_000);
+    arm_itimer(seconds.saturating_mul(1_000_000_000), 0);
+    SLEEP_CALLS.fetch_add(1, Ordering::Relaxed);
+    previous
+}
+
+fn timeval_ns(bytes: &[u8; 32], offset: usize) -> u64 {
+    read_array_u64(bytes, offset)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(read_array_u64(bytes, offset + 8).saturating_mul(1000))
+}
+
+fn write_timeval(bytes: &mut [u8; 32], offset: usize, nanoseconds: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&(nanoseconds / 1_000_000_000).to_le_bytes());
+    bytes[offset + 8..offset + 16]
+        .copy_from_slice(&((nanoseconds % 1_000_000_000) / 1000).to_le_bytes());
+}
+
+fn current_itimerval() -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    write_timeval(&mut bytes, 0, ITIMER_INTERVAL.load(Ordering::Acquire));
+    write_timeval(&mut bytes, 16, itimer_remaining());
+    bytes
+}
+
+fn linux_getitimer(which: u64, current: u64) -> u64 {
+    if which != 0 {
+        return error(22);
+    }
+    if !user::copy_to_user(current, &current_itimerval()) {
+        return error(14);
+    }
+    0
+}
+
+fn linux_setitimer(which: u64, new_value: u64, old_value: u64) -> u64 {
+    if which != 0 {
+        return error(22);
+    }
+    let mut request = [0u8; 32];
+    if new_value != 0 && !user::copy_from_user(new_value, &mut request) {
+        return error(14);
+    }
+    if old_value != 0 && !user::copy_to_user(old_value, &current_itimerval()) {
+        return error(14);
+    }
+    if new_value != 0 {
+        arm_itimer(timeval_ns(&request, 16), timeval_ns(&request, 0));
+    }
+    SLEEP_CALLS.fetch_add(1, Ordering::Relaxed);
+    0
+}
+
+/// pause(): waits (yielding) until a signal is ready for delivery, then fails
+/// with EINTR so the handler runs at syscall return.
+fn linux_pause() -> u64 {
+    loop {
+        if check_itimer().is_some()
+            || SIGNAL_PENDING.load(Ordering::Acquire) & !SIGNAL_MASK.load(Ordering::Acquire) != 0
+        {
+            return error(4);
+        }
+        yield_in_syscall();
+    }
+}
+
 fn linux_nanosleep(request: u64, remaining: u64) -> u64 {
     let Some(duration) = read_timespec(request) else {
         return error(22);
@@ -2976,12 +3726,12 @@ fn linux_nanosleep(request: u64, remaining: u64) -> u64 {
         return error(22);
     }
     let deadline = crate::time::monotonic_nanoseconds().saturating_add(duration);
-    wait_until(deadline);
-    if remaining != 0 && !user::copy_to_user(remaining, &[0; 16]) {
+    let left = sleep_until(deadline);
+    if remaining != 0 && !write_timespec(remaining, left.unwrap_or(0)) {
         return error(14);
     }
     SLEEP_CALLS.fetch_add(1, Ordering::Relaxed);
-    0
+    if left.is_some() { error(4) } else { 0 }
 }
 
 fn linux_clock_nanosleep(clock: u64, flags: u64, request: u64, remaining: u64) -> u64 {
@@ -3002,12 +3752,12 @@ fn linux_clock_nanosleep(clock: u64, flags: u64, request: u64, remaining: u64) -
         return error(22);
     }
     let deadline = crate::time::monotonic_nanoseconds().saturating_add(duration);
-    wait_until(deadline);
-    if remaining != 0 && flags == 0 && !user::copy_to_user(remaining, &[0; 16]) {
+    let left = sleep_until(deadline);
+    if remaining != 0 && flags == 0 && !write_timespec(remaining, left.unwrap_or(0)) {
         return error(14);
     }
     SLEEP_CALLS.fetch_add(1, Ordering::Relaxed);
-    0
+    if left.is_some() { error(4) } else { 0 }
 }
 
 fn read_timespec(address: u64) -> Option<u64> {
@@ -3021,6 +3771,31 @@ fn read_timespec(address: u64) -> Option<u64> {
         return None;
     }
     seconds.checked_mul(1_000_000_000)?.checked_add(nanoseconds)
+}
+
+/// Sleeps until `deadline`, yielding the CPU, but wakes early when a signal
+/// is ready for delivery (its handler then runs at syscall return). Returns
+/// the nanoseconds left when interrupted.
+fn sleep_until(deadline: u64) -> Option<u64> {
+    loop {
+        let now = crate::time::monotonic_nanoseconds();
+        if now >= deadline {
+            return None;
+        }
+        if check_itimer().is_some()
+            || SIGNAL_PENDING.load(Ordering::Acquire) & !SIGNAL_MASK.load(Ordering::Acquire) != 0
+        {
+            return Some(deadline - now);
+        }
+        yield_in_syscall();
+    }
+}
+
+fn write_timespec(address: u64, nanoseconds: u64) -> bool {
+    let mut encoded = [0u8; 16];
+    encoded[..8].copy_from_slice(&(nanoseconds / 1_000_000_000).to_le_bytes());
+    encoded[8..].copy_from_slice(&(nanoseconds % 1_000_000_000).to_le_bytes());
+    user::copy_to_user(address, &encoded)
 }
 
 fn wait_until(deadline: u64) {
@@ -3105,10 +3880,10 @@ fn linux_getdents64(descriptor: u64, address: u64, capacity: u64) -> u64 {
         Err(failure) => return vfs_error(failure),
     };
     let record_length = (19usize + entry.name_len as usize + 1).next_multiple_of(8);
-    if record_length > capacity || record_length > 80 {
+    if record_length > capacity || record_length > 288 {
         return error(22);
     }
-    let mut record = [0u8; 80];
+    let mut record = [0u8; 288];
     record[..8].copy_from_slice(&entry.inode.to_le_bytes());
     record[8..16].copy_from_slice(&1i64.to_le_bytes());
     record[16..18].copy_from_slice(&(record_length as u16).to_le_bytes());

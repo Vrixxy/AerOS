@@ -2,7 +2,8 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $projects = @(
     @("init", "aeros-init"),
-    @("std-smoke", "aeros-std-smoke")
+    @("std-smoke", "aeros-std-smoke"),
+    @("fork-probe", "aeros-fork-probe")
 )
 $destinationRoot = Join-Path $root "assets\userspace"
 

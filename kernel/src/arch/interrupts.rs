@@ -114,6 +114,74 @@ impl InterruptFrame {
         })
     }
 
+    /// The interrupted user context (None when the interrupt hit kernel code).
+    fn user_regs(&self) -> Option<user::UserRegs> {
+        if self.cs & 3 != 3 {
+            return None;
+        }
+        let base = self as *const InterruptFrame as *const u64;
+        Some(user::UserRegs {
+            rax: self.rax,
+            rbx: self.rbx,
+            rcx: self.rcx,
+            rdx: self.rdx,
+            rbp: self.rbp,
+            rsi: self.rsi,
+            rdi: self.rdi,
+            r8: self.r8,
+            r9: self.r9,
+            r10: self.r10,
+            r11: self.r11,
+            r12: self.r12,
+            r13: self.r13,
+            r14: self.r14,
+            r15: self.r15,
+            rip: self.rip,
+            rflags: self.rflags,
+            rsp: unsafe { core::ptr::read(base.add(20)) },
+        })
+    }
+
+    fn set_user_regs(&mut self, regs: &user::UserRegs) {
+        self.rax = regs.rax;
+        self.rbx = regs.rbx;
+        self.rcx = regs.rcx;
+        self.rdx = regs.rdx;
+        self.rbp = regs.rbp;
+        self.rsi = regs.rsi;
+        self.rdi = regs.rdi;
+        self.r8 = regs.r8;
+        self.r9 = regs.r9;
+        self.r10 = regs.r10;
+        self.r11 = regs.r11;
+        self.r12 = regs.r12;
+        self.r13 = regs.r13;
+        self.r14 = regs.r14;
+        self.r15 = regs.r15;
+        self.rip = regs.rip;
+        self.rflags = regs.rflags;
+        let base = self as *mut InterruptFrame as *mut u64;
+        unsafe { core::ptr::write(base.add(20), regs.rsp) };
+    }
+
+    /// Timer tick that interrupted a user process: hands it any pending
+    /// signal handler. Nonzero means the process must exit (status set).
+    fn deliver_user_signal(&mut self) -> u64 {
+        let Some(mut regs) = self.user_regs() else {
+            return 0;
+        };
+        match crate::syscall::deliver_async_signal(&mut regs) {
+            None => {
+                self.set_user_regs(&regs);
+                0
+            }
+            Some(code) => {
+                user::set_exit_code(code);
+                1
+            }
+        }
+    }
+
     pub fn set_return(&mut self, rip: u64, rsp: u64) {
         self.rip = rip;
         let base = self as *mut InterruptFrame as *mut u64;
@@ -355,7 +423,7 @@ extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
             TIMER_TICKS.fetch_add(1, Ordering::Release);
             end_legacy_interrupt(32);
             crate::scheduler::on_timer_tick();
-            0
+            frame.deliver_user_signal()
         }
         33..=47 => {
             end_legacy_interrupt(frame.vector as u8);
@@ -365,7 +433,7 @@ extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
             LOCAL_TIMER_TICKS.fetch_add(1, Ordering::Release);
             crate::arch::apic::end_interrupt();
             crate::scheduler::on_timer_tick();
-            0
+            frame.deliver_user_signal()
         }
         49 => {
             IPI_ACKS.fetch_add(1, Ordering::Release);
@@ -424,6 +492,21 @@ extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
                     }
                     0
                 }
+                crate::syscall::BootstrapResult::ExecPath { bytes, length } => {
+                    let loaded = core::str::from_utf8(&bytes[..length])
+                        .ok()
+                        .and_then(|path| crate::vfs::file(path).ok().map(|file| (path, file)));
+                    match loaded {
+                        None => frame.rax = 0u64.wrapping_sub(2),
+                        Some((path, file)) => {
+                            match crate::scheduler::exec_current_user_task_path(file.data, path) {
+                                Some((entry, stack_top)) => frame.set_return(entry, stack_top),
+                                None => frame.rax = 0u64.wrapping_sub(8),
+                            }
+                        }
+                    }
+                    0
+                }
                 crate::syscall::BootstrapResult::Wait { pid } => {
                     frame.rax = match crate::scheduler::wait_for_child(pid) {
                         Some(status) => status,
@@ -470,13 +553,29 @@ extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
             {
                 return 0;
             }
+            // Write to a present, read-only page: copy-on-write after fork().
+            // Ring-0 writes (copy_to_user into a shared page) land here too.
+            if frame.vector == 14
+                && frame.error & 3 == 3
+                && crate::scheduler::handle_cow_fault_current(fault_address)
+            {
+                return 0;
+            }
             if frame.cs & 3 == 3 && frame.vector < 32 {
                 user::terminate_fault(frame.vector, frame.error, fault_address);
                 return 1;
             }
+            let frame_words = frame as *const InterruptFrame as *const u64;
+            let saved_rsp = unsafe { core::ptr::read(frame_words.add(20)) };
             serial::format(format_args!(
-                "AEROS_EXCEPTION vector={} error={:#x} rip={:#x} cs={:#x} rflags={:#x} cr2={:#x}\n",
-                frame.vector, frame.error, frame.rip, frame.cs, frame.rflags, fault_address
+                "AEROS_EXCEPTION vector={} error={:#x} rip={:#x} cs={:#x} rflags={:#x} cr2={:#x} rsp={:#x}\n",
+                frame.vector,
+                frame.error,
+                frame.rip,
+                frame.cs,
+                frame.rflags,
+                fault_address,
+                saved_rsp
             ));
             arch::halt_forever();
         }

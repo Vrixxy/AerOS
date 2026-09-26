@@ -14,6 +14,15 @@ use crate::serial;
 use crate::shell;
 use crate::vfs;
 
+#[path = "desktop_flow.rs"]
+mod flow;
+#[path = "desktop_panels.rs"]
+mod panels;
+#[path = "desktop_search.rs"]
+mod search;
+#[path = "desktop_shell.rs"]
+mod shellui;
+
 const DESIGN_WIDTH: i32 = 752;
 const DESIGN_HEIGHT: i32 = 458;
 const WALLPAPER_WIDTH: usize = 4_148;
@@ -22,7 +31,25 @@ const WALLPAPER: &[u8] = include_bytes!("../../assets/wallpapers/aeros-mountains
 const MAX_DESKTOP_PIXELS: usize = 1_920 * 1_080;
 const MAX_URL: usize = 128;
 const MAX_PATH: usize = 96;
-const DEFAULT_URL: &str = "example.com";
+/// Set by the self-test so it exercises the built-in HTTP path even when a
+/// Linux guest exists.
+static FORCE_NATIVE_FETCH: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// Text lines visible in the browser page area, and one line's height.
+const BROWSER_VISIBLE_LINES: usize = 17;
+const BROWSER_LINE_HEIGHT: i32 = 14;
+/// Width of one page character in thousandths of a logical pixel (measured
+/// from the font when the page is drawn; used to find clicked links).
+static BROWSER_CHAR_W_MILLI: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(6600);
+const BROWSER_FAVORITES: [(&str, &str); 6] = [
+    ("Wikipedia", "https://en.wikipedia.org"),
+    ("DuckDuckGo", "https://lite.duckduckgo.com/lite"),
+    ("Debian", "https://www.debian.org"),
+    ("GitHub", "https://github.com"),
+    ("Hacker News", "https://news.ycombinator.com"),
+    ("Example", "https://example.com"),
+];
 const DOCK_HOLD_NS: u64 = 90_000_000;
 const MOTION_TICK_HZ: u32 = 240;
 /// How many TSC cycles the Linux guest runs per desktop loop iteration.
@@ -58,6 +85,8 @@ const SCREEN_TRANSITION_NS: u64 = 220_000_000;
 const SCREEN_FADE_MAX_ALPHA: u32 = 130;
 const MAX_NAME: usize = 20;
 const LOGIN_ERROR_NS: u64 = 1_500_000_000;
+/// Idle time on the desktop before the session locks itself.
+const AUTO_LOCK_NS: u64 = 300_000_000_000;
 const SHELL_LINE_MAX: usize = 56;
 const SHELL_HISTORY_LINES: usize = 14;
 const FILES_MAX_ENTRIES: usize = 12;
@@ -67,8 +96,23 @@ const NOTES_MAX_ENTRIES: usize = 7;
 const TRASH_MAX_ENTRIES: usize = 6;
 const NAME_INPUT_MAX: usize = 32;
 const NOTE_MAX_BYTES: usize = 4_096;
-const TRASH_DIRECTORY: &str = "/data/.trash";
-const NOTES_DIRECTORY: &str = "/data/Notes";
+/// Where Trash and Notes live: on the real home volume when there is one
+/// (long names, any size, kept between runs), else in the small /data area.
+fn trash_directory() -> &'static str {
+    if crate::datafs::route("/home").is_some() {
+        "/home/Trash"
+    } else {
+        "/data/.trash"
+    }
+}
+
+fn notes_directory() -> &'static str {
+    if crate::datafs::route("/home").is_some() {
+        "/home/Notes"
+    } else {
+        "/data/Notes"
+    }
+}
 
 fn ease_out_milli(progress_milli: u32) -> u32 {
     let inverse = 1000 - progress_milli.min(1000);
@@ -85,7 +129,7 @@ const DOCK_NAMES: [&str; 7] = [
     "Trash",
 ];
 const APP_LABELS: [&str; 20] = [
-    "", "", "", "", "", "L", "M", "P", "E", "I", "D", "V", "R", "L", "H", "W", "G", "K", "U", "X",
+    "", "", "", "", "", "L", "M", "P", "E", "I", "D", "V", "R", "L", "H", "W", "G", "K", "U", "S",
 ];
 const APP_NAMES: [&str; 20] = [
     "Terminal",
@@ -139,6 +183,7 @@ enum DesktopApp {
     Trash,
     Terminal,
     Linux,
+    Store,
 }
 
 impl DesktopApp {
@@ -152,6 +197,7 @@ impl DesktopApp {
             Self::Notes => "notes",
             Self::Trash => "trash",
             Self::Terminal => "terminal",
+            Self::Store => "store",
         }
     }
 }
@@ -159,8 +205,11 @@ impl DesktopApp {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Language,
+    Keyboard,
     Username,
     Password,
+    Confirm,
+    Welcome,
     Lock,
     Login,
     Desktop,
@@ -170,8 +219,11 @@ impl Screen {
     const fn name(self) -> &'static str {
         match self {
             Self::Language => "language",
+            Self::Keyboard => "keyboard",
             Self::Username => "username",
             Self::Password => "password",
+            Self::Confirm => "confirm",
+            Self::Welcome => "welcome",
             Self::Lock => "lock",
             Self::Login => "login",
             Self::Desktop => "desktop",
@@ -180,9 +232,12 @@ impl Screen {
 
     const fn next(self) -> Self {
         match self {
-            Self::Language => Self::Username,
+            Self::Language => Self::Keyboard,
+            Self::Keyboard => Self::Username,
             Self::Username => Self::Password,
-            Self::Password => Self::Lock,
+            Self::Password => Self::Confirm,
+            Self::Confirm => Self::Welcome,
+            Self::Welcome => Self::Lock,
             Self::Lock => Self::Login,
             Self::Login | Self::Desktop => Self::Desktop,
         }
@@ -685,15 +740,81 @@ struct DesktopState {
     dock_press_ns: [u64; DOCK_BUTTONS.len()],
     dock_release_ns: [u64; DOCK_BUTTONS.len()],
     motion_until_ns: u64,
+    music_active: bool,
+    music_playing: bool,
+    music_track: u8,
+    music_elapsed_ns: u64,
+    music_started_ns: u64,
+    music_shown_ns: u64,
+    music_pause_ns: u64,
+    music_expand_at_ns: u64,
+    music_expand_until_ns: u64,
+    music_track_ns: u64,
+    volume: u8,
+    volume_prev: u8,
+    muted: bool,
+    volume_event_ns: u64,
+    volume_hud_until_ns: u64,
     overlay_open_at_ns: u64,
     screen_transition_at_ns: u64,
     username_input: [u8; MAX_NAME],
     username_len: usize,
     setup_password_input: [u8; MAX_NAME],
     setup_password_len: usize,
+    confirm_input: [u8; MAX_NAME],
+    confirm_len: usize,
+    /// Salted password hash made at setup (the typed password is wiped).
+    credential: Option<crate::auth::Credential>,
+    lockout: crate::auth::Lockout,
+    /// Password-hash work factor (lowered only by the self-tests).
+    kdf_iterations: u32,
+    /// Why the current setup step was refused ("" = nothing to show).
+    setup_error: &'static str,
+    setup_error_ns: u64,
+    account_unsaved: bool,
+    setup_typed_ns: u64,
+    search_open: bool,
+    search_at_ns: u64,
+    search_input: [u8; search::SEARCH_MAX],
+    search_len: usize,
+    search_focus: usize,
+    search_typed_ns: u64,
+    hover_index: usize,
+    hover_prev: usize,
+    hover_at_ns: u64,
+    quick_toggle_ns: [u64; 4],
+    quick_focus: usize,
+    brightness: u8,
+    brightness_prev: u8,
+    brightness_event_ns: u64,
+    brightness_hud_until_ns: u64,
+    notif_seen: u32,
+    toast_at_ns: u64,
+    notif_open: bool,
+    notif_at_ns: u64,
+    ctx_open: bool,
+    ctx_at_ns: u64,
+    ctx_origin: Point,
+    ctx_focus: usize,
+    clip_at_ns: u64,
+    power_open: bool,
+    power_at_ns: u64,
+    power_focus: usize,
+    power_flyout: bool,
+    power_flyout_ns: u64,
+    power_action: shellui::PowerAction,
+    power_action_at_ns: u64,
+    kb_search: [u8; flow::KB_SEARCH_MAX],
+    kb_search_len: usize,
+    kb_cursor: usize,
+    kb_scroll_from: i32,
+    kb_scroll_target: i32,
+    kb_scroll_at_ns: u64,
     login_input: [u8; MAX_NAME],
     login_len: usize,
     login_error_until_ns: u64,
+    login_typed_ns: u64,
+    persist_account: bool,
     terminal_input: [u8; SHELL_LINE_MAX],
     terminal_input_len: usize,
     terminal_lines: [[u8; SHELL_LINE_MAX]; SHELL_HISTORY_LINES],
@@ -709,6 +830,23 @@ struct DesktopState {
     terminal_draft_len: usize,
     seamless: Seamless,
     clip_open: bool,
+    /// The last pointer input looked like a finger (a jump, not a glide).
+    touch_mode: bool,
+    /// The on-screen keyboard is showing.
+    osk_open: bool,
+    osk_shift: bool,
+    osk_symbols: bool,
+    /// The user hid the keyboard for the current text field.
+    osk_dismissed: bool,
+    /// The store's search field was tapped (so the touch keyboard may show).
+    store_search_focus: bool,
+    /// Scancodes the keyboard has queued that are not from real keys.
+    osk_pending: u32,
+    /// Shield toast: the last event shown, its text and when it goes away.
+    shield_seen: u32,
+    shield_text: [u8; 56],
+    shield_len: usize,
+    shield_until_ns: u64,
     clip_selected: usize,
     /// Clipboard generation last handed to the guest (MAX = never).
     clip_synced: u32,
@@ -775,15 +913,78 @@ impl DesktopState {
             dock_press_ns: [0; DOCK_BUTTONS.len()],
             dock_release_ns: [0; DOCK_BUTTONS.len()],
             motion_until_ns: 0,
+            music_active: false,
+            music_playing: false,
+            music_track: 0,
+            music_elapsed_ns: 0,
+            music_started_ns: 0,
+            music_shown_ns: 0,
+            music_pause_ns: 0,
+            music_expand_at_ns: 0,
+            music_expand_until_ns: 0,
+            music_track_ns: 0,
+            volume: 42,
+            volume_prev: 42,
+            muted: false,
+            volume_event_ns: 0,
+            volume_hud_until_ns: 0,
             overlay_open_at_ns: 0,
             screen_transition_at_ns: 0,
             username_input: [0; MAX_NAME],
             username_len: 0,
             setup_password_input: [0; MAX_NAME],
             setup_password_len: 0,
+            confirm_input: [0; MAX_NAME],
+            confirm_len: 0,
+            credential: None,
+            lockout: crate::auth::Lockout::new(),
+            kdf_iterations: crate::auth::ITERATIONS,
+            setup_error: "",
+            setup_error_ns: 0,
+            account_unsaved: false,
+            setup_typed_ns: 0,
+            search_open: false,
+            search_at_ns: 0,
+            search_input: [0; search::SEARCH_MAX],
+            search_len: 0,
+            search_focus: 0,
+            search_typed_ns: 0,
+            hover_index: usize::MAX,
+            hover_prev: usize::MAX,
+            hover_at_ns: 0,
+            quick_toggle_ns: [0; 4],
+            quick_focus: 0,
+            brightness: 100,
+            brightness_prev: 100,
+            brightness_event_ns: 0,
+            brightness_hud_until_ns: 0,
+            notif_seen: 0,
+            toast_at_ns: 0,
+            notif_open: false,
+            notif_at_ns: 0,
+            ctx_open: false,
+            ctx_at_ns: 0,
+            ctx_origin: Point::new(0, 0),
+            ctx_focus: 0,
+            clip_at_ns: 0,
+            power_open: false,
+            power_at_ns: 0,
+            power_focus: 0,
+            power_flyout: false,
+            power_flyout_ns: 0,
+            power_action: shellui::PowerAction::None,
+            power_action_at_ns: 0,
+            kb_search: [0; flow::KB_SEARCH_MAX],
+            kb_search_len: 0,
+            kb_cursor: 0,
+            kb_scroll_from: 0,
+            kb_scroll_target: 0,
+            kb_scroll_at_ns: 0,
             login_input: [0; MAX_NAME],
             login_len: 0,
             login_error_until_ns: 0,
+            login_typed_ns: 0,
+            persist_account: false,
             terminal_input: [0; SHELL_LINE_MAX],
             terminal_input_len: 0,
             terminal_lines: [[0; SHELL_LINE_MAX]; SHELL_HISTORY_LINES],
@@ -795,6 +996,17 @@ impl DesktopState {
             terminal_draft_len: 0,
             seamless: Seamless::new(),
             clip_open: false,
+            touch_mode: false,
+            osk_open: false,
+            osk_shift: false,
+            osk_symbols: false,
+            osk_dismissed: false,
+            store_search_focus: false,
+            osk_pending: 0,
+            shield_seen: 0,
+            shield_text: [0; 56],
+            shield_len: 0,
+            shield_until_ns: 0,
             clip_selected: 0,
             clip_synced: u32::MAX,
             dock_entrance_at_ns: 0,
@@ -827,7 +1039,25 @@ impl DesktopState {
         }
     }
 
+    fn toggle_maximize(&mut self) {
+        if !can_maximize(self.app) {
+            return;
+        }
+        let next = if is_maximized(self.app) {
+            0
+        } else {
+            self.app as u8 + 1
+        };
+        MAXIMIZED_APP.store(next, Ordering::Relaxed);
+        let now = crate::time::monotonic_nanoseconds();
+        self.window_open_at_ns = now;
+        self.motion_until_ns = self.motion_until_ns.max(now.saturating_add(WINDOW_OPEN_NS));
+    }
+
     fn set_app(&mut self, target: DesktopApp) {
+        if target != self.app {
+            MAXIMIZED_APP.store(0, Ordering::Relaxed);
+        }
         if target != DesktopApp::None && self.app != target {
             let now = crate::time::monotonic_nanoseconds();
             self.window_open_at_ns = now;
@@ -845,6 +1075,8 @@ impl DesktopState {
     fn set_overlay(&mut self, target: Overlay) {
         let now = crate::time::monotonic_nanoseconds();
         if target != Overlay::None && self.overlay != target {
+            self.hover_prev = usize::MAX;
+            self.hover_index = usize::MAX;
             self.overlay_open_at_ns = now;
             self.motion_until_ns = self
                 .motion_until_ns
@@ -858,6 +1090,89 @@ impl DesktopState {
                 .max(now.saturating_add(OVERLAY_TRANSITION_NS));
         }
         self.overlay = target;
+    }
+
+    /// Whether something on screen is waiting for typed text.
+    fn text_input_active(&self) -> bool {
+        self.search_open
+            || (self.app == DesktopApp::Browser && self.url_active)
+            || (self.app == DesktopApp::Store
+                && self.overlay == Overlay::None
+                && crate::store::get().detail.is_none())
+            || self.app == DesktopApp::Terminal
+            || (self.app == DesktopApp::Files && self.files_mode == FilesMode::NamingFolder)
+            || (self.app == DesktopApp::Notes && self.notes_mode != NotesMode::List)
+            || matches!(
+                self.screen,
+                Screen::Keyboard
+                    | Screen::Username
+                    | Screen::Password
+                    | Screen::Confirm
+                    | Screen::Login
+            )
+    }
+
+    /// Whether the touch keyboard should be up: text is wanted, and in the
+    /// store only once its search field was tapped.
+    fn osk_wanted(&self) -> bool {
+        self.text_input_active() && (self.app != DesktopApp::Store || self.store_search_focus)
+    }
+
+    fn osk_hit(&self, point: Point) -> Option<OskKey> {
+        let (keys, count) = osk_keys(self.osk_symbols);
+        keys[..count]
+            .iter()
+            .find(|(rect, _)| rect.contains(point))
+            .map(|(_, key)| *key)
+    }
+
+    /// Queue a key as if it had been typed on a keyboard, so every text field
+    /// (and the Linux guest) handles it the way it handles real keys.
+    fn osk_tap(&mut self, code: u8, shift: bool) {
+        let mut queued = 0;
+        if shift {
+            keyboard::push_scancode(0x2a);
+            queued += 1;
+        }
+        keyboard::push_scancode(code);
+        keyboard::push_scancode(code | 0x80);
+        queued += 2;
+        if shift {
+            keyboard::push_scancode(0xaa);
+            queued += 1;
+        }
+        self.osk_pending += queued;
+    }
+
+    fn osk_type_char(&mut self, wanted: u8) {
+        for code in 0x02..=0x35u8 {
+            for shift in [false, true] {
+                if shell::scancode_character(code, shift, false) == Some(wanted) {
+                    self.osk_tap(code, shift);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn osk_press(&mut self, key: OskKey) {
+        match key {
+            OskKey::Char(byte) => {
+                let byte = if self.osk_shift && byte.is_ascii_lowercase() {
+                    byte.to_ascii_uppercase()
+                } else {
+                    byte
+                };
+                self.osk_type_char(byte);
+                self.osk_shift = false;
+            }
+            OskKey::Shift => self.osk_shift = !self.osk_shift,
+            OskKey::Backspace => self.osk_tap(0x0e, false),
+            OskKey::Symbols => self.osk_symbols = !self.osk_symbols,
+            OskKey::Space => self.osk_tap(0x39, false),
+            OskKey::Enter => self.osk_tap(0x1c, false),
+            OskKey::Hide => self.osk_dismissed = true,
+        }
     }
 
     fn set_screen(&mut self, target: Screen) {
@@ -885,11 +1200,63 @@ impl DesktopState {
     }
 
     fn handle(&mut self, key: DesktopKey) -> DesktopAction {
+        match key {
+            DesktopKey::VolumeUp => {
+                self.volume_step(6);
+                return DesktopAction::Redraw;
+            }
+            DesktopKey::VolumeDown => {
+                self.volume_step(-6);
+                return DesktopAction::Redraw;
+            }
+            DesktopKey::Mute => {
+                self.toggle_mute();
+                return DesktopAction::Redraw;
+            }
+            DesktopKey::PlayPause => {
+                self.music_toggle();
+                return DesktopAction::Redraw;
+            }
+            DesktopKey::NextTrack => {
+                self.music_skip(1);
+                return DesktopAction::Redraw;
+            }
+            DesktopKey::PrevTrack => {
+                self.music_skip(-1);
+                return DesktopAction::Redraw;
+            }
+            DesktopKey::BrightnessUp => {
+                self.brightness_step(8);
+                return DesktopAction::Redraw;
+            }
+            DesktopKey::BrightnessDown => {
+                self.brightness_step(-8);
+                return DesktopAction::Redraw;
+            }
+            _ => {}
+        }
+        if let Some(action) = self.power_key(key) {
+            return action;
+        }
+        if self.screen == Screen::Desktop {
+            if let Some(action) = self.search_key(key) {
+                return action;
+            }
+            if let Some(action) = self.notify_key(key) {
+                return action;
+            }
+            if let Some(action) = self.context_key(key) {
+                return action;
+            }
+            if let Some(action) = self.quick_key(key) {
+                return action;
+            }
+        }
         if self.screen == Screen::Login {
             return match key {
+                // Escape only clears what was typed; it never unlocks.
                 DesktopKey::Escape => {
-                    self.login_len = 0;
-                    self.set_screen(Screen::Desktop);
+                    self.wipe_login();
                     DesktopAction::Redraw
                 }
                 DesktopKey::Activate => self.try_login(),
@@ -993,44 +1360,153 @@ impl DesktopState {
             };
         }
         if self.screen != Screen::Desktop {
-            match key {
-                DesktopKey::Escape => {
-                    self.set_screen(Screen::Desktop);
-                    return DesktopAction::Redraw;
-                }
-                DesktopKey::Character(byte) if self.screen == Screen::Username => {
-                    return if self.push_username_byte(byte) {
-                        DesktopAction::Redraw
-                    } else {
-                        DesktopAction::Idle
-                    };
-                }
-                DesktopKey::Character(byte) if self.screen == Screen::Password => {
-                    return if self.push_setup_password_byte(byte) {
-                        DesktopAction::Redraw
-                    } else {
-                        DesktopAction::Idle
-                    };
-                }
-                DesktopKey::Backspace if self.screen == Screen::Username => {
-                    self.username_len = self.username_len.saturating_sub(1);
-                    return DesktopAction::Redraw;
-                }
-                DesktopKey::Backspace if self.screen == Screen::Password => {
-                    self.setup_password_len = self.setup_password_len.saturating_sub(1);
-                    return DesktopAction::Redraw;
-                }
-                DesktopKey::Activate | DesktopKey::Tab | DesktopKey::Right | DesktopKey::Down => {
-                    self.set_screen(self.screen.next());
-                    return DesktopAction::Redraw;
-                }
-                _ => {
-                    if self.screen == Screen::Lock {
-                        self.set_screen(Screen::Login);
+            // Setup cannot be skipped and hotkeys do nothing until the
+            // account exists and the user has signed in.
+            if self.screen == Screen::Lock {
+                // Any key wakes the lock screen to the sign-in prompt.
+                self.set_screen(Screen::Login);
+                return DesktopAction::Redraw;
+            }
+            if self.screen == Screen::Keyboard {
+                match key {
+                    DesktopKey::Up => return self.keyboard_move(-1),
+                    DesktopKey::Down => return self.keyboard_move(1),
+                    DesktopKey::Character(byte) => return self.keyboard_type(byte),
+                    DesktopKey::Backspace => {
+                        self.kb_search_len = self.kb_search_len.saturating_sub(1);
+                        self.keyboard_refilter();
                         return DesktopAction::Redraw;
                     }
-                    self.set_screen(Screen::Desktop);
+                    DesktopKey::Escape => {
+                        self.kb_search_len = 0;
+                        self.keyboard_refilter();
+                        return DesktopAction::Redraw;
+                    }
+                    DesktopKey::Tab | DesktopKey::Right => return DesktopAction::Idle,
+                    _ => {}
                 }
+            }
+            return match key {
+                DesktopKey::Escape => {
+                    self.wipe_setup_field();
+                    DesktopAction::Redraw
+                }
+                DesktopKey::Character(byte) => {
+                    let pushed = match self.screen {
+                        Screen::Username => self.push_username_byte(byte),
+                        Screen::Password => self.push_setup_password_byte(byte),
+                        Screen::Confirm => self.push_confirm_byte(byte),
+                        _ => false,
+                    };
+                    if pushed {
+                        self.setup_error = "";
+                        self.setup_typed_ns = crate::time::monotonic_nanoseconds();
+                        self.motion_until_ns =
+                            self.motion_until_ns.max(self.setup_typed_ns + 300_000_000);
+                        DesktopAction::Redraw
+                    } else {
+                        DesktopAction::Idle
+                    }
+                }
+                DesktopKey::Backspace => {
+                    match self.screen {
+                        Screen::Username => self.username_len = self.username_len.saturating_sub(1),
+                        Screen::Password => {
+                            self.setup_password_len = self.setup_password_len.saturating_sub(1);
+                            self.setup_password_input[self.setup_password_len] = 0;
+                        }
+                        Screen::Confirm => {
+                            self.confirm_len = self.confirm_len.saturating_sub(1);
+                            self.confirm_input[self.confirm_len] = 0;
+                        }
+                        _ => {}
+                    }
+                    self.setup_error = "";
+                    DesktopAction::Redraw
+                }
+                DesktopKey::Activate | DesktopKey::Tab | DesktopKey::Right | DesktopKey::Down => {
+                    self.advance_setup()
+                }
+                _ => DesktopAction::Idle,
+            };
+        }
+        if self.app == DesktopApp::Browser && self.overlay == Overlay::None && !self.url_active {
+            let now = crate::time::monotonic_nanoseconds();
+            let web = crate::web::get();
+            match key {
+                DesktopKey::Up => {
+                    web.scroll_by(-3, BROWSER_VISIBLE_LINES);
+                    return DesktopAction::Redraw;
+                }
+                DesktopKey::Down => {
+                    web.scroll_by(3, BROWSER_VISIBLE_LINES);
+                    return DesktopAction::Redraw;
+                }
+                DesktopKey::Left => {
+                    web.back(now);
+                    return DesktopAction::Redraw;
+                }
+                DesktopKey::Right => {
+                    web.forward(now);
+                    return DesktopAction::Redraw;
+                }
+                _ => {}
+            }
+        }
+        if self.app == DesktopApp::Store && self.overlay == Overlay::None {
+            let store = crate::store::get();
+            match key {
+                DesktopKey::Escape if store.detail.is_some() => {
+                    store.detail = None;
+                    return DesktopAction::Redraw;
+                }
+                DesktopKey::Escape if !store.query().is_empty() => {
+                    while store.pop_query() {}
+                    return DesktopAction::Redraw;
+                }
+                DesktopKey::Backspace => {
+                    return if store.detail.is_none() && store.pop_query() {
+                        DesktopAction::Redraw
+                    } else {
+                        DesktopAction::Idle
+                    };
+                }
+                DesktopKey::Character(byte) => {
+                    return if store.detail.is_none() && store.push_query(byte) {
+                        DesktopAction::Redraw
+                    } else {
+                        DesktopAction::Idle
+                    };
+                }
+                DesktopKey::Up => {
+                    store.scroll_rows(-1);
+                    return DesktopAction::Redraw;
+                }
+                DesktopKey::Down => {
+                    store.scroll_rows(1);
+                    return DesktopAction::Redraw;
+                }
+                DesktopKey::Tab => {
+                    let next = if store.tab == crate::store::StoreTab::Installed {
+                        crate::store::StoreTab::Discover
+                    } else {
+                        crate::store::StoreTab::Installed
+                    };
+                    store.switch_tab(next);
+                    return DesktopAction::Redraw;
+                }
+                DesktopKey::Activate => {
+                    let target = store.detail.or_else(|| store.shown_index(0));
+                    if let Some(index) = target {
+                        if store.detail.is_some() {
+                            self.store_primary(index);
+                        } else {
+                            self.store_open(index);
+                        }
+                    }
+                    return DesktopAction::Redraw;
+                }
+                _ => {}
             }
         }
         match key {
@@ -1051,11 +1527,19 @@ impl DesktopState {
                 self.seamless.enabled = false;
                 self.set_app(DesktopApp::Linux);
             }
+            DesktopKey::Store => {
+                self.set_overlay(Overlay::None);
+                self.open_store();
+            }
             DesktopKey::Seamless => {
                 self.set_overlay(Overlay::None);
                 self.set_app(DesktopApp::None);
                 self.seamless.enabled = true;
             }
+            DesktopKey::Power => self.open_power_menu(),
+            DesktopKey::Notifications => self.toggle_notify_center(),
+            DesktopKey::Search => self.open_search(),
+            DesktopKey::BrightnessUp | DesktopKey::BrightnessDown => return DesktopAction::Idle,
             DesktopKey::Apps => {
                 self.set_overlay(if self.overlay == Overlay::Apps {
                     Overlay::None
@@ -1079,6 +1563,12 @@ impl DesktopState {
                 }
                 return DesktopAction::Idle;
             }
+            DesktopKey::VolumeUp
+            | DesktopKey::VolumeDown
+            | DesktopKey::Mute
+            | DesktopKey::PlayPause
+            | DesktopKey::NextTrack
+            | DesktopKey::PrevTrack => return DesktopAction::Idle,
             DesktopKey::Character(byte) => {
                 if self.app == DesktopApp::Browser && self.url_active && self.push_url_byte(byte) {
                     return DesktopAction::Redraw;
@@ -1154,6 +1644,7 @@ impl DesktopState {
                         3 => self.open_notes(),
                         4 => self.set_app(DesktopApp::Settings),
                         5 => self.set_app(DesktopApp::Linux),
+                        19 => self.open_store(),
                         _ => self.open_files(),
                     }
                 } else if self.overlay == Overlay::Quick {
@@ -1182,32 +1673,67 @@ impl DesktopState {
     }
 
     fn click(&mut self, point: Point) -> DesktopAction {
+        if self.osk_open {
+            if let Some(key) = self.osk_hit(point) {
+                self.osk_press(key);
+                return DesktopAction::Redraw;
+            }
+            if osk_rect().contains(point) {
+                return DesktopAction::Idle;
+            }
+        }
+        if let Some(action) = self.power_click(point) {
+            return action;
+        }
+        if self.screen == Screen::Desktop {
+            if let Some(action) = self.search_click(point) {
+                return action;
+            }
+            if let Some(action) = self.notify_click(point) {
+                return action;
+            }
+            if let Some(action) = self.context_click(point) {
+                return action;
+            }
+        }
+        if let Some(action) = self.music_hub_click(point) {
+            return action;
+        }
+        self.music_click_away();
         if self.screen == Screen::Login {
             return DesktopAction::Idle;
         }
         if self.screen != Screen::Desktop {
-            self.set_screen(if self.screen == Screen::Lock {
-                Screen::Login
-            } else {
-                self.screen.next()
-            });
-            return DesktopAction::Redraw;
+            if self.screen == Screen::Lock {
+                self.set_screen(Screen::Login);
+                return DesktopAction::Redraw;
+            }
+            return self.setup_click(point);
         }
         if self.app != DesktopApp::None && self.overlay == Overlay::None {
             let base = window_base_rect(self.app);
-            let close = Rect::new(base.x + base.width - 75, base.y + 7, 14, 14);
-            if close.contains(point) {
+            let (minimize, maximize, close) = window_control_rects(base);
+            if close.contains(point) || minimize.contains(point) {
+                // Minimize hides the window; its state is kept for next time.
                 self.set_app(DesktopApp::None);
+                return DesktopAction::Redraw;
+            }
+            if maximize.contains(point) {
+                self.toggle_maximize();
                 return DesktopAction::Redraw;
             }
         }
         if self.app == DesktopApp::Browser
             && self.overlay == Overlay::None
-            && Rect::new(132, 75, 493, 38).contains(point)
+            && let Some(action) = self.browser_click(point)
         {
-            self.url_active = true;
-            self.browser_phase = BrowserPhase::Editing;
-            return DesktopAction::Redraw;
+            return action;
+        }
+        if self.app == DesktopApp::Store
+            && self.overlay == Overlay::None
+            && let Some(action) = self.store_click(point)
+        {
+            return action;
         }
         if self.app == DesktopApp::Files
             && self.overlay == Overlay::None
@@ -1354,6 +1880,29 @@ impl DesktopState {
                 }
             }
         }
+        if Rect::new(503, 377, 216, 55).contains(point) && self.overlay == Overlay::None {
+            self.toggle_notify_center();
+            return DesktopAction::Redraw;
+        }
+        if self.overlay != Overlay::None {
+            // The dock stays clickable while a panel is open.
+            for index in 0..DOCK_BUTTONS.len() {
+                let bounds = Rect::new(44 + index as i32 * 64, 380, 50, 50);
+                if !bounds.contains(point) {
+                    continue;
+                }
+                let toggles_open_panel = (index == 0 && self.overlay == Overlay::Apps)
+                    || (index == 2 && self.overlay == Overlay::Quick);
+                if toggles_open_panel {
+                    self.set_overlay(Overlay::None);
+                    return DesktopAction::Redraw;
+                }
+                self.dock_focus = index;
+                self.focus_visible = true;
+                self.set_overlay(Overlay::None);
+                return self.handle(DesktopKey::Activate);
+            }
+        }
         if self.overlay == Overlay::Apps {
             for index in 0..APP_LABELS.len().min(6) {
                 let bounds = Rect::new(58 + index as i32 * 64, 48, 50, 50);
@@ -1363,11 +1912,16 @@ impl DesktopState {
                     return self.handle(DesktopKey::Activate);
                 }
             }
-            return DesktopAction::Idle;
+            if Rect::new(25, 20, 702, 420).contains(point) {
+                return DesktopAction::Idle;
+            }
+            // Clicking away from the panel closes it.
+            self.set_overlay(Overlay::None);
+            return DesktopAction::Redraw;
         }
         if self.overlay == Overlay::Quick {
-            if Rect::new(327, 26, 314, 328).contains(point) {
-                return self.handle(DesktopKey::Activate);
+            if panels::QUICK_PANEL.contains(point) {
+                return self.quick_click(point);
             }
             self.set_overlay(Overlay::None);
             return DesktopAction::Redraw;
@@ -1384,18 +1938,233 @@ impl DesktopState {
         DesktopAction::Idle
     }
 
+    /// The address the user sees (typed text or the loaded page's).
+    fn browser_click(&mut self, point: Point) -> Option<DesktopAction> {
+        let base = window_base_rect(DesktopApp::Browser);
+        let now = crate::time::monotonic_nanoseconds();
+        let web = crate::web::get();
+        let bar_y = base.y + 34;
+        let back = Rect::new(base.x + 14, bar_y, 28, 26);
+        let forward = Rect::new(base.x + 46, bar_y, 28, 26);
+        let reload = Rect::new(base.right() - 44, bar_y, 28, 26);
+        let pill = Rect::new(base.x + 84, bar_y, base.width - 84 - 58, 26);
+        if back.contains(point) {
+            web.back(now);
+            return Some(DesktopAction::Redraw);
+        }
+        if forward.contains(point) {
+            web.forward(now);
+            return Some(DesktopAction::Redraw);
+        }
+        if reload.contains(point) {
+            web.reload(now);
+            return Some(DesktopAction::Redraw);
+        }
+        if pill.contains(point) {
+            self.url_active = true;
+            if web.state == crate::web::WebState::Blank {
+                self.browser_phase = BrowserPhase::Editing;
+            }
+            // Editing starts from the address of the page on screen.
+            let current = web.url();
+            if !current.is_empty() && self.url_len == 0 {
+                let bytes = current.as_bytes();
+                let len = bytes.len().min(MAX_URL);
+                self.url_input[..len].copy_from_slice(&bytes[..len]);
+                self.url_len = len;
+            }
+            return Some(DesktopAction::Redraw);
+        }
+        let content = browser_content_rect(base);
+        if !content.contains(point) {
+            return None;
+        }
+        if web.state == crate::web::WebState::Blank {
+            for (index, (_, address)) in BROWSER_FAVORITES.iter().enumerate() {
+                if browser_favorite_rect(content, index).contains(point) {
+                    let bytes = address.as_bytes();
+                    self.url_input[..bytes.len()].copy_from_slice(bytes);
+                    self.url_len = bytes.len();
+                    self.url_active = false;
+                    web.navigate(address, now);
+                    self.browser_phase = BrowserPhase::Loading;
+                    return Some(DesktopAction::Redraw);
+                }
+            }
+            return None;
+        }
+        // A click on a `[n]` link marker in the page text.
+        let char_width = BROWSER_CHAR_W_MILLI
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .max(1) as i64;
+        let row = ((point.y - content.y - 8) / BROWSER_LINE_HEIGHT).max(0) as usize;
+        let line_index = web.scroll + row;
+        let column = (((point.x - content.x - 12) as i64) * 1000 / char_width).max(0) as usize;
+        let line = web.line(line_index).as_bytes();
+        let mut at = 0;
+        while at < line.len() {
+            if line[at] == b'[' {
+                let mut end = at + 1;
+                while end < line.len() && line[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if end > at + 1 && end < line.len() && line[end] == b']' {
+                    if (at..=end).contains(&column) {
+                        let number = core::str::from_utf8(&line[at + 1..end])
+                            .ok()
+                            .and_then(|digits| digits.parse::<u32>().ok())?;
+                        let mut target = [0u8; crate::web::URL_MAX];
+                        let text = web.reference(number)?;
+                        let len = text.len().min(target.len());
+                        target[..len].copy_from_slice(&text.as_bytes()[..len]);
+                        let target = core::str::from_utf8(&target[..len]).ok()?;
+                        self.url_len = 0;
+                        web.navigate(target, now);
+                        self.browser_phase = BrowserPhase::Loading;
+                        return Some(DesktopAction::Redraw);
+                    }
+                    at = end;
+                }
+            }
+            at += 1;
+        }
+        None
+    }
+
+    /// The main button of an app: Open if it is installed, else Get.
+    fn store_primary(&mut self, index: usize) {
+        let store = crate::store::get();
+        let now = crate::time::monotonic_nanoseconds();
+        if !crate::svm::linux_agent_ready() {
+            // Linux isn't running: start it (its windows and app list follow).
+            self.show_linux_apps();
+            return;
+        }
+        match store.tab {
+            crate::store::StoreTab::Installed => {
+                if store.launch(index) {
+                    self.show_linux_apps();
+                }
+            }
+            crate::store::StoreTab::Discover => {
+                if let Some(installed) = store.installed_index(&crate::store::CATALOG[index]) {
+                    if store.launch(installed) {
+                        self.show_linux_apps();
+                    }
+                } else {
+                    store.install(index, now);
+                }
+            }
+        }
+    }
+
+    /// A grid item was chosen: an installed app opens, a catalogue app
+    /// shows its page.
+    fn store_open(&mut self, index: usize) {
+        let store = crate::store::get();
+        match store.tab {
+            crate::store::StoreTab::Installed => self.store_primary(index),
+            crate::store::StoreTab::Discover => store.detail = Some(index),
+        }
+    }
+
+    fn store_click(&mut self, point: Point) -> Option<DesktopAction> {
+        use crate::store::{GRID_COLUMNS, GRID_ROWS, StoreTab};
+        let base = window_base_rect(DesktopApp::Store);
+        let store = crate::store::get();
+        if let Some(index) = store.detail {
+            if store_back_rect(base).contains(point) {
+                store.detail = None;
+                return Some(DesktopAction::Redraw);
+            }
+            if store_get_rect(base).contains(point) {
+                self.store_primary(index);
+                return Some(DesktopAction::Redraw);
+            }
+            for (slot, other) in store.similar(index).into_iter().enumerate() {
+                if other < crate::store::CATALOG.len()
+                    && store_similar_rect(base, slot).contains(point)
+                {
+                    store.detail = Some(other);
+                    return Some(DesktopAction::Redraw);
+                }
+            }
+            return None;
+        }
+        if store_search_rect(base).contains(point) {
+            self.store_search_focus = true;
+            self.osk_dismissed = false;
+            return Some(DesktopAction::Redraw);
+        }
+        self.store_search_focus = false;
+        if store_toggle_rect(base).contains(point) {
+            let next = if store.tab == StoreTab::Installed {
+                StoreTab::Discover
+            } else {
+                StoreTab::Installed
+            };
+            store.switch_tab(next);
+            return Some(DesktopAction::Redraw);
+        }
+        if store.tab == StoreTab::Installed
+            && !crate::svm::linux_agent_ready()
+            && store_start_button_rect(base).contains(point)
+        {
+            self.show_linux_apps();
+            return Some(DesktopAction::Redraw);
+        }
+        for slot in 0..GRID_COLUMNS * GRID_ROWS {
+            let (column, row) = (slot % GRID_COLUMNS, slot / GRID_COLUMNS);
+            let position = (store.scroll + row) * GRID_COLUMNS + column;
+            let Some(index) = store.shown_index(position) else {
+                break;
+            };
+            if store_cell_rect(base, column, row).contains(point) {
+                self.store_open(index);
+                return Some(DesktopAction::Redraw);
+            }
+        }
+        None
+    }
+
     fn open_browser(&mut self) {
         self.set_app(DesktopApp::Browser);
         self.set_overlay(Overlay::None);
-        self.url_active = true;
-        if self.url_len == 0 {
-            self.url_input[..DEFAULT_URL.len()].copy_from_slice(DEFAULT_URL.as_bytes());
-            self.url_len = DEFAULT_URL.len();
+        // Straight to the address bar; a page already open stays as it was,
+        // otherwise the start page (favourites) shows.
+        self.url_active = crate::web::get().state == crate::web::WebState::Blank;
+        if self.url_active {
+            self.browser_phase = BrowserPhase::Editing;
         }
-        self.start_load();
+    }
+
+    fn open_store(&mut self) {
+        self.set_app(DesktopApp::Store);
+        self.set_overlay(Overlay::None);
+        self.url_active = false;
+    }
+
+    /// Enters seamless mode so Linux windows show as AerOS windows.
+    fn show_linux_apps(&mut self) {
+        self.set_overlay(Overlay::None);
+        self.set_app(DesktopApp::None);
+        self.seamless.enabled = true;
     }
 
     fn start_load(&mut self) {
+        // With the Linux guest available the page is fetched there (real TLS).
+        if crate::svm::linux_ready()
+            && self.url_len > 0
+            && !FORCE_NATIVE_FETCH.load(core::sync::atomic::Ordering::Relaxed)
+        {
+            let now = crate::time::monotonic_nanoseconds();
+            let mut scratch = [0u8; MAX_URL];
+            scratch[..self.url_len].copy_from_slice(&self.url_input[..self.url_len]);
+            let typed = core::str::from_utf8(&scratch[..self.url_len]).unwrap_or("");
+            crate::web::get().navigate(typed, now);
+            self.browser_phase = BrowserPhase::Loading;
+            return;
+        }
         self.browser_online = false;
         self.browser_http_status = 0;
         self.browser_http_bytes = 0;
@@ -1500,9 +2269,10 @@ impl DesktopState {
             let mut buffer = [0u8; NOTE_MAX_BYTES];
             match shell::read_file(target.as_str(), &mut buffer) {
                 Ok(length) => {
-                    let _ = vfs::create_directory(TRASH_DIRECTORY, 0o777);
+                    let _ = vfs::create_directory(trash_directory(), 0o777);
                     let mut trash_path: shell::Text<256> = shell::Text::new();
-                    let _ = shell::normalize_path(TRASH_DIRECTORY, row.name_str(), &mut trash_path);
+                    let _ =
+                        shell::normalize_path(trash_directory(), row.name_str(), &mut trash_path);
                     match vfs::open_file(trash_path.as_str(), true, false, true, 0o644, true) {
                         Ok(descriptor) => {
                             let write_result = vfs::write(descriptor, &buffer[..length], false);
@@ -1560,7 +2330,7 @@ impl DesktopState {
     }
 
     fn notes_reload(&mut self) {
-        let (count, overflow) = list_directory(NOTES_DIRECTORY, &mut self.notes_entries);
+        let (count, overflow) = list_directory(notes_directory(), &mut self.notes_entries);
         self.notes_entry_count = count;
         self.notes_overflow = overflow;
     }
@@ -1572,7 +2342,7 @@ impl DesktopState {
 
     fn notes_path_for(&self, name: &str) -> shell::Text<256> {
         let mut joined: shell::Text<256> = shell::Text::new();
-        let _ = shell::normalize_path(NOTES_DIRECTORY, name, &mut joined);
+        let _ = shell::normalize_path(notes_directory(), name, &mut joined);
         joined
     }
 
@@ -1606,7 +2376,7 @@ impl DesktopState {
     }
 
     fn notes_save(&mut self) {
-        let _ = vfs::create_directory(NOTES_DIRECTORY, 0o777);
+        let _ = vfs::create_directory(notes_directory(), 0o777);
         let path = self.notes_path_for(self.notes_current_name.as_str());
         match vfs::open_file(path.as_str(), true, false, true, 0o644, true) {
             Ok(descriptor) => {
@@ -1646,7 +2416,7 @@ impl DesktopState {
     }
 
     fn trash_reload(&mut self) {
-        let (count, overflow) = list_directory(TRASH_DIRECTORY, &mut self.trash_entries);
+        let (count, overflow) = list_directory(trash_directory(), &mut self.trash_entries);
         self.trash_entry_count = count;
         self.trash_overflow = overflow;
         if self.trash_selected >= count {
@@ -1661,7 +2431,7 @@ impl DesktopState {
 
     fn trash_path_for(&self, name: &str) -> shell::Text<256> {
         let mut joined: shell::Text<256> = shell::Text::new();
-        let _ = shell::normalize_path(TRASH_DIRECTORY, name, &mut joined);
+        let _ = shell::normalize_path(trash_directory(), name, &mut joined);
         joined
     }
 
@@ -1751,12 +2521,212 @@ impl DesktopState {
         true
     }
 
+    fn push_confirm_byte(&mut self, byte: u8) -> bool {
+        if self.confirm_len >= MAX_NAME || !byte.is_ascii_graphic() {
+            return false;
+        }
+        self.confirm_input[self.confirm_len] = byte;
+        self.confirm_len += 1;
+        true
+    }
+
+    fn wipe_login(&mut self) {
+        crate::auth::wipe(&mut self.login_input);
+        self.login_len = 0;
+    }
+
+    fn wipe_setup_secrets(&mut self) {
+        crate::auth::wipe(&mut self.setup_password_input);
+        crate::auth::wipe(&mut self.confirm_input);
+        self.setup_password_len = 0;
+        self.confirm_len = 0;
+    }
+
+    /// Escape in a setup step clears that step's field.
+    fn wipe_setup_field(&mut self) {
+        match self.screen {
+            Screen::Username => self.username_len = 0,
+            Screen::Password => {
+                crate::auth::wipe(&mut self.setup_password_input);
+                self.setup_password_len = 0;
+            }
+            Screen::Confirm => {
+                crate::auth::wipe(&mut self.confirm_input);
+                self.confirm_len = 0;
+            }
+            _ => {}
+        }
+        self.setup_error = "";
+    }
+
+    /// Moves setup forward only when the current step is acceptable: a
+    /// username, a password that passes the policy, and the same password
+    /// typed again. Confirming turns it into a salted hash and wipes the text.
+    fn advance_setup(&mut self) -> DesktopAction {
+        match self.screen {
+            Screen::Keyboard => {
+                let mut matches = [0usize; 16];
+                let count = flow::keyboard_matches(self, &mut matches);
+                if count == 0 {
+                    return DesktopAction::Idle;
+                }
+                let chosen = matches[self.kb_cursor.min(count - 1)];
+                if self.persist_account {
+                    crate::settings::set_keyboard_layout(chosen);
+                } else {
+                    crate::keymap::set_layout(chosen);
+                }
+            }
+            Screen::Username if self.username_len == 0 => {
+                self.fail_setup("Choose a username to continue");
+                return DesktopAction::Redraw;
+            }
+            Screen::Password => {
+                if let Err(reason) = crate::auth::check_password(
+                    &self.setup_password_input[..self.setup_password_len],
+                    &self.username_input[..self.username_len],
+                ) {
+                    self.fail_setup(reason);
+                    return DesktopAction::Redraw;
+                }
+            }
+            Screen::Confirm => {
+                let same = crate::auth::constant_time_eq(
+                    &self.setup_password_input[..self.setup_password_len],
+                    &self.confirm_input[..self.confirm_len],
+                );
+                if !same {
+                    crate::auth::wipe(&mut self.confirm_input);
+                    self.confirm_len = 0;
+                    self.fail_setup("Passwords do not match");
+                    return DesktopAction::Redraw;
+                }
+                self.credential = Some(crate::auth::Credential::new(
+                    &self.setup_password_input[..self.setup_password_len],
+                    self.kdf_iterations,
+                ));
+                self.wipe_setup_secrets();
+                self.account_unsaved = true;
+            }
+            _ => {}
+        }
+        self.setup_error = "";
+        self.set_screen(self.screen.next());
+        DesktopAction::Redraw
+    }
+
+    fn fail_setup(&mut self, reason: &'static str) {
+        self.setup_error = reason;
+        self.setup_error_ns = crate::time::monotonic_nanoseconds();
+        self.motion_until_ns = self.motion_until_ns.max(self.setup_error_ns + 460_000_000);
+    }
+
+    fn keyboard_refilter(&mut self) {
+        let mut matches = [0usize; 16];
+        let count = flow::keyboard_matches(self, &mut matches);
+        self.kb_cursor = 0;
+        self.keyboard_scroll_to(0, count);
+    }
+
+    fn keyboard_scroll_to(&mut self, cursor: usize, count: usize) {
+        let now = crate::time::monotonic_nanoseconds();
+        let current = flow::keyboard_scroll_milli(self, now);
+        let visible = flow::KB_VISIBLE;
+        let max_first = (count as i32 - visible).max(0);
+        let mut first = self.kb_scroll_target;
+        if (cursor as i32) < first {
+            first = cursor as i32;
+        } else if cursor as i32 >= first + visible {
+            first = cursor as i32 - visible + 1;
+        }
+        self.kb_scroll_from = current;
+        self.kb_scroll_target = first.clamp(0, max_first);
+        self.kb_scroll_at_ns = now;
+        self.motion_until_ns = self.motion_until_ns.max(now + 320_000_000);
+    }
+
+    fn keyboard_move(&mut self, step: i32) -> DesktopAction {
+        let mut matches = [0usize; 16];
+        let count = flow::keyboard_matches(self, &mut matches);
+        if count == 0 {
+            return DesktopAction::Idle;
+        }
+        let next = (self.kb_cursor as i32 + step).clamp(0, count as i32 - 1) as usize;
+        if next == self.kb_cursor {
+            return DesktopAction::Idle;
+        }
+        self.kb_cursor = next;
+        self.keyboard_scroll_to(next, count);
+        DesktopAction::Redraw
+    }
+
+    fn keyboard_type(&mut self, byte: u8) -> DesktopAction {
+        if self.kb_search_len >= flow::KB_SEARCH_MAX || !byte.is_ascii_graphic() {
+            return DesktopAction::Idle;
+        }
+        self.kb_search[self.kb_search_len] = byte;
+        self.kb_search_len += 1;
+        self.keyboard_refilter();
+        DesktopAction::Redraw
+    }
+
+    fn setup_click(&mut self, point: Point) -> DesktopAction {
+        match self.screen {
+            Screen::Language => {
+                if flow::LANGUAGE_ENGLISH.contains(point) {
+                    self.advance_setup()
+                } else {
+                    DesktopAction::Idle
+                }
+            }
+            Screen::Keyboard => {
+                let now = crate::time::monotonic_nanoseconds();
+                let scroll = flow::keyboard_scroll_milli(self, now);
+                let mut matches = [0usize; 16];
+                let count = flow::keyboard_matches(self, &mut matches);
+                for position in 0..count {
+                    let y = flow::KB_LIST.y + position as i32 * flow::KB_ROW_PITCH
+                        - scroll * flow::KB_ROW_PITCH / 1000;
+                    let row =
+                        Rect::new(flow::KB_LIST.x, y, flow::KB_LIST.width, flow::KB_ROW_HEIGHT);
+                    if row.contains(point) && flow::KB_LIST.contains(point) {
+                        if self.kb_cursor == position {
+                            return self.advance_setup();
+                        }
+                        self.kb_cursor = position;
+                        self.keyboard_scroll_to(position, count);
+                        return DesktopAction::Redraw;
+                    }
+                }
+                DesktopAction::Idle
+            }
+            Screen::Welcome => self.advance_setup(),
+            _ => DesktopAction::Idle,
+        }
+    }
+
+    /// Back to the sign-in screen: overlays close, the clipboard (which may
+    /// hold a secret) is emptied and the guest gets no input until sign-in.
+    fn lock_session(&mut self) -> bool {
+        if self.screen != Screen::Desktop || self.credential.is_none() {
+            return false;
+        }
+        self.wipe_login();
+        self.clip_open = false;
+        self.set_overlay(Overlay::None);
+        crate::clipboard::get().clear();
+        self.set_screen(Screen::Login);
+        true
+    }
+
     fn push_login_byte(&mut self, byte: u8) -> bool {
         if self.login_len >= MAX_NAME || !byte.is_ascii_graphic() {
             return false;
         }
         self.login_input[self.login_len] = byte;
         self.login_len += 1;
+        self.login_typed_ns = crate::time::monotonic_nanoseconds();
+        self.motion_until_ns = self.motion_until_ns.max(self.login_typed_ns + 260_000_000);
         true
     }
 
@@ -1770,17 +2740,39 @@ impl DesktopState {
     }
 
     fn try_login(&mut self) -> DesktopAction {
+        let now = crate::time::monotonic_nanoseconds();
+        if self.lockout.is_locked(now) {
+            // Throttled: the attempt is not even checked.
+            self.wipe_login();
+            return DesktopAction::Redraw;
+        }
+        let had_input = self.login_len > 0;
         let matches_password = self.login_len > 0
-            && self.login_input[..self.login_len]
-                == self.setup_password_input[..self.setup_password_len];
-        self.login_len = 0;
-        self.login_input = [0; MAX_NAME];
+            && self
+                .credential
+                .as_ref()
+                .is_some_and(|credential| credential.verify(&self.login_input[..self.login_len]));
+        self.wipe_login();
+        serial::format(format_args!(
+            "AEROS_LOGIN ok={} failures={} check_ms={}
+",
+            matches_password,
+            self.lockout.failures(),
+            crate::time::monotonic_nanoseconds().saturating_sub(now) / 1_000_000
+        ));
         if matches_password {
+            self.lockout.record_success();
             self.set_screen(Screen::Desktop);
         } else {
             let now = crate::time::monotonic_nanoseconds();
+            if had_input {
+                self.lockout.record_failure(now);
+            }
             self.login_error_until_ns = now.saturating_add(LOGIN_ERROR_NS);
-            self.motion_until_ns = self.motion_until_ns.max(self.login_error_until_ns);
+            self.motion_until_ns = self
+                .motion_until_ns
+                .max(self.login_error_until_ns)
+                .max(self.lockout.locked_until_ns());
         }
         DesktopAction::Redraw
     }
@@ -1924,12 +2916,24 @@ enum DesktopKey {
     Down,
     Apps,
     Quick,
+    Power,
+    Notifications,
+    Search,
+    BrightnessUp,
+    BrightnessDown,
     Terminal,
     Browser,
     Settings,
     Linux,
     Seamless,
+    Store,
     Backspace,
+    VolumeUp,
+    VolumeDown,
+    Mute,
+    PlayPause,
+    NextTrack,
+    PrevTrack,
     Character(u8),
 }
 
@@ -1969,6 +2973,12 @@ impl KeyDecoder {
         }
         let released = scancode & 0x80 != 0;
         let code = scancode & 0x7f;
+        // Right Alt is AltGr: it selects the third/fourth layer of the layout.
+        if self.extended && code == 0x38 {
+            crate::keymap::set_altgr(!released);
+            self.extended = false;
+            return None;
+        }
         if code == 0x2a || code == 0x36 {
             self.shift = !released;
             self.extended = false;
@@ -1990,6 +3000,13 @@ impl KeyDecoder {
                 0x48 => Some(DesktopKey::Up),
                 0x50 => Some(DesktopKey::Down),
                 0x5b | 0x5c => Some(DesktopKey::Apps),
+                0x5e => Some(DesktopKey::Power),
+                0x30 => Some(DesktopKey::VolumeUp),
+                0x2e => Some(DesktopKey::VolumeDown),
+                0x20 => Some(DesktopKey::Mute),
+                0x22 => Some(DesktopKey::PlayPause),
+                0x19 => Some(DesktopKey::NextTrack),
+                0x10 => Some(DesktopKey::PrevTrack),
                 _ => None,
             };
         }
@@ -2009,11 +3026,22 @@ impl KeyDecoder {
             0x1c | 0x39 => Some(DesktopKey::Activate),
             0x1e => Some(DesktopKey::Apps),
             0x10 => Some(DesktopKey::Quick),
+            0x19 => Some(DesktopKey::Power),
+            0x31 => Some(DesktopKey::Notifications),
+            0x35 => Some(DesktopKey::Search),
+            0x3f => Some(DesktopKey::BrightnessDown),
+            0x40 => Some(DesktopKey::BrightnessUp),
             0x14 => Some(DesktopKey::Terminal),
             0x30 => Some(DesktopKey::Browser),
             0x1f => Some(DesktopKey::Settings),
             0x26 => Some(DesktopKey::Linux),
             0x25 => Some(DesktopKey::Seamless),
+            0x22 => Some(DesktopKey::Store),
+            0x0d => Some(DesktopKey::VolumeUp),
+            0x0c => Some(DesktopKey::VolumeDown),
+            0x32 => Some(DesktopKey::PlayPause),
+            0x34 => Some(DesktopKey::NextTrack),
+            0x33 => Some(DesktopKey::PrevTrack),
             _ => None,
         }
     }
@@ -2153,11 +3181,11 @@ pub fn render_self_test(real_frame: &mut FrameBuffer, fonts: &FontCatalog) -> De
     };
     let apps = {
         let mut painter = Painter::new(frame);
-        draw_app_switcher(&mut painter, layout, ui_font, &state, now, false, 0)
+        draw_app_switcher(&mut painter, layout, ui_font, &state, now, false, 0, false)
     };
     let quick = {
         let mut painter = Painter::new(frame);
-        draw_quick_settings(&mut painter, layout, ui_font, &state, now)
+        panels::draw_quick(&mut painter, layout, ui_font, &state, now)
     };
     let window = {
         let mut window_state = state;
@@ -2199,11 +3227,43 @@ pub fn render_self_test(real_frame: &mut FrameBuffer, fonts: &FontCatalog) -> De
         let mut screen_state = state;
         screen_state.screen = Screen::Language;
         let language = draw_setup(&mut painter, layout, ui_font, &screen_state);
+        screen_state.screen = Screen::Keyboard;
+        let keyboard = draw_setup(&mut painter, layout, ui_font, &screen_state);
+        screen_state.screen = Screen::Welcome;
+        let welcome = draw_setup(&mut painter, layout, ui_font, &screen_state);
         screen_state.screen = Screen::Password;
         let password = draw_setup(&mut painter, layout, ui_font, &screen_state);
-        let lock = draw_lock(&mut painter, layout, ui_font, &screen_state, false);
+        let lock = draw_lock(&mut painter, layout, ui_font, &screen_state, now, false);
         let signin = draw_signin(&mut painter, layout, ui_font, &screen_state, now, false);
-        language && password && lock && signin
+        language && keyboard && welcome && password && lock && signin
+    };
+    let shell_ui = {
+        let bounds = Rect::new(0, 0, frame.width() as i32, frame.height() as i32);
+        let mut painter = Painter::new(frame);
+        let mut ui_state = state;
+        ui_state.screen = Screen::Desktop;
+        ui_state.power_open = true;
+        ui_state.power_at_ns = now.saturating_sub(2_000_000_000);
+        ui_state.power_flyout = true;
+        ui_state.power_flyout_ns = now.saturating_sub(2_000_000_000);
+        ui_state.ctx_open = true;
+        ui_state.ctx_at_ns = now.saturating_sub(2_000_000_000);
+        ui_state.ctx_origin = Point::new(200, 120);
+        ui_state.search_open = true;
+        ui_state.search_at_ns = now.saturating_sub(2_000_000_000);
+        ui_state.notif_open = true;
+        ui_state.notif_at_ns = now.saturating_sub(2_000_000_000);
+        crate::notify::push(0, "Self test", "A notification for the render check");
+        let power = shellui::draw_power_menu(&mut painter, layout, ui_font, bounds, &ui_state, now);
+        shellui::draw_lockout(&mut painter, layout, ui_font, bounds, 42, now, now);
+        panels::draw_toast(&mut painter, layout, ui_font, &ui_state, now);
+        panels::draw_notify_stack(&mut painter, layout, ui_font, &ui_state, now);
+        panels::draw_context(&mut painter, layout, ui_font, &ui_state, now);
+        panels::draw_clipboard_panel(&mut painter, layout, ui_font, &ui_state, now);
+        panels::draw_hud(&mut painter, layout, &ui_state, now);
+        search::draw_search(&mut painter, layout, ui_font, &ui_state, now);
+        crate::notify::clear();
+        power
     };
     draw_cursor_at(frame, 40, 40);
     let wallpaper = wallpaper_valid();
@@ -2216,6 +3276,7 @@ pub fn render_self_test(real_frame: &mut FrameBuffer, fonts: &FontCatalog) -> De
         && quick_settings
         && window
         && session
+        && shell_ui
         && button_report.verified
         && input;
     DesktopReport {
@@ -2232,6 +3293,21 @@ pub fn render_self_test(real_frame: &mut FrameBuffer, fonts: &FontCatalog) -> De
 
 pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::SystemInfo<'_>) -> ! {
     let mut state = DesktopState::new();
+    #[cfg(not(feature = "boot-test"))]
+    {
+        state.persist_account = true;
+        if state.load_account() {
+            state.screen = Screen::Lock;
+        }
+    }
+    {
+        // Boot splash first; setup then fades in from dark once it ends.
+        let started = crate::time::monotonic_nanoseconds().max(1);
+        BOOT_SPLASH_START_NS.store(started, Ordering::Relaxed);
+        crate::audio::play_effect(crate::sfx::Effect::Boot);
+        state.screen_transition_at_ns = started + BOOT_SPLASH_NS;
+        state.motion_until_ns = started + BOOT_SPLASH_NS + SCREEN_TRANSITION_NS + 100_000_000;
+    }
     let mut shell = shell::Shell::new(shell_info, true);
     let mut decoder = KeyDecoder::new();
     let mut cursor = CursorSprite::new();
@@ -2246,14 +3322,20 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
     let mut minute = crate::rtc::unix_seconds() / 60;
     let mut pointer_generation = crate::mouse::state().generation;
     let mut pointer_down = false;
+    let mut right_was_down = false;
     let mut idle_ticks: u32 = 0;
     let mut settle_repaints: u32 = 12;
     let mut motion_animating = false;
+    let mut last_ambient_ns = 0u64;
+    let mut last_pointer_event_ns = 0u64;
+    let mut last_paint_cost_ns = 0u64;
     let mut blink_phase = true;
+    let mut setup_caret = true;
     let mut linux_screen_hash = 0u64;
     let mut linux_last_paint_ns = 0u64;
     let mut guest_ptr = GuestPointer::new();
     let mut seam_generation_seen = 0u32;
+    let mut last_web_paint_ns = 0u64;
     // Clipboard shortcuts: modifier state, the guest's clipboard sequence we
     // last took, a scratch buffer, and a paste to replay into the guest once
     // its agent has taken over the new clipboard text.
@@ -2265,9 +3347,58 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
     let mut guest_clip_seen = 0u32;
     let clip_buf = crate::clipboard::scratch();
     let mut guest_paste_at: Option<u64> = None;
+    let mut swallow_l = false;
+    let mut last_pointer_pos = (0i32, 0i32);
+    let mut touch_down: Option<(i32, i32)> = None;
+    let mut touch_last_y = 0i32;
+    let mut touch_moved = false;
+    let mut last_input_ns = crate::time::monotonic_nanoseconds();
     loop {
         let mut redraw = false;
+        let splash_active = boot_splash(crate::time::monotonic_nanoseconds()).is_some();
+        if let Some(action) = state.power_due(crate::time::monotonic_nanoseconds()) {
+            match action {
+                shellui::PowerAction::Restart => {
+                    serial::line("AEROS_REBOOT_REQUESTED source=power-menu authorized=true");
+                    arch::reboot();
+                }
+                _ => {
+                    let power = crate::power::current();
+                    serial::line("AEROS_SHUTDOWN source=power-menu filesystems=safe");
+                    if power.ready {
+                        crate::power::shutdown(&power);
+                    } else {
+                        arch::halt_forever();
+                    }
+                }
+            }
+        }
+        if state.account_unsaved
+            && state.screen == Screen::Welcome
+            && crate::time::monotonic_nanoseconds() >= state.screen_transition_at_ns + 700_000_000
+        {
+            state.account_unsaved = false;
+            state.save_account();
+        }
+        if !splash_active
+            && state.screen == Screen::Welcome
+            && crate::time::monotonic_nanoseconds()
+                >= state.screen_transition_at_ns + flow::WELCOME_NS
+        {
+            state.set_screen(Screen::Lock);
+            redraw = true;
+        }
         while let Some(scancode) = keyboard::pop_scancode() {
+            if splash_active {
+                continue;
+            }
+            if state.osk_pending > 0 {
+                state.osk_pending -= 1;
+            } else if state.touch_mode {
+                state.touch_mode = false;
+                redraw = true;
+            }
+            last_input_ns = crate::time::monotonic_nanoseconds();
             let was_extended = ext_pending;
             ext_pending = scancode == 0xe0;
             let code = scancode & 0x7f;
@@ -2284,11 +3415,42 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                     meta_used = true;
                 }
             }
+            // Print Screen: save a picture of the screen to /home/Pictures.
+            if was_extended && code == 0x37 && !released && state.screen == Screen::Desktop {
+                match crate::screenshot::save(frame) {
+                    Ok(path) => {
+                        serial::format(format_args!(
+                            "AEROS_SCREENSHOT_SAVED {}
+",
+                            path.as_str()
+                        ));
+                        crate::notify::push(3, "Screenshot", "Saved to your Pictures folder");
+                    }
+                    Err(_) => serial::line("AEROS_SCREENSHOT_FAILED"),
+                }
+                continue;
+            }
             if state.screen == Screen::Desktop {
+                // Super+L: lock the session.
+                if scancode != 0xe0 && code == 0x26 && !was_extended {
+                    if !released && meta_down {
+                        meta_used = true;
+                        swallow_l = true;
+                        redraw |= state.lock_session();
+                        continue;
+                    }
+                    if released && swallow_l {
+                        swallow_l = false;
+                        continue;
+                    }
+                }
                 // Super+V: clipboard history.
                 if scancode != 0xe0 && code == 0x2f && !was_extended {
                     if !released && meta_down {
                         state.clip_open = !state.clip_open;
+                        state.clip_at_ns = crate::time::monotonic_nanoseconds();
+                        state.motion_until_ns =
+                            state.motion_until_ns.max(state.clip_at_ns + 700_000_000);
                         state.clip_selected = 0;
                         state.set_overlay(Overlay::None);
                         meta_used = true;
@@ -2453,17 +3615,7 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 }
                 continue;
             }
-            decoder.set_text_mode(
-                (state.app == DesktopApp::Browser && state.url_active)
-                    || state.app == DesktopApp::Terminal
-                    || (state.app == DesktopApp::Files
-                        && state.files_mode == FilesMode::NamingFolder)
-                    || (state.app == DesktopApp::Notes && state.notes_mode != NotesMode::List)
-                    || matches!(
-                        state.screen,
-                        Screen::Username | Screen::Password | Screen::Login
-                    ),
-            );
+            decoder.set_text_mode(state.text_input_active());
             let Some(key) = decoder.feed(scancode) else {
                 continue;
             };
@@ -2579,8 +3731,57 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
             }
         }
         let pointer = crate::mouse::state();
+        let now_pointer_ns = crate::time::monotonic_nanoseconds();
         let pointer_moved = pointer.generation != pointer_generation;
+        let packets = pointer.generation.saturating_sub(pointer_generation);
         pointer_generation = pointer.generation;
+        {
+            // A finger lands: the pointer jumps to a new place in a packet or
+            // two. A mouse glides through many small steps.
+            let finger_idle = now_pointer_ns.saturating_sub(last_pointer_event_ns) > 450_000_000;
+            if pointer_moved {
+                last_pointer_event_ns = now_pointer_ns;
+            }
+            let jump = (pointer.x - last_pointer_pos.0)
+                .abs()
+                .max((pointer.y - last_pointer_pos.1).abs());
+            if pointer_moved && jump >= 60 && packets <= 6 && finger_idle && pointer.left {
+                if !state.touch_mode {
+                    state.touch_mode = true;
+                    redraw = true;
+                    serial::line("AEROS_TOUCH mode=on");
+                }
+            } else if pointer_moved && jump > 0 && jump < 24 && !pointer.left && state.touch_mode {
+                state.touch_mode = false;
+                redraw = true;
+                serial::line("AEROS_TOUCH mode=off");
+            }
+            last_pointer_pos = (pointer.x, pointer.y);
+            if state.app != DesktopApp::Store || crate::store::get().detail.is_some() {
+                state.store_search_focus = false;
+            }
+            let active = state.osk_wanted();
+            if !active {
+                state.osk_dismissed = false;
+                state.osk_symbols = false;
+                state.osk_shift = false;
+            }
+            let want = state.touch_mode && active && !state.osk_dismissed && !splash_active;
+            if want != state.osk_open {
+                state.osk_open = want;
+                redraw = true;
+            }
+        }
+        let now_ns = crate::time::monotonic_nanoseconds();
+        if pointer_moved || pointer.left {
+            last_input_ns = now_ns;
+        }
+        if state.screen == Screen::Desktop
+            && now_ns.saturating_sub(last_input_ns) >= AUTO_LOCK_NS
+            && state.lock_session()
+        {
+            redraw = true;
+        }
         if state.app == DesktopApp::Linux && linux_zoomed() {
             let before = linux_pan();
             update_linux_pan(frame, &pointer);
@@ -2605,12 +3806,71 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
             seam_over = outcome.over;
             redraw |= outcome.redraw;
         }
-        if press_edge && !seam_consumed {
-            let layout = Layout::new(frame);
-            let logical = layout.to_logical(Point::new(pointer.x, pointer.y));
-            match state.click(logical) {
-                DesktopAction::Redraw => redraw = true,
-                DesktopAction::Idle => {}
+        // Every press since the last frame, so a tap that came and went
+        // between two frames still counts.
+        let mut presses = [(0i32, 0i32); 8];
+        let mut press_count = 0;
+        while let Some(point) = crate::mouse::take_press() {
+            if press_count < presses.len() {
+                presses[press_count] = point;
+                press_count += 1;
+            }
+        }
+        if state.seamless.enabled {
+            if press_edge && !seam_consumed && !splash_active {
+                let layout = Layout::new(frame);
+                let logical = layout.to_logical(Point::new(pointer.x, pointer.y));
+                match state.click(logical) {
+                    DesktopAction::Redraw => redraw = true,
+                    DesktopAction::Idle => {}
+                }
+            }
+        } else if !splash_active {
+            for (index, &(press_x, press_y)) in presses[..press_count].iter().enumerate() {
+                let still_down = pointer.left && index + 1 == press_count;
+                if state.touch_mode && still_down {
+                    // A finger that is still down: act when it lifts, unless
+                    // it turns into a swipe.
+                    touch_down = Some((press_x, press_y));
+                    touch_last_y = press_y;
+                    touch_moved = false;
+                } else {
+                    let layout = Layout::new(frame);
+                    let logical = layout.to_logical(Point::new(press_x, press_y));
+                    match state.click(logical) {
+                        DesktopAction::Redraw => redraw = true,
+                        DesktopAction::Idle => {}
+                    }
+                }
+            }
+        }
+        if let Some((start_x, start_y)) = touch_down {
+            if pointer.left {
+                if (pointer.x - start_x).abs().max((pointer.y - start_y).abs()) > 20 {
+                    touch_moved = true;
+                }
+                let step = pointer.y - touch_last_y;
+                if touch_moved && step.abs() >= 60 {
+                    let direction = if step < 0 { 1 } else { -1 };
+                    if state.app == DesktopApp::Store && state.overlay == Overlay::None {
+                        crate::store::get().scroll_rows(direction);
+                        redraw = true;
+                    } else if state.app == DesktopApp::Browser && state.overlay == Overlay::None {
+                        crate::web::get().scroll_by(direction * 3, BROWSER_VISIBLE_LINES);
+                        redraw = true;
+                    }
+                    touch_last_y = pointer.y;
+                }
+            } else {
+                touch_down = None;
+                if !touch_moved && !splash_active {
+                    let layout = Layout::new(frame);
+                    let logical = layout.to_logical(Point::new(start_x, start_y));
+                    match state.click(logical) {
+                        DesktopAction::Redraw => redraw = true,
+                        DesktopAction::Idle => {}
+                    }
+                }
             }
         }
         pointer_down = pointer.left;
@@ -2621,6 +3881,11 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
         let wheel = crate::mouse::take_wheel();
         if wheel != 0 && over_linux {
             crate::svm::linux_mouse_wheel(pointer_buttons(&pointer), wheel);
+        } else if wheel != 0 && state.app == DesktopApp::Store && state.overlay == Overlay::None {
+            crate::store::get().scroll_rows(wheel);
+        } else if wheel != 0 && state.app == DesktopApp::Browser && state.overlay == Overlay::None {
+            crate::web::get().scroll_by(wheel * 3, BROWSER_VISIBLE_LINES);
+            redraw = true;
         }
         if over_linux != guest_ptr.over {
             cursor.erase(frame);
@@ -2630,16 +3895,96 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
             }
             guest_ptr.over = over_linux;
         }
+        {
+            let now = crate::time::monotonic_nanoseconds();
+            let generation = crate::notify::generation();
+            if generation != state.notif_seen {
+                state.notif_seen = generation;
+                if state.screen == Screen::Desktop && !state.notif_open {
+                    state.notice_arrived(now);
+                }
+                redraw = true;
+            }
+            if pointer_moved && !splash_active {
+                let layout = Layout::new(frame);
+                let logical = layout.to_logical(Point::new(pointer.x, pointer.y));
+                if state.hover_dock(logical, now) {
+                    redraw = true;
+                }
+            }
+            let right_edge = pointer.right && !right_was_down;
+            right_was_down = pointer.right;
+            if right_edge
+                && !splash_active
+                && state.screen == Screen::Desktop
+                && state.app == DesktopApp::None
+                && state.overlay == Overlay::None
+                && !state.power_open
+                && !state.clip_open
+            {
+                let layout = Layout::new(frame);
+                let logical = layout.to_logical(Point::new(pointer.x, pointer.y));
+                if logical.y < 350 {
+                    state.open_context_menu(logical);
+                    redraw = true;
+                }
+            }
+        }
+        {
+            // Realtime protection: periodic sweep, and a toast for anything
+            // the Shield just did.
+            let now = crate::time::monotonic_nanoseconds();
+            crate::antivirus::tick(now);
+            let seq = crate::antivirus::event_seq();
+            if seq != state.shield_seen {
+                state.shield_seen = seq;
+                if let Some(event) = crate::antivirus::latest_event() {
+                    let mut text = ClockBuffer56::new();
+                    let _ = write!(text, "Shield: {}  {}", event.kind, event.name);
+                    state.shield_text = text.bytes;
+                    state.shield_len = text.len;
+                    crate::notify::push(1, "AerOS Shield", text.as_str());
+                    redraw = true;
+                }
+            }
+        }
         let current_minute = crate::rtc::unix_seconds() / 60;
         if current_minute != minute {
             minute = current_minute;
             redraw = true;
         }
+        {
+            let now_ns = crate::time::monotonic_nanoseconds();
+            if state.ambient_active(now_ns)
+                && now_ns.saturating_sub(last_ambient_ns)
+                    >= AMBIENT_FRAME_NS.max(last_paint_cost_ns * 2)
+                && !keyboard::has_pending()
+            {
+                last_ambient_ns = now_ns;
+                redraw = true;
+            }
+        }
+        crate::audio::pump();
+        crate::xhci::poll();
+        crate::datafs::poll();
+        crate::ntp::tick(crate::time::monotonic_nanoseconds());
+        crate::keymap::sync_guest();
         let motion_animating_now = crate::time::monotonic_nanoseconds() < state.motion_until_ns;
         if motion_animating_now || motion_animating {
             redraw = true;
         }
         motion_animating = motion_animating_now;
+        if matches!(
+            state.screen,
+            Screen::Keyboard | Screen::Username | Screen::Password | Screen::Confirm
+        ) || state.search_open
+        {
+            let caret_now = (crate::time::monotonic_nanoseconds() / 520_000_000).is_multiple_of(2);
+            if caret_now != setup_caret {
+                setup_caret = caret_now;
+                redraw = true;
+            }
+        }
         if state.app == DesktopApp::Terminal {
             let blink_phase_now =
                 (crate::time::monotonic_nanoseconds() / 530_000_000).is_multiple_of(2);
@@ -2648,17 +3993,50 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 redraw = true;
             }
         }
+        if crate::svm::linux_ready() {
+            let now_ns = crate::time::monotonic_nanoseconds();
+            let web = crate::web::get();
+            if state.app == DesktopApp::Browser || web.busy() {
+                let before = (web.state, web.line_count());
+                web.tick(now_ns);
+                let animating = web.busy()
+                    && now_ns.saturating_sub(last_web_paint_ns)
+                        > if web.state == crate::web::WebState::Starting {
+                            300_000_000
+                        } else {
+                            120_000_000
+                        };
+                if (web.state, web.line_count()) != before || animating {
+                    last_web_paint_ns = now_ns;
+                    redraw |= state.app == DesktopApp::Browser;
+                }
+            }
+            let store = crate::store::get();
+            let before = (store.count, store.install);
+            store.tick();
+            let installing = store.install == crate::store::InstallState::Installing
+                && now_ns.saturating_sub(last_web_paint_ns) > 500_000_000;
+            if state.app == DesktopApp::Store
+                && ((store.count, store.install) != before || installing)
+            {
+                last_web_paint_ns = now_ns;
+                redraw = true;
+            }
+        }
         if redraw {
-            cursor.erase(frame);
+            let paint_start = crate::time::monotonic_nanoseconds();
             let verified = present_desktop(frame, fonts, &state);
+            last_paint_cost_ns = crate::time::monotonic_nanoseconds().saturating_sub(paint_start);
+            cursor.erase(frame);
             cursor.paint(frame, cursor_target(frame));
             serial::format(format_args!(
-                "AEROS_DESKTOP_REDRAW overlay={} window={} verified={} app={} screen={}\n",
+                "AEROS_DESKTOP_REDRAW overlay={} window={} verified={} app={} screen={} cost_us={}\n",
                 state.overlay.name(),
                 state.app != DesktopApp::None,
                 verified,
                 state.app.name(),
-                state.screen.name()
+                state.screen.name(),
+                last_paint_cost_ns / 1000
             ));
         } else if pointer_moved {
             cursor.erase(frame);
@@ -2669,8 +4047,8 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
             if idle_ticks >= 90 {
                 idle_ticks = 0;
                 settle_repaints -= 1;
-                cursor.erase(frame);
                 let _ = present_desktop_mode(frame, fonts, &state, true);
+                cursor.erase(frame);
                 cursor.paint(frame, cursor_target(frame));
             }
         }
@@ -2728,8 +4106,8 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                     };
                 }
             }
-            cursor.erase(frame);
             let verified = present_desktop(frame, fonts, &state);
+            cursor.erase(frame);
             cursor.paint(frame, cursor_target(frame));
             serial::format(format_args!(
                 "AEROS_BROWSER host={} path={} dns={} tcp={} http_status={} bytes={} phase={} verified={}\n",
@@ -2743,19 +4121,48 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 verified
             ));
         }
-        if (state.app == DesktopApp::Linux || state.seamless.enabled) && crate::svm::linux_ready() {
+        // The guest also runs while the browser or the store is open: it
+        // fetches the pages and lists the apps.
+        if (state.app == DesktopApp::Linux
+            || state.seamless.enabled
+            || state.app == DesktopApp::Browser
+            || state.app == DesktopApp::Store)
+            && crate::svm::linux_ready()
+        {
             let started = tsc();
-            crate::svm::linux_pump(LINUX_SLICE_TSC);
+            // While the browser or an install waits on the guest, give it
+            // longer slices: it is the one with work to do.
+            let waiting = crate::web::get().busy()
+                || crate::store::get().install == crate::store::InstallState::Installing;
+            crate::svm::linux_pump(if waiting {
+                LINUX_SLICE_TSC * 50
+            } else {
+                LINUX_SLICE_TSC
+            });
             // Repaint when the guest's screen changed, at most ~15 times a
             // second, so a busy console doesn't starve input handling.
             let now_ns = crate::time::monotonic_nanoseconds();
-            if now_ns.saturating_sub(linux_last_paint_ns) >= 66_000_000 {
-                let signature = linux_screen_signature(state.seamless.enabled);
+            let animating = loading_animating(&state);
+            let interval = if animating { 33_000_000 } else { 66_000_000 };
+            if now_ns.saturating_sub(linux_last_paint_ns) >= interval {
+                // The guest's screen only matters when it is shown; otherwise (the
+                // browser or the store is open and the guest just works in the
+                // background) its changes must not trigger repaints, which would
+                // starve it of CPU.
+                let shown = state.app == DesktopApp::Linux || state.seamless.enabled;
+                let mut signature = if shown {
+                    linux_screen_signature(state.seamless.enabled)
+                } else {
+                    0
+                };
+                if animating {
+                    signature ^= now_ns / 33_000_000;
+                }
                 if signature != linux_screen_hash {
                     linux_screen_hash = signature;
                     linux_last_paint_ns = now_ns;
-                    cursor.erase(frame);
                     present_desktop(frame, fonts, &state);
+                    cursor.erase(frame);
                     cursor.paint(frame, cursor_target(frame));
                 }
             }
@@ -3176,144 +4583,309 @@ fn guest_has_keyboard(state: &DesktopState) -> bool {
 }
 
 /// The Super+V clipboard history popup.
-fn draw_clipboard(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OskKey {
+    Char(u8),
+    Shift,
+    Backspace,
+    Symbols,
+    Space,
+    Enter,
+    Hide,
+}
+
+const OSK_KEY_H: i32 = 30;
+const OSK_GAP: i32 = 5;
+const OSK_X: i32 = 16;
+const OSK_W: i32 = 720;
+
+fn osk_rect() -> Rect {
+    let height = 4 * OSK_KEY_H + 3 * OSK_GAP + 16;
+    Rect::new(OSK_X - 8, DESIGN_HEIGHT - height - 4, OSK_W + 16, height)
+}
+
+/// Every key of the on-screen keyboard with its rectangle (logical
+/// coordinates), for drawing and for hit testing.
+fn osk_keys(symbols: bool) -> ([(Rect, OskKey); 40], usize) {
+    let mut keys = [(Rect::new(0, 0, 0, 0), OskKey::Space); 40];
+    let mut count = 0;
+    let top = osk_rect().y + 8;
+    let unit = (OSK_W - 9 * OSK_GAP) / 10;
+    let rows: [&[u8]; 3] = if symbols {
+        [b"1234567890", b"-/:;()&@\"", b".,?!'#="]
+    } else {
+        [b"qwertyuiop", b"asdfghjkl", b"zxcvbnm"]
+    };
+    for (row, letters) in rows.iter().enumerate().take(2) {
+        let y = top + row as i32 * (OSK_KEY_H + OSK_GAP);
+        let width = letters.len() as i32 * unit + (letters.len() as i32 - 1) * OSK_GAP;
+        let mut x = OSK_X + (OSK_W - width) / 2;
+        for &letter in letters.iter() {
+            keys[count] = (Rect::new(x, y, unit, OSK_KEY_H), OskKey::Char(letter));
+            count += 1;
+            x += unit + OSK_GAP;
+        }
+    }
+    let y = top + 2 * (OSK_KEY_H + OSK_GAP);
+    let wide = unit * 3 / 2;
+    let letters = rows[2];
+    let width = 2 * wide + letters.len() as i32 * unit + (letters.len() as i32 + 1) * OSK_GAP;
+    let mut x = OSK_X + (OSK_W - width) / 2;
+    keys[count] = (Rect::new(x, y, wide, OSK_KEY_H), OskKey::Shift);
+    count += 1;
+    x += wide + OSK_GAP;
+    for &letter in letters.iter() {
+        keys[count] = (Rect::new(x, y, unit, OSK_KEY_H), OskKey::Char(letter));
+        count += 1;
+        x += unit + OSK_GAP;
+    }
+    keys[count] = (Rect::new(x, y, wide, OSK_KEY_H), OskKey::Backspace);
+    count += 1;
+    let y = top + 3 * (OSK_KEY_H + OSK_GAP);
+    let side = unit * 3 / 2;
+    let enter = unit * 2;
+    let space = OSK_W - side - unit - unit - enter - 4 * OSK_GAP;
+    let mut x = OSK_X;
+    keys[count] = (Rect::new(x, y, side, OSK_KEY_H), OskKey::Symbols);
+    count += 1;
+    x += side + OSK_GAP;
+    keys[count] = (Rect::new(x, y, unit, OSK_KEY_H), OskKey::Hide);
+    count += 1;
+    x += unit + OSK_GAP;
+    keys[count] = (Rect::new(x, y, space, OSK_KEY_H), OskKey::Space);
+    count += 1;
+    x += space + OSK_GAP;
+    keys[count] = (Rect::new(x, y, unit, OSK_KEY_H), OskKey::Char(b'.'));
+    count += 1;
+    x += unit + OSK_GAP;
+    keys[count] = (Rect::new(x, y, enter, OSK_KEY_H), OskKey::Enter);
+    count += 1;
+    (keys, count)
+}
+
+/// The on-screen keyboard (shown for finger input when text is wanted).
+fn draw_osk(painter: &mut Painter<'_>, layout: Layout, ui_font: RasterFont, state: &DesktopState) {
+    let panel = osk_rect();
+    painter.fill_rounded_rect(
+        layout.rect(panel),
+        layout.radii(CornerRadii::all(18)),
+        Rgba::new(22, 27, 33, 240),
+    );
+    let (keys, count) = osk_keys(state.osk_symbols);
+    for (rect, key) in &keys[..count] {
+        let fill = match key {
+            OskKey::Enter => Rgba::new(64, 140, 205, 255),
+            OskKey::Shift if state.osk_shift => Rgba::new(226, 232, 238, 255),
+            OskKey::Char(_) | OskKey::Space => Rgba::new(74, 82, 92, 255),
+            _ => Rgba::new(48, 55, 64, 255),
+        };
+        painter.fill_rounded_rect(layout.rect(*rect), layout.radii(CornerRadii::all(8)), fill);
+        let mut single = [0u8; 1];
+        let label = match key {
+            OskKey::Char(byte) => {
+                single[0] = if state.osk_shift && byte.is_ascii_lowercase() {
+                    byte.to_ascii_uppercase()
+                } else {
+                    *byte
+                };
+                core::str::from_utf8(&single).unwrap_or("?")
+            }
+            OskKey::Shift => "Shift",
+            OskKey::Backspace => "Del",
+            OskKey::Symbols => {
+                if state.osk_symbols {
+                    "ABC"
+                } else {
+                    "?123"
+                }
+            }
+            OskKey::Space => "Space",
+            OskKey::Enter => "Enter",
+            OskKey::Hide => "Hide",
+        };
+        let ink = if matches!(key, OskKey::Shift) && state.osk_shift {
+            Color::rgb(20, 26, 32)
+        } else {
+            Color::rgb(240, 243, 246)
+        };
+        centered_text(painter, layout, ui_font, *rect, label, 14, ink);
+    }
+}
+
+static LOADING_SINCE_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LOADING_DONE_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The guest has shown a window at least once: the loading screen is over for good.
+static LINUX_SEEN_UP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Fade in / out of the loading screen.
+const LOADING_FADE_NS: u64 = 400_000_000;
+
+/// When the desktop runtime started (0 = not yet): the boot splash is timed
+/// from here.
+static BOOT_SPLASH_START_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// How long the boot splash is on screen; the last part fades to dark, and
+/// the setup screen then fades in from dark.
+const BOOT_SPLASH_NS: u64 = 3_200_000_000;
+const BOOT_SPLASH_FADE_NS: u64 = 500_000_000;
+
+/// The boot splash for this frame, or `None` once it is over: the view
+/// (progress and timing) and how far it has faded to dark (0 = not at all).
+fn boot_splash(now: u64) -> Option<(crate::loading::LoadingView, u8)> {
+    let start = BOOT_SPLASH_START_NS.load(core::sync::atomic::Ordering::Relaxed);
+    if start == 0 {
+        return None;
+    }
+    let elapsed = now.saturating_sub(start);
+    if elapsed >= BOOT_SPLASH_NS {
+        return None;
+    }
+    let done = (elapsed * 1000 / BOOT_SPLASH_NS) as u32;
+    let inverse = 1000 - done;
+    let progress = (1000 - inverse * inverse / 1000) as u16;
+    let view = crate::loading::LoadingView {
+        kind: crate::loading::LoadingKind::System,
+        stage: "Starting AerOS",
+        progress_permille: progress,
+        elapsed_secs: (elapsed / 1_000_000_000) as u32,
+        elapsed_ms: elapsed / 1_000_000,
+    };
+    let fade_start = BOOT_SPLASH_NS - BOOT_SPLASH_FADE_NS;
+    let dark = if elapsed > fade_start {
+        ((elapsed - fade_start) * 255 / BOOT_SPLASH_FADE_NS) as u8
+    } else {
+        0
+    };
+    Some((view, dark))
+}
+
+/// The boot splash: the setup card's frosted glass over the wallpaper, a
+/// rounded tile with the logo, a tip, and a pill progress bar.
+fn draw_boot_splash(
     painter: &mut Painter<'_>,
     layout: Layout,
     ui_font: RasterFont,
-    state: &DesktopState,
+    _mono_font: RasterFont,
+    view: &crate::loading::LoadingView,
+    screen: Rect,
+    dark: u8,
 ) {
-    let count = crate::clipboard::get().len();
-    let rows = count.max(1) as i32;
-    let panel = Rect::new(176, 60, 400, 78 + rows * 26);
-    let radii = layout.radii(CornerRadii::all(16));
-    painter.fill_rounded_rect(layout.rect(panel), radii, Rgba::new(244, 246, 248, 246));
-    painter.stroke_rounded_rect(layout.rect(panel), radii, 2, Rgba::new(64, 140, 205, 255));
-    text(
+    flow::draw_boot_screen(
         painter,
         layout,
         ui_font,
-        Point::new(panel.x + 18, panel.y + 12),
-        "Clipboard",
-        16,
-        Color::rgb(18, 23, 26),
+        screen,
+        view.elapsed_ms,
+        Some(view.progress_permille),
+        "",
+        255,
     );
-    if count == 0 {
-        text(
-            painter,
-            layout,
-            ui_font,
-            Point::new(panel.x + 18, panel.y + 46),
-            "Nothing copied yet",
-            13,
-            Color::rgb(90, 100, 110),
-        );
-    }
-    for index in 0..count {
-        let row = Rect::new(
-            panel.x + 10,
-            panel.y + 40 + index as i32 * 26,
-            panel.width - 20,
-            24,
-        );
-        if index == state.clip_selected {
-            painter.fill_rounded_rect(
-                layout.rect(row),
-                layout.radii(CornerRadii::all(8)),
-                Rgba::new(64, 140, 205, 70),
-            );
-        }
-        // One line: the first ~48 characters, newlines shown as spaces.
-        let mut label = [b' '; 56];
-        label[0] = b'1' + index as u8;
-        let mut used = 3;
-        for &byte in crate::clipboard::get().entry(index) {
-            if used == label.len() {
-                break;
-            }
-            if byte.is_ascii_graphic() || byte == b' ' {
-                label[used] = byte;
-                used += 1;
-            } else if byte == b'\n' || byte == b'\r' || byte == b'\t' {
-                used += 1;
-            }
-        }
-        let label = core::str::from_utf8(&label[..used]).unwrap_or("");
-        text(
-            painter,
-            layout,
-            ui_font,
-            Point::new(row.x + 8, row.y + 4),
-            label,
-            13,
-            Color::rgb(18, 23, 26),
-        );
-    }
-    text(
-        painter,
-        layout,
-        ui_font,
-        Point::new(panel.x + 18, panel.y + panel.height - 22),
-        "Up/Down or 1-9 choose   Enter paste   Del clear   Esc close",
-        11,
-        Color::rgb(90, 100, 110),
-    );
+    draw_screen_fade(painter, screen, dark);
 }
 
-/// The loading screen: the frosted card, the AerOS logo in a rounded frame,
-/// a tip line and a pill progress bar. `view` says what is loading and how far
-/// along it is.
+/// The loading screen for this frame: what to show and how opaque it is
+/// (255 = fully covering the desktop). It fades in when seamless mode is
+/// opened before the Linux desktop is up, and fades out (with the bar
+/// filled) once the guest's windows appear.
+fn loading_overlay(state: &DesktopState, now: u64) -> Option<(crate::loading::LoadingView, u8)> {
+    use core::sync::atomic::Ordering::Relaxed;
+    if !state.seamless.enabled || state.screen != Screen::Desktop {
+        LOADING_SINCE_NS.store(0, Relaxed);
+        LOADING_DONE_NS.store(0, Relaxed);
+        return None;
+    }
+    let mut since = LOADING_SINCE_NS.load(Relaxed);
+    // "Up" means the first window exists (the agent's table alone appears a
+    // few seconds earlier, with nothing in it yet).
+    let up = crate::svm::linux_windows().is_some_and(|windows| windows.count > 0);
+    if up {
+        LINUX_SEEN_UP.store(true, Relaxed);
+    }
+    if up || LINUX_SEEN_UP.load(Relaxed) {
+        // Only fade out if a loading screen was actually showing.
+        if since == 0 {
+            return None;
+        }
+        let mut done = LOADING_DONE_NS.load(Relaxed);
+        if done == 0 {
+            done = now;
+            LOADING_DONE_NS.store(now, Relaxed);
+        }
+        let t = now.saturating_sub(done);
+        if t >= LOADING_FADE_NS {
+            LOADING_SINCE_NS.store(0, Relaxed);
+            LOADING_DONE_NS.store(0, Relaxed);
+            return None;
+        }
+        let view = crate::loading::LoadingView {
+            kind: crate::loading::LoadingKind::Linux,
+            stage: "Ready",
+            progress_permille: 1000,
+            elapsed_secs: 0,
+            elapsed_ms: now.saturating_sub(since) / 1_000_000,
+        };
+        let alpha = 255 - (t * 255 / LOADING_FADE_NS) as u32;
+        return Some((view, alpha as u8));
+    }
+    LOADING_DONE_NS.store(0, Relaxed);
+    if since == 0 {
+        since = now;
+        LOADING_SINCE_NS.store(now, Relaxed);
+    }
+    let view = crate::loading::linux_view(since, now)?;
+    let fade_in = (now.saturating_sub(since) * 255 / LOADING_FADE_NS).min(255) as u8;
+    Some((view, fade_in))
+}
+
+/// Whether the loading screen is on screen (or fading), so the desktop keeps
+/// repainting it for its animation.
+fn loading_animating(state: &DesktopState) -> bool {
+    state.seamless.enabled
+        && (LOADING_SINCE_NS.load(core::sync::atomic::Ordering::Relaxed) != 0
+            || !LINUX_SEEN_UP.load(core::sync::atomic::Ordering::Relaxed))
+}
+
+/// Scales a colour towards black (the loading screen is black, so this is
+/// also its fade).
+fn dim(color: Color, alpha: u8) -> Color {
+    let scale = |channel: u8| (channel as u32 * alpha as u32 / 255) as u8;
+    Color::rgb(scale(color.red), scale(color.green), scale(color.blue))
+}
+
+/// The loading screen, in the style of a macOS startup: solid black, the
+/// logo centred, a slim progress bar under it and a dim tip line. The bar
+/// follows the progress smoothly, a highlight glides along its fill, and tips
+/// cross-fade. `alpha` fades the whole screen in or out.
 fn draw_loading(
     painter: &mut Painter<'_>,
     layout: Layout,
     ui_font: RasterFont,
-    mono_font: RasterFont,
+    _mono_font: RasterFont,
+    screen: Rect,
     view: &crate::loading::LoadingView,
+    alpha: u8,
 ) {
-    draw_login_card(painter, layout, 0xae5e_0030, false);
-    // Logo frame.
-    let frame = Rect::new(236, 24, 282, 226);
-    let radii = layout.radii(CornerRadii::all(44));
-    painter.fill_rounded_rect(layout.rect(frame), radii, Rgba::new(255, 255, 255, 34));
-    painter.stroke_rounded_rect(layout.rect(frame), radii, 1, Rgba::new(235, 246, 250, 120));
-    text(
-        painter,
-        layout,
-        mono_font,
-        Point::new(frame.x + 8, frame.y + 28),
-        AEROS_LOGO,
-        4,
-        Color::rgb(10, 62, 84),
-    );
-    // Tip line.
-    centered_text(
+    flow::draw_boot_screen(
         painter,
         layout,
         ui_font,
-        Rect::new(LOGIN_CARD.x, 270, LOGIN_CARD.width, 26),
-        crate::loading::tip(view.elapsed_secs),
-        19,
-        Color::rgb(22, 30, 38),
+        screen,
+        view.elapsed_ms,
+        Some(view.progress_permille),
+        "",
+        alpha,
     );
-    // Progress pill.
-    let track = Rect::new(204, 314, 344, 46);
-    let pill = layout.radii(CornerRadii::all(23));
-    painter.fill_rounded_rect(layout.rect(track), pill, Rgba::new(255, 255, 255, 46));
-    let fill_width = (track.width * view.progress_permille as i32 / 1000).max(track.height);
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(track.x, track.y, fill_width, track.height)),
-        pill,
-        Rgba::new(255, 255, 255, 120),
-    );
-    painter.stroke_rounded_rect(layout.rect(track), pill, 1, Rgba::new(235, 246, 250, 130));
     if view.is_slow() {
-        centered_text(
-            painter,
-            layout,
+        let note = "Taking longer than usual...";
+        let height = layout.scale.logical(12);
+        let width = ui_font.text_width(note, height);
+        painter.text(
             ui_font,
-            Rect::new(LOGIN_CARD.x, 372, LOGIN_CARD.width, 20),
-            "Taking longer than usual...",
-            13,
-            Color::rgb(60, 72, 84),
+            Point::new(
+                screen.x + (screen.width - width) / 2,
+                screen.y + screen.height * 2 / 3 + layout.scale.logical(60),
+            ),
+            note,
+            height,
+            dim(Color::rgb(120, 120, 126), alpha),
         );
     }
 }
@@ -3322,23 +4894,11 @@ fn draw_seamless(
     painter: &mut Painter<'_>,
     layout: Layout,
     ui_font: RasterFont,
-    mono_font: RasterFont,
     state: &DesktopState,
 ) {
     let seam = &state.seamless;
     let Some(windows) = crate::svm::linux_windows() else {
-        // The guest's desktop isn't up yet: show the loading screen.
-        static LOADING_SINCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-        let now = crate::time::monotonic_nanoseconds();
-        let mut since = LOADING_SINCE.load(core::sync::atomic::Ordering::Relaxed);
-        if since == 0 {
-            since = now;
-            LOADING_SINCE.store(now, core::sync::atomic::Ordering::Relaxed);
-        }
-        if let Some(view) = crate::loading::linux_view(since, now) {
-            draw_loading(painter, layout, ui_font, mono_font, &view);
-        }
-        return;
+        return; // the loading overlay covers this (see `loading_overlay`)
     };
     let framebuffer = crate::svm::linux_framebuffer();
     for &id in seam.order.iter().filter(|id| **id != 0) {
@@ -3687,6 +5247,44 @@ fn present_desktop_mode(
 
 fn draw_desktop(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &DesktopState) -> bool {
     let now = crate::time::monotonic_nanoseconds();
+    let acting = state.power_action != shellui::PowerAction::None;
+    let covered = acting
+        && now.saturating_sub(state.power_action_at_ns) >= 560_000_000
+        && state.power_action != shellui::PowerAction::Sleep;
+    let asleep = acting
+        && state.power_action == shellui::PowerAction::Sleep
+        && now.saturating_sub(state.power_action_at_ns) >= 560_000_000;
+    let mut ok = true;
+    if !covered && !asleep {
+        ok = draw_desktop_base(frame, fonts, state);
+    }
+    let Some(ui_font) = fonts.ui() else {
+        return ok;
+    };
+    let layout = Layout::new(frame);
+    let screen_bounds = Rect::new(0, 0, frame.width() as i32, frame.height() as i32);
+    let mut painter = Painter::new(frame);
+    if state.screen == Screen::Desktop && state.power_visible(now) && !acting {
+        ok &= shellui::draw_power_menu(&mut painter, layout, ui_font, screen_bounds, state, now);
+    }
+    if state.screen == Screen::Desktop && !acting {
+        search::draw_dock_preview(&mut painter, layout, state, now);
+        search::draw_search(&mut painter, layout, ui_font, state, now);
+        panels::draw_toast(&mut painter, layout, ui_font, state, now);
+        panels::draw_notify_stack(&mut painter, layout, ui_font, state, now);
+        panels::draw_context(&mut painter, layout, ui_font, state, now);
+    }
+    if acting {
+        shellui::draw_power_action(&mut painter, layout, ui_font, screen_bounds, state, now);
+    }
+    ok
+}
+
+fn draw_desktop_base(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &DesktopState) -> bool {
+    let now = crate::time::monotonic_nanoseconds();
+    let moving = now < state.motion_until_ns;
+    button::set_paint_step(if moving { 4 } else { 2 });
+    MOTION_CHEAP.store(moving, Ordering::Relaxed);
     let layout = Layout::new(frame);
     let scrolling = state.screen != Screen::Desktop
         && state.previous_screen == Screen::Lock
@@ -3737,6 +5335,51 @@ fn draw_desktop(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &DesktopSta
     } else {
         None
     };
+    let wallpaper_region = if state.power_visible(now)
+        || state.power_action != shellui::PowerAction::None
+        || state.top_layers_active(now)
+    {
+        None
+    } else {
+        wallpaper_region
+    };
+    if let Some((view, dark)) = boot_splash(now)
+        && let (Some(ui_font), Some(mono_font)) = (fonts.ui(), fonts.mono())
+    {
+        draw_wallpaper(frame, None);
+        let wallpaper = wallpaper_valid();
+        let screen_bounds = Rect::new(0, 0, frame.width() as i32, frame.height() as i32);
+        let mut painter = Painter::new(frame);
+        draw_boot_splash(
+            &mut painter,
+            layout,
+            ui_font,
+            mono_font,
+            &view,
+            screen_bounds,
+            dark,
+        );
+        return wallpaper;
+    }
+    // A fully opaque loading screen hides the whole desktop, so draw only it:
+    // that is cheap enough to animate at 30 fps without starving the guest of
+    // the CPU time it needs to finish starting.
+    if let Some((view, 255)) = loading_overlay(state, now)
+        && let (Some(ui_font), Some(mono_font)) = (fonts.ui(), fonts.mono())
+    {
+        let screen_bounds = Rect::new(0, 0, frame.width() as i32, frame.height() as i32);
+        let mut painter = Painter::new(frame);
+        draw_loading(
+            &mut painter,
+            layout,
+            ui_font,
+            mono_font,
+            screen_bounds,
+            &view,
+            255,
+        );
+        return true;
+    }
     draw_wallpaper(frame, wallpaper_region);
     let wallpaper = wallpaper_valid();
     let Some(ui_font) = fonts.ui() else {
@@ -3759,6 +5402,7 @@ fn draw_desktop(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &DesktopSta
                 shift_layout_y(layout, -scroll),
                 ui_font,
                 state,
+                now,
                 true,
             );
             let login_ok = draw_signin(
@@ -3772,18 +5416,73 @@ fn draw_desktop(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &DesktopSta
             lock_ok && login_ok
         } else {
             match state.screen {
-                Screen::Lock => draw_lock(&mut painter, layout, ui_font, state, false),
-                Screen::Login => draw_signin(&mut painter, layout, ui_font, state, now, false),
+                Screen::Lock => draw_lock(&mut painter, layout, ui_font, state, now, false),
+                Screen::Login if state.lockout.seconds_left(now) > 0 => {
+                    shellui::draw_lockout(
+                        &mut painter,
+                        layout,
+                        ui_font,
+                        screen_bounds,
+                        state.lockout.seconds_left(now),
+                        now,
+                        state.login_error_until_ns.saturating_sub(LOGIN_ERROR_NS),
+                    );
+                    true
+                }
+                Screen::Login => {
+                    let raised = if state.osk_open {
+                        shift_layout_y(layout, -70)
+                    } else {
+                        layout
+                    };
+                    draw_signin(&mut painter, raised, ui_font, state, now, false)
+                }
                 _ => draw_setup(&mut painter, layout, ui_font, state),
             }
         };
         if !scrolling {
             draw_screen_fade(&mut painter, screen_bounds, fade_alpha);
         }
+        draw_music_hub(&mut painter, layout, ui_font, state, now);
+        panels::draw_hud(&mut painter, layout, state, now);
+        if state.osk_open {
+            draw_osk(&mut painter, layout, ui_font, state);
+        }
         return wallpaper && session;
     }
+    // A settled app-switcher frame (many frosted buttons) never changes until
+    // the focus moves or the minute ticks, so the whole frame is replayed.
+    let panel_static = state.overlay == Overlay::Apps
+        && !state.power_visible(now)
+        && !state.top_layers_active(now)
+        && !moving
+        && sliding_overlay.is_none()
+        && state.app == DesktopApp::None
+        && !window_closing
+        && !state.seamless.enabled
+        && !state.clip_open
+        && !state.osk_open
+        && !state.music_visible(now)
+        && now >= state.volume_hud_until_ns + VOLUME_SLIDE_NS
+        && now >= state.shield_until_ns
+        && fade_alpha == 0
+        && loading_overlay(state, now).is_none()
+        && now.saturating_sub(state.overlay_open_at_ns) > OVERLAY_TRANSITION_NS + 100_000_000;
+    let screen_len = (frame_pixels(screen_bounds)).min(PANEL_CACHE_PIXELS);
+    let panel_key = dock_cache_key(layout, screen_bounds)
+        ^ ((state.app_focus as u64 + 1) << 8)
+        ^ ((state.focus_visible as u64) << 20)
+        ^ 0x9a7e_0000;
+    let panel_cache = unsafe { &mut *PANEL_CACHE.0.get() };
+    if panel_static
+        && screen_len == frame_pixels(screen_bounds)
+        && PANEL_CACHE_KEY.load(Ordering::Acquire) == panel_key
+        && painter.write_region(screen_bounds, &panel_cache[..screen_len])
+    {
+        return wallpaper;
+    }
     if state.seamless.enabled {
-        draw_seamless(&mut painter, layout, ui_font, mono_font, state);
+        draw_seamless(&mut painter, layout, ui_font, state);
     }
     if state.app != DesktopApp::None {
         let _ = draw_window(&mut painter, layout, ui_font, mono_font, state, now, false);
@@ -3812,6 +5511,20 @@ fn draw_desktop(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &DesktopSta
             state.overlay_close_at_ns
         };
         let panel_layout = overlay_slide_layout(layout, opening, at_ns, now);
+        // While sliding, nothing may show below the dock's bottom edge: the
+        // panel rises out of (and sinks back into) the dock, which is drawn
+        // in front of it, instead of coming up from the screen edge.
+        let sliding = sliding_overlay == Some(Overlay::Apps);
+        if sliding {
+            // The visible part ends at the dock's top edge (logical y 369)
+            // and the limit eases down to the dock's bottom (440, where the
+            // settled panel ends) as it settles, so lifting the clip at the
+            // end changes nothing on screen.
+            let reveal = overlay_reveal_milli(opening, at_ns, now).clamp(0, 1000);
+            let limit = 369 + (440 - 369) * reveal / 1000;
+            let clip_bottom = layout.point(Point::new(0, limit)).y;
+            painter.set_clip(Rect::new(0, 0, screen_bounds.width, clip_bottom));
+        }
         let _ = draw_app_switcher(
             &mut painter,
             panel_layout,
@@ -3820,7 +5533,11 @@ fn draw_desktop(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &DesktopSta
             now,
             opening,
             at_ns,
+            sliding,
         );
+        if sliding {
+            painter.reset_clip();
+        }
     }
     if state.overlay == Overlay::Quick || sliding_overlay == Some(Overlay::Quick) {
         let opening = state.overlay == Overlay::Quick;
@@ -3830,13 +5547,76 @@ fn draw_desktop(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &DesktopSta
             state.overlay_close_at_ns
         };
         let panel_layout = overlay_slide_layout(layout, opening, at_ns, now);
-        let _ = draw_quick_settings(&mut painter, panel_layout, ui_font, state, now);
+        let _ = panels::draw_quick(&mut painter, panel_layout, ui_font, state, now);
     }
     if state.clip_open {
-        draw_clipboard(&mut painter, layout, ui_font, state);
+        panels::draw_clipboard_panel(&mut painter, layout, ui_font, state, now);
     }
     let outer_dock = !apps_active;
-    let (dock, controls) = draw_dock(&mut painter, layout, ui_font, state, outer_dock, now);
+    let dock_cacheable = outer_dock
+        && state.overlay == Overlay::None
+        && sliding_overlay.is_none()
+        && !matches!(
+            state.app,
+            DesktopApp::Browser | DesktopApp::Store | DesktopApp::Linux
+        )
+        && !window_closing
+        && !opening
+        && !state.seamless.enabled
+        && !state.clip_open
+        && dock_is_settled(state, now);
+    let dock_region = {
+        let full = layout.rect(Rect::new(8, 350, 736, 108));
+        full.intersect(screen_bounds).unwrap_or(full)
+    };
+    let dock_key = dock_cache_key(layout, dock_region)
+        ^ ((state.app as u64 + 1) << 8)
+        ^ ((state.focus_visible as u64) << 20)
+        ^ ((state.dock_focus as u64) << 24)
+        ^ ((is_maximized(state.app) as u64) << 30)
+        ^ ((state.hover_index.wrapping_add(1) as u64) << 34);
+    let cache = unsafe { &mut *DOCK_CACHE.0.get() };
+    let cache_len = (dock_region.width.max(0) as usize) * (dock_region.height.max(0) as usize);
+    let (dock, controls) = if dock_cacheable
+        && cache_len <= cache.len()
+        && DOCK_CACHE_KEY.load(Ordering::Acquire) == dock_key
+        && painter.write_region(dock_region, &cache[..cache_len])
+    {
+        (true, true)
+    } else {
+        let result = draw_dock(&mut painter, layout, ui_font, state, outer_dock, now);
+        if dock_cacheable
+            && !moving
+            && cache_len <= cache.len()
+            && painter.read_region(dock_region, &mut cache[..cache_len])
+        {
+            DOCK_CACHE_KEY.store(dock_key, Ordering::Release);
+        }
+        result
+    };
+    draw_music_hub(&mut painter, layout, ui_font, state, now);
+    panels::draw_hud(&mut painter, layout, state, now);
+    // The keyboard sits over everything, dock included.
+    if state.osk_open {
+        draw_osk(&mut painter, layout, ui_font, state);
+    }
+    if let Some((view, alpha)) = loading_overlay(state, now) {
+        draw_loading(
+            &mut painter,
+            layout,
+            ui_font,
+            mono_font,
+            screen_bounds,
+            &view,
+            alpha,
+        );
+    }
+    if panel_static
+        && screen_len == frame_pixels(screen_bounds)
+        && painter.read_region(screen_bounds, &mut panel_cache[..screen_len])
+    {
+        PANEL_CACHE_KEY.store(panel_key, Ordering::Release);
+    }
     draw_screen_fade(&mut painter, screen_bounds, fade_alpha);
     wallpaper && dock && controls
 }
@@ -3874,7 +5654,7 @@ fn overlay_panel_rect(overlay: Overlay) -> Rect {
     if overlay == Overlay::Apps {
         Rect::new(25, 20, 702, 420)
     } else {
-        Rect::new(327, 26, 314, 328)
+        panels::QUICK_PANEL
     }
 }
 
@@ -4007,7 +5787,24 @@ fn draw_dock(
         let press_at = state.dock_press_ns[index];
         let release_at = state.dock_release_ns[index];
         let held = press_at != 0 && now_ns < release_at;
-        let fall_offset = dock_fall_offset(state.dock_entrance_at_ns, index, now_ns);
+        let mut fall_offset = dock_fall_offset(state.dock_entrance_at_ns, index, now_ns);
+        let opens = match index {
+            1 => DesktopApp::Terminal,
+            3 => DesktopApp::Files,
+            4 => DesktopApp::Browser,
+            5 => DesktopApp::Notes,
+            6 => DesktopApp::Trash,
+            _ => DesktopApp::None,
+        };
+        if opens != DesktopApp::None
+            && state.app == opens
+            && now_ns.saturating_sub(state.window_open_at_ns) < 620_000_000
+        {
+            let p = progress_of(now_ns, state.window_open_at_ns, 620_000_000) as u64;
+            fall_offset -=
+                (wave_milli(p * 3 / 2 + 500).abs() * (1000 - p as i32) / 1000) * 14 / 1000;
+        }
+        fall_offset -= state.dock_lift(index, now_ns);
         let icon_rect = Rect::new(44 + index as i32 * 64, 380 + fall_offset, 50, 50);
         let mut button = Button::new(icon_rect, DOCK_BUTTONS[index], DOCK_NAMES[index], &styles)
             .with_transition(
@@ -4101,6 +5898,7 @@ fn draw_hint_pill(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_app_switcher(
     painter: &mut Painter<'_>,
     layout: Layout,
@@ -4109,17 +5907,28 @@ fn draw_app_switcher(
     now_ns: u64,
     opening: bool,
     panel_opened_at_ns: u64,
+    cheap: bool,
 ) -> bool {
-    let surface = frost_mode(
-        painter,
-        layout,
-        Rect::new(25, 20, 702, 420),
-        CornerRadii::all(30),
-        dock_style(),
-        0xaea0_0001,
-        false,
-    )
-    .captured;
+    // While the panel moves it is still real glass, but the colour work is
+    // done per 3x3 block (about 9x cheaper): the full-quality blur of a
+    // panel this size made the slide choppy.
+    let surface = painter
+        .frosted_rounded_rect_stepped(
+            layout.rect(Rect::new(25, 20, 702, 420)),
+            layout.radii(CornerRadii::all(30)),
+            {
+                let mut style = layout.frost(dock_style());
+                if cheap {
+                    style.shadow = Rgba::transparent();
+                    style.shadow_spread = 0;
+                    style.shadow_softness = 0;
+                }
+                style
+            },
+            0xaea0_0001,
+            if cheap { 4 } else { 2 },
+        )
+        .captured;
     let styles = ButtonStyles::figma_glass()
         .with_font(font)
         .with_font_size(13);
@@ -4278,62 +6087,39 @@ fn draw_icon(painter: &mut Painter<'_>, layout: Layout, kind: usize, bounds: Rec
     }
 }
 
-fn draw_quick_settings(
-    painter: &mut Painter<'_>,
-    layout: Layout,
-    font: RasterFont,
-    state: &DesktopState,
-    _now_ns: u64,
-) -> bool {
-    let panel = Rect::new(327, 26, 314, 328);
-    let captured = frost_mode(
-        painter,
-        layout,
-        panel,
-        CornerRadii::all(30),
-        dock_style(),
-        0xae91_0001,
-        false,
+/// Which app's window is maximized (0 = none, else the app's number + 1).
+static MAXIMIZED_APP: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Windows whose contents follow their size, so they can be maximized.
+fn can_maximize(app: DesktopApp) -> bool {
+    matches!(
+        app,
+        DesktopApp::Store | DesktopApp::Terminal | DesktopApp::Linux
     )
-    .captured;
-    draw_toggle(
-        painter,
-        layout,
-        font,
-        Rect::new(346, 48, 70, 43),
-        "Wi",
-        state.wifi,
-    );
-    draw_toggle(
-        painter,
-        layout,
-        font,
-        Rect::new(514, 48, 70, 43),
-        "BT",
-        state.bluetooth,
-    );
-    draw_toggle(
-        painter,
-        layout,
-        font,
-        Rect::new(346, 105, 70, 43),
-        "Mic",
-        state.microphone,
-    );
-    draw_toggle(
-        painter,
-        layout,
-        font,
-        Rect::new(514, 105, 70, 43),
-        "Eco",
-        state.battery_saver,
-    );
-    draw_slider(painter, layout, font, 347, 178, "Brightness", 42);
-    draw_slider(painter, layout, font, 347, 244, "Volume", 42);
-    captured
+}
+
+fn is_maximized(app: DesktopApp) -> bool {
+    MAXIMIZED_APP.load(Ordering::Relaxed) == app as u8 + 1
+}
+
+/// The three controls at the right of a window's title bar (minimize,
+/// maximize, close), as touch-sized hit boxes.
+fn window_control_rects(window: Rect) -> (Rect, Rect, Rect) {
+    let box_at = |from_right: i32| {
+        Rect::new(
+            window.x + window.width - from_right - 12,
+            window.y + 2,
+            24,
+            24,
+        )
+    };
+    (box_at(72), box_at(46), box_at(20))
 }
 
 fn window_base_rect(app: DesktopApp) -> Rect {
+    if is_maximized(app) {
+        return Rect::new(10, 10, 732, 354);
+    }
     match app {
         DesktopApp::Terminal => Rect::new(14, 15, 724, 340),
         DesktopApp::Files => Rect::new(70, 36, 610, 300),
@@ -4341,6 +6127,8 @@ fn window_base_rect(app: DesktopApp) -> Rect {
         DesktopApp::Trash => Rect::new(256, 90, 336, 260),
         // 602x320 of content: the guest screen is scaled down to fit.
         DesktopApp::Linux => Rect::new(65, 10, 622, 364),
+        DesktopApp::Browser => Rect::new(60, 16, 632, 350),
+        DesktopApp::Store => Rect::new(80, 18, 592, 346),
         _ => Rect::new(113, 32, 531, 303),
     }
 }
@@ -4388,7 +6176,69 @@ fn window_titlebar_color(app: DesktopApp) -> Rgba {
         DesktopApp::Files => Rgba::new(235, 244, 250, 245),
         DesktopApp::Notes => Rgba::new(250, 241, 222, 248),
         DesktopApp::Trash => Rgba::new(238, 231, 231, 240),
-        _ => Rgba::new(243, 244, 246, 242),
+        _ => Rgba::new(231, 231, 231, 246),
+    }
+}
+
+/// Minimize, maximize and close, drawn as in the design: small light glyphs
+/// with a thin dark outline (a pill, a rounded square and a crossed pair of bars).
+fn draw_window_controls(painter: &mut Painter<'_>, layout: Layout, window: Rect) {
+    let outline = Rgba::opaque(73, 73, 73);
+    let fill = Rgba::opaque(217, 217, 217);
+    let centre_y = window.y + 14;
+    let round = |value: i32| layout.radii(CornerRadii::all(value));
+    let minimize = Rect::new(window.x + window.width - 72 - 8, centre_y - 3, 16, 7);
+    painter.fill_rounded_rect(layout.rect(minimize), round(3), outline);
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(
+            minimize.x + 1,
+            minimize.y + 1,
+            minimize.width - 2,
+            minimize.height - 2,
+        )),
+        round(2),
+        fill,
+    );
+    let maximize = Rect::new(window.x + window.width - 46 - 8, centre_y - 8, 16, 16);
+    painter.fill_rounded_rect(layout.rect(maximize), round(5), outline);
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(
+            maximize.x + 1,
+            maximize.y + 1,
+            maximize.width - 2,
+            maximize.height - 2,
+        )),
+        round(4),
+        fill,
+    );
+    let centre_x = window.x + window.width - 20;
+    for step in -5..=5 {
+        for sign in [1, -1] {
+            painter.fill_rounded_rect(
+                layout.rect(Rect::new(
+                    centre_x + step - 3,
+                    centre_y + sign * step - 3,
+                    6,
+                    6,
+                )),
+                round(3),
+                outline,
+            );
+        }
+    }
+    for step in -5..=5 {
+        for sign in [1, -1] {
+            painter.fill_rounded_rect(
+                layout.rect(Rect::new(
+                    centre_x + step - 2,
+                    centre_y + sign * step - 2,
+                    4,
+                    4,
+                )),
+                round(2),
+                fill,
+            );
+        }
     }
 }
 
@@ -4408,16 +6258,59 @@ fn draw_window(
         window_open_scale(base, state.window_open_at_ns, now_ns)
     };
     let opening = !closing && now_ns.saturating_sub(state.window_open_at_ns) < WINDOW_OPEN_NS;
-    let captured = frost_mode(
-        painter,
-        layout,
-        outer,
-        CornerRadii::all(30),
-        window_style_for(state.app),
-        0xaec5_0001,
-        opening,
-    )
-    .captured;
+    let blur_off =
+        opening || closing || (state.app == DesktopApp::Browser && crate::web::get().busy());
+    // A settled window's frosted body only depends on the wallpaper, so it is
+    // rendered once and replayed (every keystroke used to re-blur it).
+    let cacheable = !opening && !closing && !blur_off && !state.seamless.enabled;
+    let margin = layout.scale.logical(36);
+    let region = {
+        let physical = layout.rect(outer);
+        Rect::new(
+            physical.x - margin,
+            physical.y - margin,
+            physical.width + margin * 2,
+            physical.height + margin * 2,
+        )
+    };
+    let region = region
+        .intersect(Rect::new(
+            0,
+            0,
+            painter.frame_width(),
+            painter.frame_height(),
+        ))
+        .unwrap_or(region);
+    let cache = unsafe { &mut *WINDOW_CACHE.0.get() };
+    let cache_len = (region.width.max(0) as usize) * (region.height.max(0) as usize);
+    let mut key = dock_cache_key(layout, region) ^ 0x71d0_0000;
+    key ^= (state.app as u64 + 1) * 0x9e37_79b9;
+    let captured = if cacheable
+        && cache_len <= cache.len()
+        && WINDOW_CACHE_KEY.load(Ordering::Acquire) == key
+        && painter.write_region(region, &cache[..cache_len])
+    {
+        true
+    } else {
+        let captured = frost_mode(
+            painter,
+            layout,
+            outer,
+            CornerRadii::all(30),
+            window_style_for(state.app),
+            0xaec5_0001,
+            blur_off,
+        )
+        .captured;
+        if cacheable
+            && captured
+            && cache_len <= cache.len()
+            && painter.read_region(region, &mut cache[..cache_len])
+        {
+            WINDOW_CACHE_KEY.store(key, Ordering::Release);
+        }
+        captured
+    };
     painter.fill_rounded_rect(
         layout.rect(Rect::new(outer.x, outer.y, outer.width, 28)),
         layout.radii(CornerRadii::new(14, 14, 0, 0)),
@@ -4436,28 +6329,19 @@ fn draw_window(
             DesktopApp::Trash => "Trash",
             DesktopApp::Terminal => "Shell",
             DesktopApp::Linux => "Linux",
+            DesktopApp::Store => "App Store",
             DesktopApp::None => "AerOS",
         },
         13,
         Color::rgb(18, 23, 26),
     );
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(outer.x + outer.width - 75, outer.y + 7, 14, 14)),
-        layout.radii(CornerRadii::all(7)),
-        Rgba::opaque(198, 31, 18),
-    );
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(outer.x + outer.width - 54, outer.y + 6, 17, 17)),
-        layout.radii(CornerRadii::all(5)),
-        Rgba::opaque(20, 145, 18),
-    );
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(outer.x + outer.width - 30, outer.y + 12, 15, 4)),
-        layout.radii(CornerRadii::all(2)),
-        Rgba::opaque(213, 142, 10),
-    );
+    draw_window_controls(painter, layout, outer);
     if state.app == DesktopApp::Browser {
         draw_browser(painter, layout, ui_font, mono_font, state);
+        return captured;
+    }
+    if state.app == DesktopApp::Store {
+        draw_store(painter, layout, ui_font, mono_font, state);
         return captured;
     }
     if state.app == DesktopApp::Settings {
@@ -4805,6 +6689,101 @@ fn draw_shell_window(
     }
 }
 
+fn browser_content_rect(base: Rect) -> Rect {
+    Rect::new(base.x + 10, base.y + 70, base.width - 20, base.height - 80)
+}
+
+fn browser_favorite_rect(content: Rect, index: usize) -> Rect {
+    let column = (index % 3) as i32;
+    let row = (index / 3) as i32;
+    Rect::new(
+        content.x + 28 + column * 190,
+        content.y + 64 + row * 80,
+        176,
+        66,
+    )
+}
+
+fn tile_color(seed: usize) -> Rgba {
+    const PALETTE: [(u8, u8, u8); 6] = [
+        (76, 163, 224),
+        (231, 111, 81),
+        (94, 187, 120),
+        (160, 120, 220),
+        (240, 180, 60),
+        (70, 190, 190),
+    ];
+    let (red, green, blue) = PALETTE[seed % PALETTE.len()];
+    Rgba::opaque(red, green, blue)
+}
+
+/// A round-cornered toolbar button with a text glyph.
+fn browser_nav_button(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    font: RasterFont,
+    bounds: Rect,
+    glyph: &str,
+    enabled: bool,
+) {
+    painter.fill_rounded_rect(
+        layout.rect(bounds),
+        layout.radii(CornerRadii::all(9)),
+        Rgba::new(226, 231, 236, if enabled { 230 } else { 120 }),
+    );
+    let tone = if enabled {
+        Color::rgb(52, 62, 72)
+    } else {
+        Color::rgb(160, 168, 176)
+    };
+    centered_text(painter, layout, font, bounds, glyph, 17, tone);
+}
+
+/// Draws one line of page text, colouring `[n]` link markers blue.
+#[allow(clippy::too_many_arguments)]
+fn draw_page_line(
+    painter: &mut Painter<'_>,
+    font: RasterFont,
+    origin: Point,
+    line: &str,
+    px: i32,
+    char_width: i32,
+    plain: Color,
+    link: Color,
+) {
+    let bytes = line.as_bytes();
+    let mut x = origin.x;
+    let mut start = 0usize;
+    let mut at = 0usize;
+    let flush = |painter: &mut Painter<'_>, from: usize, to: usize, color: Color, x: &mut i32| {
+        if to > from
+            && let Ok(segment) = core::str::from_utf8(&bytes[from..to])
+        {
+            painter.text(font, Point::new(*x, origin.y), segment, px, color);
+        }
+        *x += char_width * (to - from) as i32;
+    };
+    while at < bytes.len() {
+        if bytes[at] == b'[' {
+            let mut end = at + 1;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > at + 1 && end < bytes.len() && bytes[end] == b']' {
+                flush(painter, start, at, plain, &mut x);
+                flush(painter, at, end + 1, link, &mut x);
+                start = end + 1;
+                at = end + 1;
+                continue;
+            }
+        }
+        at += 1;
+    }
+    flush(painter, start, bytes.len(), plain, &mut x);
+}
+
+/// The browser: a Safari-style toolbar (back, forward, address pill, reload)
+/// over a white page area. Pages come from the Linux guest as text.
 fn draw_browser(
     painter: &mut Painter<'_>,
     layout: Layout,
@@ -4812,44 +6791,918 @@ fn draw_browser(
     mono_font: RasterFont,
     state: &DesktopState,
 ) {
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(132, 75, 493, 38)),
-        layout.radii(CornerRadii::all(19)),
-        Rgba::new(244, 249, 250, 205),
+    let base = window_base_rect(DesktopApp::Browser);
+    let web = crate::web::get();
+    let now = crate::time::monotonic_nanoseconds();
+    let bar_y = base.y + 34;
+    browser_nav_button(
+        painter,
+        layout,
+        ui_font,
+        Rect::new(base.x + 14, bar_y, 28, 26),
+        "<",
+        web.can_go_back(),
     );
+    browser_nav_button(
+        painter,
+        layout,
+        ui_font,
+        Rect::new(base.x + 46, bar_y, 28, 26),
+        ">",
+        web.can_go_forward(),
+    );
+    // Reload: a ring with a gap.
+    let reload = Rect::new(base.right() - 44, bar_y, 28, 26);
+    browser_nav_button(painter, layout, ui_font, reload, "", true);
+    let ring = Rect::new(reload.x + 7, reload.y + 5, 14, 14);
+    let ring_color = Rgba::opaque(52, 62, 72);
+    painter.fill_rounded_rect(
+        layout.rect(ring),
+        layout.radii(CornerRadii::all(7)),
+        ring_color,
+    );
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(ring.x + 2, ring.y + 2, 10, 10)),
+        layout.radii(CornerRadii::all(5)),
+        Rgba::new(226, 231, 236, 255),
+    );
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(ring.x + 8, ring.y - 1, 7, 6)),
+        layout.radii(CornerRadii::all(0)),
+        Rgba::new(226, 231, 236, 255),
+    );
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(ring.x + 10, ring.y, 5, 3)),
+        layout.radii(CornerRadii::all(1)),
+        ring_color,
+    );
+    // Address pill.
+    let pill = Rect::new(base.x + 84, bar_y, base.width - 84 - 58, 26);
+    let pill_radii = layout.radii(CornerRadii::all(13));
+    painter.fill_rounded_rect(
+        layout.rect(pill),
+        pill_radii,
+        if state.url_active {
+            Rgba::opaque(255, 255, 255)
+        } else {
+            Rgba::new(226, 231, 236, 235)
+        },
+    );
+    if web.busy() {
+        let elapsed_ms = now.saturating_sub(web.started_ns) / 1_000_000;
+        let progress = crate::loading::creeping_progress(elapsed_ms) as i32;
+        painter.fill_rounded_rect(
+            layout.rect(Rect::new(
+                pill.x,
+                pill.y,
+                (pill.width * progress / 1000).max(26),
+                pill.height,
+            )),
+            pill_radii,
+            Rgba::new(64, 140, 205, 70),
+        );
+    }
     painter.stroke_rounded_rect(
-        layout.rect(Rect::new(132, 75, 493, 38)),
-        layout.radii(CornerRadii::all(19)),
+        layout.rect(pill),
+        pill_radii,
         layout
             .scale
             .logical(if state.url_active { 2 } else { 1 })
             .max(1) as u8,
         if state.url_active {
-            Rgba::new(31, 108, 138, 220)
+            Rgba::new(31, 108, 205, 230)
         } else {
-            Rgba::new(120, 140, 148, 120)
+            Rgba::new(150, 160, 170, 120)
         },
     );
-    let mut bar = [0u8; MAX_URL + 1];
-    let shown = state.url_str().as_bytes();
-    let visible = shown.len().min(MAX_URL - 8);
-    bar[..visible].copy_from_slice(&shown[shown.len() - visible..]);
-    let mut bar_len = visible;
     if state.url_active {
-        bar[bar_len] = b'_';
-        bar_len += 1;
+        let mut bar = [0u8; MAX_URL + 1];
+        let shown = state.url_str().as_bytes();
+        let visible = shown.len().min(MAX_URL - 8).min(64);
+        bar[..visible].copy_from_slice(&shown[shown.len() - visible..]);
+        bar[visible] = b'_';
+        if let Ok(bar_text) = core::str::from_utf8(&bar[..visible + 1]) {
+            text(
+                painter,
+                layout,
+                ui_font,
+                Point::new(pill.x + 14, pill.y + 6),
+                bar_text,
+                13,
+                Color::rgb(25, 32, 40),
+            );
+        }
+    } else {
+        let address = web.url();
+        let (label, tone) = if address.is_empty() {
+            ("Search or enter website name", Color::rgb(120, 130, 140))
+        } else {
+            (crate::web::host_of(address), Color::rgb(30, 38, 46))
+        };
+        let width = ui_font.text_width(label, layout.scale.logical(13));
+        let lock = address.starts_with("https://");
+        let total = width + if lock { layout.scale.logical(14) } else { 0 };
+        let start = layout.rect(pill).x + (layout.rect(pill).width - total) / 2;
+        if lock {
+            let body = Rect::new(
+                pill.x + pill.width / 2 - (total / 2) / 2 - 2,
+                pill.y + 11,
+                8,
+                6,
+            );
+            let lock_color = Rgba::opaque(110, 120, 130);
+            let _ = body;
+            let lock_x = pixel_to_logical(layout, start);
+            painter.fill_rounded_rect(
+                layout.rect(Rect::new(lock_x, pill.y + 11, 8, 6)),
+                layout.radii(CornerRadii::all(2)),
+                lock_color,
+            );
+            painter.stroke_rounded_rect(
+                layout.rect(Rect::new(lock_x + 1, pill.y + 7, 6, 6)),
+                layout.radii(CornerRadii::all(3)),
+                1,
+                lock_color,
+            );
+        }
+        painter.text(
+            ui_font,
+            Point::new(
+                start + if lock { layout.scale.logical(14) } else { 0 },
+                layout.point(Point::new(0, pill.y + 6)).y,
+            ),
+            label,
+            layout.scale.logical(13),
+            tone,
+        );
     }
-    if let Ok(bar_text) = core::str::from_utf8(&bar[..bar_len]) {
+    // Page area.
+    let content = browser_content_rect(base);
+    let card = layout.rect(content);
+    painter.fill_rounded_rect(
+        card,
+        layout.radii(CornerRadii::all(10)),
+        Rgba::new(253, 253, 254, 245),
+    );
+    painter.stroke_rounded_rect(
+        card,
+        layout.radii(CornerRadii::all(10)),
+        1,
+        Rgba::new(150, 160, 170, 90),
+    );
+    let previous_clip = painter.clip();
+    painter.set_clip(card);
+    let dark = Color::rgb(28, 34, 40);
+    let muted = Color::rgb(112, 122, 132);
+    let native_fallback = !crate::svm::linux_ready();
+    match web.state {
+        _ if native_fallback => {
+            draw_browser_legacy_body(painter, layout, ui_font, mono_font, state);
+        }
+        crate::web::WebState::Blank => {
+            text(
+                painter,
+                layout,
+                ui_font,
+                Point::new(content.x + 28, content.y + 26),
+                "Favorites",
+                17,
+                dark,
+            );
+            for (index, (name, address)) in BROWSER_FAVORITES.iter().enumerate() {
+                let tile = browser_favorite_rect(content, index);
+                painter.fill_rounded_rect(
+                    layout.rect(tile),
+                    layout.radii(CornerRadii::all(14)),
+                    Rgba::new(238, 242, 246, 255),
+                );
+                let icon = Rect::new(tile.x + 12, tile.y + 13, 40, 40);
+                painter.fill_rounded_rect(
+                    layout.rect(icon),
+                    layout.radii(CornerRadii::all(10)),
+                    tile_color(index),
+                );
+                let initial = &name[..1];
+                centered_text(
+                    painter,
+                    layout,
+                    ui_font,
+                    icon,
+                    initial,
+                    20,
+                    Color::rgb(255, 255, 255),
+                );
+                text(
+                    painter,
+                    layout,
+                    ui_font,
+                    Point::new(tile.x + 62, tile.y + 15),
+                    name,
+                    14,
+                    dark,
+                );
+                text(
+                    painter,
+                    layout,
+                    ui_font,
+                    Point::new(tile.x + 62, tile.y + 35),
+                    crate::web::host_of(address),
+                    10,
+                    muted,
+                );
+            }
+            text(
+                painter,
+                layout,
+                ui_font,
+                Point::new(content.x + 28, content.y + 232),
+                "Pages are fetched and drawn as text by the Linux system.",
+                11,
+                muted,
+            );
+        }
+        crate::web::WebState::Starting | crate::web::WebState::Loading => {
+            let (title, note) = if web.state == crate::web::WebState::Starting {
+                (
+                    "Starting the Linux web engine...",
+                    "The first page takes about a minute; later pages are quick.",
+                )
+            } else {
+                ("Loading...", crate::web::host_of(web.url()))
+            };
+            centered_text(
+                painter,
+                layout,
+                ui_font,
+                Rect::new(content.x, content.y + 96, content.width, 24),
+                title,
+                17,
+                dark,
+            );
+            centered_text(
+                painter,
+                layout,
+                ui_font,
+                Rect::new(content.x, content.y + 124, content.width, 20),
+                note,
+                12,
+                muted,
+            );
+            // A soft indeterminate bar.
+            let track = Rect::new(content.x + content.width / 2 - 90, content.y + 158, 180, 4);
+            painter.fill_rounded_rect(
+                layout.rect(track),
+                layout.radii(CornerRadii::all(2)),
+                Rgba::new(150, 160, 170, 70),
+            );
+            let phase = (now / 1_000_000 % 1400) as i32;
+            let head = track.x + (track.width + 60) * phase / 1400 - 60;
+            let left = head.max(track.x);
+            let right = (head + 60).min(track.right());
+            if right > left {
+                painter.fill_rounded_rect(
+                    layout.rect(Rect::new(left, track.y, right - left, track.height)),
+                    layout.radii(CornerRadii::all(2)),
+                    Rgba::opaque(64, 140, 205),
+                );
+            }
+        }
+        crate::web::WebState::Loaded | crate::web::WebState::Failed => {
+            let px = layout.scale.logical(11);
+            let char_width = mono_font.text_width("M", px).max(1);
+            BROWSER_CHAR_W_MILLI.store(
+                (char_width as i64 * 1_000_000 / layout.scale.logical(1000).max(1) as i64) as u32,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            let origin_x = card.x + layout.scale.logical(12);
+            let mut y = card.y + layout.scale.logical(8);
+            let failed = web.state == crate::web::WebState::Failed;
+            if failed {
+                text(
+                    painter,
+                    layout,
+                    ui_font,
+                    Point::new(content.x + 12, content.y + 10),
+                    "The page could not be opened",
+                    14,
+                    Color::rgb(178, 52, 40),
+                );
+                y += layout.scale.logical(26);
+            }
+            for row in 0..BROWSER_VISIBLE_LINES {
+                let line = web.line(web.scroll + row);
+                draw_page_line(
+                    painter,
+                    mono_font,
+                    Point::new(origin_x, y),
+                    line,
+                    px,
+                    char_width,
+                    dark,
+                    Color::rgb(31, 108, 205),
+                );
+                y += layout.scale.logical(BROWSER_LINE_HEIGHT);
+            }
+            // A thin overlay scrollbar.
+            let total = web.line_count();
+            if total > BROWSER_VISIBLE_LINES {
+                let track = Rect::new(content.right() - 8, content.y + 10, 4, content.height - 20);
+                let thumb_h = (track.height * BROWSER_VISIBLE_LINES as i32 / total as i32).max(24);
+                let travel = track.height - thumb_h;
+                let max_scroll = (total - BROWSER_VISIBLE_LINES).max(1) as i32;
+                let thumb_y = track.y + travel * web.scroll as i32 / max_scroll;
+                painter.fill_rounded_rect(
+                    layout.rect(Rect::new(track.x, thumb_y, track.width, thumb_h)),
+                    layout.radii(CornerRadii::all(2)),
+                    Rgba::new(90, 100, 110, 150),
+                );
+            }
+        }
+    }
+    painter.set_clip(previous_clip);
+}
+
+/// Converts a physical x back to logical units (for icon placement).
+fn pixel_to_logical(layout: Layout, physical_x: i32) -> i32 {
+    let per_thousand = layout.scale.logical(1000).max(1) as i64;
+    ((physical_x - layout.offset.x) as i64 * 1000 / per_thousand) as i32
+}
+
+fn store_search_rect(base: Rect) -> Rect {
+    Rect::new(base.x + (base.width - 220) / 2, base.y + 40, 220, 26)
+}
+
+fn store_toggle_rect(base: Rect) -> Rect {
+    Rect::new(base.x + 22, base.y + 40, 84, 26)
+}
+
+/// Column and row spacing of the app grid (it grows with the window).
+fn store_grid_pitch(base: Rect) -> (i32, i32) {
+    ((base.width - 24) / 3, (base.height - 98) / 4)
+}
+
+fn store_cell_rect(base: Rect, column: usize, row: usize) -> Rect {
+    let (across, down) = store_grid_pitch(base);
+    Rect::new(
+        base.x + 12 + column as i32 * across,
+        base.y + 80 + row as i32 * down,
+        across - 4,
+        down - 4,
+    )
+}
+
+fn store_back_rect(base: Rect) -> Rect {
+    Rect::new(base.x + 18, base.y + 36, 70, 18)
+}
+
+fn store_get_rect(base: Rect) -> Rect {
+    Rect::new(base.x + 98, base.y + 104, 90, 24)
+}
+
+fn store_group_rect(base: Rect) -> Rect {
+    Rect::new(base.x + base.width - 292, base.y + 58, 270, 66)
+}
+
+fn store_about_rect(base: Rect) -> Rect {
+    Rect::new(
+        base.x + 22,
+        base.y + 142,
+        base.width / 2 - 46,
+        base.height - 160,
+    )
+}
+
+fn store_similar_panel(base: Rect) -> Rect {
+    Rect::new(
+        base.x + base.width / 2 - 10,
+        base.y + 142,
+        base.width / 2 - 12,
+        base.height - 160,
+    )
+}
+
+fn store_similar_rect(base: Rect, slot: usize) -> Rect {
+    let panel = store_similar_panel(base);
+    let across = (panel.width - 16) / 2;
+    let down = (panel.height - 44) / 2;
+    Rect::new(
+        panel.x + 10 + (slot % 2) as i32 * across,
+        panel.y + 36 + (slot / 2) as i32 * down,
+        across - 2,
+        58,
+    )
+}
+
+fn store_start_button_rect(base: Rect) -> Rect {
+    Rect::new(base.x + base.width / 2 - 60, base.y + 190, 120, 34)
+}
+
+/// The first `count` bytes of an ASCII string.
+fn clip_text(value: &str, count: usize) -> &str {
+    value.get(..count.min(value.len())).unwrap_or(value)
+}
+
+/// Draws `value` wrapped to `width_chars` columns; returns the lines used.
+#[allow(clippy::too_many_arguments)]
+fn draw_wrapped(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    font: RasterFont,
+    origin: Point,
+    width_chars: usize,
+    max_lines: usize,
+    value: &str,
+    height: i32,
+    color: Color,
+) -> usize {
+    let mut rest = value;
+    let mut lines = 0;
+    while !rest.is_empty() && lines < max_lines {
+        let mut cut = rest.len().min(width_chars);
+        if cut < rest.len()
+            && let Some(space) = rest[..cut].rfind(' ')
+        {
+            cut = space;
+        }
+        let (line, tail) = rest.split_at(cut);
+        text(
+            painter,
+            layout,
+            font,
+            Point::new(origin.x, origin.y + lines as i32 * (height + 4)),
+            line,
+            height,
+            color,
+        );
+        lines += 1;
+        rest = tail.trim_start();
+    }
+    lines
+}
+
+/// A rounded app icon: a coloured tile with the app's initial.
+fn draw_store_icon(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    font: RasterFont,
+    bounds: Rect,
+    name: &str,
+    seed: usize,
+) {
+    if let Some(icon) = crate::store::icon_for_name(name) {
+        let physical = layout.rect(bounds);
+        painter.draw_rgba_scaled(
+            physical,
+            icon,
+            crate::store::ICON_SIZE,
+            crate::store::ICON_SIZE,
+        );
+        return;
+    }
+    painter.fill_rounded_rect(
+        layout.rect(bounds),
+        layout.radii(CornerRadii::all(bounds.width / 4)),
+        tile_color(seed),
+    );
+    if let Some(initial) = name.get(..1) {
+        centered_text(
+            painter,
+            layout,
+            font,
+            bounds,
+            initial,
+            bounds.height * 2 / 5,
+            Color::rgb(255, 255, 255),
+        );
+    }
+}
+
+/// The app store (styled after the mockup): a search grid of apps, and a
+/// page per app with Get, size, age rating and similar apps. It sits directly
+/// on the window's glass (no backdrop of its own), like the Shell window.
+fn draw_store(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    ui_font: RasterFont,
+    _mono_font: RasterFont,
+    _state: &DesktopState,
+) {
+    use crate::store::{CATALOG, GRID_COLUMNS, GRID_ROWS, StoreTab};
+    let base = window_base_rect(DesktopApp::Store);
+    let store = crate::store::get();
+    let ink = Color::rgb(18, 23, 26);
+    let muted = Color::rgb(66, 82, 94);
+    let link = Color::rgb(28, 104, 186);
+    let accent = Rgba::opaque(64, 140, 205);
+    // Frosted white cards on the glass.
+    let card = Rgba::new(255, 255, 255, 120);
+    let pill = Rgba::new(255, 255, 255, 175);
+    let edge = Rgba::new(255, 255, 255, 170);
+    let running = crate::svm::linux_agent_ready();
+    let stroke = layout.scale.logical(1).max(1) as u8;
+
+    if let Some(index) = store.detail {
+        let entry = &CATALOG[index];
         text(
             painter,
             layout,
             ui_font,
-            Point::new(154, 86),
-            bar_text,
+            Point::new(base.x + 22, base.y + 38),
+            "< Store",
+            12,
+            link,
+        );
+        draw_store_icon(
+            painter,
+            layout,
+            ui_font,
+            Rect::new(base.x + 22, base.y + 58, 64, 64),
+            entry.name,
+            index,
+        );
+        text(
+            painter,
+            layout,
+            ui_font,
+            Point::new(base.x + 98, base.y + 58),
+            entry.name,
+            20,
+            ink,
+        );
+        if entry.verified {
+            let name_width = ui_font.text_width(entry.name, layout.scale.logical(20));
+            let badge_x = base.x + 98 + pixel_to_logical(layout, layout.offset.x + name_width) + 8;
+            let badge = Rect::new(badge_x, base.y + 62, 16, 16);
+            painter.fill_rounded_rect(
+                layout.rect(badge),
+                layout.radii(CornerRadii::all(8)),
+                Rgba::opaque(58, 150, 230),
+            );
+            centered_text(
+                painter,
+                layout,
+                ui_font,
+                badge,
+                "v",
+                11,
+                Color::rgb(255, 255, 255),
+            );
+        }
+        text(
+            painter,
+            layout,
+            ui_font,
+            Point::new(base.x + 98, base.y + 84),
+            entry.blurb,
+            12,
+            muted,
+        );
+        let installing = store.installing == Some(index);
+        let have = store.installed_index(entry).is_some();
+        let get = store_get_rect(base);
+        let (label, fill, tone) = if have {
+            ("Open", accent, Color::rgb(255, 255, 255))
+        } else if installing {
+            ("Installing", Rgba::new(255, 255, 255, 200), link)
+        } else {
+            ("Get", Rgba::opaque(44, 52, 62), Color::rgb(245, 247, 249))
+        };
+        painter.fill_rounded_rect(layout.rect(get), layout.radii(CornerRadii::all(12)), fill);
+        centered_text(painter, layout, ui_font, get, label, 12, tone);
+        // Size / age rating group.
+        let group = store_group_rect(base);
+        painter.fill_rounded_rect(layout.rect(group), layout.radii(CornerRadii::all(30)), card);
+        painter.stroke_rounded_rect(
+            layout.rect(group),
+            layout.radii(CornerRadii::all(30)),
+            stroke,
+            edge,
+        );
+        for (slot, (title, value)) in [("Size", entry.size), ("Age Rating", entry.age)]
+            .into_iter()
+            .enumerate()
+        {
+            let column = Rect::new(group.x + 14 + slot as i32 * 122, group.y + 8, 114, 18);
+            centered_text(painter, layout, ui_font, column, title, 12, ink);
+            let value_pill = Rect::new(column.x + 12, group.y + 32, 90, 22);
+            painter.fill_rounded_rect(
+                layout.rect(value_pill),
+                layout.radii(CornerRadii::all(11)),
+                pill,
+            );
+            centered_text(painter, layout, ui_font, value_pill, value, 12, ink);
+        }
+        // Longer description.
+        let about = store_about_rect(base);
+        painter.fill_rounded_rect(layout.rect(about), layout.radii(CornerRadii::all(18)), card);
+        painter.stroke_rounded_rect(
+            layout.rect(about),
+            layout.radii(CornerRadii::all(18)),
+            stroke,
+            edge,
+        );
+        let used = draw_wrapped(
+            painter,
+            layout,
+            ui_font,
+            Point::new(about.x + 16, about.y + 14),
+            (about.width * 36 / 250).max(20) as usize,
+            7,
+            entry.long,
+            11,
+            ink,
+        );
+        let mut y = about.y + 14 + used as i32 * 15 + 8;
+        for (label, value) in [
+            ("Category", entry.category),
+            ("From", "Flathub (Flatpak)"),
+            ("ID", entry.flatpak),
+        ] {
+            text(
+                painter,
+                layout,
+                ui_font,
+                Point::new(about.x + 16, y),
+                label,
+                10,
+                muted,
+            );
+            text(
+                painter,
+                layout,
+                ui_font,
+                Point::new(about.x + 76, y),
+                clip_text(value, 28),
+                10,
+                ink,
+            );
+            y += 15;
+        }
+        // Similar apps.
+        let similar = store_similar_panel(base);
+        painter.fill_rounded_rect(
+            layout.rect(similar),
+            layout.radii(CornerRadii::all(24)),
+            card,
+        );
+        painter.stroke_rounded_rect(
+            layout.rect(similar),
+            layout.radii(CornerRadii::all(24)),
+            stroke,
+            edge,
+        );
+        centered_text(
+            painter,
+            layout,
+            ui_font,
+            Rect::new(similar.x, similar.y + 8, similar.width, 20),
+            "Similar Apps",
             13,
-            Color::rgb(25, 45, 52),
+            ink,
+        );
+        for (slot, other) in store.similar(index).into_iter().enumerate() {
+            let Some(entry) = CATALOG.get(other) else {
+                continue;
+            };
+            let cell = store_similar_rect(base, slot);
+            draw_store_icon(
+                painter,
+                layout,
+                ui_font,
+                Rect::new(cell.x + 2, cell.y + 6, 44, 44),
+                entry.name,
+                other,
+            );
+            text(
+                painter,
+                layout,
+                ui_font,
+                Point::new(cell.x + 52, cell.y + 12),
+                clip_text(entry.name, 11),
+                11,
+                ink,
+            );
+            text(
+                painter,
+                layout,
+                ui_font,
+                Point::new(cell.x + 52, cell.y + 28),
+                clip_text(entry.blurb, 16),
+                9,
+                muted,
+            );
+        }
+        draw_store_status(painter, layout, ui_font, base, store.install, muted, false);
+        return;
+    }
+
+    // Grid: toggle, search pill, status.
+    let toggle = store_toggle_rect(base);
+    painter.fill_rounded_rect(
+        layout.rect(toggle),
+        layout.radii(CornerRadii::all(13)),
+        pill,
+    );
+    painter.stroke_rounded_rect(
+        layout.rect(toggle),
+        layout.radii(CornerRadii::all(13)),
+        stroke,
+        edge,
+    );
+    centered_text(
+        painter,
+        layout,
+        ui_font,
+        toggle,
+        if store.tab == StoreTab::Installed {
+            "Installed"
+        } else {
+            "Discover"
+        },
+        12,
+        ink,
+    );
+    let search = store_search_rect(base);
+    painter.fill_rounded_rect(
+        layout.rect(search),
+        layout.radii(CornerRadii::all(13)),
+        Rgba::opaque(248, 249, 251),
+    );
+    let query = store.query();
+    if query.is_empty() {
+        centered_text(
+            painter,
+            layout,
+            ui_font,
+            search,
+            "Search for an App",
+            11,
+            Color::rgb(120, 126, 134),
+        );
+    } else {
+        text(
+            painter,
+            layout,
+            ui_font,
+            Point::new(search.x + 14, search.y + 6),
+            query,
+            13,
+            Color::rgb(28, 32, 38),
         );
     }
+    draw_store_status(
+        painter,
+        layout,
+        ui_font,
+        base,
+        store.install,
+        muted,
+        !running,
+    );
+
+    let shown = store.shown();
+    if store.tab == StoreTab::Installed && !running {
+        centered_text(
+            painter,
+            layout,
+            ui_font,
+            Rect::new(base.x, base.y + 130, base.width, 24),
+            "Linux isn't running",
+            17,
+            ink,
+        );
+        centered_text(
+            painter,
+            layout,
+            ui_font,
+            Rect::new(base.x, base.y + 158, base.width, 20),
+            "Start it to see the apps you have.",
+            12,
+            muted,
+        );
+        let button = store_start_button_rect(base);
+        painter.fill_rounded_rect(
+            layout.rect(button),
+            layout.radii(CornerRadii::all(17)),
+            accent,
+        );
+        centered_text(
+            painter,
+            layout,
+            ui_font,
+            button,
+            "Start Linux",
+            13,
+            Color::rgb(255, 255, 255),
+        );
+        return;
+    }
+    if shown == 0 {
+        centered_text(
+            painter,
+            layout,
+            ui_font,
+            Rect::new(base.x, base.y + 160, base.width, 22),
+            if query.is_empty() {
+                "No apps found yet"
+            } else {
+                "No apps match your search"
+            },
+            15,
+            muted,
+        );
+        return;
+    }
+    for slot in 0..GRID_COLUMNS * GRID_ROWS {
+        let (column, row) = (slot % GRID_COLUMNS, slot / GRID_COLUMNS);
+        let position = (store.scroll + row) * GRID_COLUMNS + column;
+        let Some(index) = store.shown_index(position) else {
+            break;
+        };
+        let cell = store_cell_rect(base, column, row);
+        let (name, sub) = match store.tab {
+            StoreTab::Installed => {
+                let app = store.app(index);
+                (
+                    app.map_or("", |app| app.name_str()),
+                    app.map_or("", |app| app.category_str()),
+                )
+            }
+            StoreTab::Discover => (CATALOG[index].name, CATALOG[index].blurb),
+        };
+        if position == store.selected && !store.query().is_empty() {
+            painter.fill_rounded_rect(
+                layout.rect(cell),
+                layout.radii(CornerRadii::all(12)),
+                Rgba::new(255, 255, 255, 90),
+            );
+        }
+        draw_store_icon(
+            painter,
+            layout,
+            ui_font,
+            Rect::new(cell.x + 6, cell.y + 7, 44, 44),
+            name,
+            index + name.len(),
+        );
+        text(
+            painter,
+            layout,
+            ui_font,
+            Point::new(cell.x + 58, cell.y + 12),
+            clip_text(name, 16),
+            14,
+            ink,
+        );
+        text(
+            painter,
+            layout,
+            ui_font,
+            Point::new(cell.x + 58, cell.y + 31),
+            clip_text(sub, 26),
+            10,
+            muted,
+        );
+    }
+}
+
+/// The one-line install status at the top right of the store.
+fn draw_store_status(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    ui_font: RasterFont,
+    base: Rect,
+    install: crate::store::InstallState,
+    muted: Color,
+    linux_off: bool,
+) {
+    use crate::store::InstallState;
+    let message = match install {
+        InstallState::Installing => "Installing... this can take a while",
+        InstallState::Done => "Done - see it under Installed",
+        InstallState::Failed => "Install failed - check the network",
+        InstallState::Idle if linux_off => "Linux is off - Get starts it",
+        InstallState::Idle => "",
+    };
+    text(
+        painter,
+        layout,
+        ui_font,
+        Point::new(base.x + base.width - 178, base.y + 47),
+        message,
+        10,
+        muted,
+    );
+}
+
+fn draw_browser_legacy_body(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    ui_font: RasterFont,
+    mono_font: RasterFont,
+    state: &DesktopState,
+) {
+    let _ = state.url_active;
     painter.fill_rounded_rect(
         layout.rect(Rect::new(133, 125, 9, 9)),
         layout.radii(CornerRadii::all(5)),
@@ -5834,272 +8687,48 @@ fn draw_setup(
     font: RasterFont,
     state: &DesktopState,
 ) -> bool {
-    let card = Rect::new(96, 12, 560, 434);
-    let captured = frost(
-        painter,
-        layout,
-        card,
-        CornerRadii::all(88),
-        setup_card_style(),
-        0xae5e_0001,
-    )
-    .captured;
-    centered_text(
-        painter,
-        layout,
-        font,
-        Rect::new(card.x, 40, card.width, 34),
-        "AerOS Setup",
-        27,
-        Color::rgb(244, 246, 248),
-    );
-    let heading = match state.screen {
-        Screen::Username => "Set a Username",
-        Screen::Password => "Set a Password",
-        _ => "Select a keyboard language",
-    };
-    centered_text(
-        painter,
-        layout,
-        font,
-        Rect::new(card.x, 132, card.width, 28),
-        heading,
-        20,
-        Color::rgb(238, 241, 244),
-    );
-    let mut fields = true;
-    if state.screen == Screen::Language {
-        let search = Rect::new(226, 196, 300, 46);
-        fields &= frost(
-            painter,
-            layout,
-            search,
-            CornerRadii::all(23),
-            setup_field_style(),
-            0xae5e_0002,
-        )
-        .captured;
-        centered_text(
-            painter,
-            layout,
-            font,
-            search,
-            "Search",
-            15,
-            Color::rgb(232, 236, 239),
-        );
-        for row in 0..2 {
-            let bounds = Rect::new(226, 258 + row * 54, 300, 46);
-            fields &= frost(
-                painter,
-                layout,
-                bounds,
-                CornerRadii::all(23),
-                setup_field_style(),
-                0xae5e_0010 + row as u32,
-            )
-            .captured;
-            centered_text(
-                painter,
-                layout,
-                font,
-                bounds,
-                "Keyboard Language in region",
-                12,
-                Color::rgb(228, 232, 236),
-            );
-        }
+    let card = flow::CARD;
+    let now = crate::time::monotonic_nanoseconds();
+    let region = layout
+        .rect(Rect::new(80, 0, 592, 458))
+        .intersect(Rect::new(0, 0, 4096, 4096))
+        .unwrap_or_else(|| layout.rect(card));
+    let cache = unsafe { &mut *SETUP_CACHE.0.get() };
+    let cache_len = (region.width.max(0) as usize) * (region.height.max(0) as usize);
+    let key = dock_cache_key(layout, region) ^ 0x5e70_0000;
+    let captured = if cache_len <= cache.len()
+        && SETUP_CACHE_KEY.load(Ordering::Acquire) == key
+        && painter.write_region(region, &cache[..cache_len])
+    {
+        true
     } else {
-        let field = Rect::new(206, 214, 340, 58);
-        fields &= frost(
+        let captured = frost(
             painter,
             layout,
-            field,
-            CornerRadii::all(29),
-            setup_field_style(),
-            0xae5e_0003,
+            card,
+            CornerRadii::all(88),
+            setup_card_style(),
+            0xae5e_0001,
         )
         .captured;
-        let caret = if state.screen == Screen::Password {
-            masked_caret(state.setup_password_len)
-        } else {
-            typed_caret(&state.username_input[..state.username_len])
-        };
-        centered_text(
-            painter,
-            layout,
-            font,
-            field,
-            caret.as_str(),
-            15,
-            Color::rgb(236, 239, 242),
-        );
-    }
-    centered_text(
-        painter,
-        layout,
-        font,
-        Rect::new(card.x, 392, card.width, 24),
-        "Press Enter to continue",
-        12,
-        Color::rgb(214, 220, 226),
-    );
-    captured && fields
-}
-
-fn draw_avatar(painter: &mut Painter<'_>, layout: Layout, center: Point, radius: i32) {
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(
-            center.x - radius,
-            center.y - radius,
-            radius * 2,
-            radius * 2,
-        )),
-        layout.radii(CornerRadii::all(radius)),
-        Rgba::new(244, 247, 249, 245),
-    );
-    let head = radius * 13 / 20;
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(
-            center.x - head / 2,
-            center.y - radius * 11 / 20,
-            head,
-            head,
-        )),
-        layout.radii(CornerRadii::all(head / 2)),
-        Rgba::new(150, 158, 164, 235),
-    );
-    let shoulder_w = radius * 11 / 10;
-    let shoulder_h = radius * 7 / 10;
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(
-            center.x - shoulder_w / 2,
-            center.y + radius / 20,
-            shoulder_w,
-            shoulder_h,
-        )),
-        layout.radii(CornerRadii::new(
-            shoulder_w / 2,
-            shoulder_w / 2,
-            radius * 3 / 20,
-            radius * 3 / 20,
-        )),
-        Rgba::new(150, 158, 164, 235),
-    );
+        if captured
+            && cache_len <= cache.len()
+            && painter.read_region(region, &mut cache[..cache_len])
+        {
+            SETUP_CACHE_KEY.store(key, Ordering::Release);
+        }
+        captured
+    };
+    let content = match state.screen {
+        Screen::Language => flow::draw_language(painter, layout, font, state, now),
+        Screen::Keyboard => flow::draw_keyboard(painter, layout, font, state, now),
+        Screen::Welcome => flow::draw_welcome(painter, layout, font, state, now),
+        _ => flow::draw_credentials(painter, layout, font, state, now),
+    };
+    captured && content
 }
 
 const LOGIN_CARD: Rect = Rect::new(96, 12, 560, 434);
-
-fn draw_login_card(painter: &mut Painter<'_>, layout: Layout, seed: u32, cheap: bool) -> bool {
-    frost_mode(
-        painter,
-        layout,
-        LOGIN_CARD,
-        CornerRadii::all(88),
-        setup_card_style(),
-        seed,
-        cheap,
-    )
-    .captured
-}
-
-fn draw_lock(
-    painter: &mut Painter<'_>,
-    layout: Layout,
-    font: RasterFont,
-    state: &DesktopState,
-    cheap: bool,
-) -> bool {
-    let captured = draw_login_card(painter, layout, 0xae5e_0020, cheap);
-    let clock = time_text();
-    centered_text(
-        painter,
-        layout,
-        font,
-        Rect::new(LOGIN_CARD.x, 78, LOGIN_CARD.width, 92),
-        clock.as_str(),
-        66,
-        Color::rgb(248, 250, 252),
-    );
-    draw_avatar(painter, layout, Point::new(376, 258), 64);
-    centered_text(
-        painter,
-        layout,
-        font,
-        Rect::new(LOGIN_CARD.x, 352, LOGIN_CARD.width, 24),
-        state.display_name(),
-        17,
-        Color::rgb(240, 244, 247),
-    );
-    captured
-}
-
-fn draw_signin(
-    painter: &mut Painter<'_>,
-    layout: Layout,
-    font: RasterFont,
-    state: &DesktopState,
-    now_ns: u64,
-    cheap: bool,
-) -> bool {
-    let captured = draw_login_card(painter, layout, 0xae5e_0021, cheap);
-    centered_text(
-        painter,
-        layout,
-        font,
-        Rect::new(LOGIN_CARD.x, 76, LOGIN_CARD.width, 34),
-        "Welcome back",
-        26,
-        Color::rgb(246, 249, 251),
-    );
-    draw_avatar(painter, layout, Point::new(376, 172), 46);
-    centered_text(
-        painter,
-        layout,
-        font,
-        Rect::new(LOGIN_CARD.x, 238, LOGIN_CARD.width, 22),
-        state.display_name(),
-        14,
-        Color::rgb(238, 242, 245),
-    );
-    let field = Rect::new(266, 296, 220, 48);
-    painter.fill_rounded_rect(
-        layout.rect(field),
-        layout.radii(CornerRadii::all(24)),
-        Rgba::new(240, 243, 245, 240),
-    );
-    let caret = masked_caret(state.login_len);
-    centered_text(
-        painter,
-        layout,
-        font,
-        field,
-        caret.as_str(),
-        14,
-        Color::rgb(38, 52, 60),
-    );
-    let error_active = now_ns < state.login_error_until_ns;
-    let hint = if error_active {
-        "Incorrect password"
-    } else {
-        "Press Enter to sign in"
-    };
-    let hint_color = if error_active {
-        Color::rgb(232, 128, 120)
-    } else {
-        Color::rgb(218, 224, 230)
-    };
-    centered_text(
-        painter,
-        layout,
-        font,
-        Rect::new(LOGIN_CARD.x, 358, LOGIN_CARD.width, 22),
-        hint,
-        11,
-        hint_color,
-    );
-    captured
-}
 
 const CURSOR_ROWS: [i32; 20] = [
     1, 2, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18, 15, 12, 9, 6, 4, 2, 1,
@@ -6295,47 +8924,6 @@ fn draw_toggle(
     );
 }
 
-fn draw_slider(
-    painter: &mut Painter<'_>,
-    layout: Layout,
-    font: RasterFont,
-    x: i32,
-    y: i32,
-    label: &str,
-    amount: i32,
-) {
-    text(
-        painter,
-        layout,
-        font,
-        Point::new(x, y),
-        label,
-        9,
-        Color::rgb(25, 47, 54),
-    );
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(x, y + 18, 179, 17)),
-        layout.radii(CornerRadii::all(9)),
-        Rgba::new(236, 246, 249, 110),
-    );
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(x + 6, y + 24, 167, 5)),
-        layout.radii(CornerRadii::all(3)),
-        Rgba::new(235, 245, 248, 170),
-    );
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(x + amount, y + 18, 18, 18)),
-        layout.radii(CornerRadii::all(9)),
-        Rgba::new(180, 203, 211, 245),
-    );
-    painter.stroke_rounded_rect(
-        layout.rect(Rect::new(x + amount, y + 18, 18, 18)),
-        layout.radii(CornerRadii::all(9)),
-        1,
-        Rgba::new(61, 89, 99, 100),
-    );
-}
-
 fn centered_text(
     painter: &mut Painter<'_>,
     layout: Layout,
@@ -6386,7 +8974,15 @@ fn frost(
     style: FrostStyle,
     seed: u32,
 ) -> FrostReport {
-    frost_mode(painter, layout, bounds, radii, style, seed, false)
+    frost_mode(
+        painter,
+        layout,
+        bounds,
+        radii,
+        style,
+        seed,
+        MOTION_CHEAP.load(Ordering::Relaxed),
+    )
 }
 
 /// Skips the per-pixel blur sampling and paints a flat tint instead. The blur
@@ -6402,34 +8998,23 @@ fn frost_mode(
     seed: u32,
     cheap: bool,
 ) -> FrostReport {
-    if !cheap {
-        return painter.frosted_rounded_rect(
-            layout.rect(bounds),
-            layout.radii(radii),
-            layout.frost(style),
-            seed,
-        );
-    }
-    let physical_bounds = layout.rect(bounds);
-    let physical_radii = layout.radii(radii);
-    let physical_style = layout.frost(style);
-    // Flat tint instead of the real per-pixel blur sampling (capture +
-    // multi-pass blur), which is the expensive part. Keeping the fill means
-    // the panel reads the same as its settled appearance while moving —
-    // only the blur texture is missing, not the whole translucent backing.
-    painter.fill_rounded_rect(physical_bounds, physical_radii, physical_style.tint);
-    painter.stroke_rounded_rect(
-        physical_bounds,
-        physical_radii,
-        physical_style.border_width,
-        physical_style.border,
-    );
-    FrostReport {
-        pixels: bounds.width as usize * bounds.height as usize,
-        blur_radius: physical_style.blur_radius,
-        captured: false,
-        clipped: false,
-    }
+    // Big shapes use block-wise colour work (2x2 settled, 3x3 while moving):
+    // the blur is smooth, so it is hard to see, and it is 4-9x cheaper.
+    let large = bounds.width * bounds.height > 60_000;
+    let step = if cheap {
+        3
+    } else if large {
+        2
+    } else {
+        1
+    };
+    painter.frosted_rounded_rect_stepped(
+        layout.rect(bounds),
+        layout.radii(radii),
+        layout.frost(style),
+        seed,
+        step,
+    )
 }
 
 fn dock_style() -> FrostStyle {
@@ -6649,6 +9234,7 @@ fn input_self_test() -> bool {
     let right = decoder.feed(0x4d) == Some(DesktopKey::Right);
     let terminal = decoder.feed(0x14) == Some(DesktopKey::Terminal);
     let mut state = DesktopState::new();
+    state.screen = Screen::Desktop;
     let redraw =
         state.handle(DesktopKey::Apps) == DesktopAction::Redraw && state.overlay == Overlay::Apps;
     let launch = state.handle(DesktopKey::Activate) == DesktopAction::Redraw
@@ -6673,80 +9259,132 @@ fn pointer_self_test() -> bool {
     apps.click(Point::new(69, 405));
     let opened = apps.overlay == Overlay::Apps;
     let mut wake = DesktopState::new();
-    let advanced = wake.click(Point::new(120, 120)) == DesktopAction::Redraw
-        && wake.screen == Screen::Username;
+    let ignored =
+        wake.click(Point::new(120, 120)) == DesktopAction::Idle && wake.screen == Screen::Language;
+    let advanced = wake.click(Point::new(376, 182)) == DesktopAction::Redraw
+        && wake.screen == Screen::Keyboard;
     let scale = Scale::from_milli(1_700).unwrap_or(Scale::ONE);
     let round_trip = (scale.invert(scale.logical(200)) - 200).abs() <= 1;
-    terminal && opened && advanced && round_trip
+    terminal && opened && ignored && advanced && round_trip
 }
 
 fn session_self_test() -> bool {
     let mut walk = DesktopState::new();
-    let steps = [
-        Screen::Username,
-        Screen::Password,
-        Screen::Lock,
-        Screen::Login,
-    ];
-    let mut advanced = true;
-    for expected in steps {
-        walk.handle(DesktopKey::Activate);
-        advanced &= walk.screen == expected;
-    }
-    // A bare Enter with nothing typed must NOT sign in -- this is the exact
-    // click-through-to-desktop bug being fixed, so it's the one invariant
-    // this test exists to protect.
-    let bare_enter_blocked =
-        walk.handle(DesktopKey::Activate) == DesktopAction::Redraw && walk.screen == Screen::Login;
-    for byte in b"wrong" {
+    // Setup cannot be walked through with empty fields.
+    walk.handle(DesktopKey::Activate);
+    let english_done = walk.screen == Screen::Keyboard;
+    walk.handle(DesktopKey::Character(b's'));
+    walk.handle(DesktopKey::Character(b'w'));
+    let mut hits = [0usize; 16];
+    let filtered = flow::keyboard_matches(&walk, &mut hits) == 1 && walk.kb_search_len == 2;
+    walk.handle(DesktopKey::Backspace);
+    walk.handle(DesktopKey::Backspace);
+    walk.handle(DesktopKey::Down);
+    walk.handle(DesktopKey::Down);
+    let moved = walk.kb_cursor == 2;
+    walk.handle(DesktopKey::Up);
+    walk.handle(DesktopKey::Activate);
+    let language_done = english_done && filtered && moved && walk.screen == Screen::Username;
+    let empty_name_blocked = walk.handle(DesktopKey::Activate) == DesktopAction::Redraw
+        && walk.screen == Screen::Username;
+    for byte in b"aer" {
         walk.handle(DesktopKey::Character(*byte));
     }
     walk.handle(DesktopKey::Activate);
-    let wrong_password_blocked = walk.screen == Screen::Login && walk.login_len == 0;
-    let click_does_not_sign_in =
-        walk.click(Point::new(376, 320)) == DesktopAction::Idle && walk.screen == Screen::Login;
+    let empty_password_blocked = walk.handle(DesktopKey::Activate) == DesktopAction::Redraw
+        && walk.screen == Screen::Password;
+    for byte in b"abc" {
+        walk.handle(DesktopKey::Character(*byte));
+    }
+    walk.handle(DesktopKey::Activate);
+    let weak_blocked = walk.screen == Screen::Password;
+    let click_blocked =
+        walk.click(Point::new(120, 120)) == DesktopAction::Idle && walk.screen == Screen::Password;
+    let escape_blocked = walk.handle(DesktopKey::Escape) == DesktopAction::Redraw
+        && walk.screen == Screen::Password
+        && walk.setup_password_len == 0;
+    let hotkey_blocked =
+        walk.handle(DesktopKey::Browser) == DesktopAction::Idle && walk.screen == Screen::Password;
 
+    // Full setup with a mismatching confirmation, then a matching one.
     let mut real = DesktopState::new();
+    real.kdf_iterations = 32;
+    real.handle(DesktopKey::Activate);
     real.handle(DesktopKey::Activate);
     for byte in b"aer" {
         real.handle(DesktopKey::Character(*byte));
     }
     let username_captured = real.username_str() == "aer";
     real.handle(DesktopKey::Activate);
-    for byte in b"secret" {
+    for byte in b"tr1cky-Pass" {
         real.handle(DesktopKey::Character(*byte));
     }
     real.handle(DesktopKey::Activate);
+    let on_confirm = real.screen == Screen::Confirm;
+    for byte in b"tr1cky-Pasz" {
+        real.handle(DesktopKey::Character(*byte));
+    }
     real.handle(DesktopKey::Activate);
-    for byte in b"secret" {
+    let mismatch_blocked = real.screen == Screen::Confirm && real.confirm_len == 0;
+    for byte in b"tr1cky-Pass" {
+        real.handle(DesktopKey::Character(*byte));
+    }
+    real.handle(DesktopKey::Activate);
+    let welcomed = real.screen == Screen::Welcome;
+    real.handle(DesktopKey::Activate);
+    let hashed = welcomed
+        && real.screen == Screen::Lock
+        && real.credential.is_some()
+        && real.setup_password_len == 0
+        && real.setup_password_input == [0; MAX_NAME];
+    real.handle(DesktopKey::Character(b'x'));
+    let lock_wakes = real.screen == Screen::Login;
+    // A bare Enter and Escape must not sign in.
+    let bare_enter_blocked =
+        real.handle(DesktopKey::Activate) == DesktopAction::Redraw && real.screen == Screen::Login;
+    let escape_no_bypass =
+        real.handle(DesktopKey::Escape) == DesktopAction::Redraw && real.screen == Screen::Login;
+    let click_does_not_sign_in =
+        real.click(Point::new(376, 320)) == DesktopAction::Idle && real.screen == Screen::Login;
+    for byte in b"wrong" {
+        real.handle(DesktopKey::Character(*byte));
+    }
+    real.handle(DesktopKey::Activate);
+    let wrong_password_blocked = real.screen == Screen::Login && real.login_len == 0;
+    for byte in b"tr1cky-Pass" {
         real.handle(DesktopKey::Character(*byte));
     }
     real.handle(DesktopKey::Activate);
     let correct_password_signs_in = real.screen == Screen::Desktop;
+    let relocks = real.lock_session() && real.screen == Screen::Login;
 
-    let mut lock = DesktopState::new();
-    lock.handle(DesktopKey::Activate);
-    lock.handle(DesktopKey::Activate);
-    lock.handle(DesktopKey::Activate);
-    let any_key_unlocks = lock.screen == Screen::Lock
-        && lock.handle(DesktopKey::Character(b'x')) == DesktopAction::Redraw
-        && lock.screen == Screen::Login;
-    let mut skipped = DesktopState::new();
-    skipped.handle(DesktopKey::Escape);
-    let escape_skips = skipped.screen == Screen::Desktop;
     let mut hotkey = DesktopState::new();
+    hotkey.screen = Screen::Desktop;
     let dismissed = hotkey.handle(DesktopKey::Browser) == DesktopAction::Redraw
         && hotkey.screen == Screen::Desktop
         && hotkey.app == DesktopApp::Browser;
-    advanced
-        && bare_enter_blocked
-        && wrong_password_blocked
-        && click_does_not_sign_in
+    let no_account_no_lock = !hotkey.lock_session();
+    language_done
+        && empty_name_blocked
+        && empty_password_blocked
+        && weak_blocked
+        && click_blocked
+        && escape_blocked
+        && hotkey_blocked
         && username_captured
+        && on_confirm
+        && mismatch_blocked
+        && hashed
+        && lock_wakes
+        && bare_enter_blocked
+        && escape_no_bypass
+        && click_does_not_sign_in
+        && wrong_password_blocked
         && correct_password_signs_in
-        && any_key_unlocks
-        && escape_skips
+        && relocks
         && dismissed
+        && no_account_no_lock
+        && crate::auth::self_test()
 }
 
 fn url_parse_self_test() -> bool {
@@ -6777,7 +9415,9 @@ fn url_parse_self_test() -> bool {
         for byte in b"aeros.dev/x" {
             state.push_url_byte(*byte);
         }
+        FORCE_NATIVE_FETCH.store(true, core::sync::atomic::Ordering::Relaxed);
         state.submit_url();
+        FORCE_NATIVE_FETCH.store(false, core::sync::atomic::Ordering::Relaxed);
         state.browser_pending
             && state.browser_phase == BrowserPhase::Loading
             && state.browser_host_str() == "aeros.dev"
@@ -6786,31 +9426,15 @@ fn url_parse_self_test() -> bool {
     simple && scheme_and_path && secure && empty && spaces && bare && typed && submit
 }
 
-fn typed_caret(bytes: &[u8]) -> ClockBuffer {
-    let mut result = ClockBuffer::new();
-    let _ = result.write_str(core::str::from_utf8(bytes).unwrap_or(""));
-    let _ = result.write_str("_");
-    result
-}
-
-fn masked_caret(len: usize) -> ClockBuffer {
-    let mut result = ClockBuffer::new();
-    for _ in 0..len.min(MAX_NAME) {
-        let _ = result.write_str("*");
-    }
-    let _ = result.write_str("_");
-    result
-}
-
 fn time_text() -> ClockBuffer {
-    let current = crate::rtc::utc_date_time();
+    let current = crate::rtc::local_date_time();
     let mut result = ClockBuffer::new();
     let _ = write!(result, "{:02}:{:02}", current.hour, current.minute);
     result
 }
 
 fn date_text() -> ClockBuffer {
-    let current = crate::rtc::utc_date_time();
+    let current = crate::rtc::local_date_time();
     let mut result = ClockBuffer::new();
     let _ = write!(
         result,
@@ -6847,6 +9471,36 @@ fn empty_report(button: bool, input: bool) -> DesktopReport {
     }
 }
 
+/// A fixed 56-byte text buffer for the Shield toast.
+struct ClockBuffer56 {
+    bytes: [u8; 56],
+    len: usize,
+}
+
+impl ClockBuffer56 {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; 56],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
+    }
+}
+
+impl Write for ClockBuffer56 {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        // Truncate rather than fail: a long name still shows its start.
+        let room = self.bytes.len() - self.len;
+        let take = value.len().min(room);
+        self.bytes[self.len..self.len + take].copy_from_slice(&value.as_bytes()[..take]);
+        self.len += take;
+        Ok(())
+    }
+}
+
 struct ClockBuffer {
     bytes: [u8; 24],
     len: usize,
@@ -6876,3 +9530,911 @@ impl Write for ClockBuffer {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Motion helpers, the music hub, the volume HUD and the lock/login screens.
+// ---------------------------------------------------------------------------
+
+const MUSIC_TRACKS: [(&str, &str); 4] = [
+    ("Neon Drive", "AerOS Sessions"),
+    ("Glass Horizon", "Frost Ensemble"),
+    ("Low Orbit", "Kernel Panic"),
+    ("Blue Hour", "Dock and Roll"),
+];
+const MUSIC_COLORS: [(u8, u8, u8); 4] = [
+    (72, 156, 58),
+    (66, 112, 208),
+    (206, 86, 124),
+    (222, 158, 56),
+];
+const MUSIC_TRACK_NS: u64 = 200_000_000_000;
+const MUSIC_EXPAND_NS: u64 = 4_500_000_000;
+const MUSIC_SLIDE_NS: u64 = 520_000_000;
+const MUSIC_PAUSE_LINGER_NS: u64 = 2_500_000_000;
+const VOLUME_HUD_NS: u64 = 1_900_000_000;
+const VOLUME_SLIDE_NS: u64 = 380_000_000;
+/// Redraw interval for ambient (always moving) elements.
+const AMBIENT_FRAME_NS: u64 = 45_000_000;
+
+fn ease_out_back_milli(progress_milli: u32) -> i32 {
+    let u = progress_milli.min(1000) as i64 - 1000;
+    (1000 + 2702 * u * u * u / 1_000_000_000 + 1702 * u * u / 1_000_000) as i32
+}
+
+fn ease_in_out_milli(progress_milli: u32) -> i32 {
+    let t = progress_milli.min(1000) as i64;
+    (t * t * (3000 - 2 * t) / 1_000_000) as i32
+}
+
+/// Smooth periodic wave: phase in 0..1000, result in -1000..=1000.
+fn wave_milli(phase_milli: u64) -> i32 {
+    let p = (phase_milli % 1000) as i64;
+    let t = if p < 500 { p * 2 } else { (1000 - p) * 2 };
+    let s = t * t * (3000 - 2 * t) / 1_000_000;
+    (s * 2 - 1000) as i32
+}
+
+fn lerp_i32(from: i32, to: i32, t_milli: i32) -> i32 {
+    from + ((to - from) as i64 * t_milli as i64 / 1000) as i32
+}
+
+fn progress_of(now_ns: u64, start_ns: u64, duration_ns: u64) -> u32 {
+    (now_ns.saturating_sub(start_ns).min(duration_ns) * 1000 / duration_ns) as u32
+}
+
+fn mix_color(from: Color, to: Color, t_milli: i32) -> Color {
+    let t = t_milli.clamp(0, 1000);
+    let mix = |a: u8, b: u8| lerp_i32(a as i32, b as i32, t) as u8;
+    Color::rgb(
+        mix(from.red, to.red),
+        mix(from.green, to.green),
+        mix(from.blue, to.blue),
+    )
+}
+
+fn weekday_text() -> &'static str {
+    const NAMES: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    NAMES[((crate::rtc::local_seconds() / 86_400 + 4) % 7) as usize]
+}
+
+const ACCOUNT_PATH: &str = "/data/ACCOUNT.DAT";
+const ACCOUNT_MAGIC: &[u8; 4] = b"AEA1";
+
+impl DesktopState {
+    /// Keeps the account (name + salted password hash, never the password)
+    /// on the data disk so setup only happens once.
+    fn save_account(&self) {
+        let Some(credential) = self.credential else {
+            return;
+        };
+        if !self.persist_account {
+            return;
+        }
+        let mut buffer = [0u8; 5 + MAX_NAME + crate::auth::Credential::STORED_LEN];
+        buffer[..4].copy_from_slice(ACCOUNT_MAGIC);
+        buffer[4] = self.username_len as u8;
+        buffer[5..5 + self.username_len].copy_from_slice(&self.username_input[..self.username_len]);
+        let mut length = 5 + self.username_len;
+        buffer[length..length + crate::auth::Credential::STORED_LEN]
+            .copy_from_slice(&credential.to_bytes());
+        length += crate::auth::Credential::STORED_LEN;
+        let saved = match vfs::open_file(ACCOUNT_PATH, true, false, true, 0o600, true) {
+            Ok(descriptor) => {
+                let written = vfs::write(descriptor, &buffer[..length], false).is_ok();
+                let _ = vfs::close(descriptor);
+                written
+            }
+            Err(_) => false,
+        };
+        serial::format(format_args!("AEROS_ACCOUNT saved={saved}\n"));
+    }
+
+    #[cfg_attr(feature = "boot-test", allow(dead_code))]
+    fn load_account(&mut self) -> bool {
+        let mut buffer = [0u8; 5 + MAX_NAME + crate::auth::Credential::STORED_LEN + 1];
+        let Ok(descriptor) = vfs::open_file(ACCOUNT_PATH, false, false, false, 0, false) else {
+            return false;
+        };
+        let read = vfs::read(descriptor, &mut buffer);
+        let _ = vfs::close(descriptor);
+        let Ok(length) = read else {
+            return false;
+        };
+        let data = &buffer[..length];
+        if data.len() < 5 || &data[..4] != ACCOUNT_MAGIC {
+            return false;
+        }
+        let name_len = data[4] as usize;
+        if name_len == 0
+            || name_len > MAX_NAME
+            || data.len() != 5 + name_len + crate::auth::Credential::STORED_LEN
+        {
+            return false;
+        }
+        let Some(credential) = crate::auth::Credential::from_bytes(&data[5 + name_len..]) else {
+            return false;
+        };
+        self.username_input[..name_len].copy_from_slice(&data[5..5 + name_len]);
+        self.username_len = name_len;
+        self.credential = Some(credential);
+        true
+    }
+
+    fn apply_volume(&self) {
+        crate::audio::set_volume(if self.muted { 0 } else { self.volume });
+    }
+
+    fn music_now_elapsed(&self, now: u64) -> u64 {
+        if self.music_playing {
+            now.saturating_sub(self.music_started_ns)
+        } else {
+            self.music_elapsed_ns
+        }
+    }
+
+    fn music_visible(&self, now: u64) -> bool {
+        self.music_active
+            && (self.music_playing
+                || now < self.music_pause_ns.saturating_add(MUSIC_PAUSE_LINGER_NS))
+    }
+
+    fn music_expanded(&self, now: u64) -> bool {
+        now < self.music_expand_until_ns
+    }
+
+    fn music_bump(&mut self, now: u64, expand: bool) {
+        if expand {
+            if !self.music_expanded(now) {
+                self.music_expand_at_ns = now;
+            }
+            self.music_expand_until_ns = now + MUSIC_EXPAND_NS;
+        }
+        self.music_track_ns = now;
+        self.motion_until_ns = self
+            .motion_until_ns
+            .max(self.music_expand_until_ns + 400_000_000)
+            .max(now + 700_000_000);
+    }
+
+    fn music_toggle(&mut self) {
+        let now = crate::time::monotonic_nanoseconds();
+        if self.music_playing {
+            self.music_elapsed_ns = now.saturating_sub(self.music_started_ns);
+            self.music_playing = false;
+            self.music_pause_ns = now;
+            crate::audio::stop();
+        } else {
+            if !self.music_visible(now) {
+                self.music_shown_ns = now;
+            }
+            self.music_active = true;
+            self.music_playing = true;
+            self.music_started_ns = now.saturating_sub(self.music_elapsed_ns);
+            self.apply_volume();
+            if self.music_elapsed_ns == 0 {
+                crate::audio::play_song(self.music_track as usize);
+            } else {
+                crate::audio::resume();
+            }
+        }
+        self.music_bump(now, true);
+    }
+
+    fn music_skip(&mut self, step: i32) {
+        let now = crate::time::monotonic_nanoseconds();
+        if !self.music_visible(now) {
+            self.music_shown_ns = now;
+        }
+        let count = MUSIC_TRACKS.len() as i32;
+        self.music_track = (self.music_track as i32 + step).rem_euclid(count) as u8;
+        self.music_active = true;
+        self.music_playing = true;
+        self.music_elapsed_ns = 0;
+        self.music_started_ns = now;
+        self.apply_volume();
+        crate::audio::play_song(self.music_track as usize);
+        self.music_bump(now, true);
+    }
+
+    fn volume_step(&mut self, delta: i32) {
+        let now = crate::time::monotonic_nanoseconds();
+        self.volume_prev = self.shown_volume(now);
+        self.muted = false;
+        self.volume = (self.volume as i32 + delta).clamp(0, 100) as u8;
+        self.apply_volume();
+        self.volume_event_ns = now;
+        self.volume_hud_until_ns = now + VOLUME_HUD_NS;
+        self.motion_until_ns = self.motion_until_ns.max(self.volume_hud_until_ns);
+    }
+
+    fn toggle_mute(&mut self) {
+        let now = crate::time::monotonic_nanoseconds();
+        self.volume_prev = self.shown_volume(now);
+        self.muted = !self.muted;
+        self.apply_volume();
+        self.volume_event_ns = now;
+        self.volume_hud_until_ns = now + VOLUME_HUD_NS;
+        self.motion_until_ns = self.motion_until_ns.max(self.volume_hud_until_ns);
+    }
+
+    /// The level the HUD draws: eases from the previous level to the new one.
+    fn shown_volume(&self, now: u64) -> u8 {
+        let target = if self.muted { 0 } else { self.volume as i32 };
+        let t = ease_out_milli(progress_of(now, self.volume_event_ns, 240_000_000));
+        lerp_i32(self.volume_prev as i32, target, t as i32).clamp(0, 100) as u8
+    }
+
+    /// Something floating above the desktop is on screen or moving, so the
+    /// whole frame is repainted (no partial-region shortcuts).
+    fn top_layers_active(&self, now: u64) -> bool {
+        self.toast_visible(now)
+            || self.notify_center_visible(now)
+            || self.search_visible(now)
+            || self.preview_wanted()
+            || self.ctx_open
+            || now < self.brightness_hud_until_ns + VOLUME_SLIDE_NS
+            || now < self.volume_hud_until_ns + VOLUME_SLIDE_NS
+            || self.clip_open
+    }
+
+    fn ambient_active(&self, now: u64) -> bool {
+        self.music_visible(now)
+            || matches!(self.screen, Screen::Lock | Screen::Login | Screen::Welcome)
+            || self.power_action != shellui::PowerAction::None
+            || now < self.volume_hud_until_ns + VOLUME_SLIDE_NS
+    }
+
+    /// Geometry of the music hub in design coordinates for this instant:
+    /// (bounds, morph 0..=1000 where 1000 = fully expanded).
+    fn music_hub_geometry(&self, now: u64) -> (Rect, i32) {
+        let morph = if self.music_expanded(now) {
+            ease_out_back_milli(progress_of(now, self.music_expand_at_ns, 520_000_000))
+        } else {
+            1000 - ease_out_milli(progress_of(now, self.music_expand_until_ns, 320_000_000)) as i32
+        }
+        .clamp(-120, 1120);
+        let width = lerp_i32(176, 262, morph);
+        let height = lerp_i32(27, 96, morph).max(20);
+        let appear = ease_out_back_milli(progress_of(now, self.music_shown_ns, MUSIC_SLIDE_NS));
+        let leave = if self.music_playing {
+            0
+        } else {
+            ease_in_out_milli(progress_of(
+                now,
+                (self.music_pause_ns + MUSIC_PAUSE_LINGER_NS).saturating_sub(400_000_000),
+                400_000_000,
+            ))
+        };
+        let rise = (1000 - appear.min(1000)) + leave;
+        let y = -(height * rise.clamp(0, 1200) / 1000);
+        (
+            Rect::new(376 - width / 2, y, width, height),
+            morph.clamp(0, 1000),
+        )
+    }
+
+    /// A click anywhere outside the expanded hub folds it back up.
+    fn music_click_away(&mut self) {
+        let now = crate::time::monotonic_nanoseconds();
+        if self.screen == Screen::Desktop && self.music_expanded(now) {
+            self.music_expand_until_ns = now;
+            self.motion_until_ns = self.motion_until_ns.max(now + 500_000_000);
+        }
+    }
+
+    fn music_hub_click(&mut self, point: Point) -> Option<DesktopAction> {
+        let now = crate::time::monotonic_nanoseconds();
+        if !self.music_visible(now) {
+            return None;
+        }
+        let (bounds, morph) = self.music_hub_geometry(now);
+        if !bounds.contains(point) {
+            return None;
+        }
+        if self.music_expanded(now) && morph > 700 {
+            let controls_y = bounds.y + 56;
+            let button = |slot: i32| Rect::new(bounds.x + 76 + slot * 44, controls_y, 40, 28);
+            if button(0).contains(point) {
+                self.music_skip(-1);
+            } else if button(1).contains(point) {
+                self.music_toggle();
+            } else if button(2).contains(point) {
+                self.music_skip(1);
+            }
+        } else {
+            self.music_bump(now, true);
+        }
+        self.motion_until_ns = self.motion_until_ns.max(now + 700_000_000);
+        Some(DesktopAction::Redraw)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_triangle(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    x: i32,
+    cy: i32,
+    w: i32,
+    h: i32,
+    right: bool,
+    color: Rgba,
+) {
+    for i in 0..w {
+        let span = (h * (w - i) / w).max(1);
+        let column = if right { x + i } else { x + w - 1 - i };
+        painter.fill_rounded_rect(
+            layout.rect(Rect::new(column, cy - span / 2, 1, span)),
+            layout.radii(CornerRadii::all(0)),
+            color,
+        );
+    }
+}
+
+fn eq_level(playing: bool, now: u64, bar: u64) -> i32 {
+    if playing {
+        300 + 700 * (wave_milli(now / 3_000_000 + bar * 170) + 1000) / 2000
+    } else {
+        180
+    }
+}
+
+fn draw_music_hub(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    font: RasterFont,
+    state: &DesktopState,
+    now: u64,
+) {
+    if !state.music_visible(now) {
+        return;
+    }
+    let (bounds, morph) = state.music_hub_geometry(now);
+    if bounds.y + bounds.height <= 0 {
+        return;
+    }
+    let bottom = lerp_i32(13, 30, morph);
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(
+            bounds.x + 2,
+            bounds.y,
+            bounds.width - 4,
+            bounds.height + 4,
+        )),
+        layout.radii(CornerRadii::new(0, 0, bottom + 2, bottom + 2)),
+        Rgba::new(0, 0, 0, 34),
+    );
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(
+            bounds.x,
+            bounds.y - 8,
+            bounds.width,
+            bounds.height + 8,
+        )),
+        layout.radii(CornerRadii::new(0, 0, bottom, bottom)),
+        Rgba::new(4, 6, 8, 248),
+    );
+    let (r, g, b) = MUSIC_COLORS[state.music_track as usize % MUSIC_COLORS.len()];
+    let track = MUSIC_TRACKS[state.music_track as usize % MUSIC_TRACKS.len()];
+    let since_track = now.saturating_sub(state.music_track_ns);
+    // Track changes make the art square pop.
+    let pop = if since_track < 420_000_000 {
+        ease_out_back_milli(progress_of(now, state.music_track_ns, 420_000_000)) - 1000
+    } else {
+        0
+    };
+    if morph < 500 {
+        let art = 14 + pop / 120;
+        painter.fill_rounded_rect(
+            layout.rect(Rect::new(
+                bounds.x + 9 - (art - 14) / 2,
+                bounds.y + 10 - (art - 14) / 2,
+                art,
+                art,
+            )),
+            layout.radii(CornerRadii::all(4)),
+            Rgba::new(r, g, b, 255),
+        );
+        text(
+            painter,
+            layout,
+            font,
+            Point::new(bounds.x + 30, bounds.y + 11),
+            track.0,
+            9,
+            Color::rgb(232, 236, 240),
+        );
+        for bar in 0..4u64 {
+            let h = 3 + 10 * eq_level(state.music_playing, now, bar) / 1000;
+            painter.fill_rounded_rect(
+                layout.rect(Rect::new(
+                    bounds.x + bounds.width - 30 + bar as i32 * 5,
+                    bounds.y + 19 - h,
+                    3,
+                    h,
+                )),
+                layout.radii(CornerRadii::all(1)),
+                Rgba::new(r, g, b, 255),
+            );
+        }
+    } else {
+        let art = 62 + pop / 30;
+        painter.fill_rounded_rect(
+            layout.rect(Rect::new(
+                bounds.x + 14 - (art - 62) / 2,
+                bounds.y + 14 - (art - 62) / 2,
+                art,
+                art,
+            )),
+            layout.radii(CornerRadii::all(16)),
+            Rgba::new(r, g, b, 255),
+        );
+        painter.fill_rounded_rect(
+            layout.rect(Rect::new(bounds.x + 22, bounds.y + 22, 20, 20)),
+            layout.radii(CornerRadii::all(10)),
+            Rgba::new(255, 255, 255, 46),
+        );
+        text(
+            painter,
+            layout,
+            font,
+            Point::new(bounds.x + 86, bounds.y + 14),
+            track.0,
+            12,
+            Color::rgb(244, 246, 248),
+        );
+        text(
+            painter,
+            layout,
+            font,
+            Point::new(bounds.x + 86, bounds.y + 32),
+            track.1,
+            9,
+            Color::rgb(150, 158, 166),
+        );
+        let white = Rgba::new(244, 246, 248, 255);
+        let cy = bounds.y + 70;
+        draw_triangle(painter, layout, bounds.x + 88, cy, 8, 12, false, white);
+        draw_triangle(painter, layout, bounds.x + 95, cy, 8, 12, false, white);
+        if state.music_playing {
+            for offset in [0, 6] {
+                painter.fill_rounded_rect(
+                    layout.rect(Rect::new(bounds.x + 130 + offset, cy - 7, 4, 14)),
+                    layout.radii(CornerRadii::all(1)),
+                    white,
+                );
+            }
+        } else {
+            draw_triangle(painter, layout, bounds.x + 131, cy, 10, 14, true, white);
+        }
+        draw_triangle(painter, layout, bounds.x + 172, cy, 8, 12, true, white);
+        draw_triangle(painter, layout, bounds.x + 179, cy, 8, 12, true, white);
+        let elapsed = state.music_now_elapsed(now) % MUSIC_TRACK_NS;
+        let fill = (elapsed * 230 / MUSIC_TRACK_NS) as i32;
+        painter.fill_rounded_rect(
+            layout.rect(Rect::new(
+                bounds.x + 16,
+                bounds.y + bounds.height - 12,
+                230,
+                3,
+            )),
+            layout.radii(CornerRadii::all(1)),
+            Rgba::new(255, 255, 255, 50),
+        );
+        painter.fill_rounded_rect(
+            layout.rect(Rect::new(
+                bounds.x + 16,
+                bounds.y + bounds.height - 12,
+                fill.max(2),
+                3,
+            )),
+            layout.radii(CornerRadii::all(1)),
+            Rgba::new(r, g, b, 255),
+        );
+        for bar in 0..4u64 {
+            let h = 3 + 14 * eq_level(state.music_playing, now, bar) / 1000;
+            painter.fill_rounded_rect(
+                layout.rect(Rect::new(
+                    bounds.x + bounds.width - 30 + bar as i32 * 5,
+                    bounds.y + 28 - h,
+                    3,
+                    h,
+                )),
+                layout.radii(CornerRadii::all(1)),
+                Rgba::new(r, g, b, 255),
+            );
+        }
+    }
+}
+
+fn draw_leaf_mark(painter: &mut Painter<'_>, layout: Layout, center: Point, radius: i32, now: u64) {
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(
+            center.x - radius,
+            center.y - radius,
+            radius * 2,
+            radius * 2,
+        )),
+        layout.radii(CornerRadii::all(radius)),
+        Rgba::new(4, 5, 6, 252),
+    );
+    let mask = crate::logo::rgba();
+    let box_w = (radius * 190 / 100).max(4);
+    let box_h = box_w * crate::logo::HEIGHT as i32 / crate::logo::WIDTH as i32;
+    let shimmer = (now / 8_000_000) as i32;
+    let step = 2;
+    let mut y = -box_h / 2;
+    while y < box_h / 2 {
+        let mut x = -box_w / 2;
+        while x < box_w / 2 {
+            let u = ((x + box_w / 2) * crate::logo::WIDTH as i32 / box_w) as usize;
+            let v = ((y + box_h / 2) * crate::logo::HEIGHT as i32 / box_h) as usize;
+            let covered = u < crate::logo::WIDTH
+                && v < crate::logo::HEIGHT
+                && mask[(v * crate::logo::WIDTH + u) * 4 + 3] > 140;
+            if covered {
+                let glint = ((x * 3 + y * 5 + shimmer) & 63) < 4;
+                let alpha = if glint { 255 } else { 205 };
+                painter.fill_rounded_rect(
+                    layout.rect(Rect::new(center.x + x, center.y + y, 2, 2)),
+                    layout.radii(CornerRadii::all(1)),
+                    Rgba::new(230, 236, 240, alpha),
+                );
+            }
+            x += step;
+        }
+        y += step;
+    }
+}
+
+/// The glass square holding the account mark, with a floating bob and a
+/// slow pulsing halo. `size` already includes any pop-in scaling.
+fn draw_account_tile(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    center: Point,
+    size: i32,
+    now: u64,
+    cheap: bool,
+    seed: u32,
+) -> bool {
+    let bob = wave_milli(now / 3_000_000) * 3 / 1000;
+    let halo_phase = (now / 2_400_000) % 1000;
+    let halo = (halo_phase as i32) * 14 / 1000;
+    let halo_alpha = (70 - (halo_phase as i32) * 70 / 1000).max(0) as u8;
+    let tile = Rect::new(center.x - size / 2, center.y - size / 2 + bob, size, size);
+    let radius = size * 28 / 100;
+    painter.stroke_rounded_rect(
+        layout.rect(Rect::new(
+            tile.x - halo,
+            tile.y - halo,
+            tile.width + halo * 2,
+            tile.height + halo * 2,
+        )),
+        layout.radii(CornerRadii::all(radius + halo)),
+        2,
+        Rgba::new(255, 255, 255, halo_alpha),
+    );
+    let _ = frost_mode(
+        painter,
+        layout,
+        tile,
+        CornerRadii::all(radius),
+        setup_card_style(),
+        seed,
+        // The tile sits on a smooth wallpaper, so a flat tint reads the
+        // same as the blur and keeps every animated frame cheap.
+        true,
+    );
+    let _ = cheap;
+    painter.fill_rounded_rect(
+        layout.rect(tile),
+        layout.radii(CornerRadii::all(radius)),
+        Rgba::new(150, 156, 160, 52),
+    );
+    draw_leaf_mark(
+        painter,
+        layout,
+        Point::new(tile.x + size / 2, tile.y + size / 2),
+        size * 36 / 100,
+        now,
+    );
+    true
+}
+
+fn draw_lock(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    font: RasterFont,
+    state: &DesktopState,
+    now: u64,
+    cheap: bool,
+) -> bool {
+    let entered = now.saturating_sub(state.screen_transition_at_ns);
+    let rise = 1000 - ease_out_milli(progress_of(entered, 0, 700_000_000)) as i32;
+    let pop = ease_out_back_milli(progress_of(entered, 120_000_000, 720_000_000)).max(0);
+    let clock = time_text();
+    let breathe = wave_milli(now / 4_000_000).abs();
+    centered_text(
+        painter,
+        layout,
+        font,
+        Rect::new(LOGIN_CARD.x, 40 + rise * 26 / 1000, LOGIN_CARD.width, 64),
+        clock.as_str(),
+        56,
+        mix_color(
+            Color::rgb(255, 255, 255),
+            Color::rgb(226, 238, 246),
+            breathe,
+        ),
+    );
+    let mut date = ClockBuffer::new();
+    let current = crate::rtc::local_date_time();
+    let _ = write!(
+        date,
+        "{}  {}/{}/{:02}",
+        weekday_text(),
+        current.day,
+        current.month,
+        current.year % 100
+    );
+    centered_text(
+        painter,
+        layout,
+        font,
+        Rect::new(LOGIN_CARD.x, 102 + rise * 34 / 1000, LOGIN_CARD.width, 18),
+        date.as_str(),
+        11,
+        Color::rgb(232, 238, 242),
+    );
+    let captured = draw_account_tile(
+        painter,
+        layout,
+        Point::new(376, 236),
+        (128 * pop / 1000).max(8),
+        now,
+        cheap,
+        0xae5e_0020,
+    );
+    let hint_glow = (wave_milli(now / 5_000_000) + 1000) / 2;
+    centered_text(
+        painter,
+        layout,
+        font,
+        Rect::new(LOGIN_CARD.x, 336 + rise * 30 / 1000, LOGIN_CARD.width, 22),
+        state.display_name(),
+        16,
+        Color::rgb(244, 247, 249),
+    );
+    centered_text(
+        painter,
+        layout,
+        font,
+        Rect::new(LOGIN_CARD.x, 362 + rise * 40 / 1000, LOGIN_CARD.width, 20),
+        "Press any key",
+        11,
+        mix_color(
+            Color::rgb(190, 200, 208),
+            Color::rgb(255, 255, 255),
+            hint_glow,
+        ),
+    );
+    captured
+}
+
+fn draw_signin(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    font: RasterFont,
+    state: &DesktopState,
+    now_ns: u64,
+    cheap: bool,
+) -> bool {
+    let entered = now_ns.saturating_sub(state.screen_transition_at_ns);
+    let rise = 1000 - ease_out_milli(progress_of(entered, 0, 600_000_000)) as i32;
+    let pop = ease_out_back_milli(progress_of(entered, 60_000_000, 680_000_000)).max(0);
+    centered_text(
+        painter,
+        layout,
+        font,
+        Rect::new(LOGIN_CARD.x, 44 + rise * 24 / 1000, LOGIN_CARD.width, 34),
+        "Welcome back",
+        26,
+        Color::rgb(248, 250, 252),
+    );
+    let captured = draw_account_tile(
+        painter,
+        layout,
+        Point::new(376, 170),
+        (112 * pop / 1000).max(8),
+        now_ns,
+        cheap,
+        0xae5e_0021,
+    );
+    centered_text(
+        painter,
+        layout,
+        font,
+        Rect::new(LOGIN_CARD.x, 240 + rise * 30 / 1000, LOGIN_CARD.width, 22),
+        state.display_name(),
+        14,
+        Color::rgb(240, 244, 247),
+    );
+    let error_active = now_ns < state.login_error_until_ns;
+    let error_started = state.login_error_until_ns.saturating_sub(LOGIN_ERROR_NS);
+    let shake = if error_active && now_ns.saturating_sub(error_started) < 520_000_000 {
+        let p = progress_of(now_ns, error_started, 520_000_000) as i64;
+        (wave_milli((p * 4) as u64) as i64 * 13 * (1000 - p) / 1_000_000) as i32
+    } else {
+        0
+    };
+    let grow = ease_out_back_milli(progress_of(entered, 220_000_000, 620_000_000)).max(0);
+    let width = (220 * grow / 1000).max(40);
+    let field = Rect::new(376 - width / 2 + shake, 296 + rise * 34 / 1000, width, 48);
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(
+            field.x - 2,
+            field.y + 3,
+            field.width + 4,
+            field.height + 2,
+        )),
+        layout.radii(CornerRadii::all(26)),
+        Rgba::new(0, 0, 0, 34),
+    );
+    let flash = if error_active {
+        mix_color(
+            Color::rgb(255, 255, 255),
+            Color::rgb(250, 208, 202),
+            wave_milli(now_ns / 2_000_000).abs(),
+        )
+    } else {
+        Color::rgb(255, 255, 255)
+    };
+    painter.fill_rounded_rect(
+        layout.rect(field),
+        layout.radii(CornerRadii::all(24)),
+        Rgba::new(flash.red, flash.green, flash.blue, 244),
+    );
+    if error_active {
+        let pop = ease_out_back_milli(progress_of(now_ns, error_started, 360_000_000)).max(0);
+        panels::icon_cross(
+            painter,
+            layout,
+            Point::new(field.x + width - 30, field.y + 24),
+            (11 * pop / 1000).max(3),
+            Rgba::new(232, 54, 42, 255),
+        );
+    }
+    // Typed characters appear as dots that pop in one by one.
+    let dots = state.login_len.min(14) as i32;
+    if dots == 0 {
+        let blink = (now_ns / 500_000_000).is_multiple_of(2);
+        if blink && width > 100 {
+            painter.fill_rounded_rect(
+                layout.rect(Rect::new(field.x + width / 2 - 1, field.y + 14, 2, 20)),
+                layout.radii(CornerRadii::all(1)),
+                Rgba::new(70, 84, 92, 200),
+            );
+        }
+    } else {
+        let step = 13;
+        let start = field.x + width / 2 - (dots * step) / 2 + step / 2;
+        for index in 0..dots {
+            let pop_dot = if index == dots - 1 {
+                ease_out_back_milli(progress_of(now_ns, state.login_typed_ns, 220_000_000)).max(0)
+            } else {
+                1000
+            };
+            let size = (9 * pop_dot / 1000).max(2);
+            painter.fill_rounded_rect(
+                layout.rect(Rect::new(
+                    start + index * step - size / 2,
+                    field.y + 24 - size / 2,
+                    size,
+                    size,
+                )),
+                layout.radii(CornerRadii::all(size / 2)),
+                Rgba::new(38, 52, 60, 255),
+            );
+        }
+    }
+    let wait = state.lockout.seconds_left(now_ns);
+    let mut wait_text = ClockBuffer::new();
+    let hint = if wait > 0 {
+        let _ = write!(wait_text, "Locked - wait {wait}s");
+        wait_text.as_str()
+    } else if error_active {
+        "Incorrect password"
+    } else {
+        "Press Enter to sign in"
+    };
+    let hint_color = if error_active || wait > 0 {
+        Color::rgb(238, 132, 124)
+    } else {
+        Color::rgb(222, 228, 234)
+    };
+    centered_text(
+        painter,
+        layout,
+        font,
+        Rect::new(LOGIN_CARD.x, 362 + rise * 40 / 1000, LOGIN_CARD.width, 22),
+        hint,
+        11,
+        hint_color,
+    );
+    captured
+}
+
+struct DockCache(UnsafeCell<[u32; 320_000]>);
+
+unsafe impl Sync for DockCache {}
+
+static DOCK_CACHE: DockCache = DockCache(UnsafeCell::new([0; 320_000]));
+static DOCK_CACHE_KEY: AtomicU64 = AtomicU64::new(0);
+
+/// The dock is drawn from static art and the clock, so once its entrance and
+/// press animations are over it looks identical from frame to frame.
+fn dock_is_settled(state: &DesktopState, now: u64) -> bool {
+    let entrance_end = state.dock_entrance_at_ns
+        + DOCK_FALL_NS
+        + DOCK_BUTTONS.len() as u64 * DOCK_FALL_STAGGER_NS
+        + 200_000_000;
+    now > entrance_end
+        && now > state.hover_at_ns.saturating_add(460_000_000)
+        && state
+            .dock_release_ns
+            .iter()
+            .all(|release| now > release.saturating_add(400_000_000))
+}
+
+fn dock_cache_key(layout: Layout, region: Rect) -> u64 {
+    let time = time_text();
+    let date = date_text();
+    let mut key: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |value: u64| {
+        key ^= value;
+        key = key.wrapping_mul(0x100_0000_01b3);
+    };
+    for byte in time.as_str().bytes().chain(date.as_str().bytes()) {
+        mix(byte as u64);
+    }
+    mix(region.x as u64);
+    mix(region.y as u64);
+    mix(region.width as u64);
+    mix(region.height as u64);
+    mix(layout.offset.x as u64);
+    mix(layout.offset.y as u64);
+    mix(wallpaper_valid() as u64);
+    key | 1
+}
+
+struct SetupCache(UnsafeCell<[u32; 1_200_000]>);
+
+unsafe impl Sync for SetupCache {}
+
+static SETUP_CACHE: SetupCache = SetupCache(UnsafeCell::new([0; 1_200_000]));
+static SETUP_CACHE_KEY: AtomicU64 = AtomicU64::new(0);
+
+struct WindowCache(UnsafeCell<[u32; 1_800_000]>);
+
+unsafe impl Sync for WindowCache {}
+
+static WINDOW_CACHE: WindowCache = WindowCache(UnsafeCell::new([0; 1_800_000]));
+static WINDOW_CACHE_KEY: AtomicU64 = AtomicU64::new(0);
+
+const PANEL_CACHE_PIXELS: usize = 1_920 * 1_080;
+
+struct PanelCache(UnsafeCell<[u32; PANEL_CACHE_PIXELS]>);
+
+unsafe impl Sync for PanelCache {}
+
+static PANEL_CACHE: PanelCache = PanelCache(UnsafeCell::new([0; PANEL_CACHE_PIXELS]));
+static PANEL_CACHE_KEY: AtomicU64 = AtomicU64::new(0);
+
+fn frame_pixels(bounds: Rect) -> usize {
+    (bounds.width.max(0) as usize) * (bounds.height.max(0) as usize)
+}
+
+/// True while an animation is running: frosted panels drop the blur for a flat
+/// tint so each frame stays cheap (the real glass returns once motion ends).
+static MOTION_CHEAP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

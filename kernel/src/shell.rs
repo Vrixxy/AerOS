@@ -25,6 +25,7 @@ pub struct SystemInfo<'a> {
     pub memory: &'a BootMemoryMap,
     pub allocator: AllocatorStats,
     pub pci: &'a PciInventory,
+    #[allow(dead_code)]
     pub storage: AhciReport,
     pub fat: FatReport,
     pub network: NetworkReport,
@@ -44,6 +45,7 @@ pub struct ShellReport {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Handler {
+    Notify,
     Help,
     Man,
     Clear,
@@ -95,6 +97,7 @@ enum Handler {
     Shutdown,
     Ear,
     Run,
+    Av,
 }
 
 #[derive(Clone, Copy)]
@@ -122,7 +125,14 @@ const fn command(
     }
 }
 
-static COMMANDS: [CommandSpec; 51] = [
+static COMMANDS: [CommandSpec; 53] = [
+    command(
+        "notify",
+        "notify <message...>",
+        "show a desktop notification",
+        false,
+        Handler::Notify,
+    ),
     command(
         "help",
         "help [command]",
@@ -457,10 +467,17 @@ static COMMANDS: [CommandSpec; 51] = [
     ),
     command(
         "run",
-        "run <path>",
+        "run <path> [args...]",
         "load and execute a real ELF binary as a scheduled process",
         false,
         Handler::Run,
+    ),
+    command(
+        "av",
+        "av <scan [--clean] [path]|status|log|realtime [on|off]|hash <file>|quarantine|restore <id>|delete <id>|test>",
+        "AerOS Shield antivirus: scan, quarantine, status",
+        false,
+        Handler::Av,
     ),
 ];
 
@@ -825,6 +842,16 @@ impl<'a> Shell<'a> {
             Handler::Man => self.command_man(arguments, offset, output),
             Handler::Clear => return Control::Clear,
             Handler::Echo => self.command_echo(arguments, offset, output),
+            Handler::Notify => {
+                let mut message: Text<64> = Text::new();
+                for index in offset..arguments.count {
+                    if index != offset {
+                        let _ = write!(message, " ");
+                    }
+                    let _ = write!(message, "{}", arguments.get(index).unwrap_or(""));
+                }
+                crate::notify::push(0, "Terminal", message.as_str());
+            }
             Handler::Pwd => {
                 let _ = writeln!(output, "{}", self.cwd.as_str());
             }
@@ -841,6 +868,7 @@ impl<'a> Shell<'a> {
             Handler::Cp => self.command_cp(arguments, offset, output),
             Handler::Mv => self.command_mv(arguments, offset, output),
             Handler::Chmod => self.command_chmod(arguments, offset, output),
+            Handler::Av => self.command_av(arguments, offset, output),
             Handler::Uname => self.command_uname(arguments, offset, output),
             Handler::Hostname => self.command_hostname(arguments, offset, output),
             Handler::Whoami => {
@@ -1306,11 +1334,35 @@ impl Shell<'_> {
                 return;
             }
         };
+        if let Some(found) = crate::antivirus::scan_bytes(file.data)
+            && found.class != crate::antivirus::Class::Info
+        {
+            let _ = writeln!(
+                output,
+                "run: blocked by AerOS Shield: {} ({})",
+                found.name,
+                found.class.label()
+            );
+            self.last_status = 126;
+            return;
+        }
         let Some(state) = crate::arch::paging::boot_state() else {
             self.fail(output, "run", "paging not ready");
             return;
         };
-        let Some((id, _slot, _space)) = crate::scheduler::spawn_process(&state, file.data) else {
+        let mut argv: [&[u8]; 16] = [&[]; 16];
+        argv[0] = path.as_str().as_bytes();
+        let mut argc = 1;
+        while argc < argv.len() {
+            let Some(value) = arguments.get(offset + argc) else {
+                break;
+            };
+            argv[argc] = value.as_bytes();
+            argc += 1;
+        }
+        let Some((id, _slot, _space)) =
+            crate::scheduler::spawn_process_with(&state, file.data, path.as_str(), &argv[..argc])
+        else {
             self.fail(output, "run", "not a valid executable");
             return;
         };
@@ -1319,6 +1371,203 @@ impl Shell<'_> {
                 let _ = writeln!(output, "[{} exited with {}]", path.as_str(), exit_code);
             }
             None => self.fail(output, "run", "process did not exit"),
+        }
+    }
+
+    fn command_av(&mut self, arguments: &Arguments, offset: usize, output: &mut Text<MAX_OUTPUT>) {
+        use crate::antivirus as av;
+        match arguments.get(offset) {
+            None | Some("status") => {
+                let status = av::status();
+                let _ = writeln!(
+                    output,
+                    "AerOS Shield  realtime protection: {}",
+                    if av::realtime_enabled() { "on" } else { "OFF" }
+                );
+                let _ = writeln!(output, "signatures:   {}", status.signatures);
+                let _ = writeln!(output, "files scanned {}", status.files_scanned);
+                let _ = writeln!(output, "threats found {}", status.threats_found);
+                let _ = writeln!(
+                    output,
+                    "programs checked {} (blocked {})",
+                    status.execs_checked, status.execs_blocked
+                );
+                let _ = writeln!(output, "in quarantine {}", status.quarantined);
+            }
+            Some("scan") => {
+                let mut index = offset + 1;
+                let clean = arguments.get(index) == Some("--clean");
+                if clean {
+                    index += 1;
+                }
+                let mut path = Text::new();
+                if self
+                    .make_path(arguments.get(index).unwrap_or("/"), &mut path)
+                    .is_err()
+                {
+                    self.fail(output, "av", "invalid path");
+                    return;
+                }
+                let mut report = av::Report::new();
+                av::scan_path(path.as_str(), clean, &mut report);
+                for finding in report.findings.iter().flatten() {
+                    let _ = write!(
+                        output,
+                        "[{}] {}  {}",
+                        finding.detection.class.label(),
+                        finding.detection.name,
+                        finding.path.as_str()
+                    );
+                    match finding.quarantined {
+                        Some(id) => {
+                            let _ = writeln!(output, "  -> #{id}");
+                        }
+                        None => {
+                            let _ = writeln!(output);
+                        }
+                    }
+                }
+                let _ = writeln!(
+                    output,
+                    "scanned {} files: {} threats, {} notes, {} unreadable",
+                    report.files, report.threats, report.infos, report.errors
+                );
+                if report.threats > 0 && !clean {
+                    let _ = writeln!(
+                        output,
+                        "run \"av scan --clean {}\" to quarantine them",
+                        path.as_str()
+                    );
+                }
+                if report.threats > 0 {
+                    self.last_status = 1;
+                }
+            }
+            Some("hash") => {
+                let Some(input) = arguments.get(offset + 1) else {
+                    self.usage_named(output, "av");
+                    return;
+                };
+                let mut path = Text::new();
+                if self.make_path(input, &mut path).is_err() {
+                    self.fail(output, "av", "invalid path");
+                    return;
+                }
+                match av::scan_file(path.as_str()) {
+                    Ok((found, digest)) => {
+                        for byte in digest {
+                            let _ = write!(output, "{byte:02x}");
+                        }
+                        let _ = writeln!(output, "  {}", path.as_str());
+                        if let Some(found) = found {
+                            let _ = writeln!(
+                                output,
+                                "verdict: {} ({})",
+                                found.name,
+                                found.class.label()
+                            );
+                        } else {
+                            let _ = writeln!(output, "verdict: clean");
+                        }
+                    }
+                    Err(failure) => self.fail_vfs(output, "av", failure),
+                }
+            }
+            Some("quarantine") => {
+                let mut any = false;
+                av::quarantine_list(|entry| {
+                    any = true;
+                    let _ = writeln!(
+                        output,
+                        "#{} {}  from {}",
+                        entry.id,
+                        entry.name,
+                        entry.original.as_str()
+                    );
+                });
+                if !any {
+                    let _ = writeln!(output, "quarantine is empty");
+                }
+            }
+            Some(action @ ("restore" | "delete")) => {
+                if self.effective_uid != 0 {
+                    self.fail(output, "av", "needs elevation: use ear av ...");
+                    return;
+                }
+                let Some(id) = arguments
+                    .get(offset + 1)
+                    .and_then(|value| value.parse::<u32>().ok())
+                else {
+                    self.usage_named(output, "av");
+                    return;
+                };
+                let result = if action == "restore" {
+                    av::restore(id)
+                } else {
+                    av::delete(id)
+                };
+                match result {
+                    Ok(()) => {
+                        let _ = writeln!(output, "{action}d #{id}");
+                    }
+                    Err(reason) => self.fail(output, "av", reason),
+                }
+            }
+            Some("realtime") => match arguments.get(offset + 1) {
+                Some(choice @ ("on" | "off")) => {
+                    if self.effective_uid != 0 {
+                        self.fail(output, "av", "needs elevation: use ear av realtime ...");
+                        return;
+                    }
+                    av::set_realtime(choice == "on");
+                    let _ = writeln!(output, "realtime protection {choice}");
+                }
+                None => {
+                    let _ = writeln!(
+                        output,
+                        "realtime protection is {}",
+                        if av::realtime_enabled() { "on" } else { "off" }
+                    );
+                }
+                Some(_) => self.usage_named(output, "av"),
+            },
+            Some("log") => {
+                let mut any = false;
+                av::events(|event| {
+                    any = true;
+                    let _ = writeln!(
+                        output,
+                        "#{} {}: {}  {}",
+                        event.seq,
+                        event.kind,
+                        event.name,
+                        event.path.as_str()
+                    );
+                });
+                if !any {
+                    let _ = writeln!(output, "no events yet");
+                }
+            }
+            Some("test") => {
+                // Drops the harmless industry-standard antivirus test file.
+                let test = av::eicar();
+                match vfs::open_file("/tmp/eicar.com.txt", true, false, true, 0o644, true) {
+                    Ok(descriptor) => {
+                        let _ = vfs::write(descriptor, &test, false);
+                        let _ = vfs::close(descriptor);
+                        let _ =
+                            writeln!(output, "wrote /tmp/eicar.com.txt (the standard test file)");
+                        if av::realtime_enabled() && vfs::metadata("/tmp/eicar.com.txt").is_err() {
+                            let _ =
+                                writeln!(output, "realtime protection quarantined it: see av log");
+                        } else {
+                            let _ = writeln!(output, "now run: av scan /tmp");
+                        }
+                    }
+                    Err(failure) => self.fail_vfs(output, "av", failure),
+                }
+            }
+            Some(_) => self.usage_named(output, "av"),
         }
     }
 
@@ -1681,23 +1930,47 @@ impl Shell<'_> {
     }
 
     fn command_lsblk(&mut self, output: &mut Text<MAX_OUTPUT>) {
-        if !self.info.storage.present {
-            self.fail(output, "lsblk", "no block device detected");
-            return;
+        use crate::fatfs::Disk;
+        let mut disks = [None; 8];
+        let mut count = 0;
+        for index in 0..crate::ahci::disk_count().min(3) {
+            disks[count] = Some(Disk::Ahci(index));
+            count += 1;
         }
-        let bytes = self
-            .info
-            .storage
-            .sectors
-            .saturating_mul(self.info.storage.sector_bytes as u64);
-        let _ = writeln!(output, "NAME   SIZE MiB  TYPE  FILESYSTEM  MODEL");
-        let _ = writeln!(
-            output,
-            "sda    {:>8}  disk  FAT{}       {}",
-            bytes / 1024 / 1024,
-            self.info.fat.fat_bits,
-            self.info.storage.model()
-        );
+        for disk in [Disk::Nvme, Disk::Usb, Disk::Sd, Disk::Virtio] {
+            disks[count] = Some(disk);
+            count += 1;
+        }
+        let _ = writeln!(output, "NAME      SIZE MiB  TYPE  MOUNTPOINT");
+        let mut listed = false;
+        for disk in disks.into_iter().flatten() {
+            let sectors = disk.sectors();
+            if sectors == 0 {
+                continue;
+            }
+            listed = true;
+            let name = crate::datafs::device_name(disk);
+            let mut mount_path: Text<32> = Text::new();
+            let mut index = 0;
+            while index < 4 {
+                if let Some(mount) = crate::datafs::mount_info(index)
+                    && mount.device == name
+                {
+                    let _ = mount_path.push_str_checked(mount.path());
+                }
+                index += 1;
+            }
+            let _ = writeln!(
+                output,
+                "{:<9} {:>8}  disk  {}",
+                name,
+                sectors * 512 / 1024 / 1024,
+                mount_path.as_str()
+            );
+        }
+        if !listed {
+            self.fail(output, "lsblk", "no block device detected");
+        }
     }
 
     fn command_mount(
@@ -1712,6 +1985,19 @@ impl Shell<'_> {
         }
         let _ = writeln!(output, "initramfs on / type initramfs (ro)");
         let _ = writeln!(output, "tmpfs on /tmp type tmpfs (rw,nosuid,nodev)");
+        let mut index = 0;
+        while index < 4 {
+            if let Some(mount) = crate::datafs::mount_info(index) {
+                let _ = writeln!(
+                    output,
+                    "{} on {} type fat{} (rw)",
+                    mount.device,
+                    mount.path(),
+                    if mount.fat32 { 32 } else { 16 }
+                );
+            }
+            index += 1;
+        }
         if self.info.fat.mounted {
             let _ = writeln!(
                 output,
@@ -1731,6 +2017,16 @@ impl Shell<'_> {
             self.usage_named(output, "umount");
             return;
         };
+        if let Some(name) = path.strip_prefix("/media/") {
+            match crate::datafs::eject(name.trim_end_matches('/')) {
+                Ok(()) => {
+                    let _ = writeln!(output, "{path} unmounted; it is safe to remove");
+                }
+                Err(vfs::VfsError::Busy) => self.fail(output, "umount", "target is busy"),
+                Err(_) => self.fail(output, "umount", "not mounted"),
+            }
+            return;
+        }
         match path {
             "/" | "/tmp" => self.fail(
                 output,
@@ -1765,6 +2061,21 @@ impl Shell<'_> {
             stats.mutable_bytes.div_ceil(1024),
             tmp_capacity.saturating_sub(stats.mutable_bytes) / 1024
         );
+        let mut index = 0;
+        while index < 4 {
+            if let Some(mount) = crate::datafs::mount_info(index) {
+                let _ = writeln!(
+                    output,
+                    "{:<12} {:>9}  {:>4}  {:>9}  {}",
+                    mount.device,
+                    mount.total_bytes / 1024,
+                    (mount.total_bytes - mount.free_bytes) / 1024,
+                    mount.free_bytes / 1024,
+                    mount.path()
+                );
+            }
+            index += 1;
+        }
     }
 
     fn command_sync(&mut self, output: &mut Text<MAX_OUTPUT>) {
@@ -2255,11 +2566,17 @@ pub fn self_test(info: SystemInfo<'_>) -> ShellReport {
         parser,
         privilege,
         filesystem,
-        verified: COMMANDS.len() == 51 && unique && parser && privilege && filesystem,
+        verified: COMMANDS.len() == 53 && unique && parser && privilege && filesystem,
     }
 }
 
 pub(crate) fn scancode_character(code: u8, shift: bool, caps: bool) -> Option<u8> {
+    crate::keymap::ascii(code, shift, caps)
+}
+
+/// The original US-only mapping (kept for reference/tests of the shell).
+#[allow(dead_code)]
+fn scancode_character_us(code: u8, shift: bool, caps: bool) -> Option<u8> {
     let base = match code {
         0x02 => b'1',
         0x03 => b'2',

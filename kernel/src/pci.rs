@@ -143,6 +143,20 @@ impl PciInventory {
         observed & 0x0006 == 0x0006
     }
 
+    /// I/O space + bus mastering, for legacy port-I/O devices such as AC'97.
+    pub fn enable_io_bus_master(&self, device: PciDevice) -> bool {
+        let command = read16(device.bus, device.slot, device.function, 0x04);
+        write16(
+            device.bus,
+            device.slot,
+            device.function,
+            0x04,
+            command | 0x0005,
+        );
+        let observed = read16(device.bus, device.slot, device.function, 0x04);
+        observed & 0x0005 == 0x0005
+    }
+
     pub fn log_devices(&self) {
         for entry in &self.devices[..self.count] {
             serial::format(format_args!(

@@ -24,9 +24,10 @@ pub struct LoadingView {
     pub stage: &'static str,
     /// 0..=1000; an estimate, not a promise.
     pub progress_permille: u16,
-    /// Seconds since loading began (for spinners, "taking longer than
-    /// usual" hints and so on).
+    /// Seconds since loading began ("taking longer than usual" hints).
     pub elapsed_secs: u32,
+    /// Milliseconds since loading began (for animation).
+    pub elapsed_ms: u64,
 }
 
 impl LoadingView {
@@ -46,34 +47,34 @@ impl LoadingView {
 /// guest agent have published so far. `None` once its desktop is up (the
 /// windows table exists), or when nothing asked for Linux.
 pub fn linux_view(started_ns: u64, now_ns: u64) -> Option<LoadingView> {
-    if crate::svm::linux_windows().is_some() {
+    if crate::svm::linux_windows().is_some_and(|windows| windows.count > 0) {
         return None;
     }
-    let elapsed_secs = (now_ns.saturating_sub(started_ns) / 1_000_000_000) as u32;
-    let (stage, floor) = if !crate::svm::linux_ready() {
-        ("Preparing Linux", 0)
+    let elapsed_ms = now_ns.saturating_sub(started_ns) / 1_000_000;
+    let elapsed_secs = (elapsed_ms / 1000) as u32;
+    let stage = if !crate::svm::linux_ready() {
+        "Preparing Linux"
     } else if elapsed_secs < 8 {
-        ("Starting the kernel", 60)
+        "Starting the kernel"
     } else if elapsed_secs < 25 {
-        ("Starting services", 300)
+        "Starting services"
     } else {
-        ("Starting the desktop", 600)
+        "Starting the desktop"
     };
-    // Creeps towards 95% so the bar never looks stuck or finished early;
-    // 60 s is about a normal start.
-    let creep = (elapsed_secs.min(60) * 950 / 60) as u16;
     Some(LoadingView {
         kind: LoadingKind::Linux,
         stage,
-        progress_permille: creep.max(floor).min(950),
+        progress_permille: creeping_progress(elapsed_ms),
         elapsed_secs,
+        elapsed_ms,
     })
 }
 
-/// Tips shown under the logo, rotated every few seconds.
-const TIPS: [&str; 1] = ["Tip: [Insert Tip here]"];
-
-/// The tip to show after `elapsed_secs` of loading.
-pub fn tip(elapsed_secs: u32) -> &'static str {
-    TIPS[(elapsed_secs / 8) as usize % TIPS.len()]
+/// A smooth estimate: eases out towards 95% over about a minute (a normal
+/// start), so the bar keeps moving without ever looking finished early.
+pub fn creeping_progress(elapsed_ms: u64) -> u16 {
+    let progress = (elapsed_ms.min(60_000) * 1000 / 60_000) as u32;
+    let inverse = 1000 - progress;
+    let eased = 1000 - inverse * inverse / 1000;
+    (eased * 950 / 1000) as u16
 }

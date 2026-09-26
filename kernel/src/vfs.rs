@@ -1,9 +1,10 @@
+use crate::datafs;
 use crate::fat;
 use crate::sync::TicketLock;
 
 const MAX_NODES: usize = 32;
 const MAX_HANDLES: usize = 24;
-const MAX_NAME: usize = 48;
+pub const MAX_NAME: usize = 255;
 const MAX_DEPTH: usize = 16;
 const ROOT_NODE: u16 = 0;
 const READ_BITS: u16 = 0o444;
@@ -194,6 +195,8 @@ struct OpenHandle {
     generation: u16,
     cursor: usize,
     open: bool,
+    /// Written through this handle since it was opened (scanned on close).
+    dirty: bool,
 }
 
 impl OpenHandle {
@@ -202,6 +205,7 @@ impl OpenHandle {
         generation: 1,
         cursor: 0,
         open: false,
+        dirty: false,
     };
 }
 
@@ -249,6 +253,8 @@ pub struct Metadata {
     pub inode: u64,
     pub mode: u32,
     pub size: u64,
+    /// Last modification, Unix seconds (0 when the filesystem doesn't record it).
+    pub modified: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -343,6 +349,8 @@ impl Vfs {
         }
         self.mount_directory("/tmp", 0o777)?;
         self.mount_directory("/data", 0o777)?;
+        self.mount_directory("/home", 0o755)?;
+        self.mount_directory("/media", 0o755)?;
         self.load_persisted_files();
         Ok(())
     }
@@ -811,6 +819,7 @@ impl Vfs {
         };
         Metadata {
             inode: index as u64 + 1,
+            modified: 0,
             mode: kind | node.mode as u32,
             size: if node.storage == STATIC_STORAGE {
                 node.data.len() as u64
@@ -957,6 +966,7 @@ impl Vfs {
             generation,
             cursor: 0,
             open: true,
+            dirty: false,
         };
         Ok(((generation as u32) << 16) | slot as u32)
     }
@@ -1171,11 +1181,65 @@ impl Vfs {
         Ok(target)
     }
 
+    fn mark_dirty(&mut self, descriptor: u32) {
+        if let Ok(handle) = self.handle_mut(descriptor) {
+            handle.dirty = true;
+        }
+    }
+
+    /// Whether the handle's file lives in the read-only boot image.
+    fn handle_is_static(&mut self, descriptor: u32) -> bool {
+        match self.handle_mut(descriptor) {
+            Ok(handle) => {
+                let node = handle.node;
+                self.nodes[node as usize].storage == STATIC_STORAGE
+            }
+            Err(_) => true,
+        }
+    }
+
+    /// The absolute path of a node, written into `out`; returns its length
+    /// (0 when it does not fit).
+    fn node_path(&self, node: u16, out: &mut [u8; 128]) -> usize {
+        let mut position = out.len();
+        let mut current = node;
+        while current != ROOT_NODE {
+            let entry = &self.nodes[current as usize];
+            let name = &entry.name[..entry.name_len as usize];
+            if position < name.len() + 1 {
+                return 0;
+            }
+            position -= name.len();
+            out[position..position + name.len()].copy_from_slice(name);
+            position -= 1;
+            out[position] = b'/';
+            current = entry.parent;
+        }
+        let length = out.len() - position;
+        out.copy_within(position.., 0);
+        length
+    }
+
+    /// If the handle was written to, clears that and returns the file's path.
+    fn take_dirty_path(&mut self, descriptor: u32) -> Option<([u8; 128], usize)> {
+        let handle = self.handle_mut(descriptor).ok()?;
+        if !handle.dirty {
+            return None;
+        }
+        handle.dirty = false;
+        let node = handle.node;
+        let mut buffer = [0u8; 128];
+        let length = self.node_path(node, &mut buffer);
+        (length > 0).then_some((buffer, length))
+    }
+
     fn close(&mut self, descriptor: u32) -> Result<(), VfsError> {
         let handle = self.handle_mut(descriptor)?;
         handle.open = false;
         handle.cursor = 0;
-        handle.generation = handle.generation.wrapping_add(1).max(1);
+        // Bit 15 stays clear so a descriptor never has its top bit set (that
+        // marks the persistent mount's descriptors).
+        handle.generation = (handle.generation.wrapping_add(1) & 0x7fff).max(1);
         Ok(())
     }
 
@@ -1296,15 +1360,35 @@ pub fn initialize(entries: &[InitramfsEntry]) -> VfsStats {
     filesystem.stats(verified)
 }
 
+/// The mount (and the path inside it) a path lives on, when it is under a
+/// live persistent mount (`/home`, `/media/<label>`).
+fn home(path: &str) -> Option<(usize, &str)> {
+    datafs::route(path)
+}
+
+fn is_mounted_descriptor(descriptor: u32) -> bool {
+    descriptor & datafs::HANDLE_FLAG != 0
+}
+
 pub fn file(path: &str) -> Result<FileView, VfsError> {
+    if home(path).is_some() {
+        // Views of persistent files would have to be 'static; use open+read.
+        return Err(VfsError::NotFound);
+    }
     FILESYSTEM.lock().file(path)
 }
 
 pub fn metadata(path: &str) -> Result<Metadata, VfsError> {
+    if let Some((mount, rest)) = home(path) {
+        return datafs::metadata(mount, rest);
+    }
     FILESYSTEM.lock().metadata(path)
 }
 
 pub fn descriptor_metadata(descriptor: u32) -> Result<Metadata, VfsError> {
+    if is_mounted_descriptor(descriptor) {
+        return datafs::descriptor_metadata(descriptor);
+    }
     FILESYSTEM.lock().descriptor_metadata(descriptor)
 }
 
@@ -1316,69 +1400,217 @@ pub fn open_file(
     mode: u16,
     write: bool,
 ) -> Result<u32, VfsError> {
+    if let Some((mount, rest)) = home(path) {
+        let descriptor = datafs::open_file(mount, rest, create, exclusive, truncate, write)?;
+        // Realtime protection: a file is scanned before anyone reads it.
+        if !create && !write && !truncate && !crate::antivirus::on_open(path) {
+            let _ = datafs::close(descriptor);
+            return Err(VfsError::PermissionDenied);
+        }
+        return Ok(descriptor);
+    }
+    let descriptor = FILESYSTEM
+        .lock()
+        .open_file(path, create, exclusive, truncate, mode, write)?;
+    if truncate || write {
+        FILESYSTEM.lock().mark_dirty(descriptor);
+    }
+    // Realtime protection: a writable file is scanned before anyone reads
+    // it. (The read-only boot image is trusted and scanned at boot.)
+    if !create && !write && !truncate && !FILESYSTEM.lock().handle_is_static(descriptor) {
+        let readable = crate::antivirus::on_open(path);
+        if !readable {
+            let _ = FILESYSTEM.lock().close(descriptor);
+            return Err(VfsError::PermissionDenied);
+        }
+    }
+    Ok(descriptor)
+}
+
+/// Opens a file for reading without realtime scanning: for the scanner's own
+/// use, which must not recurse into itself.
+pub fn open_file_raw(path: &str) -> Result<u32, VfsError> {
+    if let Some((mount, rest)) = home(path) {
+        return datafs::open_file(mount, rest, false, false, false, false);
+    }
     FILESYSTEM
         .lock()
-        .open_file(path, create, exclusive, truncate, mode, write)
+        .open_file(path, false, false, false, 0, false)
 }
 
 pub fn open_directory(path: &str) -> Result<u32, VfsError> {
+    if let Some((mount, rest)) = home(path) {
+        return datafs::open_directory(mount, rest);
+    }
     FILESYSTEM.lock().open_directory(path)
 }
 
 pub fn next_directory_entry(descriptor: u32) -> Result<Option<DirectoryEntry>, VfsError> {
+    if is_mounted_descriptor(descriptor) {
+        return datafs::next_directory_entry(descriptor);
+    }
     FILESYSTEM.lock().next_directory_entry(descriptor)
 }
 
 pub fn read(descriptor: u32, destination: &mut [u8]) -> Result<usize, VfsError> {
+    if is_mounted_descriptor(descriptor) {
+        return datafs::read(descriptor, destination);
+    }
     FILESYSTEM.lock().read(descriptor, destination)
 }
 
 pub fn read_at(descriptor: u32, offset: usize, destination: &mut [u8]) -> Result<usize, VfsError> {
+    if is_mounted_descriptor(descriptor) {
+        return datafs::read_at(descriptor, offset, destination);
+    }
     FILESYSTEM.lock().read_at(descriptor, offset, destination)
 }
 
 pub fn write_at(descriptor: u32, offset: usize, source: &[u8]) -> Result<usize, VfsError> {
-    FILESYSTEM.lock().write_at(descriptor, offset, source)
+    if is_mounted_descriptor(descriptor) {
+        return datafs::write_at(descriptor, offset, source);
+    }
+    let result = FILESYSTEM.lock().write_at(descriptor, offset, source);
+    if result.is_ok() {
+        FILESYSTEM.lock().mark_dirty(descriptor);
+    }
+    result
 }
 
 pub fn write(descriptor: u32, source: &[u8], append: bool) -> Result<usize, VfsError> {
-    FILESYSTEM.lock().write(descriptor, source, append)
+    if is_mounted_descriptor(descriptor) {
+        return datafs::write(descriptor, source, append);
+    }
+    let result = FILESYSTEM.lock().write(descriptor, source, append);
+    if result.is_ok() {
+        FILESYSTEM.lock().mark_dirty(descriptor);
+    }
+    result
 }
 
 pub fn seek(descriptor: u32, offset: i64, whence: u64) -> Result<usize, VfsError> {
+    if is_mounted_descriptor(descriptor) {
+        return datafs::seek(descriptor, offset, whence);
+    }
     FILESYSTEM.lock().seek(descriptor, offset, whence)
 }
 
 pub fn close(descriptor: u32) -> Result<(), VfsError> {
-    FILESYSTEM.lock().close(descriptor)
+    if is_mounted_descriptor(descriptor) {
+        return datafs::close(descriptor);
+    }
+    let written = FILESYSTEM.lock().take_dirty_path(descriptor);
+    let result = FILESYSTEM.lock().close(descriptor);
+    // Realtime protection: scan a file when its writer is done with it.
+    if let Some((buffer, length)) = written
+        && let Ok(path) = core::str::from_utf8(&buffer[..length])
+    {
+        crate::antivirus::on_modified(path);
+    }
+    result
 }
 
 pub fn create_directory(path: &str, mode: u16) -> Result<(), VfsError> {
+    if let Some((mount, rest)) = home(path) {
+        return datafs::create_directory(mount, rest);
+    }
     FILESYSTEM.lock().create_directory(path, mode)
 }
 
 pub fn remove(path: &str, directory: bool) -> Result<(), VfsError> {
+    if let Some((mount, rest)) = home(path) {
+        return datafs::remove(mount, rest, directory);
+    }
     FILESYSTEM.lock().remove(path, directory)
 }
 
+/// Copies a file between the in-memory tree and a mount, then deletes the
+/// source (a rename that crosses mounts).
+fn move_across(source: &str, destination: &str, replace: bool) -> Result<(), VfsError> {
+    let metadata = metadata(source)?;
+    if metadata.mode & 0o170000 == 0o040000 {
+        return Err(VfsError::Busy);
+    }
+    if !replace && self::metadata(destination).is_ok() {
+        return Err(VfsError::Exists);
+    }
+    let input = open_file_raw(source)?;
+    let output = match open_file(destination, true, false, true, 0o644, true) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            let _ = close(input);
+            return Err(error);
+        }
+    };
+    let mut buffer = [0u8; 4096];
+    let mut failure = None;
+    loop {
+        match read(input, &mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                if let Err(error) = write(output, &buffer[..count], false) {
+                    failure = Some(error);
+                    break;
+                }
+            }
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+    let _ = close(input);
+    let _ = close(output);
+    if let Some(error) = failure {
+        let _ = remove(destination, false);
+        return Err(error);
+    }
+    remove(source, false)
+}
+
 pub fn rename(source: &str, destination: &str) -> Result<(), VfsError> {
-    FILESYSTEM.lock().rename(source, destination)
+    match (home(source), home(destination)) {
+        (Some((from_mount, from)), Some((to_mount, to))) if from_mount == to_mount => {
+            datafs::rename(from_mount, from, to, true)
+        }
+        (None, None) => FILESYSTEM.lock().rename(source, destination),
+        _ => move_across(source, destination, true),
+    }
 }
 
 pub fn rename_noreplace(source: &str, destination: &str) -> Result<(), VfsError> {
-    FILESYSTEM.lock().rename_noreplace(source, destination)
+    match (home(source), home(destination)) {
+        (Some((from_mount, from)), Some((to_mount, to))) if from_mount == to_mount => {
+            datafs::rename(from_mount, from, to, false)
+        }
+        (None, None) => FILESYSTEM.lock().rename_noreplace(source, destination),
+        _ => move_across(source, destination, false),
+    }
 }
 
 pub fn chmod(path: &str, mode: u16) -> Result<(), VfsError> {
+    if let Some((mount, rest)) = home(path) {
+        return datafs::chmod(mount, rest, mode);
+    }
     FILESYSTEM.lock().chmod(path, mode)
 }
 
 pub fn fchmod(descriptor: u32, mode: u16) -> Result<(), VfsError> {
+    if is_mounted_descriptor(descriptor) {
+        return datafs::fchmod(descriptor, mode);
+    }
     FILESYSTEM.lock().fchmod(descriptor, mode)
 }
 
 pub fn truncate(descriptor: u32, length: usize) -> Result<(), VfsError> {
-    FILESYSTEM.lock().truncate(descriptor, length)
+    if is_mounted_descriptor(descriptor) {
+        return datafs::truncate(descriptor, length);
+    }
+    let result = FILESYSTEM.lock().truncate(descriptor, length);
+    if result.is_ok() {
+        FILESYSTEM.lock().mark_dirty(descriptor);
+    }
+    result
 }
 
 pub fn stats() -> VfsStats {

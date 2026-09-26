@@ -1,9 +1,11 @@
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::arch;
 
 static UNIX_BASE: AtomicU64 = AtomicU64::new(0);
 static MONOTONIC_BASE: AtomicU64 = AtomicU64::new(0);
+/// Index into `timezone::ZONES` (0 = UTC).
+static ZONE: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Snapshot {
@@ -109,8 +111,85 @@ pub fn unix_nanoseconds() -> u128 {
     base.saturating_add(monotonic.saturating_sub(started) as u128)
 }
 
+/// Sets the running clock (not the hardware clock).
+pub fn set_unix_seconds(seconds: u64) {
+    UNIX_BASE.store(seconds, Ordering::Release);
+    MONOTONIC_BASE.store(crate::time::monotonic_nanoseconds(), Ordering::Release);
+}
+
+pub fn timezone_index() -> usize {
+    ZONE.load(Ordering::Acquire) as usize
+}
+
+pub fn set_timezone_index(index: usize) {
+    if index < crate::timezone::ZONES.len() {
+        ZONE.store(index as u32, Ordering::Release);
+    }
+}
+
+/// Offset of the chosen time zone from UTC right now, in minutes.
+pub fn local_offset_minutes() -> i32 {
+    crate::timezone::offset_minutes(timezone_index(), unix_seconds())
+}
+
+/// Wall-clock seconds in the chosen time zone (Unix seconds shifted by its offset).
+pub fn local_seconds() -> u64 {
+    (unix_seconds() as i64 + local_offset_minutes() as i64 * 60).max(0) as u64
+}
+
+#[allow(dead_code)]
 pub fn utc_date_time() -> UtcDateTime {
-    let seconds = unix_seconds();
+    date_time_at(unix_seconds())
+}
+
+/// Date and time in the chosen time zone.
+pub fn local_date_time() -> UtcDateTime {
+    date_time_at(local_seconds())
+}
+
+/// Writes the time into the battery-backed hardware clock (as UTC), so it
+/// survives a restart without network.
+#[allow(dead_code)] // the Settings app sets the clock through this
+pub fn set_hardware_time(unix: u64) -> bool {
+    let days = unix / 86_400;
+    let seconds_of_day = unix % 86_400;
+    let date = date_time_at(unix);
+    let weekday = ((days + 4) % 7 + 1) as u8; // 1 = Sunday
+    let second = (seconds_of_day % 60) as u8;
+    let status_b = read_register(0x0b);
+    let binary = status_b & 4 != 0;
+    let encode = |value: u8| {
+        if binary {
+            value
+        } else {
+            (value / 10) << 4 | (value % 10)
+        }
+    };
+    // Stop the clock updating while the registers are rewritten; 24-hour mode.
+    write_register(0x0b, status_b | 0x80 | 0x02);
+    write_register(0x00, encode(second));
+    write_register(0x02, encode(date.minute));
+    write_register(0x04, encode(date.hour));
+    write_register(0x06, weekday);
+    write_register(0x07, encode(date.day));
+    write_register(0x08, encode(date.month));
+    write_register(0x09, encode((date.year % 100) as u8));
+    write_register(0x32, encode((date.year / 100) as u8));
+    write_register(0x0b, (status_b | 0x02) & !0x80);
+    set_unix_seconds(unix);
+    true
+}
+
+#[allow(dead_code)]
+fn write_register(register: u8, value: u8) {
+    unsafe {
+        arch::outb(0x70, 0x80 | register);
+        arch::outb(0x71, value);
+        arch::outb(0x70, 0);
+    }
+}
+
+fn date_time_at(seconds: u64) -> UtcDateTime {
     let mut days = seconds / 86_400;
     let seconds_of_day = seconds % 86_400;
     let mut year = 1970u16;

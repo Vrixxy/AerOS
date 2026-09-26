@@ -6,9 +6,10 @@ pub static INIT_ELF: [u8; INIT_LENGTH] = make_init_elf();
 pub static FAULT_ELF: [u8; 0x1002] = make_fault_elf();
 pub static COMPILED_INIT: &[u8] = include_bytes!("../../assets/userspace/aeros-init");
 pub static STD_SMOKE: &[u8] = include_bytes!("../../assets/userspace/aeros-std-smoke");
+pub static FORK_PROBE: &[u8] = include_bytes!("../../assets/userspace/aeros-fork-probe");
 pub static RELEASE: &[u8] = b"AerOS 0.1.0 x86_64\n";
 
-pub fn entries() -> [InitramfsEntry; 5] {
+pub fn entries() -> [InitramfsEntry; 6] {
     [
         InitramfsEntry {
             path: "/bin/init",
@@ -33,6 +34,11 @@ pub fn entries() -> [InitramfsEntry; 5] {
         InitramfsEntry {
             path: "/bin/aeros-std-smoke",
             data: STD_SMOKE,
+            mode: 0o555,
+        },
+        InitramfsEntry {
+            path: "/bin/aeros-fork-probe",
+            data: FORK_PROBE,
             mode: 0o555,
         },
     ]

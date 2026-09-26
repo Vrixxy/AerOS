@@ -54,6 +54,7 @@ struct TransmitDescriptor {
 
 #[derive(Clone, Copy)]
 pub struct NetworkReport {
+    pub driver: &'static str,
     pub present: bool,
     pub mmio: u64,
     pub mac: [u8; 6],
@@ -69,7 +70,28 @@ pub struct NetworkReport {
 }
 
 impl NetworkReport {
+    /// The link report for a NIC other than the Intel one, when it is the
+    /// interface the network stack ends up using.
+    pub fn from_nic(nic: &crate::nic::NicReport, driver: &'static str) -> Self {
+        Self {
+            driver,
+            present: nic.present,
+            mmio: nic.mmio,
+            mac: nic.mac,
+            gateway_mac: nic.gateway_mac,
+            link: nic.link,
+            full_duplex: true,
+            speed_mbps: 100,
+            tx: nic.tx,
+            rx: nic.arp_reply,
+            rx_bytes: 60,
+            arp_reply: nic.arp_reply,
+            verified: nic.verified,
+        }
+    }
+
     const EMPTY: Self = Self {
+        driver: "none",
         present: false,
         mmio: 0,
         mac: [0; 6],
@@ -299,6 +321,10 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> NetworkRep
         };
     }
     NetworkReport {
+        driver: match device.device {
+            0x10d3 => "e1000e",
+            _ => "e1000",
+        },
         present: true,
         mmio,
         mac,

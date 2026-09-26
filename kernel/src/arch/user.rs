@@ -109,6 +109,29 @@ pub struct ForkSnapshot {
     pub rsp: u64,
 }
 
+/// Every user-visible register of an interrupted process.
+#[derive(Clone, Copy)]
+pub struct UserRegs {
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rbp: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rip: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+}
+
 pub fn resume_forked_child(snapshot: &ForkSnapshot, user_start: u64, user_end: u64) -> u64 {
     let cpu = CpuInfo::detect();
     let (_, smap_enabled) = enable_user_protections(&cpu);
