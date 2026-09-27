@@ -1,0 +1,168 @@
+AerOS Non-Commercial License
+Copyright (c) 2026 Vrixxy
+
+1. DEFINITIONS
+
+"Software" means the AerOS source code, object code, documentation,
+and associated files distributed under this license.
+
+"Commercial Use" means any use of the Software, in whole or in
+part, that is intended for, directed toward, or that in practice
+results in commercial advantage, monetary compensation, or other
+consideration of value, for you or for any third party, whether the
+benefit is direct or indirect and whether or not money changes
+hands. Commercial Use includes, without limitation:
+  (a) selling, licensing, sublicensing, leasing, or renting the
+      Software, in original or modified form;
+  (b) using the Software to provide, support, or operate a paid
+      product, subscription, or service, including a hosted,
+      remote, or network-accessible service, even if the Software
+      itself is never distributed, sold, or exposed to end users;
+  (c) incorporating the Software, in whole or in part, into a
+      product, firmware image, device, or service that is sold,
+      licensed, leased, or otherwise monetized;
+  (d) using the Software in the internal operations, research and
+      development, testing, or infrastructure of a for-profit
+      entity, where such use provides any commercial benefit to
+      that entity, regardless of whether the Software or any
+      product built with it is ever sold or released externally;
+  (e) using the Software to perform paid consulting, contracting,
+      freelance, or agency work for a client, or to fulfill any
+      paid engagement, deliverable, or statement of work;
+  (f) using the Software to create, deliver, or support paid
+      training, courses, tutorials, certifications, workshops, or
+      similar educational offerings for which any fee is charged;
+  (g) using the Software to generate, mine, farm, or otherwise
+      produce cryptocurrency, tokens, or other assets of tradeable
+      or monetary value;
+  (h) using the Software to develop, demonstrate, or support a
+      product, prototype, or pitch for the purpose of raising
+      investment, securing funding, or otherwise attracting
+      financial backing;
+  (i) monetizing the Software, a derivative of it, or content
+      relating to it through advertising, sponsorships,
+      affiliate links, paywalls, donations tied to service access,
+      or similar revenue mechanisms; or
+  (j) using the Software in connection with research or
+      development that is funded by a commercial sponsor, grant,
+      or contract where the resulting work product, findings, or
+      IP are intended for commercial exploitation.
+
+"Private Use" means personal, educational, research, or
+non-commercial hobbyist use by an individual or non-profit entity
+that does not fall within any of the categories described above.
+For the avoidance of doubt, Private Use includes: purely personal
+experimentation and learning; coursework and research at academic
+institutions that is not funded or directed toward commercial
+exploitation as described in (j); and publishing or sharing your
+own unmodified or modified copies of the Software at no charge,
+where you receive no commercial benefit, direct or indirect, from
+doing so. If you are uncertain whether a particular use qualifies
+as Private Use, contact the copyright holder before proceeding.
+
+"Contributor" means the copyright holder and any individual or
+entity that has contributed code, documentation, or other material
+to the Software with the copyright holder's acceptance.
+
+2. GRANT OF LICENSE
+
+Subject to the terms of this license, the copyright holder grants
+you a worldwide, royalty-free, non-exclusive license to use, copy,
+modify, merge, and distribute the Software, in source or binary
+form, solely for Private Use.
+
+You may distribute copies or modified versions of the Software to
+third parties, provided that:
+  (a) this license text is included, unmodified, with any copy or
+      substantial portion of the Software you distribute;
+  (b) you retain all copyright, patent, trademark, and attribution
+      notices present in the copy you received, and do not remove
+      or obscure any notice that this license governs the
+      Software; and
+  (c) such distribution is not itself a Commercial Use.
+
+3. RESTRICTIONS
+
+Commercial Use of the Software, or of any derivative work based on
+the Software, is expressly prohibited without a separate written
+agreement with the copyright holder granting such rights. If you
+wish to use the Software commercially, contact the copyright holder
+to negotiate a separate commercial license.
+
+You may not circumvent this restriction by any indirect means,
+including without limitation: routing Commercial Use through a
+shell company, affiliate, contractor, or other intermediary;
+offering the Software or a derivative "free of charge" as a loss
+leader for a paid product, service, device, or subscription; or
+bundling the Software with commercial hardware or services such
+that its use provides a commercial benefit to the distributor.
+
+This license does not grant any right to use the name "AerOS," the
+copyright holder's name, or any associated trademarks or logos to
+endorse, market, or promote derivative works or distributions,
+except as required to comply with the attribution requirements of
+Section 2.
+
+4. PATENT GRANT
+
+Each Contributor grants you a worldwide, royalty-free, non-exclusive
+patent license, under patent claims the Contributor owns or
+controls that are necessarily infringed by the Software as
+contributed, to make, use, and run the Software solely for Private
+Use.
+
+This patent license terminates automatically, without notice, as
+to any party that engages in Commercial Use of the Software or
+that initiates a patent infringement claim (including a
+cross-claim or counterclaim) alleging that the Software infringes
+a patent.
+
+5. NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND
+NON-INFRINGEMENT. THE COPYRIGHT HOLDER MAKES NO REPRESENTATION OR
+WARRANTY THAT THE SOFTWARE WILL BE ERROR-FREE, SECURE, OR SUITABLE
+FOR USE ON, WITH, OR AS AN OPERATING SYSTEM FOR ANY PARTICULAR
+HARDWARE, DEVICE, OR SYSTEM. USE OF THE SOFTWARE, INCLUDING AS OR
+WITHIN AN OPERATING SYSTEM KERNEL, IS ENTIRELY AT YOUR OWN RISK.
+
+6. LIMITATION OF LIABILITY
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT
+SHALL THE COPYRIGHT HOLDER OR ANY CONTRIBUTOR BE LIABLE FOR ANY
+CLAIM, DAMAGES, DATA LOSS, HARDWARE DAMAGE, LOSS OF PROFITS, OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR
+OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+Nothing in this license excludes or limits liability for death or
+personal injury caused by gross negligence or willful misconduct,
+where such exclusion would be void under mandatory provisions of
+the Swiss Code of Obligations (Art. 100 para. 1 CO) or other
+applicable mandatory law.
+
+7. GOVERNING LAW AND JURISDICTION
+
+This license is governed by and construed in accordance with the
+substantive laws of Switzerland, excluding its conflict-of-law
+rules and excluding the United Nations Convention on Contracts for
+the International Sale of Goods (CISG). The exclusive place of
+jurisdiction for any dispute arising out of or in connection with
+this license is Zurich, Switzerland, to the extent permitted by
+mandatory law.
+
+8. TERMINATION
+
+This license terminates automatically if you engage in Commercial
+Use of the Software or otherwise breach its terms. Upon
+termination, you must cease all use and distribution of the
+Software under this license.
+
+9. SEVERABILITY
+
+If any provision of this license is held to be unenforceable, the
+remaining provisions will remain in full force and effect, and the
+unenforceable provision will be reformed to the minimum extent
+necessary to make it enforceable.
