@@ -31,12 +31,12 @@
                                               ...::::::..
 
 AerOS Non-Commercial License
-Copyright (c) 2026 Vrixxy
-
+Copyright (c) 2026 Vrixxy (GitHub account: github.com/Vrixxy)
 1. DEFINITIONS
 
 "Software" means the AerOS source code, object code, documentation,
-and associated files distributed under this license.
+and associated files distributed under this license, excluding the
+Third-Party Components described in Section 6.
 
 "Commercial Use" means any use of the Software, in whole or in
 part, that is intended for, directed toward, or that in practice
@@ -54,10 +54,11 @@ hands. Commercial Use includes, without limitation:
       product, firmware image, device, or service that is sold,
       licensed, leased, or otherwise monetized;
   (d) using the Software in the internal operations, research and
-      development, testing, or infrastructure of a for-profit
-      entity, where such use provides any commercial benefit to
-      that entity, regardless of whether the Software or any
-      product built with it is ever sold or released externally;
+      development, testing, evaluation, or infrastructure of a
+      for-profit entity, where such use provides any commercial
+      benefit to that entity, regardless of whether the Software
+      or any product built with it is ever sold or released
+      externally;
   (e) using the Software to perform paid consulting, contracting,
       freelance, or agency work for a client, or to fulfill any
       paid engagement, deliverable, or statement of work;
@@ -86,11 +87,14 @@ that does not fall within any of the categories described above.
 For the avoidance of doubt, Private Use includes: purely personal
 experimentation and learning; coursework and research at academic
 institutions that is not funded or directed toward commercial
-exploitation as described in (j); and publishing or sharing your
-own unmodified or modified copies of the Software at no charge,
-where you receive no commercial benefit, direct or indirect, from
-doing so. If you are uncertain whether a particular use qualifies
-as Private Use, contact the copyright holder before proceeding.
+exploitation as described in (j); publishing or sharing your own
+unmodified or modified copies of the Software at no charge, where
+you receive no commercial benefit, direct or indirect, from doing
+so; and listing the Software or your own non-commercial work on it
+in a personal portfolio, résumé, or academic record, which is not
+by itself Commercial Use. If you are uncertain whether a particular
+use qualifies as Private Use, contact the copyright holder before
+proceeding.
 
 "Contributor" means the copyright holder and any individual or
 entity that has contributed code, documentation, or other material
@@ -121,6 +125,9 @@ agreement with the copyright holder granting such rights. If you
 wish to use the Software commercially, contact the copyright holder
 to negotiate a separate commercial license.
 
+Contact the copyright holder at AerOS.contact@protonmail.com (Beware that this is the only mail account for AerOS) or through
+the GitHub account named in the copyright line.
+
 You may not circumvent this restriction by any indirect means,
 including without limitation: routing Commercial Use through a
 shell company, affiliate, contractor, or other intermediary;
@@ -149,7 +156,32 @@ that initiates a patent infringement claim (including a
 cross-claim or counterclaim) alleging that the Software infringes
 a patent.
 
-5. NO WARRANTY
+5. CONTRIBUTIONS
+
+Unless you state otherwise in writing at the time of submission,
+any contribution you intentionally submit for inclusion in the
+Software is licensed to the copyright holder under a perpetual,
+worldwide, non-exclusive, royalty-free, irrevocable license to use,
+reproduce, modify, distribute, sublicense, and relicense that
+contribution under any terms, including commercial terms. You keep
+the copyright in your contribution. By submitting it you confirm
+that you have the right to grant this license and that the
+contribution does not include material you have no right to submit.
+Accepted contributions are also made available to others under this
+license.
+
+6. THIRD-PARTY COMPONENTS
+
+This license covers only material written by the copyright holder
+and by Contributors. Software libraries, firmware, operating-system
+kernels, guest images, fonts, and other components written by others
+("Third-Party Components") remain under their own licenses, which
+are listed in the file THIRD_PARTY_NOTICES or in the components'
+own files. Nothing in this license restricts any right you have
+under those licenses, and nothing in this license grants any right
+in a Third-Party Component.
+
+7. NO WARRANTY
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
 EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
@@ -160,7 +192,7 @@ FOR USE ON, WITH, OR AS AN OPERATING SYSTEM FOR ANY PARTICULAR
 HARDWARE, DEVICE, OR SYSTEM. USE OF THE SOFTWARE, INCLUDING AS OR
 WITHIN AN OPERATING SYSTEM KERNEL, IS ENTIRELY AT YOUR OWN RISK.
 
-6. LIMITATION OF LIABILITY
+8. LIMITATION OF LIABILITY
 
 TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT
 SHALL THE COPYRIGHT HOLDER OR ANY CONTRIBUTOR BE LIABLE FOR ANY
@@ -169,13 +201,12 @@ OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR
 OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-Nothing in this license excludes or limits liability for death or
-personal injury caused by gross negligence or willful misconduct,
-where such exclusion would be void under mandatory provisions of
-the Swiss Code of Obligations (Art. 100 para. 1 CO) or other
-applicable mandatory law.
+Nothing in this license excludes or limits liability for unlawful
+intent or gross negligence, or any other liability that cannot be
+excluded or limited under mandatory law (including Art. 100
+para. 1 of the Swiss Code of Obligations).
 
-7. GOVERNING LAW AND JURISDICTION
+9. GOVERNING LAW AND JURISDICTION
 
 This license is governed by and construed in accordance with the
 substantive laws of Switzerland, excluding its conflict-of-law
@@ -185,14 +216,22 @@ jurisdiction for any dispute arising out of or in connection with
 this license is Zurich, Switzerland, to the extent permitted by
 mandatory law.
 
-8. TERMINATION
+10. TERMINATION
 
 This license terminates automatically if you engage in Commercial
 Use of the Software or otherwise breach its terms. Upon
 termination, you must cease all use and distribution of the
 Software under this license.
 
-9. SEVERABILITY
+However, if you stop the Commercial Use or cure the breach within
+30 days after you become aware of it or the copyright holder
+notifies you of it, whichever is earlier, your license is
+reinstated, unless you have breached this license before and
+been reinstated, or the breach was willful. Copies you distributed
+to others in good faith before termination are not affected as long
+as those recipients comply with this license.
+
+11. SEVERABILITY
 
 If any provision of this license is held to be unenforceable, the
 remaining provisions will remain in full force and effect, and the
