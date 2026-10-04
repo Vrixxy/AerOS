@@ -225,6 +225,50 @@ const TEST_PROGRESSIVE: &[u8] = include_bytes!("../../assets/test/photo-small-pr
 #[cfg(feature = "boot-test")]
 const TEST_JPEG: &[u8] = include_bytes!("../../assets/wallpapers/aeros-mountains.jpeg");
 
+/// Builds the malformed-PNG regression case `self_test` below feeds to
+/// `png::decode`: a real, well-formed 1x1 IHDR, one small IDAT chunk (just
+/// enough to pass the "some IDAT data exists" guard - its body is never
+/// actually valid zlib, since the point is to be rejected long before
+/// decompression is reached), a premature IEND, then a trailing chunk that
+/// still claims to be IDAT but declares a `length` far bigger than any data
+/// that follows it. `png::decode` must reject this cleanly, not panic.
+#[cfg(feature = "boot-test")]
+fn malformed_png_idat_overrun() -> [u8; 73] {
+    let mut bytes = [0u8; 73];
+    bytes[..8].copy_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    let mut at = 8;
+    // `length`+`kind`+`body`, then a 4-byte CRC field `png::decode` never
+    // actually checks the content of but does expect the *space* for
+    // (`offset = body_end + 4` for the next chunk) - left zeroed here,
+    // which is why the increment below is `12 + body.len()` (4 length + 4
+    // kind + 4 crc = 12 fixed bytes) rather than the 8 actually written.
+    let put_chunk =
+        |bytes: &mut [u8; 73], at: &mut usize, length: u32, kind: &[u8; 4], body: &[u8]| {
+            bytes[*at..*at + 4].copy_from_slice(&length.to_be_bytes());
+            bytes[*at + 4..*at + 8].copy_from_slice(kind);
+            bytes[*at + 8..*at + 8 + body.len()].copy_from_slice(body);
+            *at += 12 + body.len();
+        };
+    // IHDR: 1x1, 8-bit grayscale, no interlace.
+    put_chunk(
+        &mut bytes,
+        &mut at,
+        13,
+        b"IHDR",
+        &[0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0],
+    );
+    // One small IDAT (garbage body - never reached by the decompressor,
+    // since the point of this file is to be rejected before that).
+    put_chunk(&mut bytes, &mut at, 4, b"IDAT", &[0, 0, 0, 0]);
+    // A premature IEND - a real file's last chunk, here placed early.
+    put_chunk(&mut bytes, &mut at, 0, b"IEND", &[]);
+    // A trailing chunk claiming to be IDAT with a wildly oversized length
+    // and no real body behind it - `bytes` ends right after this header.
+    bytes[at..at + 4].copy_from_slice(&0xffff_fff0u32.to_be_bytes());
+    bytes[at + 4..at + 8].copy_from_slice(b"IDAT");
+    bytes
+}
+
 /// Decodes the bundled wallpaper files and prints signatures of the results
 /// (`tools/test.ps1` recomputes them with the host's decoders and compares),
 /// plus encode/decode round trips.
@@ -351,6 +395,30 @@ pub fn self_test() {
         cases > 0 && cases == passed
     ));
     if cases == 0 || cases != passed {
+        serial::line("AEROS_IMAGE_INVARIANT_FAILURE");
+        crate::arch::halt_forever();
+    }
+
+    // A malformed PNG built specifically to hit the gap the two IDAT-scanning
+    // passes in `png::decode` used to have between them: one small, properly
+    // bounded IDAT chunk (just enough to pass the `idat_total == 0` guard),
+    // then a premature IEND, then a bogus trailing chunk still claiming to
+    // be IDAT with a `length` field that claims far more data than the file
+    // actually has. The first pass stops at the premature IEND and never
+    // sees that last chunk; the second pass used to have no bounds check or
+    // IEND stop of its own, so it would index `target[at..at+length]` (and
+    // the matching source read) with an attacker-controlled out-of-range
+    // `length` - a slice-index panic on a crafted or merely corrupted
+    // picture file. If that regressed, this call would panic and the whole
+    // boot self-test sequence would never reach `AEROS_READY` at all, which
+    // is a stronger proof than any flag this test could set afterward - the
+    // `is_err()` check on top additionally confirms it is cleanly rejected,
+    // not silently mis-decoded.
+    let malformed_rejected = crate::png::decode(&malformed_png_idat_overrun()).is_err();
+    serial::format(format_args!(
+        "AEROS_IMAGE_PNG_MALFORMED rejected={malformed_rejected}\n"
+    ));
+    if !malformed_rejected {
         serial::line("AEROS_IMAGE_INVARIANT_FAILURE");
         crate::arch::halt_forever();
     }

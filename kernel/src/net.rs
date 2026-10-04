@@ -29,7 +29,7 @@ impl NetworkConfig {
 #[derive(Clone, Copy)]
 pub struct UdpDatagram {
     pub bytes: usize,
-    pub source: [u8; 4],
+    pub source: crate::ip::Address,
     pub source_port: u16,
 }
 
@@ -57,6 +57,7 @@ pub struct HttpReport {
     pub bytes: usize,
 }
 
+#[cfg(feature = "boot-test")]
 #[derive(Clone, Copy)]
 struct TcpSegment {
     sequence: u32,
@@ -472,6 +473,17 @@ pub fn send_udp(
     if payload.len() > MAX_UDP_PAYLOAD || source_port == 0 || destination_port == 0 {
         return false;
     }
+    crate::udp::ensure_kernel_binding(source_port);
+    crate::tcpnet::activate();
+    if crate::tcpnet::is_local(crate::ip::v4(destination)) {
+        let _ = crate::udp::deliver(
+            destination_port,
+            crate::ip::v4(destination),
+            source_port,
+            payload,
+        );
+        return true;
+    }
     let config = *CONFIG.lock();
     if !config.ready {
         return false;
@@ -510,65 +522,107 @@ pub fn receive_udp(
     if payload.len() > MAX_UDP_PAYLOAD || source_port == 0 || destination_port == 0 {
         return None;
     }
-    let config = *CONFIG.lock();
-    if !config.ready {
+    if !is_ready() && !crate::tcpnet::is_local(crate::ip::v4(source)) {
         return None;
     }
-    let mut packet = [0u8; 2048];
-    for _ in 0..12 {
-        let length = crate::nic::receive(&mut packet)?;
-        if length < 42
-            || packet[..6] != config.mac
-            || packet[12..14] != [0x08, 0x00]
-            || packet[14] >> 4 != 4
+    let slot = crate::udp::slot_of_port(destination_port)?;
+    let deadline = crate::time::monotonic_nanoseconds().saturating_add(500_000_000);
+    loop {
+        crate::tcpnet::poll();
+        if let Some(received) =
+            crate::udp::take(slot, Some((crate::ip::v4(source), source_port)), payload)
         {
-            continue;
+            return Some(UdpDatagram {
+                bytes: received.length,
+                source: crate::ip::v4(source),
+                source_port,
+            });
         }
-        let header_bytes = (packet[14] as usize & 0x0f) * 4;
-        let total_bytes = u16::from_be_bytes([packet[16], packet[17]]) as usize;
-        if header_bytes < 20
-            || total_bytes < header_bytes + 8
-            || 14 + total_bytes > length
-            || packet[23] != 17
-            || packet[26..30] != source
-            || packet[30..34] != config.local_ip
-            || u16::from_be_bytes([packet[20], packet[21]]) & 0x3fff != 0
-            || checksum(&packet[14..14 + header_bytes]) != 0
-        {
-            continue;
-        }
-        let udp_start = 14 + header_bytes;
-        let udp_length =
-            u16::from_be_bytes([packet[udp_start + 4], packet[udp_start + 5]]) as usize;
-        if udp_length < 8
-            || udp_start + udp_length > 14 + total_bytes
-            || packet[udp_start..udp_start + 2] != source_port.to_be_bytes()
-            || packet[udp_start + 2..udp_start + 4] != destination_port.to_be_bytes()
-        {
-            continue;
-        }
-        let observed = u16::from_be_bytes([packet[udp_start + 6], packet[udp_start + 7]]);
-        if observed != 0
-            && udp_checksum(
-                source,
-                config.local_ip,
-                &packet[udp_start..udp_start + udp_length],
-            ) != 0
-        {
-            continue;
-        }
-        let bytes = udp_length - 8;
-        if bytes > payload.len() {
+        if crate::time::monotonic_nanoseconds() >= deadline {
             return None;
         }
-        payload[..bytes].copy_from_slice(&packet[udp_start + 8..udp_start + udp_length]);
-        return Some(UdpDatagram {
-            bytes,
-            source,
-            source_port,
-        });
+        core::hint::spin_loop();
     }
-    None
+}
+
+/// A datagram to any address: IPv4 through `send_udp`, IPv6 through the
+/// IPv6 layer (or straight back in for this machine's own addresses).
+pub fn send_datagram(
+    destination: &crate::ip::Address,
+    source_port: u16,
+    destination_port: u16,
+    payload: &[u8],
+) -> bool {
+    if let Some(v4) = crate::ip::as_v4(destination) {
+        return send_udp(v4, source_port, destination_port, payload);
+    }
+    if payload.len() > 1440 || source_port == 0 || destination_port == 0 {
+        return false;
+    }
+    crate::udp::ensure_kernel_binding(source_port);
+    crate::tcpnet::activate();
+    if crate::tcpnet::is_local(*destination) {
+        let _ = crate::udp::deliver(destination_port, *destination, source_port, payload);
+        return true;
+    }
+    crate::ipv6::send_udp(destination, source_port, destination_port, payload)
+}
+
+pub struct ParsedUdp {
+    pub remote: crate::ip::Address,
+    pub remote_port: u16,
+    pub local_port: u16,
+    pub payload_start: usize,
+    pub payload_len: usize,
+}
+
+/// Validates an Ethernet frame as an unfragmented IPv4/UDP datagram addressed
+/// to this host, checksums included (a zero UDP checksum means none).
+pub fn parse_udp(packet: &[u8]) -> Option<ParsedUdp> {
+    let config = *CONFIG.lock();
+    let length = packet.len();
+    if length < 42
+        || packet[..6] != config.mac
+        || packet[12..14] != [0x08, 0x00]
+        || packet[14] >> 4 != 4
+        || packet[23] != 17
+        || packet[30..34] != config.local_ip
+    {
+        return None;
+    }
+    let header_bytes = (packet[14] as usize & 0x0f) * 4;
+    let total_bytes = u16::from_be_bytes([packet[16], packet[17]]) as usize;
+    if header_bytes < 20
+        || total_bytes < header_bytes + 8
+        || 14 + total_bytes > length
+        || u16::from_be_bytes([packet[20], packet[21]]) & 0x3fff != 0
+        || checksum(&packet[14..14 + header_bytes]) != 0
+    {
+        return None;
+    }
+    let remote: [u8; 4] = packet[26..30].try_into().ok()?;
+    let udp_start = 14 + header_bytes;
+    let udp_length = u16::from_be_bytes([packet[udp_start + 4], packet[udp_start + 5]]) as usize;
+    if udp_length < 8 || udp_start + udp_length > 14 + total_bytes {
+        return None;
+    }
+    let observed = u16::from_be_bytes([packet[udp_start + 6], packet[udp_start + 7]]);
+    if observed != 0
+        && udp_checksum(
+            remote,
+            config.local_ip,
+            &packet[udp_start..udp_start + udp_length],
+        ) != 0
+    {
+        return None;
+    }
+    Some(ParsedUdp {
+        remote: crate::ip::v4(remote),
+        remote_port: u16::from_be_bytes([packet[udp_start], packet[udp_start + 1]]),
+        local_port: u16::from_be_bytes([packet[udp_start + 2], packet[udp_start + 3]]),
+        payload_start: udp_start + 8,
+        payload_len: udp_length - 8,
+    })
 }
 
 struct DnsReport {
@@ -689,6 +743,36 @@ pub fn ping(destination: [u8; 4]) -> PingReport {
     }
 }
 
+/// The first AAAA record for `name`, asked of the DHCP-supplied DNS server
+/// over IPv4.
+pub fn resolve6(name: &str) -> Option<crate::ip::Address> {
+    let config = *CONFIG.lock();
+    if !config.ready {
+        return None;
+    }
+    let transaction = IPV4_ID.fetch_add(1, Ordering::Relaxed) as u16;
+    let mut query = [0u8; 272];
+    query[..2].copy_from_slice(&transaction.to_be_bytes());
+    query[2..4].copy_from_slice(&0x0100u16.to_be_bytes());
+    query[4..6].copy_from_slice(&1u16.to_be_bytes());
+    let mut cursor = encode_dns_name(name, &mut query, 12)?;
+    if cursor + 4 > query.len() {
+        return None;
+    }
+    query[cursor..cursor + 2].copy_from_slice(&28u16.to_be_bytes());
+    query[cursor + 2..cursor + 4].copy_from_slice(&1u16.to_be_bytes());
+    cursor += 4;
+    let source_port = 49_152 + transaction % 16_000;
+    if !send_udp(config.dns_ip, source_port, 53, &query[..cursor]) {
+        return None;
+    }
+    let mut response = [0u8; MAX_UDP_PAYLOAD];
+    let datagram = receive_udp(config.dns_ip, 53, source_port, &mut response)?;
+    let mut found = [0u8; 16];
+    let (ok, answers) = parse_dns_records(&response[..datagram.bytes], transaction, 28, &mut found);
+    (ok && answers != 0 && found != [0; 16]).then_some(found)
+}
+
 pub fn resolve(name: &str) -> DnsLookup {
     let config = *CONFIG.lock();
     let mut lookup = DnsLookup {
@@ -729,14 +813,37 @@ pub fn resolve(name: &str) -> DnsLookup {
     lookup
 }
 
+const HTTP_CONNECT_NS: u64 = 10_000_000_000;
+const HTTP_IDLE_NS: u64 = 5_000_000_000;
+
 pub fn http_get(address: [u8; 4], host: &str, path: &str, output: &mut [u8]) -> HttpReport {
+    http_get_port(crate::ip::v4(address), 80, host, path, output)
+}
+
+/// A plain HTTP/1.1 GET over the TCP engine: waits for the connection, sends
+/// the request and collects the response until the server closes, the buffer
+/// is full or nothing arrives for five seconds.
+pub fn http_get_port(
+    address: crate::ip::Address,
+    port: u16,
+    host: &str,
+    path: &str,
+    output: &mut [u8],
+) -> HttpReport {
+    use crate::tcp::{EAGAIN, State};
+    use crate::tcpnet;
+
     let mut report = HttpReport {
         connected: false,
         received: false,
         status: 0,
         bytes: 0,
     };
-    if !valid_unicast(address)
+    let usable = match crate::ip::as_v4(&address) {
+        Some(v4) => valid_unicast(v4),
+        None => address != crate::ip::UNSPECIFIED && !crate::ip::is_multicast(&address),
+    };
+    if !usable
         || host.is_empty()
         || host.len() > 128
         || path.is_empty()
@@ -747,33 +854,6 @@ pub fn http_get(address: [u8; 4], host: &str, path: &str, output: &mut [u8]) -> 
     {
         return report;
     }
-    let identity = IPV4_ID.fetch_add(1, Ordering::Relaxed);
-    let source_port = 49_152 + identity as u16 % 16_000;
-    let mut local_sequence = (identity as u32).wrapping_mul(0x9e37_79b9);
-    if !send_tcp(address, source_port, 80, local_sequence, 0, 0x02, &[]) {
-        return report;
-    }
-    let mut payload = [0u8; 1460];
-    let Some(syn_ack) = wait_tcp(address, 80, source_port, &mut payload, 2_000_000_000) else {
-        return report;
-    };
-    if syn_ack.flags & 0x12 != 0x12 || syn_ack.acknowledgement != local_sequence.wrapping_add(1) {
-        return report;
-    }
-    local_sequence = local_sequence.wrapping_add(1);
-    let mut remote_sequence = syn_ack.sequence.wrapping_add(1);
-    if !send_tcp(
-        address,
-        source_port,
-        80,
-        local_sequence,
-        remote_sequence,
-        0x10,
-        &[],
-    ) {
-        return report;
-    }
-    report.connected = true;
     let mut request = [0u8; 384];
     let prefix = b"GET ";
     let middle = b" HTTP/1.1\r\nHost: ";
@@ -793,59 +873,70 @@ pub fn http_get(address: [u8; 4], host: &str, path: &str, output: &mut [u8]) -> 
         request[cursor..cursor + part.len()].copy_from_slice(part);
         cursor += part.len();
     }
-    if !send_tcp(
-        address,
-        source_port,
-        80,
-        local_sequence,
-        remote_sequence,
-        0x18,
-        &request[..request_length],
-    ) {
+
+    let Some(index) = tcpnet::with_tcp(|tcp, _, _| tcp.socket()) else {
+        return report;
+    };
+    tcpnet::activate();
+    let close = |index: usize| {
+        tcpnet::with_tcp(|tcp, sink, now| tcp.close(index, now, sink));
+        for _ in 0..4 {
+            tcpnet::poll();
+        }
+    };
+    if tcpnet::with_tcp(|tcp, sink, now| tcp.connect(index, address, port, now, sink)).is_err() {
+        close(index);
         return report;
     }
-    local_sequence = local_sequence.wrapping_add(request_length as u32);
-    let deadline = crate::time::monotonic_nanoseconds().saturating_add(3_000_000_000);
-    while crate::time::monotonic_nanoseconds() < deadline && report.bytes < output.len() {
-        let Some(segment) = wait_tcp(address, 80, source_port, &mut payload, 200_000_000) else {
-            continue;
-        };
-        if segment.sequence == remote_sequence && segment.bytes != 0 {
-            let count = segment.bytes.min(output.len() - report.bytes);
-            output[report.bytes..report.bytes + count].copy_from_slice(&payload[..count]);
-            report.bytes += count;
-            remote_sequence = remote_sequence.wrapping_add(segment.bytes as u32);
-            report.received = true;
+    let deadline = tcpnet::now().saturating_add(HTTP_CONNECT_NS);
+    loop {
+        tcpnet::poll();
+        match tcpnet::with_tcp(|tcp, _, _| tcp.state(index)) {
+            Some(State::Established) => break,
+            Some(State::SynSent | State::SynReceived) if tcpnet::now() < deadline => {}
+            _ => {
+                close(index);
+                return report;
+            }
         }
-        if segment.flags & 0x01 != 0 {
-            remote_sequence = remote_sequence.wrapping_add(1);
+    }
+    report.connected = true;
+
+    let mut sent = 0;
+    let send_deadline = tcpnet::now().saturating_add(HTTP_IDLE_NS);
+    while sent < request_length && tcpnet::now() < send_deadline {
+        tcpnet::poll();
+        match tcpnet::with_tcp(|tcp, sink, now| {
+            tcp.write(index, &request[sent..request_length], now, sink)
+        }) {
+            Ok(count) => sent += count,
+            Err(EAGAIN) => {}
+            Err(_) => break,
         }
-        let _ = send_tcp(
-            address,
-            source_port,
-            80,
-            local_sequence,
-            remote_sequence,
-            0x10,
-            &[],
-        );
-        if segment.flags & 0x05 != 0 || report.bytes == output.len() {
-            break;
+    }
+    if sent == request_length {
+        let mut idle_deadline = tcpnet::now().saturating_add(HTTP_IDLE_NS);
+        while report.bytes < output.len() && tcpnet::now() < idle_deadline {
+            tcpnet::poll();
+            let slice = &mut output[report.bytes..];
+            match tcpnet::with_tcp(|tcp, sink, _| tcp.read(index, slice, sink)) {
+                Ok(0) => break,
+                Ok(count) => {
+                    report.bytes += count;
+                    report.received = true;
+                    idle_deadline = tcpnet::now().saturating_add(HTTP_IDLE_NS);
+                }
+                Err(EAGAIN) => {}
+                Err(_) => break,
+            }
         }
     }
     report.status = http_status(&output[..report.bytes]);
-    let _ = send_tcp(
-        address,
-        source_port,
-        80,
-        local_sequence,
-        remote_sequence,
-        0x11,
-        &[],
-    );
+    close(index);
     report
 }
 
+#[cfg(feature = "boot-test")]
 fn send_tcp(
     destination: [u8; 4],
     source_port: u16,
@@ -855,15 +946,111 @@ fn send_tcp(
     flags: u8,
     payload: &[u8],
 ) -> bool {
-    if payload.len() > 1460 {
-        return false;
+    send_tcp_window(
+        destination,
+        source_port,
+        destination_port,
+        sequence,
+        acknowledgement,
+        flags,
+        64_240,
+        0,
+        &crate::tcp::Sack::default(),
+        payload,
+    )
+}
+
+/// Writes a TCP header, its options and the payload into `out` with the
+/// checksum field left zero; returns the length, or 0 if it does not fit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_tcp_segment(
+    source_port: u16,
+    destination_port: u16,
+    sequence: u32,
+    acknowledgement: u32,
+    flags: u8,
+    window: u16,
+    mss: u16,
+    sack: &crate::tcp::Sack,
+    payload: &[u8],
+    out: &mut [u8],
+) -> usize {
+    let blocks = sack.count.min(crate::tcp::MAX_SACK);
+    let option_bytes = if flags & 0x02 != 0 {
+        4 * usize::from(mss != 0) + 4 * usize::from(sack.permitted)
+    } else if blocks > 0 {
+        4 + 8 * blocks
+    } else {
+        0
+    };
+    let length = 20 + option_bytes + payload.len();
+    if payload.len() > 1460 || length > out.len() {
+        return 0;
     }
+    out[..20 + option_bytes].fill(0);
+    out[..2].copy_from_slice(&source_port.to_be_bytes());
+    out[2..4].copy_from_slice(&destination_port.to_be_bytes());
+    out[4..8].copy_from_slice(&sequence.to_be_bytes());
+    out[8..12].copy_from_slice(&acknowledgement.to_be_bytes());
+    out[12] = ((5 + option_bytes / 4) as u8) << 4;
+    out[13] = flags;
+    out[14..16].copy_from_slice(&window.to_be_bytes());
+    let mut cursor = 20;
+    if flags & 0x02 != 0 {
+        if mss != 0 {
+            out[cursor..cursor + 2].copy_from_slice(&[2, 4]);
+            out[cursor + 2..cursor + 4].copy_from_slice(&mss.to_be_bytes());
+            cursor += 4;
+        }
+        if sack.permitted {
+            out[cursor..cursor + 4].copy_from_slice(&[1, 1, 4, 2]);
+        }
+    } else if blocks > 0 {
+        out[cursor..cursor + 4].copy_from_slice(&[1, 1, 5, (2 + 8 * blocks) as u8]);
+        cursor += 4;
+        for &(start, end) in &sack.blocks[..blocks] {
+            out[cursor..cursor + 4].copy_from_slice(&start.to_be_bytes());
+            out[cursor + 4..cursor + 8].copy_from_slice(&end.to_be_bytes());
+            cursor += 8;
+        }
+    }
+    out[20 + option_bytes..length].copy_from_slice(payload);
+    length
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn send_tcp_window(
+    destination: [u8; 4],
+    source_port: u16,
+    destination_port: u16,
+    sequence: u32,
+    acknowledgement: u32,
+    flags: u8,
+    window: u16,
+    mss: u16,
+    sack: &crate::tcp::Sack,
+    payload: &[u8],
+) -> bool {
     let config = *CONFIG.lock();
     if !config.ready {
         return false;
     }
     let mut packet = [0u8; 1514];
-    let tcp_length = 20 + payload.len();
+    let tcp_length = build_tcp_segment(
+        source_port,
+        destination_port,
+        sequence,
+        acknowledgement,
+        flags,
+        window,
+        mss,
+        sack,
+        payload,
+        &mut packet[34..],
+    );
+    if tcp_length == 0 {
+        return false;
+    }
     let packet_length = 34 + tcp_length;
     packet[..6].copy_from_slice(&config.gateway_mac);
     packet[6..12].copy_from_slice(&config.mac);
@@ -878,20 +1065,190 @@ fn send_tcp(
     packet[30..34].copy_from_slice(&destination);
     let ip_checksum = checksum(&packet[14..34]);
     packet[24..26].copy_from_slice(&ip_checksum.to_be_bytes());
-    packet[34..36].copy_from_slice(&source_port.to_be_bytes());
-    packet[36..38].copy_from_slice(&destination_port.to_be_bytes());
-    packet[38..42].copy_from_slice(&sequence.to_be_bytes());
-    packet[42..46].copy_from_slice(&acknowledgement.to_be_bytes());
-    packet[46] = 5 << 4;
-    packet[47] = flags;
-    packet[48..50].copy_from_slice(&64_240u16.to_be_bytes());
-    packet[54..packet_length].copy_from_slice(payload);
     let calculated =
         transport_checksum(config.local_ip, destination, 6, &packet[34..packet_length]);
     packet[50..52].copy_from_slice(&calculated.to_be_bytes());
     crate::nic::transmit(&packet[..packet_length])
 }
 
+pub struct ParsedTcp {
+    pub remote: crate::ip::Address,
+    pub remote_port: u16,
+    pub local_port: u16,
+    pub sequence: u32,
+    pub acknowledgement: u32,
+    pub flags: u8,
+    pub window: u16,
+    pub mss: u16,
+    pub sack: crate::tcp::Sack,
+    pub payload_start: usize,
+    pub payload_len: usize,
+}
+
+/// Feeds `rounds` generated frames to the TCP parser: valid Ethernet and IPv4
+/// framing with random header lengths, options, payloads and flipped bytes,
+/// checksums fixed up half the time so the deeper checks are reached.
+#[cfg(feature = "boot-test")]
+pub fn fuzz_parse_tcp(mut next: impl FnMut() -> u64, rounds: u32) {
+    let config = *CONFIG.lock();
+    let mut packet = [0u8; 1600];
+    for _ in 0..rounds {
+        let random = next();
+        let payload = (random >> 8) as usize % 300;
+        let ip_options = ((random >> 20) as usize % 11) * 4;
+        let tcp_options = ((random >> 30) as usize % 11) * 4;
+        let ip_bytes = 20 + ip_options;
+        let tcp_bytes = 20 + tcp_options;
+        let total = ip_bytes + tcp_bytes + payload;
+        packet.fill(0);
+        packet[..6].copy_from_slice(&config.mac);
+        packet[12..14].copy_from_slice(&[0x08, 0x00]);
+        packet[14] = 0x40 | (ip_bytes / 4) as u8;
+        packet[16..18].copy_from_slice(&(total as u16).to_be_bytes());
+        packet[22] = 64;
+        packet[23] = 6;
+        packet[26..30].copy_from_slice(&[10, 0, 2, 2]);
+        packet[30..34].copy_from_slice(&config.local_ip);
+        let tcp = 14 + ip_bytes;
+        packet[tcp + 12] = ((tcp_bytes / 4) as u8) << 4;
+        for byte in packet[tcp + 20..14 + total].iter_mut() {
+            *byte = next() as u8;
+        }
+        let fix_checksums = random & 1 == 0;
+        if fix_checksums {
+            let ip_checksum = checksum(&packet[14..14 + ip_bytes]);
+            packet[24..26].copy_from_slice(&ip_checksum.to_be_bytes());
+            let tcp_checksum =
+                transport_checksum([10, 0, 2, 2], config.local_ip, 6, &packet[tcp..14 + total]);
+            packet[tcp + 16..tcp + 18].copy_from_slice(&tcp_checksum.to_be_bytes());
+        }
+        for _ in 0..(random >> 40) as usize % 4 {
+            let at = next() as usize % (14 + total);
+            packet[at] = next() as u8;
+        }
+        let length = if random & 2 == 0 {
+            14 + total
+        } else {
+            next() as usize % (14 + total + 1)
+        };
+        if let Some(parsed) = parse_tcp(&packet[..length]) {
+            assert!(parsed.payload_start + parsed.payload_len <= length);
+        }
+    }
+}
+
+/// The MSS and selective-acknowledgement options of a TCP options block;
+/// whatever is absent or malformed reads as zero.
+pub(crate) fn tcp_options(options: &[u8]) -> (u16, crate::tcp::Sack) {
+    let mut mss = 0;
+    let mut sack = crate::tcp::Sack::default();
+    let mut index = 0;
+    while index < options.len() {
+        match options[index] {
+            0 => break,
+            1 => index += 1,
+            kind => {
+                let Some(&length) = options.get(index + 1) else {
+                    break;
+                };
+                let length = length as usize;
+                if length < 2 || index + length > options.len() {
+                    break;
+                }
+                let body = &options[index + 2..index + length];
+                match kind {
+                    2 if length == 4 => mss = u16::from_be_bytes([body[0], body[1]]),
+                    4 if length == 2 => sack.permitted = true,
+                    5 if length >= 10 && (length - 2).is_multiple_of(8) => {
+                        for pair in body.chunks_exact(8).take(crate::tcp::MAX_SACK) {
+                            let start = u32::from_be_bytes([pair[0], pair[1], pair[2], pair[3]]);
+                            let end = u32::from_be_bytes([pair[4], pair[5], pair[6], pair[7]]);
+                            sack.blocks[sack.count] = (start, end);
+                            sack.count += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                index += length;
+            }
+        }
+    }
+    (mss, sack)
+}
+
+/// The link-local IPv6 address for `mac` and the global one if router
+/// discovery produced it.
+pub fn ipv6_addresses(mac: [u8; 6]) -> ([u8; 16], Option<[u8; 16]>) {
+    let info = crate::ipv6::info();
+    let link_local = if info.link_local == [0; 16] {
+        link_local_address(mac)
+    } else {
+        info.link_local
+    };
+    (link_local, info.global)
+}
+
+pub fn local_address() -> [u8; 4] {
+    CONFIG.lock().local_ip
+}
+
+/// Validates an Ethernet frame as an unfragmented IPv4/TCP segment addressed
+/// to this host, checksums included.
+pub fn parse_tcp(packet: &[u8]) -> Option<ParsedTcp> {
+    let config = *CONFIG.lock();
+    let length = packet.len();
+    if length < 54
+        || packet[..6] != config.mac
+        || packet[12..14] != [0x08, 0x00]
+        || packet[14] >> 4 != 4
+        || packet[23] != 6
+        || packet[30..34] != config.local_ip
+    {
+        return None;
+    }
+    let ip_bytes = (packet[14] as usize & 0x0f) * 4;
+    let total_bytes = u16::from_be_bytes([packet[16], packet[17]]) as usize;
+    let tcp_start = 14 + ip_bytes;
+    if ip_bytes < 20
+        || total_bytes < ip_bytes + 20
+        || 14 + total_bytes > length
+        || tcp_start + 20 > length
+        || u16::from_be_bytes([packet[20], packet[21]]) & 0x3fff != 0
+    {
+        return None;
+    }
+    let remote: [u8; 4] = packet[26..30].try_into().ok()?;
+    if checksum(&packet[14..14 + ip_bytes]) != 0
+        || transport_checksum(
+            remote,
+            config.local_ip,
+            6,
+            &packet[tcp_start..14 + total_bytes],
+        ) != 0
+    {
+        return None;
+    }
+    let tcp_bytes = (packet[tcp_start + 12] as usize >> 4) * 4;
+    if tcp_bytes < 20 || tcp_start + tcp_bytes > 14 + total_bytes {
+        return None;
+    }
+    let (mss, sack) = tcp_options(&packet[tcp_start + 20..tcp_start + tcp_bytes]);
+    Some(ParsedTcp {
+        mss,
+        sack,
+        remote: crate::ip::v4(remote),
+        remote_port: u16::from_be_bytes([packet[tcp_start], packet[tcp_start + 1]]),
+        local_port: u16::from_be_bytes([packet[tcp_start + 2], packet[tcp_start + 3]]),
+        sequence: u32::from_be_bytes(packet[tcp_start + 4..tcp_start + 8].try_into().ok()?),
+        acknowledgement: u32::from_be_bytes(packet[tcp_start + 8..tcp_start + 12].try_into().ok()?),
+        flags: packet[tcp_start + 13],
+        window: u16::from_be_bytes([packet[tcp_start + 14], packet[tcp_start + 15]]),
+        payload_start: tcp_start + tcp_bytes,
+        payload_len: total_bytes - ip_bytes - tcp_bytes,
+    })
+}
+
+#[cfg(feature = "boot-test")]
 fn wait_tcp(
     source: [u8; 4],
     source_port: u16,
@@ -959,6 +1316,176 @@ fn wait_tcp(
     None
 }
 
+/// Like `wait_tcp`, but for a passive listener that doesn't know its peer's
+/// address/port yet: matches on the local (destination) port only, and
+/// reports whichever source sent the segment.
+#[cfg(feature = "boot-test")]
+fn wait_tcp_any_peer(
+    local_port: u16,
+    payload: &mut [u8],
+    deadline_ns: u64,
+) -> Option<([u8; 4], u16, TcpSegment)> {
+    let config = *CONFIG.lock();
+    let mut packet = [0u8; 2048];
+    while crate::time::monotonic_nanoseconds() < deadline_ns {
+        let Some(length) = crate::nic::receive(&mut packet) else {
+            core::hint::spin_loop();
+            continue;
+        };
+        if length < 54
+            || packet[..6] != config.mac
+            || packet[12..14] != [0x08, 0x00]
+            || packet[14] >> 4 != 4
+            || packet[23] != 6
+            || packet[30..34] != config.local_ip
+        {
+            continue;
+        }
+        let ip_bytes = (packet[14] as usize & 0x0f) * 4;
+        let total_bytes = u16::from_be_bytes([packet[16], packet[17]]) as usize;
+        let tcp_start = 14 + ip_bytes;
+        if ip_bytes < 20
+            || total_bytes < ip_bytes + 20
+            || 14 + total_bytes > length
+            || tcp_start + 20 > length
+            || u16::from_be_bytes([packet[20], packet[21]]) & 0x3fff != 0
+            || packet[tcp_start + 2..tcp_start + 4] != local_port.to_be_bytes()
+        {
+            continue;
+        }
+        let source: [u8; 4] = match packet[26..30].try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let source_port = u16::from_be_bytes([packet[tcp_start], packet[tcp_start + 1]]);
+        if checksum(&packet[14..14 + ip_bytes]) != 0
+            || transport_checksum(
+                source,
+                config.local_ip,
+                6,
+                &packet[tcp_start..14 + total_bytes],
+            ) != 0
+        {
+            continue;
+        }
+        let tcp_bytes = (packet[tcp_start + 12] as usize >> 4) * 4;
+        if tcp_bytes < 20 || tcp_start + tcp_bytes > 14 + total_bytes {
+            continue;
+        }
+        let bytes = total_bytes - ip_bytes - tcp_bytes;
+        if bytes > payload.len() {
+            return None;
+        }
+        payload[..bytes]
+            .copy_from_slice(&packet[tcp_start + tcp_bytes..tcp_start + tcp_bytes + bytes]);
+        return Some((
+            source,
+            source_port,
+            TcpSegment {
+                sequence: u32::from_be_bytes(packet[tcp_start + 4..tcp_start + 8].try_into().ok()?),
+                acknowledgement: u32::from_be_bytes(
+                    packet[tcp_start + 8..tcp_start + 12].try_into().ok()?,
+                ),
+                flags: packet[tcp_start + 13],
+                bytes,
+            },
+        ));
+    }
+    None
+}
+
+/// Boot-test-only proof of a real TCP *server*: waits for a SYN from any
+/// peer on `port`, completes the three-way handshake, echoes back whatever
+/// the peer sends until it closes (or the deadline passes), and acks its
+/// FIN. No retransmission or congestion control yet - like the existing TCP
+/// client above, this is a bounded, single-connection implementation.
+#[cfg(feature = "boot-test")]
+pub struct TcpServerReport {
+    pub syn_received: bool,
+    pub handshake_completed: bool,
+    pub echoed_bytes: usize,
+    pub closed_cleanly: bool,
+    pub verified: bool,
+}
+
+#[cfg(feature = "boot-test")]
+pub fn tcp_server_self_test(port: u16, timeout_ns: u64) -> TcpServerReport {
+    let mut report = TcpServerReport {
+        syn_received: false,
+        handshake_completed: false,
+        echoed_bytes: 0,
+        closed_cleanly: false,
+        verified: false,
+    };
+    if !CONFIG.lock().ready {
+        return report;
+    }
+    let deadline = crate::time::monotonic_nanoseconds().saturating_add(timeout_ns);
+    let mut payload = [0u8; 1460];
+    let (peer, peer_port, local_isn, mut remote_sequence) = loop {
+        let Some((source, source_port, segment)) = wait_tcp_any_peer(port, &mut payload, deadline)
+        else {
+            return report;
+        };
+        if segment.flags & 0x02 != 0 && segment.flags & 0x10 == 0 {
+            report.syn_received = true;
+            let isn = (crate::time::monotonic_nanoseconds() as u32).wrapping_mul(0x2545_f491);
+            break (source, source_port, isn, segment.sequence.wrapping_add(1));
+        }
+    };
+    if !send_tcp(peer, port, peer_port, local_isn, remote_sequence, 0x12, &[]) {
+        return report;
+    }
+    let mut local_sequence = local_isn.wrapping_add(1);
+    let Some(ack) = wait_tcp(peer, peer_port, port, &mut payload, 2_000_000_000) else {
+        return report;
+    };
+    if ack.flags & 0x10 == 0 || ack.acknowledgement != local_sequence {
+        return report;
+    }
+    report.handshake_completed = true;
+    while crate::time::monotonic_nanoseconds() < deadline {
+        let Some(segment) = wait_tcp(peer, peer_port, port, &mut payload, 2_000_000_000) else {
+            break;
+        };
+        if segment.sequence == remote_sequence && segment.bytes != 0 {
+            remote_sequence = remote_sequence.wrapping_add(segment.bytes as u32);
+            if send_tcp(
+                peer,
+                port,
+                peer_port,
+                local_sequence,
+                remote_sequence,
+                0x18,
+                &payload[..segment.bytes],
+            ) {
+                local_sequence = local_sequence.wrapping_add(segment.bytes as u32);
+                report.echoed_bytes += segment.bytes;
+            }
+        }
+        if segment.flags & 0x01 != 0 {
+            remote_sequence = remote_sequence.wrapping_add(1);
+            let _ = send_tcp(
+                peer,
+                port,
+                peer_port,
+                local_sequence,
+                remote_sequence,
+                0x11,
+                &[],
+            );
+            local_sequence = local_sequence.wrapping_add(1);
+            if let Some(fin_ack) = wait_tcp(peer, peer_port, port, &mut payload, 1_000_000_000) {
+                report.closed_cleanly =
+                    fin_ack.flags & 0x10 != 0 && fin_ack.acknowledgement == local_sequence;
+            }
+            break;
+        }
+    }
+    report.verified = report.syn_received && report.handshake_completed && report.echoed_bytes > 0;
+    report
+}
+
 fn http_status(response: &[u8]) -> u16 {
     if response.len() < 12 || !response.starts_with(b"HTTP/1.") {
         return 0;
@@ -996,45 +1523,61 @@ fn encode_dns_name(name: &str, output: &mut [u8], mut cursor: usize) -> Option<u
 }
 
 fn parse_dns(packet: &[u8], transaction: u16) -> (bool, u16, [u8; 4]) {
+    let mut found = [0u8; 16];
+    let (ok, answers) = parse_dns_records(packet, transaction, 1, &mut found);
+    let mut address = [0u8; 4];
+    address.copy_from_slice(&found[..4]);
+    (ok, answers, address)
+}
+
+/// Checks a DNS response and takes the last record of type `wanted` (1 =
+/// A, 28 = AAAA) from its answers into `found`; returns whether the response
+/// is well formed and how many answers it holds.
+fn parse_dns_records(
+    packet: &[u8],
+    transaction: u16,
+    wanted: u16,
+    found: &mut [u8; 16],
+) -> (bool, u16) {
     if packet.len() < 12
         || packet[..2] != transaction.to_be_bytes()
         || packet[2] & 0x80 == 0
         || packet[3] & 0x0f != 0
         || u16::from_be_bytes([packet[4], packet[5]]) != 1
     {
-        return (false, 0, [0; 4]);
+        return (false, 0);
     }
     let answers = u16::from_be_bytes([packet[6], packet[7]]);
     let Some(question_end) = skip_dns_name(packet, 12).and_then(|offset| offset.checked_add(4))
     else {
-        return (false, 0, [0; 4]);
+        return (false, 0);
     };
     if question_end > packet.len() {
-        return (false, 0, [0; 4]);
+        return (false, 0);
     }
     let mut cursor = question_end;
-    let mut address = [0u8; 4];
     for _ in 0..answers {
         let Some(name_end) = skip_dns_name(packet, cursor) else {
-            return (false, 0, [0; 4]);
+            return (false, 0);
         };
         cursor = name_end;
         if cursor + 10 > packet.len() {
-            return (false, 0, [0; 4]);
+            return (false, 0);
         }
         let kind = u16::from_be_bytes([packet[cursor], packet[cursor + 1]]);
         let class = u16::from_be_bytes([packet[cursor + 2], packet[cursor + 3]]);
         let length = u16::from_be_bytes([packet[cursor + 8], packet[cursor + 9]]) as usize;
         cursor += 10;
         if cursor + length > packet.len() {
-            return (false, 0, [0; 4]);
+            return (false, 0);
         }
-        if kind == 1 && class == 1 && length == 4 {
-            address.copy_from_slice(&packet[cursor..cursor + 4]);
+        let expected = if wanted == 28 { 16 } else { 4 };
+        if kind == wanted && class == 1 && length == expected {
+            found[..length].copy_from_slice(&packet[cursor..cursor + length]);
         }
         cursor += length;
     }
-    (true, answers, address)
+    (true, answers)
 }
 
 fn skip_dns_name(packet: &[u8], mut cursor: usize) -> Option<usize> {
@@ -1095,4 +1638,236 @@ fn checksum(bytes: &[u8]) -> u16 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+// --- IPv6: link-local addressing, Neighbor Discovery, ICMPv6 echo --------
+//
+// Deliberately minimal, matching this file's IPv4 stack's scope: only what
+// a self-test needs to prove a real round trip. SLAAC takes the first /64
+// prefix a router advertises (no duplicate address detection, no lifetimes;
+// no global address beyond that, no DNS over IPv6, no
+// fragmentation), no multicast listener maintenance beyond what one
+// exchange needs. Router Discovery (RS/RA) is how the router's own address
+// is learned in the first place - unlike IPv4's DHCP-assigned gateway, nothing
+// here is configured in advance.
+
+const ETHERTYPE_IPV6: [u8; 2] = [0x86, 0xdd];
+
+#[derive(Clone, Copy)]
+pub struct Ipv6Report {
+    pub link_local: [u8; 16],
+    pub router_solicited: bool,
+    pub router_advertised: bool,
+    pub router_ip: [u8; 16],
+    pub neighbor_solicited: bool,
+    pub neighbor_resolved: bool,
+    pub echo_tx: bool,
+    pub echo_rx: bool,
+    pub prefix_found: bool,
+    pub global_address: [u8; 16],
+    pub global_echo_rx: bool,
+    pub verified: bool,
+}
+
+/// A link-local address from a MAC via modified EUI-64 (RFC 4291 appendix A):
+/// `fe80::` + the MAC split around an inserted `ff:fe`, with the
+/// universal/local bit of the first byte flipped. Needs no network exchange
+/// at all - every other address in this file is learned from the network,
+/// but a node computes its own link-local address unilaterally.
+pub(crate) fn link_local_address(mac: [u8; 6]) -> [u8; 16] {
+    let mut address = [0u8; 16];
+    address[0] = 0xfe;
+    address[1] = 0x80;
+    address[8] = mac[0] ^ 0x02;
+    address[9] = mac[1];
+    address[10] = mac[2];
+    address[11] = 0xff;
+    address[12] = 0xfe;
+    address[13] = mac[3];
+    address[14] = mac[4];
+    address[15] = mac[5];
+    address
+}
+
+/// A prefix plus the modified EUI-64 interface identifier of `mac` (RFC 4862).
+pub(crate) fn slaac_address(prefix: [u8; 8], mac: [u8; 6]) -> [u8; 16] {
+    let mut address = link_local_address(mac);
+    address[..8].copy_from_slice(&prefix);
+    address
+}
+
+/// The solicited-node multicast address (and its matching multicast MAC)
+/// for `target`: `ff02::1:ffXX:XXXX` built from the address's low 24 bits,
+/// used so a Neighbor Solicitation for a specific address reaches only
+/// nodes that could plausibly hold it.
+pub(crate) fn solicited_node_multicast(target: [u8; 16]) -> ([u8; 16], [u8; 6]) {
+    let mut address = [0u8; 16];
+    address[0] = 0xff;
+    address[1] = 0x02;
+    address[11] = 0x01;
+    address[12] = 0xff;
+    address[13] = target[13];
+    address[14] = target[14];
+    address[15] = target[15];
+    let mac = [0x33, 0x33, 0xff, target[13], target[14], target[15]];
+    (address, mac)
+}
+
+/// RFC 8200 section 8.1's pseudo-header checksum: every IPv6 upper-layer
+/// protocol (ICMPv6 included) is checksummed over source + destination +
+/// upper-layer length + next-header, the same shape as `transport_checksum`
+/// but with 128-bit addresses and a 32-bit length field.
+pub(crate) fn transport_checksum_v6(
+    source: [u8; 16],
+    destination: [u8; 16],
+    next_header: u8,
+    packet: &[u8],
+) -> u16 {
+    let mut sum = 0u32;
+    for chunk in source.chunks_exact(2).chain(destination.chunks_exact(2)) {
+        sum = sum.wrapping_add(u16::from_be_bytes([chunk[0], chunk[1]]) as u32);
+    }
+    let length = packet.len() as u32;
+    sum = sum.wrapping_add((length >> 16) as u16 as u32);
+    sum = sum.wrapping_add(length as u16 as u32);
+    sum = sum.wrapping_add(next_header as u32);
+    let mut chunks = packet.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum = sum.wrapping_add(u16::from_be_bytes([chunk[0], chunk[1]]) as u32);
+    }
+    if let Some(byte) = chunks.remainder().first() {
+        sum = sum.wrapping_add((*byte as u32) << 8);
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Builds and sends one Ethernet+IPv6+ICMPv6 frame. `message` must have its
+/// checksum field (bytes 2..4) still zeroed - this fills it in.
+pub(crate) fn send_icmpv6(
+    mac: [u8; 6],
+    source: [u8; 16],
+    destination: [u8; 16],
+    destination_mac: [u8; 6],
+    hop_limit: u8,
+    message: &[u8],
+) -> bool {
+    if message.len() > 1024 {
+        return false;
+    }
+    let mut packet = [0u8; 14 + 40 + 1024];
+    packet[..6].copy_from_slice(&destination_mac);
+    packet[6..12].copy_from_slice(&mac);
+    packet[12..14].copy_from_slice(&ETHERTYPE_IPV6);
+    packet[14] = 0x60;
+    packet[18..20].copy_from_slice(&(message.len() as u16).to_be_bytes());
+    packet[20] = 58;
+    packet[21] = hop_limit;
+    packet[22..38].copy_from_slice(&source);
+    packet[38..54].copy_from_slice(&destination);
+    packet[54..54 + message.len()].copy_from_slice(message);
+    let checksum_value =
+        transport_checksum_v6(source, destination, 58, &packet[54..54 + message.len()]);
+    packet[56..58].copy_from_slice(&checksum_value.to_be_bytes());
+    crate::nic::transmit(&packet[..54 + message.len()])
+}
+
+pub(crate) struct Icmpv6Message {
+    pub(crate) source: [u8; 16],
+    pub(crate) bytes: usize,
+}
+
+/// Waits (bounded) for any ICMPv6 message of `expected_type` addressed to
+/// `mac` or to a multicast MAC, with a valid checksum. Unlike `wait_tcp`,
+/// there is no source filter - Neighbor/Router Discovery messages come from
+/// addresses this code does not know in advance (that's what they're for).
+pub(crate) fn wait_icmpv6(
+    mac: [u8; 6],
+    expected_type: u8,
+    timeout_ns: u64,
+    payload: &mut [u8],
+) -> Option<Icmpv6Message> {
+    let deadline = crate::time::monotonic_nanoseconds().saturating_add(timeout_ns);
+    let mut packet = [0u8; 2048];
+    while crate::time::monotonic_nanoseconds() < deadline {
+        let Some(length) = crate::nic::receive(&mut packet) else {
+            core::hint::spin_loop();
+            continue;
+        };
+        if length < 14 + 40 + 4
+            || (packet[..6] != mac && packet[0] != 0x33)
+            || packet[12..14] != ETHERTYPE_IPV6
+            || packet[14] >> 4 != 6
+        {
+            continue;
+        }
+        let payload_length = u16::from_be_bytes([packet[18], packet[19]]) as usize;
+        if packet[20] != 58 || 54 + payload_length > length {
+            continue;
+        }
+        let mut source = [0u8; 16];
+        source.copy_from_slice(&packet[22..38]);
+        let mut destination = [0u8; 16];
+        destination.copy_from_slice(&packet[38..54]);
+        let icmp = &packet[54..54 + payload_length];
+        if icmp.len() < 4
+            || icmp[0] != expected_type
+            || transport_checksum_v6(source, destination, 58, icmp) != 0
+        {
+            continue;
+        }
+        let copy_len = icmp.len().min(payload.len());
+        payload[..copy_len].copy_from_slice(&icmp[..copy_len]);
+        return Some(Icmpv6Message {
+            source,
+            bytes: icmp.len(),
+        });
+    }
+    None
+}
+
+/// A full IPv6 round trip with no addressing configured in advance: compute
+/// our own link-local address, discover the router and configure the global
+/// address (`ipv6::configure`), resolve the router with a Neighbor
+/// Solicitation, then ICMPv6 ping the router from both addresses.
+pub fn ipv6_self_test(link: &NetworkReport) -> Ipv6Report {
+    let link_local = link_local_address(link.mac);
+    let configuration = crate::ipv6::configure(link.mac);
+    let mut report = Ipv6Report {
+        link_local,
+        router_solicited: configuration.solicited,
+        router_advertised: configuration.advertised,
+        router_ip: configuration.router,
+        neighbor_solicited: configuration.neighbor_solicited,
+        neighbor_resolved: configuration.neighbor_resolved,
+        echo_tx: false,
+        echo_rx: false,
+        prefix_found: configuration.global.is_some(),
+        global_address: configuration.global.unwrap_or([0; 16]),
+        global_echo_rx: false,
+        verified: false,
+    };
+    if report.neighbor_resolved {
+        report.echo_tx = true;
+        report.echo_rx = crate::ipv6::ping(&report.router_ip, 0x6906, 1, 3_000_000_000).is_some();
+    }
+    if let Some(global) = configuration.global
+        && report.neighbor_resolved
+    {
+        let mut gateway = global;
+        gateway[8..].fill(0);
+        gateway[15] = 2;
+        report.global_echo_rx = crate::ipv6::ping(&gateway, 0x6907, 1, 3_000_000_000).is_some();
+    }
+    report.verified = report.router_solicited
+        && report.router_advertised
+        && report.neighbor_solicited
+        && report.neighbor_resolved
+        && report.echo_tx
+        && report.echo_rx
+        && report.prefix_found
+        && report.global_echo_rx;
+    report
 }

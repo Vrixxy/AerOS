@@ -158,7 +158,7 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> NicReport 
     report.mac = mac;
     // Rings (256-byte aligned) and buffers in one DMA block.
     let pages = (2 * RING * BUFFER / 4096 + 2) as u64;
-    let Some(dma) = frames.allocate_contiguous(pages, 1) else {
+    let Some(dma) = frames.allocate_dma(pages, 1) else {
         return report;
     };
     let base = dma.address();

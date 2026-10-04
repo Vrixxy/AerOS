@@ -191,6 +191,8 @@ fn inspect_gpt(disk_sectors: u64) -> PartitionReport {
         }
         let kind = if is_efi_system_guid(&entry[..16]) {
             0xef
+        } else if is_swap_guid(&entry[..16]) {
+            0x82
         } else {
             0xff
         };
@@ -239,6 +241,14 @@ fn validate(report: &PartitionReport, disk_sectors: u64) -> bool {
         }
     }
     true
+}
+
+fn is_swap_guid(bytes: &[u8]) -> bool {
+    bytes
+        == [
+            0x6d, 0xfd, 0x57, 0x06, 0xab, 0xa4, 0xc4, 0x43, 0x84, 0xe5, 0x09, 0x33, 0xc8, 0x4b,
+            0x4f, 0x4f,
+        ]
 }
 
 fn is_efi_system_guid(bytes: &[u8]) -> bool {

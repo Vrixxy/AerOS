@@ -22,39 +22,7 @@ impl Generator {
     };
 
     fn refill(&mut self) {
-        let mut state = [
-            0x6170_7865,
-            0x3320_646e,
-            0x7962_2d32,
-            0x6b20_6574,
-            self.key[0],
-            self.key[1],
-            self.key[2],
-            self.key[3],
-            self.key[4],
-            self.key[5],
-            self.key[6],
-            self.key[7],
-            self.counter,
-            self.nonce[0],
-            self.nonce[1],
-            self.nonce[2],
-        ];
-        let initial = state;
-        for _ in 0..10 {
-            quarter(&mut state, 0, 4, 8, 12);
-            quarter(&mut state, 1, 5, 9, 13);
-            quarter(&mut state, 2, 6, 10, 14);
-            quarter(&mut state, 3, 7, 11, 15);
-            quarter(&mut state, 0, 5, 10, 15);
-            quarter(&mut state, 1, 6, 11, 12);
-            quarter(&mut state, 2, 7, 8, 13);
-            quarter(&mut state, 3, 4, 9, 14);
-        }
-        for index in 0..16 {
-            let word = state[index].wrapping_add(initial[index]);
-            self.block[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
-        }
+        self.block = chacha20_block(&self.key, &self.nonce, self.counter);
         self.counter = self.counter.wrapping_add(1);
         if self.counter == 0 {
             self.nonce[0] = self.nonce[0].wrapping_add(1);
@@ -166,6 +134,100 @@ pub fn next_u64() -> u64 {
         return read_tsc();
     }
     u64::from_le_bytes(bytes)
+}
+
+/// One ChaCha20 block (RFC 8439 section 2.3): the standalone core `Generator`
+/// (the internal CSPRNG instance) is built on, exposed for callers that want
+/// ChaCha20 as a general-purpose stream cipher with their own key - not
+/// mixed with the CSPRNG's internally-seeded state at all.
+fn chacha20_block(key: &[u32; 8], nonce: &[u32; 3], counter: u32) -> [u8; 64] {
+    let mut state = [
+        0x6170_7865,
+        0x3320_646e,
+        0x7962_2d32,
+        0x6b20_6574,
+        key[0],
+        key[1],
+        key[2],
+        key[3],
+        key[4],
+        key[5],
+        key[6],
+        key[7],
+        counter,
+        nonce[0],
+        nonce[1],
+        nonce[2],
+    ];
+    let initial = state;
+    for _ in 0..10 {
+        quarter(&mut state, 0, 4, 8, 12);
+        quarter(&mut state, 1, 5, 9, 13);
+        quarter(&mut state, 2, 6, 10, 14);
+        quarter(&mut state, 3, 7, 11, 15);
+        quarter(&mut state, 0, 5, 10, 15);
+        quarter(&mut state, 1, 6, 11, 12);
+        quarter(&mut state, 2, 7, 8, 13);
+        quarter(&mut state, 3, 4, 9, 14);
+    }
+    let mut block = [0u8; 64];
+    for index in 0..16 {
+        let word = state[index].wrapping_add(initial[index]);
+        block[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    block
+}
+
+/// XORs `data` in place with the ChaCha20 keystream for `key`/`nonce`
+/// starting at block `counter`. Encryption and decryption are the same
+/// operation for a stream cipher, provided both sides use the same
+/// key/nonce/counter - callers must never reuse a (key, nonce) pair across
+/// two different plaintexts, or the keystream can be cancelled out between
+/// them.
+pub fn chacha20_xor(key: &[u8; 32], nonce: &[u8; 12], counter: u32, data: &mut [u8]) {
+    let key_words: [u32; 8] = core::array::from_fn(|index| {
+        u32::from_le_bytes(key[index * 4..index * 4 + 4].try_into().unwrap_or([0; 4]))
+    });
+    let nonce_words: [u32; 3] = core::array::from_fn(|index| {
+        u32::from_le_bytes(nonce[index * 4..index * 4 + 4].try_into().unwrap_or([0; 4]))
+    });
+    for (block_index, chunk) in data.chunks_mut(64).enumerate() {
+        let block = chacha20_block(
+            &key_words,
+            &nonce_words,
+            counter.wrapping_add(block_index as u32),
+        );
+        for (byte, keystream) in chunk.iter_mut().zip(block.iter()) {
+            *byte ^= keystream;
+        }
+    }
+}
+
+/// RFC 8439 section 2.4.2's test vector: encrypts the well-known plaintext
+/// with the well-known key/nonce/counter=1 and checks the ciphertext matches
+/// exactly, then decrypts (the same XOR again) and checks that round-trips
+/// back to the plaintext - proves `chacha20_xor` really is standard
+/// ChaCha20, not just "some XOR cipher that happens to round-trip".
+pub(crate) fn chacha20_self_test() -> bool {
+    let key: [u8; 32] = core::array::from_fn(|index| index as u8);
+    let nonce: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0x4a, 0, 0, 0, 0];
+    let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+    let expected_ciphertext: [u8; 114] = [
+        0x6e, 0x2e, 0x35, 0x9a, 0x25, 0x68, 0xf9, 0x80, 0x41, 0xba, 0x07, 0x28, 0xdd, 0x0d, 0x69,
+        0x81, 0xe9, 0x7e, 0x7a, 0xec, 0x1d, 0x43, 0x60, 0xc2, 0x0a, 0x27, 0xaf, 0xcc, 0xfd, 0x9f,
+        0xae, 0x0b, 0xf9, 0x1b, 0x65, 0xc5, 0x52, 0x47, 0x33, 0xab, 0x8f, 0x59, 0x3d, 0xab, 0xcd,
+        0x62, 0xb3, 0x57, 0x16, 0x39, 0xd6, 0x24, 0xe6, 0x51, 0x52, 0xab, 0x8f, 0x53, 0x0c, 0x35,
+        0x9f, 0x08, 0x61, 0xd8, 0x07, 0xca, 0x0d, 0xbf, 0x50, 0x0d, 0x6a, 0x61, 0x56, 0xa3, 0x8e,
+        0x08, 0x8a, 0x22, 0xb6, 0x5e, 0x52, 0xbc, 0x51, 0x4d, 0x16, 0xcc, 0xf8, 0x06, 0x81, 0x8c,
+        0xe9, 0x1a, 0xb7, 0x79, 0x37, 0x36, 0x5a, 0xf9, 0x0b, 0xbf, 0x74, 0xa3, 0x5b, 0xe6, 0xb4,
+        0x0b, 0x8e, 0xed, 0xf2, 0x78, 0x5e, 0x42, 0x87, 0x4d,
+    ];
+    let mut buffer = *plaintext;
+    chacha20_xor(&key, &nonce, 1, &mut buffer);
+    let encrypt_ok = buffer == expected_ciphertext;
+    chacha20_xor(&key, &nonce, 1, &mut buffer);
+    let round_trip_ok = buffer == *plaintext;
+    encrypt_ok && round_trip_ok
 }
 
 fn quarter(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {

@@ -21,6 +21,7 @@ pub const MEDIA_ROOT: usize = usize::MAX;
 const HOME_LABEL: &[u8; 9] = b"AEROSHOME";
 const BLANK_MARKER: &[u8; 16] = b"AEROS-DATA-BLANK";
 const NAME_BYTES: usize = 24;
+const PATH_BYTES: usize = 128;
 
 /// Set when a removable disk appeared or vanished; `poll` then rescans.
 pub static MEDIA_DIRTY: AtomicBool = AtomicBool::new(false);
@@ -56,6 +57,13 @@ struct Handle {
     /// File position, or the next directory entry index.
     cursor: u64,
     writable: bool,
+    /// Written since it was opened (realtime protection scans it on close).
+    dirty: bool,
+    /// The full VFS path this was opened with (e.g. `/home/Notes/todo.txt`),
+    /// for that same realtime-protection scan - FAT nodes do not otherwise
+    /// carry enough to reconstruct a path from just the handle.
+    path: [u8; PATH_BYTES],
+    path_len: u8,
 }
 
 const EMPTY_HANDLE: Handle = Handle {
@@ -68,6 +76,9 @@ const EMPTY_HANDLE: Handle = Handle {
     media_root: false,
     cursor: 0,
     writable: false,
+    dirty: false,
+    path: [0; PATH_BYTES],
+    path_len: 0,
 };
 
 struct State {
@@ -260,6 +271,7 @@ pub fn initialize() -> HomeReport {
             report.clusters = info.clusters;
             report.free_clusters = info.free_clusters;
         }
+        check_home(&mut fs);
         install(HOME_MOUNT, disk, b"home", fs);
         // The usual folders exist from the first run.
         for folder in [
@@ -272,11 +284,35 @@ pub fn initialize() -> HomeReport {
         ] {
             let _ = crate::vfs::create_directory(folder, 0o755);
         }
+        crate::mounts::persistent_root();
         report.verified = true;
         break;
     }
     scan_media();
     report
+}
+
+/// Checks the home volume as it is mounted and repairs it if it is damaged
+/// (leaked clusters alone are harmless and are left for `fsck --repair`).
+fn check_home(fs: &mut fatfs::Fs) {
+    let Ok(found) = fs.fsck(false) else {
+        return;
+    };
+    crate::serial::format(format_args!(
+        "AEROS_HOME_FSCK files={} directories={} orphans={} damaged={}\n",
+        found.files,
+        found.directories,
+        found.orphan_clusters,
+        found.damaged()
+    ));
+    if found.damaged()
+        && let Ok(after) = fs.fsck(true)
+    {
+        crate::serial::format(format_args!(
+            "AEROS_HOME_FSCK repaired broken_chains={} duplicates={} size_mismatches={} cross_linked={}\n",
+            after.broken_chains, after.duplicates, after.size_mismatches, after.cross_linked
+        ));
+    }
 }
 
 fn install(slot: usize, disk: Disk, name: &[u8], fs: Box64) {
@@ -292,7 +328,7 @@ fn install(slot: usize, disk: Disk, name: &[u8], fs: Box64) {
 }
 
 /// Drops a mount; its open descriptors stop working.
-fn unmount(slot: usize) {
+pub(crate) fn unmount(slot: usize) {
     let mut state = STATE.lock();
     let epoch = state.mounts[slot].epoch;
     for handle in state.handles.iter_mut() {
@@ -427,6 +463,7 @@ fn allocate(
     node: Node,
     directory: bool,
     writable: bool,
+    path: &str,
 ) -> Result<u32, VfsError> {
     let slot = state
         .handles
@@ -435,6 +472,9 @@ fn allocate(
         .ok_or(VfsError::HandleLimit)?;
     let generation = state.handles[slot].generation.max(1);
     let epoch = state.mounts.get(mount).map_or(0, |mount| mount.epoch);
+    let mut path_buffer = [0u8; PATH_BYTES];
+    let path_len = path.len().min(PATH_BYTES);
+    path_buffer[..path_len].copy_from_slice(&path.as_bytes()[..path_len]);
     state.handles[slot] = Handle {
         used: true,
         generation,
@@ -445,6 +485,9 @@ fn allocate(
         media_root: mount == MEDIA_ROOT,
         cursor: 0,
         writable,
+        dirty: false,
+        path: path_buffer,
+        path_len: path_len as u8,
     };
     Ok(HANDLE_FLAG | (generation as u32 & 0x7fff) << 16 | slot as u32)
 }
@@ -491,6 +534,7 @@ pub fn open_file(
     exclusive: bool,
     truncate: bool,
     write: bool,
+    full_path: &str,
 ) -> Result<u32, VfsError> {
     if mount == MEDIA_ROOT {
         return Err(VfsError::IsDirectory);
@@ -522,19 +566,19 @@ pub fn open_file(
         }
         Ok(node)
     })?;
-    allocate(&mut state, mount, node, false, write || truncate)
+    allocate(&mut state, mount, node, false, write || truncate, full_path)
 }
 
 pub fn open_directory(mount: usize, rest: &str) -> Result<u32, VfsError> {
     let mut state = STATE.lock();
     if mount == MEDIA_ROOT {
-        return allocate(&mut state, MEDIA_ROOT, Node::EMPTY, true, false);
+        return allocate(&mut state, MEDIA_ROOT, Node::EMPTY, true, false, "");
     }
     let node = with_handle_fs(&mut state, mount, |fs| fs.resolve(rest.as_bytes()))?;
     if !node.is_directory() {
         return Err(VfsError::NotDirectory);
     }
-    allocate(&mut state, mount, node, true, false)
+    allocate(&mut state, mount, node, true, false, "")
 }
 
 pub fn next_directory_entry(descriptor: u32) -> Result<Option<DirectoryEntry>, VfsError> {
@@ -686,13 +730,35 @@ pub fn truncate(descriptor: u32, length: usize) -> Result<(), VfsError> {
     Ok(())
 }
 
-pub fn close(descriptor: u32) -> Result<(), VfsError> {
+/// Marks the handle written since it was opened, so `close` scans it.
+pub fn mark_dirty(descriptor: u32) {
     let mut state = STATE.lock();
-    let slot = descriptor as usize & 0xffff;
-    lookup(&mut state, descriptor)?;
-    let handle = &mut state.handles[slot];
-    handle.used = false;
-    handle.generation = (handle.generation.wrapping_add(1) & 0x7fff).max(1);
+    if let Ok(handle) = lookup(&mut state, descriptor) {
+        handle.dirty = true;
+    }
+}
+
+pub fn close(descriptor: u32) -> Result<(), VfsError> {
+    // Realtime protection: a file written through this handle is scanned
+    // once its writer is done with it - the same policy as the in-memory
+    // filesystem (vfs.rs), just applied here since a `/home`/`/media`
+    // descriptor never reaches that code path. The scan must happen after
+    // `state`'s lock is released: it opens the file again to read it,
+    // which takes this same lock.
+    let scan_path = {
+        let mut state = STATE.lock();
+        let slot = descriptor as usize & 0xffff;
+        lookup(&mut state, descriptor)?;
+        let handle = &mut state.handles[slot];
+        handle.used = false;
+        handle.generation = (handle.generation.wrapping_add(1) & 0x7fff).max(1);
+        (handle.dirty && handle.path_len > 0).then_some((handle.path, handle.path_len))
+    };
+    if let Some((buffer, length)) = scan_path
+        && let Ok(path) = core::str::from_utf8(&buffer[..length as usize])
+    {
+        crate::antivirus::on_modified(path);
+    }
     Ok(())
 }
 
@@ -732,6 +798,19 @@ pub fn descriptor_metadata(descriptor: u32) -> Result<Metadata, VfsError> {
     let mut state = STATE.lock();
     let handle = lookup(&mut state, descriptor)?;
     Ok(node_metadata(&handle.node))
+}
+
+pub fn descriptor_path(descriptor: u32) -> Option<([u8; 128], usize)> {
+    let mut state = STATE.lock();
+    let handle = lookup(&mut state, descriptor).ok()?;
+    let mut buffer = [0u8; 128];
+    if handle.media_root {
+        buffer[..6].copy_from_slice(b"/media");
+        return Some((buffer, 6));
+    }
+    let length = handle.path_len as usize;
+    buffer[..length].copy_from_slice(&handle.path[..length]);
+    Some((buffer, length))
 }
 
 pub fn create_directory(mount: usize, rest: &str) -> Result<(), VfsError> {
@@ -831,6 +910,8 @@ pub fn device_name(disk: Disk) -> &'static str {
         Disk::Usb => "sdu",
         Disk::Sd => "mmcblk0",
         Disk::Virtio => "vda",
+        #[cfg(feature = "boot-test")]
+        Disk::Ram => "ram0",
     }
 }
 
@@ -898,6 +979,11 @@ pub fn eject(name: &str) -> Result<(), VfsError> {
         *entry = Some(disk);
     }
     Ok(())
+}
+
+/// Checks (and with `repair` fixes) the filesystem of mount slot `mount`.
+pub fn fsck(mount: usize, repair: bool) -> Result<fatfs::FsckReport, VfsError> {
+    with_fs(mount, |fs| fs.fsck(repair))
 }
 
 /// (total, free) bytes of a mounted volume, for the Files app / storage settings.

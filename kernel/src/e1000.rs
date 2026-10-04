@@ -164,7 +164,7 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> NetworkRep
     {
         return NetworkReport::EMPTY;
     }
-    let Some(memory) = frames.allocate_contiguous(9, 1) else {
+    let Some(memory) = frames.allocate_dma(9, 1) else {
         return NetworkReport::EMPTY;
     };
     let descriptor_page = memory.address();
@@ -227,7 +227,9 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> NetworkRep
         );
         write_register(mmio, RDH, 0);
         write_register(mmio, RDT, (DESCRIPTORS - 1) as u32);
-        write_register(mmio, RCTL, (1 << 1) | (1 << 15) | (1 << 26));
+        // Enable, multicast promiscuous (IPv6 neighbour and router discovery arrive
+        // as multicast), accept broadcast, strip the CRC.
+        write_register(mmio, RCTL, (1 << 1) | (1 << 4) | (1 << 15) | (1 << 26));
         let control = read_register(mmio, CTRL);
         write_register(mmio, CTRL, control | (1 << 6));
     }

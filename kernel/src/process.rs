@@ -384,7 +384,7 @@ pub fn prepare_scheduled_process_stack_with(
         return false;
     }
     let stack_physical = space.stack_physical;
-    let stack_virtual = crate::arch::paging::process_stack_base();
+    let stack_virtual = crate::arch::paging::process_stack_base(space.user_slot);
     let mut cursor = crate::arch::paging::PROCESS_STACK_BYTES as usize - 16;
     let Some(executable_address) = push_bytes(
         stack_physical,
@@ -438,7 +438,7 @@ pub fn prepare_scheduled_process_stack_with(
         push_word(&mut words, &mut count, *address);
     }
     push_word(&mut words, &mut count, 0);
-    let virtual_base = crate::arch::paging::process_virtual_base();
+    let virtual_base = crate::arch::paging::process_virtual_base(space.user_slot);
     push_pair(&mut words, &mut count, AT_PHDR, virtual_base + 64);
     push_pair(&mut words, &mut count, AT_PHENT, 56);
     push_pair(

@@ -3,7 +3,11 @@ $root = Split-Path -Parent $PSScriptRoot
 $projects = @(
     @("init", "aeros-init"),
     @("std-smoke", "aeros-std-smoke"),
-    @("fork-probe", "aeros-fork-probe")
+    @("fork-probe", "aeros-fork-probe"),
+    @("threads", "aeros-threads"),
+    @("ptrace", "aeros-ptrace"),
+    @("swap", "aeros-swap"),
+    @("bench", "aeros-bench")
 )
 $destinationRoot = Join-Path $root "assets\userspace"
 

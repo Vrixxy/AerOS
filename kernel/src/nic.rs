@@ -113,21 +113,33 @@ pub fn transmit(packet: &[u8]) -> bool {
     }
 }
 
-/// Non-blocking receive.
+/// Non-blocking receive. A frame matching an active `firewall` DENY rule is
+/// dropped right here - indistinguishable to every caller from "nothing has
+/// arrived yet" (`None`), so none of their own bounded-retry loops need to
+/// know this filtering exists.
 pub fn try_receive(destination: &mut [u8]) -> Option<usize> {
-    match PRIMARY.load(Ordering::Acquire) {
+    let length = match PRIMARY.load(Ordering::Acquire) {
         E1000 => e1000::try_receive(destination),
         RTL8139 => rtl8139::try_receive(destination),
         RTL8168 => rtl8168::try_receive(destination),
         VIRTIO => virtio_net::receive(destination),
         _ => None,
+    }?;
+    if crate::firewall::blocks(&destination[..length]) {
+        return None;
     }
+    Some(length)
 }
 
 /// Receive that waits (bounded) for a frame.
 pub fn receive(destination: &mut [u8]) -> Option<usize> {
     if PRIMARY.load(Ordering::Acquire) == E1000 {
-        return e1000::receive(destination);
+        let length = e1000::receive(destination)?;
+        return if crate::firewall::blocks(&destination[..length]) {
+            None
+        } else {
+            Some(length)
+        };
     }
     for _ in 0..40_000_000u32 {
         if let Some(length) = try_receive(destination) {

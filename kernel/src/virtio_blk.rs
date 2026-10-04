@@ -133,7 +133,7 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> VirtioBlkR
     let Some(queue) = device.queue(0, frames) else {
         return report;
     };
-    let Some(dma) = frames.allocate_contiguous(2, 1) else {
+    let Some(dma) = frames.allocate_dma(2, 1) else {
         return report;
     };
     device.driver_ok();

@@ -28,6 +28,19 @@ const DESIGN_HEIGHT: i32 = 458;
 const WALLPAPER_WIDTH: usize = 4_148;
 const WALLPAPER_HEIGHT: usize = 2_228;
 const WALLPAPER: &[u8] = include_bytes!("../../assets/wallpapers/aeros-mountains.rgb565");
+/// Hand-designed dock/app-grid icon art (built by tools\build-desktop-icons.ps1
+/// from assets\icons\src\*.png), straight-alpha RGBA, one 64x64 tile per icon:
+/// 0 apps, 1 terminal, 2 files (dock), 3 browser, 4 notes, 5 trash,
+/// 6 files (app grid, a brighter variant for the bigger bright tile).
+const DESKTOP_ICONS: &[u8] = include_bytes!("../../assets/desktop-icons.bin");
+const DESKTOP_ICON_SIZE: usize = 64;
+
+/// The raw RGBA bytes for one of `DESKTOP_ICONS`'s tiles (see its doc comment
+/// for the index order).
+fn desktop_icon(index: usize) -> &'static [u8] {
+    let bytes = DESKTOP_ICON_SIZE * DESKTOP_ICON_SIZE * 4;
+    &DESKTOP_ICONS[index * bytes..(index + 1) * bytes]
+}
 const MAX_DESKTOP_PIXELS: usize = 1_920 * 1_080;
 const MAX_URL: usize = 128;
 const MAX_PATH: usize = 96;
@@ -112,6 +125,23 @@ fn notes_directory() -> &'static str {
     } else {
         "/data/Notes"
     }
+}
+
+/// Removes the last complete UTF-8 scalar value's bytes from the end of
+/// `bytes` (1-4 bytes, not just the last byte, so backspacing a
+/// multi-byte character - e.g. an accented letter typed on a non-US
+/// layout - erases the whole character in one press). Returns the new
+/// length.
+fn utf8_backspace(bytes: &[u8]) -> usize {
+    let mut len = bytes.len();
+    if len == 0 {
+        return 0;
+    }
+    len -= 1;
+    while len > 0 && bytes[len] & 0xc0 == 0x80 {
+        len -= 1;
+    }
+    len
 }
 
 fn ease_out_milli(progress_milli: u32) -> u32 {
@@ -821,6 +851,19 @@ struct DesktopState {
     terminal_line_lens: [usize; SHELL_HISTORY_LINES],
     terminal_line_count: usize,
     terminal_elevated: bool,
+    /// Set by `terminal_submit` when `ear <command>` comes back needing the
+    /// account password (`shell::Control::NeedsPassword`): the terminal's
+    /// next Enter completes that password instead of running a new command,
+    /// and the typed line renders masked in the meantime.
+    terminal_awaiting_password: bool,
+    terminal_pending_command: [u8; SHELL_LINE_MAX],
+    terminal_pending_command_len: usize,
+    /// Set by `terminal_submit` when `passwd` runs
+    /// (`shell::Control::NeedsPasswordChange`): walks current/new/confirm
+    /// across the next three Enters, same masked-input rendering as above.
+    terminal_passwd_stage: Option<PasswdStage>,
+    terminal_passwd_new: [u8; MAX_NAME],
+    terminal_passwd_new_len: usize,
     /// 0 = typing live, not browsing history. N>0 = showing the command
     /// N-1 entries back from the most recent (Up increments, Down
     /// decrements back to 0, which restores whatever was being typed
@@ -991,6 +1034,12 @@ impl DesktopState {
             terminal_line_lens: [0; SHELL_HISTORY_LINES],
             terminal_line_count: 0,
             terminal_elevated: false,
+            terminal_awaiting_password: false,
+            terminal_pending_command: [0; SHELL_LINE_MAX],
+            terminal_pending_command_len: 0,
+            terminal_passwd_stage: None,
+            terminal_passwd_new: [0; MAX_NAME],
+            terminal_passwd_new_len: 0,
             terminal_history_index: 0,
             terminal_draft: [0; SHELL_LINE_MAX],
             terminal_draft_len: 0,
@@ -1264,8 +1313,8 @@ impl DesktopState {
                     self.login_len = self.login_len.saturating_sub(1);
                     DesktopAction::Redraw
                 }
-                DesktopKey::Character(byte) => {
-                    if self.push_login_byte(byte) {
+                DesktopKey::Character(ch) => {
+                    if ch.is_ascii() && self.push_login_byte(ch as u8) {
                         DesktopAction::Redraw
                     } else {
                         DesktopAction::Idle
@@ -1293,8 +1342,8 @@ impl DesktopState {
                     self.name_input.backspace();
                     DesktopAction::Redraw
                 }
-                DesktopKey::Character(byte) => {
-                    if self.push_name_byte(byte) {
+                DesktopKey::Character(ch) => {
+                    if ch.is_ascii() && self.push_name_byte(ch as u8) {
                         DesktopAction::Redraw
                     } else {
                         DesktopAction::Idle
@@ -1321,8 +1370,8 @@ impl DesktopState {
                     self.name_input.backspace();
                     DesktopAction::Redraw
                 }
-                DesktopKey::Character(byte) => {
-                    if self.push_name_byte(byte) {
+                DesktopKey::Character(ch) => {
+                    if ch.is_ascii() && self.push_name_byte(ch as u8) {
                         DesktopAction::Redraw
                     } else {
                         DesktopAction::Idle
@@ -1349,8 +1398,8 @@ impl DesktopState {
                     self.notes_content.backspace();
                     DesktopAction::Redraw
                 }
-                DesktopKey::Character(byte) => {
-                    if self.push_notes_byte(byte) {
+                DesktopKey::Character(ch) => {
+                    if self.push_notes_char(ch) {
                         DesktopAction::Redraw
                     } else {
                         DesktopAction::Idle
@@ -1371,7 +1420,13 @@ impl DesktopState {
                 match key {
                     DesktopKey::Up => return self.keyboard_move(-1),
                     DesktopKey::Down => return self.keyboard_move(1),
-                    DesktopKey::Character(byte) => return self.keyboard_type(byte),
+                    DesktopKey::Character(ch) => {
+                        return if ch.is_ascii() {
+                            self.keyboard_type(ch as u8)
+                        } else {
+                            DesktopAction::Idle
+                        };
+                    }
                     DesktopKey::Backspace => {
                         self.kb_search_len = self.kb_search_len.saturating_sub(1);
                         self.keyboard_refilter();
@@ -1391,12 +1446,16 @@ impl DesktopState {
                     self.wipe_setup_field();
                     DesktopAction::Redraw
                 }
-                DesktopKey::Character(byte) => {
-                    let pushed = match self.screen {
-                        Screen::Username => self.push_username_byte(byte),
-                        Screen::Password => self.push_setup_password_byte(byte),
-                        Screen::Confirm => self.push_confirm_byte(byte),
-                        _ => false,
+                DesktopKey::Character(ch) => {
+                    let pushed = if ch.is_ascii() {
+                        match self.screen {
+                            Screen::Username => self.push_username_byte(ch as u8),
+                            Screen::Password => self.push_setup_password_byte(ch as u8),
+                            Screen::Confirm => self.push_confirm_byte(ch as u8),
+                            _ => false,
+                        }
+                    } else {
+                        false
                     };
                     if pushed {
                         self.setup_error = "";
@@ -1471,8 +1530,9 @@ impl DesktopState {
                         DesktopAction::Idle
                     };
                 }
-                DesktopKey::Character(byte) => {
-                    return if store.detail.is_none() && store.push_query(byte) {
+                DesktopKey::Character(ch) => {
+                    return if ch.is_ascii() && store.detail.is_none() && store.push_query(ch as u8)
+                    {
                         DesktopAction::Redraw
                     } else {
                         DesktopAction::Idle
@@ -1569,8 +1629,12 @@ impl DesktopState {
             | DesktopKey::PlayPause
             | DesktopKey::NextTrack
             | DesktopKey::PrevTrack => return DesktopAction::Idle,
-            DesktopKey::Character(byte) => {
-                if self.app == DesktopApp::Browser && self.url_active && self.push_url_byte(byte) {
+            DesktopKey::Character(ch) => {
+                if self.app == DesktopApp::Browser
+                    && self.url_active
+                    && ch.is_ascii()
+                    && self.push_url_byte(ch as u8)
+                {
                     return DesktopAction::Redraw;
                 }
                 return DesktopAction::Idle;
@@ -1881,7 +1945,8 @@ impl DesktopState {
             }
         }
         if Rect::new(503, 377, 216, 55).contains(point) && self.overlay == Overlay::None {
-            self.toggle_notify_center();
+            self.set_overlay(Overlay::Quick);
+            self.focus_visible = true;
             return DesktopAction::Redraw;
         }
         if self.overlay != Overlay::None {
@@ -2402,11 +2467,13 @@ impl DesktopState {
         self.notes_reload();
     }
 
-    fn push_notes_byte(&mut self, byte: u8) -> bool {
-        if byte != b'\n' && !(byte.is_ascii_graphic() || byte == b' ') {
+    fn push_notes_char(&mut self, ch: char) -> bool {
+        if ch.is_ascii() && ch != '\n' && !(ch.is_ascii_graphic() || ch == ' ') {
             return false;
         }
-        self.notes_content.push_byte(byte)
+        let mut buffer = [0u8; 4];
+        self.notes_content
+            .push_str_checked(ch.encode_utf8(&mut buffer))
     }
 
     fn open_trash(&mut self) {
@@ -2760,6 +2827,14 @@ impl DesktopState {
             self.lockout.failures(),
             crate::time::monotonic_nanoseconds().saturating_sub(now) / 1_000_000
         ));
+        crate::audit::record(
+            "LOGIN",
+            format_args!(
+                "ok={} failures={}",
+                matches_password,
+                self.lockout.failures()
+            ),
+        );
         if matches_password {
             self.lockout.record_success();
             self.set_screen(Screen::Desktop);
@@ -2816,30 +2891,41 @@ impl DesktopState {
 
     /// Types `bytes` into the field (characters the field wouldn't accept
     /// from the keyboard are skipped). Returns whether anything changed.
+    /// Only the valid-UTF-8 prefix of `bytes` is used, since one character
+    /// at a time is what every field's push function understands.
     fn clip_field_paste(&mut self, field: ClipField, bytes: &[u8]) -> bool {
+        let text = core::str::from_utf8(bytes).unwrap_or_else(|failure| {
+            core::str::from_utf8(&bytes[..failure.valid_up_to()]).unwrap_or("")
+        });
         let mut changed = false;
-        for &byte in bytes {
-            let byte = if byte == b'\n' && field != ClipField::Note {
-                b' '
+        for character in text.chars() {
+            let character = if character == '\n' && field != ClipField::Note {
+                ' '
             } else {
-                byte
+                character
             };
             changed |= match field {
-                ClipField::Note => self.push_notes_byte(byte),
-                ClipField::Name => self.push_name_byte(byte),
-                ClipField::Terminal => self.push_terminal_input_byte(byte),
-                ClipField::Url => self.push_url_byte(byte),
+                ClipField::Note => self.push_notes_char(character),
+                ClipField::Name => character.is_ascii() && self.push_name_byte(character as u8),
+                ClipField::Terminal => self.push_terminal_input_char(character),
+                ClipField::Url => character.is_ascii() && self.push_url_byte(character as u8),
             };
         }
         changed
     }
 
-    fn push_terminal_input_byte(&mut self, byte: u8) -> bool {
-        if self.terminal_input_len >= SHELL_LINE_MAX || !byte.is_ascii_graphic() && byte != b' ' {
+    fn push_terminal_input_char(&mut self, ch: char) -> bool {
+        if ch.is_ascii() && !ch.is_ascii_graphic() && ch != ' ' {
             return false;
         }
-        self.terminal_input[self.terminal_input_len] = byte;
-        self.terminal_input_len += 1;
+        let mut buffer = [0u8; 4];
+        let encoded = ch.encode_utf8(&mut buffer).as_bytes();
+        if self.terminal_input_len + encoded.len() > SHELL_LINE_MAX {
+            return false;
+        }
+        self.terminal_input[self.terminal_input_len..self.terminal_input_len + encoded.len()]
+            .copy_from_slice(encoded);
+        self.terminal_input_len += encoded.len();
         true
     }
 
@@ -2869,6 +2955,12 @@ impl DesktopState {
 }
 
 fn terminal_submit(state: &mut DesktopState, shell: &mut shell::Shell<'_>) -> shell::Control {
+    if state.terminal_awaiting_password {
+        return terminal_submit_password(state, shell);
+    }
+    if state.terminal_passwd_stage.is_some() {
+        return terminal_submit_passwd_stage(state);
+    }
     let mut command: shell::Text<SHELL_LINE_MAX> = shell::Text::new();
     let _ = command.push_str_checked(state.terminal_input_str());
     state.terminal_input = [0; SHELL_LINE_MAX];
@@ -2886,6 +2978,21 @@ fn terminal_submit(state: &mut DesktopState, shell: &mut shell::Shell<'_>) -> sh
 
     let mut output: shell::Text<{ shell::MAX_OUTPUT }> = shell::Text::new();
     let control = shell.execute(command.as_str(), &mut output);
+    if control == shell::Control::NeedsPassword {
+        state.terminal_pending_command = [0; SHELL_LINE_MAX];
+        let bytes = command.as_str().as_bytes();
+        let count = bytes.len().min(SHELL_LINE_MAX);
+        state.terminal_pending_command[..count].copy_from_slice(&bytes[..count]);
+        state.terminal_pending_command_len = count;
+        state.terminal_awaiting_password = true;
+        state.terminal_push_line("Enter your account password:");
+        return control;
+    }
+    if control == shell::Control::NeedsPasswordChange {
+        state.terminal_passwd_stage = Some(PasswdStage::Current);
+        state.terminal_push_line("Current password:");
+        return control;
+    }
     state.terminal_elevated = shell.is_elevated();
     let (executed, status, elevated, denied) = shell.diagnostics();
     serial::format(format_args!(
@@ -2897,6 +3004,175 @@ fn terminal_submit(state: &mut DesktopState, shell: &mut shell::Shell<'_>) -> sh
         }
     }
     control
+}
+
+/// Completes an `ear <command>` that came back as `Control::NeedsPassword`:
+/// the line just typed is the password attempt itself, so unlike a normal
+/// command it is never echoed into the scrollback and never reaches the
+/// shell parser as text - only pass/fail crosses that line. On success the
+/// original command actually runs now, with `Shell::note_authenticated`
+/// opening a short reauth window so a run of several `ear` commands in a
+/// row does not re-prompt for every one.
+///
+/// Shares `state.lockout` with the lock screen rather than having its own:
+/// this is a second surface checking the same account credential, so a
+/// brute-force attempt against `ear` counts against (and is throttled by)
+/// the exact same exponential backoff, instead of getting a fresh free set
+/// of tries just because it came from the terminal.
+fn terminal_submit_password(
+    state: &mut DesktopState,
+    shell: &mut shell::Shell<'_>,
+) -> shell::Control {
+    let mut attempt = state.terminal_input;
+    let attempt_len = state.terminal_input_len;
+    state.terminal_input = [0; SHELL_LINE_MAX];
+    state.terminal_input_len = 0;
+    state.terminal_history_index = 0;
+    let now = crate::time::monotonic_nanoseconds();
+    if state.lockout.is_locked(now) {
+        crate::auth::wipe(&mut attempt[..attempt_len]);
+        let seconds = state.lockout.seconds_left(now);
+        let mut message: shell::Text<64> = shell::Text::new();
+        let _ = write!(message, "ear: too many attempts, wait {seconds}s");
+        state.terminal_push_line(message.as_str());
+        return shell::Control::None;
+    }
+    state.terminal_awaiting_password = false;
+    let had_input = attempt_len > 0;
+    let correct = had_input
+        && state
+            .credential
+            .is_some_and(|credential| credential.verify(&attempt[..attempt_len]));
+    crate::auth::wipe(&mut attempt[..attempt_len]);
+
+    let mut command: shell::Text<SHELL_LINE_MAX> = shell::Text::new();
+    let pending_len = state.terminal_pending_command_len;
+    let _ = command.push_str_checked(
+        core::str::from_utf8(&state.terminal_pending_command[..pending_len]).unwrap_or(""),
+    );
+    state.terminal_pending_command = [0; SHELL_LINE_MAX];
+    state.terminal_pending_command_len = 0;
+    if !correct {
+        if had_input {
+            state.lockout.record_failure(now);
+        }
+        state.terminal_push_line("ear: incorrect password");
+        return shell::Control::None;
+    }
+    state.lockout.record_success();
+    shell.note_authenticated();
+    let mut output: shell::Text<{ shell::MAX_OUTPUT }> = shell::Text::new();
+    let control = shell.execute(command.as_str(), &mut output);
+    state.terminal_elevated = shell.is_elevated();
+    let (executed, status, elevated, denied) = shell.diagnostics();
+    serial::format(format_args!(
+        "AEROS_SHELL_EXEC sequence={executed} status={status} elevations={elevated} denied={denied} verified=true\n",
+    ));
+    for line in output.as_str().split('\n') {
+        if !line.is_empty() {
+            state.terminal_push_line(line);
+        }
+    }
+    control
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PasswdStage {
+    Current,
+    New,
+    Confirm,
+}
+
+/// Advances the `passwd` state machine by one Enter: the line just typed is
+/// this stage's answer, never echoed and never reaching the shell parser,
+/// same reasoning as `terminal_submit_password`. No `shell::Shell` involved
+/// anywhere here - unlike `ear`, changing the password never runs a shell
+/// command, it only ever touches `state.credential`/`state.lockout`, so
+/// this can (and is) unit-tested directly against a bare `DesktopState`.
+fn terminal_submit_passwd_stage(state: &mut DesktopState) -> shell::Control {
+    let Some(stage) = state.terminal_passwd_stage else {
+        return shell::Control::None;
+    };
+    let mut attempt = state.terminal_input;
+    let attempt_len = state.terminal_input_len;
+    state.terminal_input = [0; SHELL_LINE_MAX];
+    state.terminal_input_len = 0;
+    match stage {
+        PasswdStage::Current => {
+            let now = crate::time::monotonic_nanoseconds();
+            if state.lockout.is_locked(now) {
+                crate::auth::wipe(&mut attempt[..attempt_len]);
+                let seconds = state.lockout.seconds_left(now);
+                let mut message: shell::Text<64> = shell::Text::new();
+                let _ = write!(message, "passwd: too many attempts, wait {seconds}s");
+                state.terminal_push_line(message.as_str());
+                state.terminal_passwd_stage = None;
+                return shell::Control::None;
+            }
+            let had_input = attempt_len > 0;
+            let correct = had_input
+                && state
+                    .credential
+                    .is_some_and(|credential| credential.verify(&attempt[..attempt_len]));
+            crate::auth::wipe(&mut attempt[..attempt_len]);
+            if !correct {
+                if had_input {
+                    state.lockout.record_failure(now);
+                }
+                state.terminal_push_line("passwd: incorrect password");
+                state.terminal_passwd_stage = None;
+                return shell::Control::None;
+            }
+            state.lockout.record_success();
+            state.terminal_passwd_stage = Some(PasswdStage::New);
+            state.terminal_push_line("New password:");
+        }
+        PasswdStage::New => {
+            state.terminal_passwd_new = [0; MAX_NAME];
+            let count = attempt_len.min(MAX_NAME);
+            state.terminal_passwd_new[..count].copy_from_slice(&attempt[..count]);
+            state.terminal_passwd_new_len = count;
+            crate::auth::wipe(&mut attempt[..attempt_len]);
+            state.terminal_passwd_stage = Some(PasswdStage::Confirm);
+            state.terminal_push_line("Confirm new password:");
+        }
+        PasswdStage::Confirm => {
+            let matches = attempt_len == state.terminal_passwd_new_len
+                && crate::auth::constant_time_eq(
+                    &attempt[..attempt_len],
+                    &state.terminal_passwd_new[..state.terminal_passwd_new_len],
+                );
+            let policy = crate::auth::check_password(
+                &state.terminal_passwd_new[..state.terminal_passwd_new_len],
+                state.username_str().as_bytes(),
+            );
+            crate::auth::wipe(&mut attempt[..attempt_len]);
+            state.terminal_passwd_stage = None;
+            if !matches {
+                crate::auth::wipe(&mut state.terminal_passwd_new[..state.terminal_passwd_new_len]);
+                state.terminal_passwd_new_len = 0;
+                state.terminal_push_line("passwd: passwords did not match");
+                return shell::Control::None;
+            }
+            if let Err(reason) = policy {
+                crate::auth::wipe(&mut state.terminal_passwd_new[..state.terminal_passwd_new_len]);
+                state.terminal_passwd_new_len = 0;
+                let mut message: shell::Text<64> = shell::Text::new();
+                let _ = write!(message, "passwd: {reason}");
+                state.terminal_push_line(message.as_str());
+                return shell::Control::None;
+            }
+            state.credential = Some(crate::auth::Credential::new(
+                &state.terminal_passwd_new[..state.terminal_passwd_new_len],
+                state.kdf_iterations,
+            ));
+            crate::auth::wipe(&mut state.terminal_passwd_new[..state.terminal_passwd_new_len]);
+            state.terminal_passwd_new_len = 0;
+            state.save_account();
+            state.terminal_push_line("passwd: password changed");
+        }
+    }
+    shell::Control::None
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2934,7 +3210,7 @@ enum DesktopKey {
     PlayPause,
     NextTrack,
     PrevTrack,
-    Character(u8),
+    Character(char),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3016,8 +3292,15 @@ impl KeyDecoder {
                 0x0f => Some(DesktopKey::Tab),
                 0x1c => Some(DesktopKey::Activate),
                 0x0e => Some(DesktopKey::Backspace),
-                _ => shell::scancode_character(code, self.shift, self.caps)
-                    .map(DesktopKey::Character),
+                _ => match crate::keymap::translate(code, self.shift, self.caps) {
+                    crate::keymap::Outcome::One(ch) => Some(DesktopKey::Character(ch)),
+                    // An accent that did not combine: the mark itself has
+                    // nowhere to go through this single-key interface, so
+                    // (as with the old ASCII-only path) only the character
+                    // typed after it comes through.
+                    crate::keymap::Outcome::Two(_, second) => Some(DesktopKey::Character(second)),
+                    crate::keymap::Outcome::Nothing => None,
+                },
             };
         }
         match code {
@@ -3309,11 +3592,25 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
         state.motion_until_ns = started + BOOT_SPLASH_NS + SCREEN_TRANSITION_NS + 100_000_000;
     }
     let mut shell = shell::Shell::new(shell_info, true);
+    // Only the live desktop's own terminal requires re-entering the
+    // account password for `ear` - every other `Shell::new` caller
+    // (self-tests, the boot sequence's own internal use) is unaffected.
+    shell.require_reauth();
+    {
+        let mut startup_output: shell::Text<{ shell::MAX_OUTPUT }> = shell::Text::new();
+        shell.run_startup_script(&mut startup_output);
+        for line in startup_output.as_str().split('\n') {
+            if !line.is_empty() {
+                state.terminal_push_line(line);
+            }
+        }
+    }
     let mut decoder = KeyDecoder::new();
     let mut cursor = CursorSprite::new();
     crate::mouse::set_bounds(frame.width(), frame.height());
     let _ = present_desktop_mode(frame, fonts, &state, true);
     cursor.paint(frame, cursor_target(frame));
+    crate::virtio_gpu::publish(frame);
     serial::line(
         "AEROS_DESKTOP_RUNTIME active=true keyboard_navigation=true terminal_hotkey=t atomic_present=true session=setup->login->desktop pointer=true",
     );
@@ -3630,11 +3927,12 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 )
             {
                 match key {
-                    DesktopKey::Character(byte) => {
-                        redraw |= state.push_terminal_input_byte(byte);
+                    DesktopKey::Character(ch) => {
+                        redraw |= state.push_terminal_input_char(ch);
                     }
                     DesktopKey::Backspace => {
-                        state.terminal_input_len = state.terminal_input_len.saturating_sub(1);
+                        state.terminal_input_len =
+                            utf8_backspace(&state.terminal_input[..state.terminal_input_len]);
                         redraw = true;
                     }
                     DesktopKey::Up => {
@@ -3693,7 +3991,9 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                                 state.terminal_line_lens = [0; SHELL_HISTORY_LINES];
                                 state.terminal_line_count = 0;
                             }
-                            shell::Control::None => {}
+                            shell::Control::None
+                            | shell::Control::NeedsPassword
+                            | shell::Control::NeedsPasswordChange => {}
                         }
                         redraw = true;
                     }
@@ -3730,6 +4030,7 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 state.clip_synced = generation;
             }
         }
+        crate::virtio_input::poll();
         let pointer = crate::mouse::state();
         let now_pointer_ns = crate::time::monotonic_nanoseconds();
         let pointer_moved = pointer.generation != pointer_generation;
@@ -4029,6 +4330,12 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
             last_paint_cost_ns = crate::time::monotonic_nanoseconds().saturating_sub(paint_start);
             cursor.erase(frame);
             cursor.paint(frame, cursor_target(frame));
+            // Same cadence as this existing redraw decision, not every
+            // cursor-only tick (see `virtio_gpu::publish`'s own doc comment):
+            // a full `width*height*4` copy plus a device round trip on every
+            // mouse-move would be the same "per-frame cost" trap the dock
+            // animation work earlier already had to design around.
+            crate::virtio_gpu::publish(frame);
             serial::format(format_args!(
                 "AEROS_DESKTOP_REDRAW overlay={} window={} verified={} app={} screen={} cost_us={}\n",
                 state.overlay.name(),
@@ -4050,6 +4357,7 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 let _ = present_desktop_mode(frame, fonts, &state, true);
                 cursor.erase(frame);
                 cursor.paint(frame, cursor_target(frame));
+                crate::virtio_gpu::publish(frame);
             }
         }
         if state.browser_pending {
@@ -5957,7 +6265,7 @@ fn draw_app_switcher(
             draw_icon(
                 painter,
                 icon_layout,
-                [1, 3, 4, 5, 2][index],
+                [1, 7, 4, 5, 2][index],
                 Rect::new(58 + column as i32 * 64, 48 + row as i32 * 67, 50, 50),
             );
         }
@@ -5992,99 +6300,44 @@ fn draw_app_switcher(
 }
 
 fn draw_icon(painter: &mut Painter<'_>, layout: Layout, kind: usize, bounds: Rect) {
+    // Real designed art for every icon except Quick Settings/Settings (2),
+    // which still falls back to a drawn glyph until that art arrives.
+    let icon_index = match kind {
+        0 => Some(0),
+        1 => Some(1),
+        3 => Some(2),
+        4 => Some(3),
+        5 => Some(4),
+        6 => Some(5),
+        7 => Some(6),
+        _ => None,
+    };
+    if let Some(index) = icon_index {
+        // Inset so the art sits inside its glass tile with breathing room,
+        // like the drawn glyphs below, instead of filling it edge to edge.
+        let margin = bounds.width * 3 / 20;
+        painter.draw_rgba_scaled(
+            layout.rect(bounds.expand(-margin)),
+            desktop_icon(index),
+            DESKTOP_ICON_SIZE,
+            DESKTOP_ICON_SIZE,
+        );
+        return;
+    }
     let x = bounds.x + 13;
     let y = bounds.y + 13;
     let ink = Rgba::new(10, 25, 31, 235);
-    match kind {
-        0 => {
-            for row in 0..2 {
-                for column in 0..2 {
-                    painter.fill_rounded_rect(
-                        layout.rect(Rect::new(x + column * 13, y + row * 13, 9, 9)),
-                        layout.radii(CornerRadii::all(3)),
-                        ink,
-                    );
-                }
-            }
-        }
-        1 => {
-            painter.fill_rounded_rect(
-                layout.rect(Rect::new(x, y + 2, 25, 21)),
-                layout.radii(CornerRadii::all(4)),
-                ink,
-            );
-            painter.fill_rounded_rect(
-                layout.rect(Rect::new(x + 5, y + 16, 11, 2)),
-                layout.radii(CornerRadii::all(1)),
-                Rgba::new(220, 240, 244, 235),
-            );
-        }
-        2 => {
-            painter.stroke_rounded_rect(
-                layout.rect(Rect::new(x + 2, y + 2, 21, 21)),
-                layout.radii(CornerRadii::all(11)),
-                layout.scale.logical(3).max(1) as u8,
-                ink,
-            );
-            painter.fill_rounded_rect(
-                layout.rect(Rect::new(x + 10, y + 10, 5, 5)),
-                layout.radii(CornerRadii::all(3)),
-                ink,
-            );
-        }
-        3 => {
-            painter.fill_rounded_rect(
-                layout.rect(Rect::new(x, y + 6, 26, 17)),
-                layout.radii(CornerRadii::all(4)),
-                ink,
-            );
-            painter.fill_rounded_rect(
-                layout.rect(Rect::new(x + 2, y + 3, 11, 6)),
-                layout.radii(CornerRadii::all(2)),
-                ink,
-            );
-        }
-        4 => {
-            painter.stroke_rounded_rect(
-                layout.rect(Rect::new(x, y, 26, 26)),
-                layout.radii(CornerRadii::all(13)),
-                layout.scale.logical(3).max(1) as u8,
-                Rgba::new(18, 91, 145, 240),
-            );
-            painter.fill_rounded_rect(
-                layout.rect(Rect::new(x + 9, y + 9, 8, 8)),
-                layout.radii(CornerRadii::all(4)),
-                Rgba::new(61, 166, 91, 240),
-            );
-        }
-        5 => {
-            painter.fill_rounded_rect(
-                layout.rect(Rect::new(x + 3, y, 20, 26)),
-                layout.radii(CornerRadii::all(4)),
-                Rgba::new(235, 242, 244, 230),
-            );
-            for row in 0..3 {
-                painter.fill_rounded_rect(
-                    layout.rect(Rect::new(x + 7, y + 7 + row * 6, 12, 2)),
-                    layout.radii(CornerRadii::all(1)),
-                    ink,
-                );
-            }
-        }
-        _ => {
-            painter.stroke_rounded_rect(
-                layout.rect(Rect::new(x + 5, y + 5, 16, 20)),
-                layout.radii(CornerRadii::new(2, 2, 5, 5)),
-                layout.scale.logical(2).max(1) as u8,
-                ink,
-            );
-            painter.fill_rounded_rect(
-                layout.rect(Rect::new(x + 3, y + 2, 20, 3)),
-                layout.radii(CornerRadii::all(2)),
-                ink,
-            );
-        }
-    }
+    painter.stroke_rounded_rect(
+        layout.rect(Rect::new(x + 2, y + 2, 21, 21)),
+        layout.radii(CornerRadii::all(11)),
+        layout.scale.logical(3).max(1) as u8,
+        ink,
+    );
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(x + 10, y + 10, 5, 5)),
+        layout.radii(CornerRadii::all(3)),
+        ink,
+    );
 }
 
 /// Which app's window is maximized (0 = none, else the app's number + 1).
@@ -6638,14 +6891,29 @@ fn draw_shell_window(
     }
     painter.set_clip(previous_clip);
 
-    let prefix = if state.terminal_elevated {
-        "root"
-    } else {
-        state.display_name()
-    };
+    let masking = state.terminal_awaiting_password || state.terminal_passwd_stage.is_some();
     let prompt_y = scrollback_top + visible as i32 * 16;
     let mut prompt: shell::Text<48> = shell::Text::new();
-    let _ = write!(prompt, "{prefix}>");
+    if state.terminal_awaiting_password {
+        let _ = write!(prompt, "Password:");
+    } else if let Some(stage) = state.terminal_passwd_stage {
+        let _ = write!(
+            prompt,
+            "{}",
+            match stage {
+                PasswdStage::Current => "Current password:",
+                PasswdStage::New => "New password:",
+                PasswdStage::Confirm => "Confirm new password:",
+            }
+        );
+    } else {
+        let prefix = if state.terminal_elevated {
+            "root"
+        } else {
+            state.display_name()
+        };
+        let _ = write!(prompt, "{prefix}>");
+    }
     text(
         painter,
         layout,
@@ -6664,15 +6932,25 @@ fn draw_shell_window(
     let prompt_origin = layout.point(Point::new(card.x + 12, prompt_y));
     let prefix_width = mono_font.text_width(prompt.as_str(), physical_size);
     let typed_x = prompt_origin.x + prefix_width + layout.scale.logical(6);
+    // While a password is being captured, show bullets instead of the real
+    // characters - same byte count as what was typed, which is accurate
+    // for the ASCII-only passwords `check_password` requires and only
+    // cosmetically approximate for a hypothetical multi-byte one.
+    let masked = [b'*'; SHELL_LINE_MAX];
+    let displayed = if masking {
+        core::str::from_utf8(&masked[..state.terminal_input_len]).unwrap_or("")
+    } else {
+        state.terminal_input_str()
+    };
     painter.text(
         mono_font,
         Point::new(typed_x, prompt_origin.y),
-        state.terminal_input_str(),
+        displayed,
         physical_size,
         Color::rgb(230, 233, 236),
     );
     if (now_ns / 530_000_000).is_multiple_of(2) {
-        let typed_width = mono_font.text_width(state.terminal_input_str(), physical_size);
+        let typed_width = mono_font.text_width(displayed, physical_size);
         let cursor_width = mono_font
             .text_width(">", physical_size)
             .max(layout.scale.logical(6));
@@ -9247,6 +9525,36 @@ fn input_self_test() -> bool {
         && url_parse_self_test()
         && session_self_test()
         && pointer_self_test()
+        && unicode_input_self_test()
+        && terminal_passwd_self_test()
+}
+
+/// The real hardware-key path (`KeyDecoder::feed` in text mode, backed by
+/// `keymap::translate`), not just `DesktopState::handle`, actually produces
+/// and stores a typed non-ASCII character - the point of switching
+/// `DesktopKey::Character` from `u8` to `char`. French AZERTY types 'e'
+/// (0x03, no shift, no dead key) as a direct check with no dead-key timing
+/// involved.
+fn unicode_input_self_test() -> bool {
+    let previous_layout = crate::keymap::layout_index();
+    let Some(french) = crate::keymap::find_layout("fr") else {
+        return false;
+    };
+    crate::keymap::set_layout(french);
+    let mut decoder = KeyDecoder::new();
+    decoder.set_text_mode(true);
+    let decoded = decoder.feed(0x03) == Some(DesktopKey::Character('é'));
+    let mut state = DesktopState::new();
+    let typed = state.push_terminal_input_char('é');
+    let stored = typed && state.terminal_input_str() == "é" && state.terminal_input_len == 2;
+    state.terminal_input_len = utf8_backspace(&state.terminal_input[..state.terminal_input_len]);
+    let erased_whole_character = state.terminal_input_len == 0;
+    // Backspacing an ASCII character still removes exactly one byte.
+    let _ = state.push_terminal_input_char('a');
+    state.terminal_input_len = utf8_backspace(&state.terminal_input[..state.terminal_input_len]);
+    let ascii_backspace_unaffected = state.terminal_input_len == 0;
+    crate::keymap::set_layout(previous_layout);
+    decoded && stored && erased_whole_character && ascii_backspace_unaffected
 }
 
 fn pointer_self_test() -> bool {
@@ -9273,8 +9581,8 @@ fn session_self_test() -> bool {
     // Setup cannot be walked through with empty fields.
     walk.handle(DesktopKey::Activate);
     let english_done = walk.screen == Screen::Keyboard;
-    walk.handle(DesktopKey::Character(b's'));
-    walk.handle(DesktopKey::Character(b'w'));
+    walk.handle(DesktopKey::Character('s'));
+    walk.handle(DesktopKey::Character('w'));
     let mut hits = [0usize; 16];
     let filtered = flow::keyboard_matches(&walk, &mut hits) == 1 && walk.kb_search_len == 2;
     walk.handle(DesktopKey::Backspace);
@@ -9287,14 +9595,14 @@ fn session_self_test() -> bool {
     let language_done = english_done && filtered && moved && walk.screen == Screen::Username;
     let empty_name_blocked = walk.handle(DesktopKey::Activate) == DesktopAction::Redraw
         && walk.screen == Screen::Username;
-    for byte in b"aer" {
-        walk.handle(DesktopKey::Character(*byte));
+    for ch in "aer".chars() {
+        walk.handle(DesktopKey::Character(ch));
     }
     walk.handle(DesktopKey::Activate);
     let empty_password_blocked = walk.handle(DesktopKey::Activate) == DesktopAction::Redraw
         && walk.screen == Screen::Password;
-    for byte in b"abc" {
-        walk.handle(DesktopKey::Character(*byte));
+    for ch in "abc".chars() {
+        walk.handle(DesktopKey::Character(ch));
     }
     walk.handle(DesktopKey::Activate);
     let weak_blocked = walk.screen == Screen::Password;
@@ -9311,23 +9619,23 @@ fn session_self_test() -> bool {
     real.kdf_iterations = 32;
     real.handle(DesktopKey::Activate);
     real.handle(DesktopKey::Activate);
-    for byte in b"aer" {
-        real.handle(DesktopKey::Character(*byte));
+    for ch in "aer".chars() {
+        real.handle(DesktopKey::Character(ch));
     }
     let username_captured = real.username_str() == "aer";
     real.handle(DesktopKey::Activate);
-    for byte in b"tr1cky-Pass" {
-        real.handle(DesktopKey::Character(*byte));
+    for ch in "tr1cky-Pass".chars() {
+        real.handle(DesktopKey::Character(ch));
     }
     real.handle(DesktopKey::Activate);
     let on_confirm = real.screen == Screen::Confirm;
-    for byte in b"tr1cky-Pasz" {
-        real.handle(DesktopKey::Character(*byte));
+    for ch in "tr1cky-Pasz".chars() {
+        real.handle(DesktopKey::Character(ch));
     }
     real.handle(DesktopKey::Activate);
     let mismatch_blocked = real.screen == Screen::Confirm && real.confirm_len == 0;
-    for byte in b"tr1cky-Pass" {
-        real.handle(DesktopKey::Character(*byte));
+    for ch in "tr1cky-Pass".chars() {
+        real.handle(DesktopKey::Character(ch));
     }
     real.handle(DesktopKey::Activate);
     let welcomed = real.screen == Screen::Welcome;
@@ -9337,7 +9645,7 @@ fn session_self_test() -> bool {
         && real.credential.is_some()
         && real.setup_password_len == 0
         && real.setup_password_input == [0; MAX_NAME];
-    real.handle(DesktopKey::Character(b'x'));
+    real.handle(DesktopKey::Character('x'));
     let lock_wakes = real.screen == Screen::Login;
     // A bare Enter and Escape must not sign in.
     let bare_enter_blocked =
@@ -9346,13 +9654,13 @@ fn session_self_test() -> bool {
         real.handle(DesktopKey::Escape) == DesktopAction::Redraw && real.screen == Screen::Login;
     let click_does_not_sign_in =
         real.click(Point::new(376, 320)) == DesktopAction::Idle && real.screen == Screen::Login;
-    for byte in b"wrong" {
-        real.handle(DesktopKey::Character(*byte));
+    for ch in "wrong".chars() {
+        real.handle(DesktopKey::Character(ch));
     }
     real.handle(DesktopKey::Activate);
     let wrong_password_blocked = real.screen == Screen::Login && real.login_len == 0;
-    for byte in b"tr1cky-Pass" {
-        real.handle(DesktopKey::Character(*byte));
+    for ch in "tr1cky-Pass".chars() {
+        real.handle(DesktopKey::Character(ch));
     }
     real.handle(DesktopKey::Activate);
     let correct_password_signs_in = real.screen == Screen::Desktop;
@@ -9385,6 +9693,128 @@ fn session_self_test() -> bool {
         && dismissed
         && no_account_no_lock
         && crate::auth::self_test()
+}
+
+/// `passwd`'s three-stage masked capture (current/new/confirm), driven
+/// directly against `terminal_submit_passwd_stage` - no `shell::Shell`
+/// needed anywhere here (see that function's own doc comment: changing
+/// the password never runs a shell command), so this needs nothing
+/// heavier than a `DesktopState` walked through setup to a known
+/// password, the same way `session_self_test` above builds `real`.
+fn terminal_passwd_self_test() -> bool {
+    let mut state = DesktopState::new();
+    state.kdf_iterations = 32;
+    state.handle(DesktopKey::Activate);
+    state.handle(DesktopKey::Activate);
+    for ch in "aer".chars() {
+        state.handle(DesktopKey::Character(ch));
+    }
+    state.handle(DesktopKey::Activate);
+    for ch in "tr1cky-Pass".chars() {
+        state.handle(DesktopKey::Character(ch));
+    }
+    state.handle(DesktopKey::Activate);
+    for ch in "tr1cky-Pass".chars() {
+        state.handle(DesktopKey::Character(ch));
+    }
+    state.handle(DesktopKey::Activate);
+    state.handle(DesktopKey::Activate);
+    // Setup lands on Lock, not Desktop directly - wake it and sign in for
+    // real, exactly like `session_self_test`'s own `real` does.
+    state.handle(DesktopKey::Character('x'));
+    for ch in "tr1cky-Pass".chars() {
+        state.handle(DesktopKey::Character(ch));
+    }
+    state.handle(DesktopKey::Activate);
+    let ready = state.screen == Screen::Desktop && state.credential.is_some();
+
+    // A wrong current password aborts back to the idle state without
+    // touching the credential.
+    state.terminal_passwd_stage = Some(PasswdStage::Current);
+    for ch in "wrong-current".chars() {
+        state.push_terminal_input_char(ch);
+    }
+    terminal_submit_passwd_stage(&mut state);
+    let wrong_current_rejected = state.terminal_passwd_stage.is_none()
+        && state
+            .credential
+            .is_some_and(|credential| credential.verify(b"tr1cky-Pass"));
+
+    // Correct current password advances to New, then Confirm.
+    state.terminal_passwd_stage = Some(PasswdStage::Current);
+    for ch in "tr1cky-Pass".chars() {
+        state.push_terminal_input_char(ch);
+    }
+    terminal_submit_passwd_stage(&mut state);
+    let advanced_to_new = state.terminal_passwd_stage == Some(PasswdStage::New);
+    for ch in "New-Pass2".chars() {
+        state.push_terminal_input_char(ch);
+    }
+    terminal_submit_passwd_stage(&mut state);
+    let advanced_to_confirm = state.terminal_passwd_stage == Some(PasswdStage::Confirm)
+        && state.terminal_passwd_new_len == "New-Pass2".len();
+
+    // A mismatched confirmation aborts without changing the credential.
+    for ch in "New-Pass3".chars() {
+        state.push_terminal_input_char(ch);
+    }
+    terminal_submit_passwd_stage(&mut state);
+    let mismatch_rejected = state.terminal_passwd_stage.is_none()
+        && state.terminal_passwd_new_len == 0
+        && state
+            .credential
+            .is_some_and(|credential| credential.verify(b"tr1cky-Pass"));
+
+    // A confirmed but policy-weak new password is rejected too.
+    state.terminal_passwd_stage = Some(PasswdStage::Current);
+    for ch in "tr1cky-Pass".chars() {
+        state.push_terminal_input_char(ch);
+    }
+    terminal_submit_passwd_stage(&mut state);
+    for ch in "weak".chars() {
+        state.push_terminal_input_char(ch);
+    }
+    terminal_submit_passwd_stage(&mut state);
+    for ch in "weak".chars() {
+        state.push_terminal_input_char(ch);
+    }
+    terminal_submit_passwd_stage(&mut state);
+    let weak_policy_rejected = state.terminal_passwd_stage.is_none()
+        && state
+            .credential
+            .is_some_and(|credential| credential.verify(b"tr1cky-Pass"));
+
+    // A correct current password, a policy-valid new password entered the
+    // same both times, actually changes the credential and persists.
+    state.terminal_passwd_stage = Some(PasswdStage::Current);
+    for ch in "tr1cky-Pass".chars() {
+        state.push_terminal_input_char(ch);
+    }
+    terminal_submit_passwd_stage(&mut state);
+    for ch in "New-Pass2".chars() {
+        state.push_terminal_input_char(ch);
+    }
+    terminal_submit_passwd_stage(&mut state);
+    for ch in "New-Pass2".chars() {
+        state.push_terminal_input_char(ch);
+    }
+    terminal_submit_passwd_stage(&mut state);
+    let changed = state.terminal_passwd_stage.is_none()
+        && state.terminal_passwd_new_len == 0
+        && state
+            .credential
+            .is_some_and(|credential| credential.verify(b"New-Pass2"))
+        && !state
+            .credential
+            .is_some_and(|credential| credential.verify(b"tr1cky-Pass"));
+
+    ready
+        && wrong_current_rejected
+        && advanced_to_new
+        && advanced_to_confirm
+        && mismatch_rejected
+        && weak_policy_rejected
+        && changed
 }
 
 fn url_parse_self_test() -> bool {

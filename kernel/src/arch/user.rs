@@ -132,10 +132,16 @@ pub struct UserRegs {
     pub rsp: u64,
 }
 
-pub fn resume_forked_child(snapshot: &ForkSnapshot, user_start: u64, user_end: u64) -> u64 {
+pub fn resume_forked_child(
+    snapshot: &ForkSnapshot,
+    user_start: u64,
+    user_end: u64,
+    fs_base: u64,
+) -> u64 {
     let cpu = CpuInfo::detect();
     let (_, smap_enabled) = enable_user_protections(&cpu);
     super::syscall_entry::reset_user_bases();
+    write_fs_base(fs_base);
     ACTIVE_USER_START.store(user_start, Ordering::Release);
     ACTIVE_USER_END.store(user_end, Ordering::Release);
     SMAP_ACTIVE.store(smap_enabled as u64, Ordering::Release);
@@ -203,6 +209,37 @@ fn run(
             && (!cpu.smep || smep_enabled)
             && (!cpu.smap || smap_enabled),
     }
+}
+
+/// The user-mode FS base the running task has set (its thread pointer).
+pub fn read_fs_base() -> u64 {
+    read_msr(FS_BASE_MSR)
+}
+
+/// Loads a task's saved FS base when it is switched in.
+pub fn write_fs_base(address: u64) {
+    // SAFETY: the FS base is user state; the kernel never uses FS.
+    unsafe { write_msr(FS_BASE_MSR, address) };
+}
+
+/// Runs `body` with the user range of a task as the active one, so the
+/// kernel can touch that task's memory (after its program has returned and
+/// the range was cleared).
+pub fn with_user_range<R>(start: u64, end: u64, body: impl FnOnce() -> R) -> R {
+    let saved = (
+        ACTIVE_USER_START.load(Ordering::Acquire),
+        ACTIVE_USER_END.load(Ordering::Acquire),
+    );
+    let cpu = CpuInfo::detect();
+    let (_, smap_enabled) = enable_user_protections(&cpu);
+    let saved_smap = SMAP_ACTIVE.swap(smap_enabled as u64, Ordering::AcqRel);
+    ACTIVE_USER_START.store(start, Ordering::Release);
+    ACTIVE_USER_END.store(end, Ordering::Release);
+    let result = body();
+    ACTIVE_USER_START.store(saved.0, Ordering::Release);
+    ACTIVE_USER_END.store(saved.1, Ordering::Release);
+    SMAP_ACTIVE.store(saved_smap, Ordering::Release);
+    result
 }
 
 pub fn set_thread_base(gs: bool, address: u64) -> bool {

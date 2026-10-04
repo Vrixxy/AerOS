@@ -127,6 +127,16 @@ pub fn load_root_file(name: &[u8; 11], skip: u64, dest_phys: u64, capacity: u64)
     Some(want)
 }
 
+/// First sector of the FAT volume the machine booted from.
+pub fn volume_start() -> Option<u64> {
+    (*MOUNTED.lock()).map(|volume| volume.start)
+}
+
+/// Forgets the cached FAT sector after another driver changed the volume.
+pub fn invalidate_cache() {
+    *FAT_CACHE.lock() = None;
+}
+
 pub fn boot_kernel() -> Option<(u32, u64)> {
     let volume = (*MOUNTED.lock())?;
     let efi = find_root(&volume, b"EFI        ")?;
@@ -319,15 +329,18 @@ fn delete_root_entry(name: &[u8; 11], expect_directory: bool) -> bool {
     if entry.directory != expect_directory {
         return false;
     }
-    if entry.cluster >= 2 && !free_chain(&volume, entry.cluster) {
-        return false;
-    }
     let mut sector = [0u8; 512];
     if !crate::blockdev::read_sector(lba, &mut sector) {
         return false;
     }
     sector[offset] = 0xe5;
-    crate::blockdev::write_boot_sector(lba, &sector)
+    if !crate::blockdev::write_boot_sector(lba, &sector) {
+        return false;
+    }
+    if entry.cluster >= 2 {
+        free_chain(&volume, entry.cluster);
+    }
+    true
 }
 
 pub fn stream_clusters(
@@ -822,13 +835,9 @@ fn write_file_in_directory(
     name: &[u8; 11],
     data: &[u8],
 ) -> bool {
-    if let Some((existing, _lba, _offset)) = find_in_sectors_located(volume, dir_cluster, name) {
-        if existing.directory {
-            return false;
-        }
-        if existing.cluster >= 2 {
-            free_chain(volume, existing.cluster);
-        }
+    let existing = find_in_sectors_located(volume, dir_cluster, name);
+    if existing.is_some_and(|(entry, _, _)| entry.directory) {
+        return false;
     }
     let cluster_bytes = volume.sectors_per_cluster as u64 * SECTOR_BYTES;
     let clusters_needed = if data.is_empty() {
@@ -844,32 +853,57 @@ fn write_file_in_directory(
     } else {
         0
     };
-    let Some((slot_lba, slot_offset)) = find_or_extend_free_slot(volume, dir_cluster, name) else {
+    let slot = match existing {
+        Some((_, lba, offset)) => Some((lba, offset)),
+        None => find_or_extend_free_slot(volume, dir_cluster, name),
+    };
+    commit_file(
+        volume,
+        slot,
+        existing.map(|(entry, _, _)| entry),
+        name,
+        first_cluster,
+        data.len(),
+    )
+}
+
+/// Publishes a freshly written chain: one directory-entry sector write makes
+/// the new file visible, and only then is the old file's chain freed, so a
+/// power cut at any point leaves either the old or the new file intact (at
+/// worst leaking clusters), never an entry pointing at freed clusters.
+fn commit_file(
+    volume: &Volume,
+    slot: Option<(u64, usize)>,
+    replaced: Option<DirectoryEntry>,
+    name: &[u8; 11],
+    first_cluster: u32,
+    length: usize,
+) -> bool {
+    let Some((slot_lba, slot_offset)) = slot else {
         if first_cluster >= 2 {
             free_chain(volume, first_cluster);
         }
         return false;
     };
-    write_directory_entry(
-        slot_lba,
-        slot_offset,
-        name,
-        first_cluster,
-        data.len() as u32,
-    )
+    if !write_directory_entry(slot_lba, slot_offset, name, first_cluster, length as u32) {
+        if first_cluster >= 2 {
+            free_chain(volume, first_cluster);
+        }
+        return false;
+    }
+    if let Some(old) = replaced
+        && old.cluster >= 2
+    {
+        free_chain(volume, old.cluster);
+    }
+    true
 }
 
 fn write_file_in_fixed_root(volume: &Volume, name: &[u8; 11], data: &[u8]) -> bool {
     let root_sectors = (volume.root_entries as u64 * 32).div_ceil(SECTOR_BYTES);
-    if let Some((existing, _lba, _offset)) =
-        find_in_sectors_located_fixed(volume.first_root, root_sectors, name)
-    {
-        if existing.directory {
-            return false;
-        }
-        if existing.cluster >= 2 {
-            free_chain(volume, existing.cluster);
-        }
+    let existing = find_in_sectors_located_fixed(volume.first_root, root_sectors, name);
+    if existing.is_some_and(|(entry, _, _)| entry.directory) {
+        return false;
     }
     let cluster_bytes = volume.sectors_per_cluster as u64 * SECTOR_BYTES;
     let clusters_needed = if data.is_empty() {
@@ -885,19 +919,17 @@ fn write_file_in_fixed_root(volume: &Volume, name: &[u8; 11], data: &[u8]) -> bo
     } else {
         0
     };
-    let Some((slot_lba, slot_offset)) = find_free_slot_fixed(volume.first_root, root_sectors, name)
-    else {
-        if first_cluster >= 2 {
-            free_chain(volume, first_cluster);
-        }
-        return false;
+    let slot = match existing {
+        Some((_, lba, offset)) => Some((lba, offset)),
+        None => find_free_slot_fixed(volume.first_root, root_sectors, name),
     };
-    write_directory_entry(
-        slot_lba,
-        slot_offset,
+    commit_file(
+        volume,
+        slot,
+        existing.map(|(entry, _, _)| entry),
         name,
         first_cluster,
-        data.len() as u32,
+        data.len(),
     )
 }
 
@@ -1014,9 +1046,6 @@ fn find_or_extend_free_slot(
                     return Some((lba, slot * 32));
                 }
                 if entry[..11] == *name {
-                    // Being replaced by the caller's free_chain step; this
-                    // slot will be reused directly rather than treated as
-                    // occupied.
                     return Some((lba, slot * 32));
                 }
             }
@@ -1167,12 +1196,16 @@ fn allocate_cluster(volume: &Volume) -> Option<u32> {
         0x0fff_ffff
     };
     let mut sector = [0u8; 512];
+    let mut loaded_lba = None;
     let max_cluster = volume.clusters as u32 + 2;
     for cluster in 2..max_cluster {
         let byte_offset = cluster as u64 * entry_bytes;
         let lba = volume.first_fat + byte_offset / SECTOR_BYTES;
-        if !crate::blockdev::read_sector(lba, &mut sector) {
-            return None;
+        if loaded_lba != Some(lba) {
+            if !crate::blockdev::read_sector(lba, &mut sector) {
+                return None;
+            }
+            loaded_lba = Some(lba);
         }
         let offset = (byte_offset % SECTOR_BYTES) as usize;
         let value = if volume.fat_bits == 16 {
@@ -1290,4 +1323,203 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
         bytes[offset + 2],
         bytes[offset + 3],
     ])
+}
+
+/// Runs `body` with the FAT volume on the RAM disk (formatted by the caller)
+/// mounted in place of the real one, then restores the real mount.
+#[cfg(feature = "boot-test")]
+pub fn with_ram_volume<R>(body: impl FnOnce() -> R) -> Option<R> {
+    let partition = Partition {
+        first_lba: 0,
+        sectors: crate::blockdev::RAM_DISK_SECTORS,
+        kind: 0x0e,
+        bootable: false,
+    };
+    let volume = read_volume(partition)?;
+    let saved = MOUNTED.lock().replace(volume);
+    forget_caches();
+    let result = body();
+    *MOUNTED.lock() = saved;
+    forget_caches();
+    Some(result)
+}
+
+/// Handle on the mounted volume for the power-loss test.
+#[cfg(feature = "boot-test")]
+#[derive(Clone, Copy)]
+pub struct Fat(Volume);
+
+#[cfg(feature = "boot-test")]
+impl Fat {
+    pub fn mounted() -> Option<Self> {
+        (*MOUNTED.lock()).map(Fat)
+    }
+}
+
+#[cfg(feature = "boot-test")]
+#[derive(Clone, Copy, Default)]
+pub struct ChainCheck {
+    pub dangling: u32,
+    pub cross_linked: u32,
+    pub short: u32,
+    /// Whether the checked directory entry exists at all.
+    pub found: bool,
+}
+
+#[cfg(feature = "boot-test")]
+pub fn forget_caches() {
+    *FAT_CACHE.lock() = None;
+    *CHAIN_HINT.lock() = None;
+}
+
+#[cfg(feature = "boot-test")]
+const CHECK_MAP_BYTES: usize = 65536;
+#[cfg(feature = "boot-test")]
+static CHECK_MAP: TicketLock<[u8; CHECK_MAP_BYTES]> = TicketLock::new([0; CHECK_MAP_BYTES]);
+
+#[cfg(feature = "boot-test")]
+fn for_each_root_entry(volume: &Volume, mut visit: impl FnMut(&[u8])) {
+    let mut sector = [0u8; 512];
+    if volume.fat_bits == 16 {
+        let root_sectors = (volume.root_entries as u64 * 32).div_ceil(SECTOR_BYTES);
+        for offset in 0..root_sectors {
+            if !crate::blockdev::read_sector(volume.first_root + offset, &mut sector) {
+                return;
+            }
+            for entry in sector.chunks_exact(32) {
+                if entry[0] == 0 {
+                    return;
+                }
+                visit(entry);
+            }
+        }
+        return;
+    }
+    let mut cluster = volume.root_cluster;
+    for _ in 0..MAX_CHAIN {
+        let base = cluster_lba(volume, cluster);
+        for s in 0..volume.sectors_per_cluster as u64 {
+            if !crate::blockdev::read_sector(base + s, &mut sector) {
+                return;
+            }
+            for entry in sector.chunks_exact(32) {
+                if entry[0] == 0 {
+                    return;
+                }
+                visit(entry);
+            }
+        }
+        match next_cluster(volume, cluster) {
+            Some(Some(next)) if next >= 2 && (next as u64) < volume.clusters + 2 => cluster = next,
+            _ => return,
+        }
+    }
+}
+
+#[cfg(feature = "boot-test")]
+static BASELINE_BUILT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Makes the next `check_root_chains` rebuild its map of the clusters used by
+/// every other file.
+#[cfg(feature = "boot-test")]
+pub fn reset_check_baseline() {
+    BASELINE_BUILT.store(false, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Checks the cluster chain of the root-directory entry `name` for a chain
+/// that runs into a free cluster, a cluster shared with another file (or a
+/// loop), and a chain too short for the recorded size. The clusters of all
+/// the other entries are mapped once per `reset_check_baseline`, so repeated
+/// checks only walk the one file. Clusters no entry references (leaks) are
+/// tolerated: they waste space but cannot corrupt data.
+#[cfg(feature = "boot-test")]
+pub fn check_root_chains(fat: &Fat, name: &[u8; 11]) -> Option<ChainCheck> {
+    use core::sync::atomic::Ordering;
+    let volume = &fat.0;
+    if volume.clusters + 2 > (CHECK_MAP_BYTES * 8) as u64 {
+        return None;
+    }
+    forget_caches();
+    let mut others = [(0u32, 0u32); 256];
+    let mut other_count = 0;
+    let mut subject = None;
+    for_each_root_entry(volume, |entry| {
+        let attributes = entry[11];
+        if entry[0] == 0xe5 || attributes == 0x0f || attributes & 0x08 != 0 || entry[0] == b'.' {
+            return;
+        }
+        let cluster = ((read_u16(entry, 20) as u32) << 16) | read_u16(entry, 26) as u32;
+        let size = if attributes & 0x10 != 0 {
+            0
+        } else {
+            read_u32(entry, 28)
+        };
+        if entry[..11] == *name {
+            subject = Some((cluster, size));
+        } else if cluster >= 2 && other_count < others.len() {
+            others[other_count] = (cluster, size);
+            other_count += 1;
+        }
+    });
+    let mut map = CHECK_MAP.lock();
+    let cluster_bytes = volume.sectors_per_cluster as u64 * SECTOR_BYTES;
+    if !BASELINE_BUILT.load(Ordering::SeqCst) {
+        map.fill(0);
+        for &(first, _) in &others[..other_count] {
+            let (mut cluster, mut steps) = (first, 0usize);
+            while cluster >= 2 && (cluster as u64) < volume.clusters + 2 && steps < 1_000_000 {
+                let (byte, bit) = (cluster as usize / 8, cluster % 8);
+                if map[byte] & (1 << bit) != 0 {
+                    break;
+                }
+                map[byte] |= 1 << bit;
+                steps += 1;
+                match next_cluster(volume, cluster) {
+                    Some(Some(next)) if next != 0 => cluster = next,
+                    Some(_) => break,
+                    None => return None,
+                }
+            }
+        }
+        BASELINE_BUILT.store(true, Ordering::SeqCst);
+    }
+    let mut report = ChainCheck::default();
+    let Some((first, size)) = subject else {
+        return Some(report);
+    };
+    report.found = true;
+    if first < 2 {
+        return Some(report);
+    }
+    let mut seen = [0u32; 64];
+    let (mut cluster, mut length) = (first, 0usize);
+    loop {
+        if cluster < 2 || cluster as u64 >= volume.clusters + 2 {
+            report.dangling += 1;
+            break;
+        }
+        let (byte, bit) = (cluster as usize / 8, cluster % 8);
+        if map[byte] & (1 << bit) != 0 || seen[..length].contains(&cluster) || length == seen.len()
+        {
+            report.cross_linked += 1;
+            break;
+        }
+        seen[length] = cluster;
+        length += 1;
+        match next_cluster(volume, cluster) {
+            None => return None,
+            Some(None) => {
+                if size > 0 && (length as u64) * cluster_bytes < size as u64 {
+                    report.short += 1;
+                }
+                break;
+            }
+            Some(Some(0)) => {
+                report.dangling += 1;
+                break;
+            }
+            Some(Some(next)) => cluster = next,
+        }
+    }
+    Some(report)
 }

@@ -4,7 +4,7 @@ use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::{arch, heap};
+use crate::{arch, heap, slab};
 
 const MAX_TASKS: usize = 32;
 const STACK_SIZE: usize = 64 * 1024;
@@ -25,6 +25,58 @@ enum TaskState {
 #[repr(C)]
 struct Context {
     rsp: u64,
+}
+
+/// What a tracer asked a stopped tracee to do next.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Resume {
+    Wait,
+    Continue,
+    Syscall,
+    Step,
+    Kill,
+}
+
+/// Debugger (ptrace) state of a task.
+#[derive(Clone, Copy)]
+pub struct Trace {
+    /// The process watching this task (0: nobody).
+    pub tracer: u64,
+    pub stopped: bool,
+    /// The stop has been reported to the tracer by `wait4`.
+    pub reported: bool,
+    /// The `wait4` status of the stop.
+    pub status: u32,
+    pub resume: Resume,
+    /// The signal the tracer wants delivered when the tracee resumes.
+    pub signal: u64,
+    pub options: u32,
+    /// The registers at the stop, in `user_regs_struct` order.
+    pub regs: [u64; 27],
+    pub dirty: bool,
+    /// 0: a signal or event stop, 1: system call entry, 2: system call exit.
+    pub kind: u8,
+    /// The tracer asked for stops at system calls.
+    pub syscall_stops: bool,
+    /// The signal of the current stop.
+    pub stop_signal: u64,
+}
+
+impl Trace {
+    pub const NONE: Trace = Trace {
+        tracer: 0,
+        stopped: false,
+        reported: false,
+        status: 0,
+        resume: Resume::Wait,
+        signal: 0,
+        options: 0,
+        regs: [0; 27],
+        dirty: false,
+        kind: 0,
+        syscall_stops: false,
+        stop_signal: 0,
+    };
 }
 
 #[derive(Clone, Copy)]
@@ -48,7 +100,29 @@ struct Task {
     process_space: Option<arch::paging::ProcessAddressSpace>,
     fork_snapshot: Option<arch::user::ForkSnapshot>,
     parent_id: u64,
+    /// POSIX process group and session ids. A freshly `spawn()`ed task
+    /// starts as its own group leader and session leader (`pgid == sid ==
+    /// id`, set in `spawn()` once `id` is known); `fork_current_user_task`
+    /// overwrites both with the parent's, since a forked child inherits its
+    /// parent's group/session rather than starting new ones (`setpgid`/
+    /// `setsid` change them explicitly afterward, same as real POSIX).
+    pgid: u64,
+    sid: u64,
     process_state: crate::syscall::ProcessState,
+    nice: i8,
+    skipped: u8,
+    /// Thread group id: the id of the task that started the process, 0 for a
+    /// task that is not a thread (its own group).
+    tgid: u64,
+    /// The user-mode FS base (thread pointer), kept while the task is switched out.
+    fs_base: u64,
+    /// `CLONE_CHILD_CLEARTID` / `set_tid_address`: a word cleared and woken at exit.
+    clear_child_tid: u64,
+    /// `set_robust_list`: the head of the robust futex list.
+    robust_list: u64,
+    /// The status set by `exit_group` (the leader's slot holds it), `u64::MAX` until then.
+    group_code: u64,
+    trace: Trace,
 }
 
 impl Task {
@@ -72,7 +146,17 @@ impl Task {
         process_space: None,
         fork_snapshot: None,
         parent_id: 0,
+        pgid: 0,
+        sid: 0,
         process_state: crate::syscall::ProcessState::EMPTY,
+        nice: 0,
+        skipped: 0,
+        tgid: 0,
+        fs_base: 0,
+        clear_child_tid: 0,
+        robust_list: 0,
+        group_code: u64::MAX,
+        trace: Trace::NONE,
     };
 }
 
@@ -123,7 +207,17 @@ impl Scheduler {
             process_space: None,
             fork_snapshot: None,
             parent_id: 0,
+            pgid: 0,
+            sid: 0,
             process_state: crate::syscall::ProcessState::EMPTY,
+            nice: 0,
+            skipped: 0,
+            tgid: 0,
+            fs_base: 0,
+            clear_child_tid: 0,
+            robust_list: 0,
+            group_code: u64::MAX,
+            trace: Trace::NONE,
         };
         self.current = 0;
         self.next_id = 1;
@@ -135,15 +229,135 @@ impl Scheduler {
         arch::gdt::set_ring0_stack(RSP0_CPU, self.tasks[0].interrupt_stack_top);
     }
 
-    fn next_ready(&self) -> Option<usize> {
+    /// Picks the next ready task in round-robin order, but preferring a lower
+    /// The thread group a task belongs to (its own id unless it is a thread).
+    fn group(&self, slot: usize) -> u64 {
+        let task = &self.tasks[slot];
+        if task.tgid == 0 { task.id } else { task.tgid }
+    }
+
+    /// The slot of the task that started the process `slot` belongs to; it owns
+    /// the address space and the stored shared state.
+    fn leader_slot(&self, slot: usize) -> usize {
+        let group = self.group(slot);
+        self.tasks
+            .iter()
+            .position(|task| task.id == group && task.state != TaskState::Empty)
+            .unwrap_or(slot)
+    }
+
+    /// Whether another task of the same process is still alive.
+    fn group_has_others(&self, slot: usize) -> bool {
+        let group = self.group(slot);
+        self.tasks.iter().enumerate().any(|(index, task)| {
+            index != slot
+                && task.state != TaskState::Empty
+                && task.state != TaskState::Exited
+                && (if task.tgid == 0 { task.id } else { task.tgid }) == group
+        })
+    }
+
+    /// Whether any task of process `group` has not exited.
+    fn group_live(&self, group: u64) -> bool {
+        self.tasks.iter().any(|task| {
+            task.state != TaskState::Empty
+                && task.state != TaskState::Exited
+                && (if task.tgid == 0 { task.id } else { task.tgid }) == group
+        })
+    }
+
+    /// Moves the Linux process state across a context switch. Tasks of one
+    /// process share everything but the signal mask, pending signals and
+    /// alternate stack, so inside a process only those change hands; between
+    /// processes the shared part goes to the leader's slot and comes from the
+    /// next leader's. `discard` drops the departing task's state (it is gone).
+    fn switch_state(&mut self, current: usize, next: usize, discard: bool) {
+        let live = crate::syscall::save_process_state();
+        self.tasks[current].process_state.copy_thread_from(&live);
+        if self.group(current) == self.group(next) {
+            crate::syscall::restore_thread_state(&self.tasks[next].process_state);
+            return;
+        }
+        if !discard {
+            let leader = self.leader_slot(current);
+            self.tasks[leader].process_state.copy_shared_from(&live);
+        }
+        let leader_next = self.leader_slot(next);
+        let mut incoming = self.tasks[leader_next].process_state;
+        incoming.copy_thread_from(&self.tasks[next].process_state);
+        crate::syscall::restore_process_state(&incoming);
+    }
+
+    /// nice value; a task passed over for long enough gains priority, so no
+    /// ready task starves.
+    fn next_ready(&mut self) -> Option<usize> {
+        let mut candidates = [(0usize, 0i8, 0u8); MAX_TASKS];
+        let mut count = 0;
         for distance in 1..=MAX_TASKS {
             let index = (self.current + distance) % MAX_TASKS;
-            if self.tasks[index].state == TaskState::Ready {
-                return Some(index);
+            let task = &self.tasks[index];
+            if task.state == TaskState::Ready {
+                candidates[count] = (index, task.nice, task.skipped);
+                count += 1;
             }
         }
-        None
+        let chosen = pick_weighted(&candidates[..count])?;
+        for (index, _, _) in &candidates[..count] {
+            let task = &mut self.tasks[*index];
+            task.skipped = if *index == chosen {
+                0
+            } else {
+                task.skipped.saturating_add(1)
+            };
+        }
+        Some(chosen)
     }
+}
+
+const AGING_STEP: u8 = 4;
+
+/// `(task index, nice, times passed over)` in round-robin order. The lowest
+/// `nice - skipped / AGING_STEP` wins, the earliest in order on a tie.
+pub(crate) fn pick_weighted(candidates: &[(usize, i8, u8)]) -> Option<usize> {
+    candidates
+        .iter()
+        .min_by_key(|(_, nice, skipped)| i16::from(*nice) - i16::from(*skipped / AGING_STEP))
+        .map(|(index, _, _)| *index)
+}
+
+pub fn set_nice(pid: u64, nice: i8) -> bool {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    match scheduler
+        .tasks
+        .iter_mut()
+        .find(|task| task.id == pid && task.id != 0 && task.state != TaskState::Empty)
+    {
+        Some(task) => {
+            task.nice = nice.clamp(-20, 19);
+            true
+        }
+        None => false,
+    }
+}
+
+pub fn nice_of(pid: u64) -> Option<i8> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    scheduler
+        .tasks
+        .iter()
+        .find(|task| task.id == pid && task.state != TaskState::Empty)
+        .map(|task| task.nice)
+}
+
+pub fn priority_self_test() -> bool {
+    let equal = pick_weighted(&[(3, 0, 0), (5, 0, 0), (1, 0, 0)]) == Some(3);
+    let prefers_low_nice = pick_weighted(&[(3, 5, 0), (5, -3, 0), (1, 0, 0)]) == Some(5);
+    let aging = pick_weighted(&[(3, 0, 0), (5, 3, 16)]) == Some(5);
+    let not_yet = pick_weighted(&[(3, 0, 0), (5, 3, 8)]) == Some(3);
+    let empty = pick_weighted(&[]).is_none();
+    equal && prefers_low_nice && aging && not_yet && empty
 }
 
 #[repr(align(64))]
@@ -200,6 +414,14 @@ pub struct SchedulerStats {
     pub highest_task_id: u64,
 }
 
+fn release_fpu(pointer: NonNull<u8>) -> bool {
+    Layout::from_size_align(
+        arch::fpu::context_state_bytes(),
+        arch::fpu::context_alignment(),
+    )
+    .is_ok_and(|layout| slab::deallocate(pointer, layout))
+}
+
 fn release_scheduler_memory(scheduler: &mut Scheduler) {
     for task in &scheduler.tasks {
         if task.stack_base != 0 {
@@ -210,8 +432,7 @@ fn release_scheduler_memory(scheduler: &mut Scheduler) {
             }
         }
         if task.fpu_base != 0 {
-            let released = NonNull::new(task.fpu_base as *mut u8)
-                .is_some_and(|pointer| heap::HEAP.deallocate(pointer));
+            let released = NonNull::new(task.fpu_base as *mut u8).is_some_and(release_fpu);
             if !released {
                 arch::halt_forever();
             }
@@ -230,8 +451,8 @@ fn release_scheduler_memory(scheduler: &mut Scheduler) {
         }
     }
     if scheduler.fpu_template_base != 0 {
-        let released = NonNull::new(scheduler.fpu_template_base as *mut u8)
-            .is_some_and(|pointer| heap::HEAP.deallocate(pointer));
+        let released =
+            NonNull::new(scheduler.fpu_template_base as *mut u8).is_some_and(release_fpu);
         if !released {
             arch::halt_forever();
         }
@@ -256,11 +477,11 @@ pub fn initialize() {
     else {
         return;
     };
-    let Some(main_fpu) = heap::HEAP.allocate(fpu_layout) else {
+    let Some(main_fpu) = slab::allocate(fpu_layout) else {
         return;
     };
-    let Some(template_fpu) = heap::HEAP.allocate(fpu_layout) else {
-        heap::HEAP.deallocate(main_fpu);
+    let Some(template_fpu) = slab::allocate(fpu_layout) else {
+        slab::deallocate(main_fpu, fpu_layout);
         return;
     };
     let initialized = unsafe {
@@ -270,8 +491,8 @@ pub fn initialize() {
             && arch::fpu::restore_context(main_fpu.as_ptr())
     };
     if !initialized {
-        heap::HEAP.deallocate(template_fpu);
-        heap::HEAP.deallocate(main_fpu);
+        slab::deallocate(template_fpu, fpu_layout);
+        slab::deallocate(main_fpu, fpu_layout);
         return;
     }
     scheduler.initialize(
@@ -298,50 +519,52 @@ pub fn spawn(entry: extern "C" fn() -> !) -> Option<u64> {
         heap::HEAP.deallocate(stack);
         return None;
     };
+    // reap() leaves a freed slot's exit status behind; the new task starts clean.
+    USER_TASK_EXIT[slot].store(u64::MAX, Ordering::Release);
     let Ok(fpu_layout) =
         Layout::from_size_align(scheduler.fpu_state_bytes, arch::fpu::context_alignment())
     else {
         heap::HEAP.deallocate(stack);
         return None;
     };
-    let Some(fpu) = heap::HEAP.allocate(fpu_layout) else {
+    let Some(fpu) = slab::allocate(fpu_layout) else {
         heap::HEAP.deallocate(stack);
         return None;
     };
     let Ok(interrupt_layout) = Layout::from_size_align(INTERRUPT_STACK_SIZE, STACK_ALIGNMENT)
     else {
-        heap::HEAP.deallocate(fpu);
+        slab::deallocate(fpu, fpu_layout);
         heap::HEAP.deallocate(stack);
         return None;
     };
     let Some(interrupt_stack) = heap::HEAP.allocate(interrupt_layout) else {
-        heap::HEAP.deallocate(fpu);
+        slab::deallocate(fpu, fpu_layout);
         heap::HEAP.deallocate(stack);
         return None;
     };
     let stack_base = stack.as_ptr() as usize;
     let Some(stack_end) = stack_base.checked_add(STACK_SIZE) else {
         heap::HEAP.deallocate(interrupt_stack);
-        heap::HEAP.deallocate(fpu);
+        slab::deallocate(fpu, fpu_layout);
         heap::HEAP.deallocate(stack);
         return None;
     };
     let Some(fake_return) = stack_end.checked_sub(8) else {
         heap::HEAP.deallocate(interrupt_stack);
-        heap::HEAP.deallocate(fpu);
+        slab::deallocate(fpu, fpu_layout);
         heap::HEAP.deallocate(stack);
         return None;
     };
     let Some(initial_rsp) = fake_return.checked_sub(72) else {
         heap::HEAP.deallocate(interrupt_stack);
-        heap::HEAP.deallocate(fpu);
+        slab::deallocate(fpu, fpu_layout);
         heap::HEAP.deallocate(stack);
         return None;
     };
     let interrupt_stack_base = interrupt_stack.as_ptr() as usize;
     let Some(interrupt_stack_top) = interrupt_stack_base.checked_add(INTERRUPT_STACK_SIZE) else {
         heap::HEAP.deallocate(interrupt_stack);
-        heap::HEAP.deallocate(fpu);
+        slab::deallocate(fpu, fpu_layout);
         heap::HEAP.deallocate(stack);
         return None;
     };
@@ -389,7 +612,17 @@ pub fn spawn(entry: extern "C" fn() -> !) -> Option<u64> {
         process_space: None,
         fork_snapshot: None,
         parent_id: 0,
+        pgid: id,
+        sid: id,
         process_state: crate::syscall::ProcessState::EMPTY,
+        nice: 0,
+        skipped: 0,
+        tgid: 0,
+        fs_base: 0,
+        clear_child_tid: 0,
+        robust_list: 0,
+        group_code: u64::MAX,
+        trace: Trace::NONE,
     };
     Some(id)
 }
@@ -448,7 +681,7 @@ pub fn spawn_process_with(
         arch::paging::destroy_process(&space);
         return None;
     }
-    let user_start = arch::paging::process_virtual_base();
+    let user_start = arch::paging::process_virtual_base(space.user_slot);
     let user_end = arch::paging::process_reserved_end(user_start);
     let Some((id, slot)) = spawn_user(space.entry, space.stack_top, user_start, user_end) else {
         arch::paging::destroy_process(&space);
@@ -466,9 +699,16 @@ pub fn fork_current_user_task(snapshot: &arch::user::ForkSnapshot) -> Option<u64
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     let current = scheduler.current;
     let parent_task_id = scheduler.tasks[current].id;
-    let parent_space = scheduler.tasks[current].process_space?;
+    let owner = scheduler.leader_slot(current);
+    if let Some(space) = scheduler.tasks[owner].process_space.as_mut() {
+        arch::paging::process_swap_in_all(space);
+    }
+    let parent_space = scheduler.tasks[owner].process_space?;
     let user_start = scheduler.tasks[current].user_start;
     let user_end = scheduler.tasks[current].user_end;
+    let parent_pgid = scheduler.tasks[current].pgid;
+    let parent_sid = scheduler.tasks[current].sid;
+    let parent_nice = scheduler.tasks[current].nice;
     // The parent is still "current", so its live Linux-ABI process state
     // (fd table, cwd, signal handlers) lives in syscall.rs's shared statics
     // right now, not in `scheduler.tasks[current].process_state` (that copy
@@ -495,8 +735,69 @@ pub fn fork_current_user_task(snapshot: &arch::user::ForkSnapshot) -> Option<u64
     scheduler.tasks[slot].user_start = user_start;
     scheduler.tasks[slot].user_end = user_end;
     scheduler.tasks[slot].parent_id = parent_task_id;
+    scheduler.tasks[slot].pgid = parent_pgid;
+    scheduler.tasks[slot].sid = parent_sid;
+    scheduler.tasks[slot].nice = parent_nice;
+    scheduler.tasks[slot].fs_base = arch::user::read_fs_base();
     scheduler.tasks[slot].process_state = parent_process_state;
     crate::syscall::clear_pending_signals(&mut scheduler.tasks[slot].process_state);
+    Some(id)
+}
+
+/// What `clone` asks of a new thread.
+pub struct ThreadRequest {
+    /// The thread's stack pointer when it starts (0 keeps the caller's).
+    pub stack: u64,
+    pub tls: Option<u64>,
+    pub clear_child_tid: u64,
+}
+
+/// Starts a new task in the running process: same address space, descriptor
+/// table, handlers and directory, its own stack, registers (from `snapshot`,
+/// with the caller's return value replaced by 0 in the child), thread pointer,
+/// signal mask and kernel stack. Returns its thread id.
+pub fn clone_thread(snapshot: &arch::user::ForkSnapshot, request: &ThreadRequest) -> Option<u64> {
+    reap_exited_threads();
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let current = scheduler.current;
+    let leader = scheduler.leader_slot(current);
+    scheduler.tasks[leader].process_space?;
+    let group = scheduler.group(current);
+    let (user_start, user_end) = (
+        scheduler.tasks[current].user_start,
+        scheduler.tasks[current].user_end,
+    );
+    let (cr3, pgid, sid) = (
+        scheduler.tasks[leader].cr3,
+        scheduler.tasks[leader].pgid,
+        scheduler.tasks[leader].sid,
+    );
+    let nice = scheduler.tasks[current].nice;
+    let live = crate::syscall::save_process_state();
+    let id = spawn(forked_task_trampoline)?;
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let slot = scheduler.tasks.iter().position(|task| task.id == id)?;
+    let mut child = *snapshot;
+    if request.stack != 0 {
+        child.rsp = request.stack;
+    }
+    let task = &mut scheduler.tasks[slot];
+    task.tgid = group;
+    task.cr3 = cr3;
+    task.process_space = None;
+    task.fork_snapshot = Some(child);
+    task.user_start = user_start;
+    task.user_end = user_end;
+    task.parent_id = 0;
+    task.pgid = pgid;
+    task.sid = sid;
+    task.nice = nice;
+    task.fs_base = request.tls.unwrap_or_else(arch::user::read_fs_base);
+    task.clear_child_tid = request.clear_child_tid;
+    task.process_state = crate::syscall::ProcessState::EMPTY;
+    task.process_state.copy_thread_from(&live);
+    crate::syscall::clear_pending_signals(&mut task.process_state);
     Some(id)
 }
 
@@ -513,10 +814,80 @@ pub fn handle_cow_fault_current(address: u64) -> bool {
         return false;
     }
     let current = scheduler.current;
-    let Some(space) = scheduler.tasks[current].process_space.as_mut() else {
+    let owner = scheduler.leader_slot(current);
+    let Some(space) = scheduler.tasks[owner].process_space.as_mut() else {
         return false;
     };
     arch::paging::process_cow_fault(space, address)
+}
+
+/// Brings an evicted page of the running process back from swap.
+pub fn handle_swap_fault_current(address: u64) -> bool {
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    if !scheduler.initialized {
+        return false;
+    }
+    let current = scheduler.current;
+    let owner = scheduler.leader_slot(current);
+    let Some(space) = scheduler.tasks[owner].process_space.as_mut() else {
+        return false;
+    };
+    arch::paging::process_swap_in(space, address)
+}
+
+static SWAP_CURSOR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Writes up to `count` pages of processes that are not running to swap.
+/// Returns how many were written.
+pub fn swap_out_pages(count: usize) -> usize {
+    if !crate::swap::active() {
+        return 0;
+    }
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let running = scheduler.group(scheduler.current);
+    let mut done = 0;
+    for index in 0..MAX_TASKS {
+        if done == count {
+            break;
+        }
+        let task = &scheduler.tasks[index];
+        if task.id == 0
+            || task.state != TaskState::Ready
+            || (task.tgid != 0 && task.tgid != task.id)
+            || task.id == running
+        {
+            continue;
+        }
+        let Some(space) = scheduler.tasks[index].process_space.as_mut() else {
+            continue;
+        };
+        while done < count {
+            let start = SWAP_CURSOR.load(Ordering::Relaxed);
+            match arch::paging::process_swap_out(space, start) {
+                Some(next) => {
+                    SWAP_CURSOR.store(next, Ordering::Relaxed);
+                    done += 1;
+                }
+                None => break,
+            }
+        }
+    }
+    done
+}
+
+/// On-demand user stack growth for the task running right now.
+pub fn handle_stack_growth_fault_current(address: u64) -> bool {
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    if !scheduler.initialized {
+        return false;
+    }
+    let current = scheduler.current;
+    let owner = scheduler.leader_slot(current);
+    let Some(space) = scheduler.tasks[owner].process_space.as_mut() else {
+        return false;
+    };
+    arch::paging::process_stack_fault(space, address)
 }
 
 /// Sends `signal` to another live task's stored process state.
@@ -526,16 +897,26 @@ pub fn signal_other_task(id: u64, signal: u64) -> Option<crate::syscall::RemoteS
     if id == 0 || !(1..=64).contains(&signal) {
         return None;
     }
-    let slot = scheduler
+    let mut slot = scheduler
         .tasks
         .iter()
         .position(|task| task.id == id && task.state != TaskState::Empty)?;
+    if scheduler.tasks[slot].state == TaskState::Exited {
+        let group = scheduler.group(slot);
+        slot = scheduler.tasks.iter().position(|task| {
+            task.state != TaskState::Empty
+                && task.state != TaskState::Exited
+                && (if task.tgid == 0 { task.id } else { task.tgid }) == group
+        })?;
+    }
     if slot == scheduler.current {
         return None;
     }
+    let traced = scheduler.tasks[slot].trace.tracer != 0;
     Some(crate::syscall::signal_stored_state(
         &mut scheduler.tasks[slot].process_state,
         signal,
+        traced,
     ))
 }
 
@@ -549,23 +930,49 @@ pub fn task_exists(id: u64) -> bool {
             .any(|task| task.id == id && task.state != TaskState::Empty)
 }
 
-pub fn any_child_id() -> Option<u64> {
+/// Ids of the processes `parent` started (up to `out.len()`).
+pub fn child_ids(parent: u64, out: &mut [u64]) -> usize {
     arch::disable_interrupts();
     let scheduler = unsafe { &*SCHEDULER.0.get() };
-    let parent = scheduler.tasks[scheduler.current].id;
-    scheduler
+    let mut count = 0;
+    for task in scheduler.tasks.iter() {
+        let leader = task.tgid == 0 || task.tgid == task.id;
+        if task.state != TaskState::Empty
+            && leader
+            && task.parent_id == parent
+            && task.id != parent
+            && count < out.len()
+        {
+            out[count] = task.id;
+            count += 1;
+        }
+    }
+    count
+}
+
+/// The process that started the process of task `id`.
+pub fn parent_of(id: u64) -> Option<u64> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    let slot = scheduler
         .tasks
         .iter()
-        .find(|task| {
-            task.state != TaskState::Empty && task.parent_id == parent && task.id != parent
-        })
-        .map(|task| task.id)
+        .position(|task| task.id == id && task.id != 0 && task.state != TaskState::Empty)?;
+    Some(scheduler.tasks[scheduler.leader_slot(slot)].parent_id)
+}
+
+/// A copy of the running task's address-space bookkeeping, `None` for a task
+/// without one (the kernel context).
+pub fn current_process_space() -> Option<arch::paging::ProcessAddressSpace> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    scheduler.tasks[scheduler.leader_slot(scheduler.current)].process_space
 }
 
 pub fn current_parent_id() -> u64 {
     arch::disable_interrupts();
     let scheduler = unsafe { &*SCHEDULER.0.get() };
-    scheduler.tasks[scheduler.current].parent_id
+    scheduler.tasks[scheduler.leader_slot(scheduler.current)].parent_id
 }
 
 /// Real Linux-ABI `getpid()`/`getppid()` for the current task, mirroring
@@ -584,8 +991,16 @@ pub fn current_task_pid_for_linux() -> Option<u64> {
     if !scheduler.initialized {
         return None;
     }
-    let task = &scheduler.tasks[scheduler.current];
-    task.process_space.is_some().then_some(task.id)
+    let owner = &scheduler.tasks[scheduler.leader_slot(scheduler.current)];
+    owner.process_space.is_some().then_some(owner.id)
+}
+
+/// The id of the running task itself (`gettid`): the process id for a task
+/// that is not a thread.
+pub fn current_tid() -> u64 {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    scheduler.tasks[scheduler.current].id
 }
 
 /// The real Linux-ABI `getppid()` counterpart to
@@ -596,8 +1011,118 @@ pub fn current_parent_pid_for_linux() -> Option<u64> {
     if !scheduler.initialized {
         return None;
     }
-    let task = &scheduler.tasks[scheduler.current];
-    task.process_space.is_some().then_some(task.parent_id)
+    let owner = &scheduler.tasks[scheduler.leader_slot(scheduler.current)];
+    owner.process_space.is_some().then_some(owner.parent_id)
+}
+
+pub fn pgid_of(pid: u64) -> Option<u64> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    scheduler
+        .tasks
+        .iter()
+        .find(|task| task.id == pid && task.state != TaskState::Empty)
+        .map(|task| task.pgid)
+}
+
+pub fn sid_of(pid: u64) -> Option<u64> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    scheduler
+        .tasks
+        .iter()
+        .find(|task| task.id == pid && task.state != TaskState::Empty)
+        .map(|task| task.sid)
+}
+
+#[derive(Clone, Copy)]
+pub struct TaskSummary {
+    pub id: u64,
+    pub parent_id: u64,
+    pub pgid: u64,
+    pub sid: u64,
+    pub running: bool,
+    pub resident_pages: u64,
+    pub nice: i8,
+}
+
+/// Every currently-live task (excluding the caller's own "self" kernel
+/// context, id 0, which callers already show separately) for `ps`/`jobs`
+/// - not just the aggregate counts `scheduler::stats()` reports.
+pub fn list_tasks(mut visit: impl FnMut(TaskSummary)) {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    for (index, task) in scheduler.tasks.iter().enumerate() {
+        if task.id != 0
+            && task.state != TaskState::Empty
+            && task.state != TaskState::Exited
+            && (task.tgid == 0 || task.tgid == task.id)
+        {
+            visit(TaskSummary {
+                id: task.id,
+                parent_id: task.parent_id,
+                pgid: task.pgid,
+                sid: task.sid,
+                running: index == scheduler.current,
+                resident_pages: task
+                    .process_space
+                    .as_ref()
+                    .map_or(0, |space| space.resident_pages()),
+                nice: task.nice,
+            });
+        }
+    }
+}
+
+/// `setpgid(pid, pgid)` core (`pid == 0` already resolved to the caller by
+/// the syscall wrapper): `pid` must be the caller itself or one of the
+/// caller's direct children (real Linux allows both), and unless `pgid == 0`
+/// (become a new group leader) the target group must already exist within
+/// `pid`'s own session - a process can't be moved into a group that belongs
+/// to a different session. Returns the errno to report on failure.
+pub fn set_pgid_for(pid: u64, pgid: u64) -> Result<(), u64> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let caller_id = scheduler.tasks[scheduler.current].id;
+    let Some(target_index) = scheduler
+        .tasks
+        .iter()
+        .position(|task| task.id == pid && task.state != TaskState::Empty)
+    else {
+        return Err(3);
+    };
+    if pid != caller_id && scheduler.tasks[target_index].parent_id != caller_id {
+        return Err(3);
+    }
+    let new_pgid = if pgid == 0 { pid } else { pgid };
+    if new_pgid != pid {
+        let session = scheduler.tasks[target_index].sid;
+        let group_exists_in_session = scheduler.tasks.iter().any(|task| {
+            task.state != TaskState::Empty && task.pgid == new_pgid && task.sid == session
+        });
+        if !group_exists_in_session {
+            return Err(1);
+        }
+    }
+    scheduler.tasks[target_index].pgid = new_pgid;
+    Ok(())
+}
+
+/// `setsid()` core: fails (EPERM) if the caller is already a process group
+/// leader (`pgid == id`) - real POSIX requires starting a genuinely new
+/// process to begin a session, so an existing leader can never call this
+/// successfully on itself.
+pub fn set_new_session() -> Result<u64, u64> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let current = scheduler.current;
+    let id = scheduler.tasks[current].id;
+    if scheduler.tasks[current].pgid == id {
+        return Err(1);
+    }
+    scheduler.tasks[current].pgid = id;
+    scheduler.tasks[current].sid = id;
+    Ok(id)
 }
 
 pub fn kill_task(target_id: u64) -> Result<(), ()> {
@@ -609,12 +1134,319 @@ pub fn kill_task(target_id: u64) -> Result<(), ()> {
     let Some(slot) = scheduler.tasks.iter().position(|task| task.id == target_id) else {
         return Err(());
     };
-    if slot == scheduler.current || scheduler.tasks[slot].state != TaskState::Ready {
+    let group = scheduler.group(slot);
+    let alive = scheduler.tasks[slot].state == TaskState::Ready
+        || (scheduler.tasks[slot].state == TaskState::Exited && scheduler.group_live(group));
+    if slot == scheduler.current || !alive || group != target_id {
         return Err(());
     }
-    scheduler.tasks[slot].state = TaskState::Exited;
+    let current = scheduler.current;
+    for index in 0..MAX_TASKS {
+        let member = &mut scheduler.tasks[index];
+        if index != current
+            && member.state == TaskState::Ready
+            && (if member.tgid == 0 {
+                member.id
+            } else {
+                member.tgid
+            }) == group
+        {
+            member.state = TaskState::Exited;
+        }
+    }
     USER_TASK_EXIT[slot].store(137, Ordering::Release);
     Ok(())
+}
+
+/// The debugger state of the running task.
+pub fn trace_current<R>(visit: impl FnOnce(&mut Trace) -> R) -> R {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let current = scheduler.current;
+    visit(&mut scheduler.tasks[current].trace)
+}
+
+/// The debugger state of task `id`.
+pub fn trace_of<R>(id: u64, visit: impl FnOnce(&mut Trace) -> R) -> Option<R> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let task = scheduler
+        .tasks
+        .iter_mut()
+        .find(|task| task.id == id && task.id != 0 && task.state != TaskState::Empty)?;
+    Some(visit(&mut task.trace))
+}
+
+/// Calls `visit(id, trace, parent)` for every live task watched by process `tracer`.
+pub fn for_each_tracee(tracer: u64, mut visit: impl FnMut(u64, &mut Trace, u64)) {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    for index in 0..MAX_TASKS {
+        let leader = scheduler.leader_slot(index);
+        let parent = scheduler.tasks[leader].parent_id;
+        let task = &mut scheduler.tasks[index];
+        if task.state != TaskState::Empty && task.id != 0 && task.trace.tracer == tracer {
+            visit(task.id, &mut task.trace, parent);
+        }
+    }
+}
+
+/// Whether the running task is being traced.
+pub fn is_traced() -> bool {
+    trace_current(|trace| trace.tracer != 0)
+}
+
+/// Releases everything the process `group` was tracing (it is going away).
+pub fn detach_tracees(group: u64) {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    for task in scheduler.tasks.iter_mut() {
+        if task.state != TaskState::Empty && task.trace.tracer == group {
+            let kill = task.trace.options & 0x10_0000 != 0;
+            task.trace.tracer = 0;
+            task.trace.syscall_stops = false;
+            task.trace.resume = if kill { Resume::Kill } else { Resume::Continue };
+            task.trace.stopped = false;
+        }
+    }
+}
+
+/// The parent process of the running process (for `PTRACE_TRACEME`).
+pub fn parent_group() -> u64 {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    scheduler.tasks[scheduler.leader_slot(scheduler.current)].parent_id
+}
+
+/// Runs `visit` on the address space of the process task `id` belongs to.
+pub fn with_task_space<R>(
+    id: u64,
+    visit: impl FnOnce(&mut arch::paging::ProcessAddressSpace) -> R,
+) -> Option<R> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let slot = scheduler
+        .tasks
+        .iter()
+        .position(|task| task.id == id && task.id != 0 && task.state != TaskState::Empty)?;
+    let owner = scheduler.leader_slot(slot);
+    scheduler.tasks[owner].process_space.as_mut().map(visit)
+}
+
+/// The saved floating-point state of a switched-out task (its first 512
+/// bytes are an FXSAVE image) and its size.
+pub fn fpu_area_of(id: u64) -> Option<(usize, usize)> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    scheduler
+        .tasks
+        .iter()
+        .find(|task| task.id == id && task.id != 0 && task.state != TaskState::Empty)
+        .map(|task| (task.fpu_base, task.fpu_size))
+}
+
+/// The status of an exited task, or `None` while it lives.
+pub fn exit_status_of(id: u64) -> Option<u64> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    let slot = scheduler
+        .tasks
+        .iter()
+        .position(|task| task.id == id && task.id != 0 && task.state != TaskState::Empty)?;
+    let leader = scheduler.leader_slot(slot);
+    if scheduler.tasks[slot].state != TaskState::Exited
+        || scheduler.group_live(scheduler.group(slot))
+    {
+        return None;
+    }
+    let code = USER_TASK_EXIT[leader].load(Ordering::Acquire);
+    (code != u64::MAX).then_some(code)
+}
+
+/// Whether `id` names a task that can still run.
+pub fn task_is_live(id: u64) -> bool {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    id != 0
+        && scheduler.tasks.iter().any(|task| {
+            task.id == id && matches!(task.state, TaskState::Ready | TaskState::Running)
+        })
+}
+
+/// The process (thread group) task `tid` belongs to.
+pub fn group_of_tid(tid: u64) -> Option<u64> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    let slot = scheduler
+        .tasks
+        .iter()
+        .position(|task| task.id == tid && task.state != TaskState::Empty && task.id != 0)?;
+    Some(scheduler.group(slot))
+}
+
+/// Ends every task of the running process except the caller (an `execve`
+/// from a multithreaded process).
+pub fn kill_other_threads() {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let current = scheduler.current;
+    let group = scheduler.group(current);
+    for index in 0..MAX_TASKS {
+        let member = &mut scheduler.tasks[index];
+        if index != current
+            && member.state == TaskState::Ready
+            && (if member.tgid == 0 {
+                member.id
+            } else {
+                member.tgid
+            }) == group
+        {
+            member.state = TaskState::Exited;
+        }
+    }
+}
+
+/// `exit_group`: ends every other task of the running process and records
+/// the status the whole process will report.
+pub fn exit_group(code: u64) {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let current = scheduler.current;
+    let leader = scheduler.leader_slot(current);
+    let group = scheduler.group(current);
+    scheduler.tasks[leader].group_code = code;
+    for index in 0..MAX_TASKS {
+        let member = &mut scheduler.tasks[index];
+        if index != current
+            && member.state == TaskState::Ready
+            && (if member.tgid == 0 {
+                member.id
+            } else {
+                member.tgid
+            }) == group
+        {
+            member.state = TaskState::Exited;
+        }
+    }
+}
+
+/// Called when a task's program is over (before it leaves the scheduler).
+/// The status of a process is reported when its last task is done; a task
+/// killed by a fatal signal takes the rest of its process with it. Returns
+/// whether this was the last task of the process.
+pub fn task_finished(code: u64) -> bool {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let current = scheduler.current;
+    if !scheduler.group_has_others(current) {
+        let group = scheduler.group(current);
+        detach_tracees(group);
+    }
+    let leader = scheduler.leader_slot(current);
+    let group = scheduler.group(current);
+    if scheduler.group_has_others(current) {
+        if !matches!(code, 132 | 134 | 135 | 136 | 137 | 139) {
+            return false;
+        }
+        scheduler.tasks[leader].group_code = code;
+        for index in 0..MAX_TASKS {
+            let member = &mut scheduler.tasks[index];
+            if index != current
+                && member.state == TaskState::Ready
+                && (if member.tgid == 0 {
+                    member.id
+                } else {
+                    member.tgid
+                }) == group
+            {
+                member.state = TaskState::Exited;
+            }
+        }
+    }
+    let status = match scheduler.tasks[leader].group_code {
+        u64::MAX => code,
+        recorded => recorded,
+    };
+    USER_TASK_EXIT[leader].store(status, Ordering::Release);
+    true
+}
+
+/// What a task has to undo before it goes: the word `CLONE_CHILD_CLEARTID`
+/// asked to clear, the robust futex list, and the range of its program.
+pub struct ExitHooks {
+    pub tid: u64,
+    pub clear_child_tid: u64,
+    pub robust_list: u64,
+    pub user_start: u64,
+    pub user_end: u64,
+}
+
+pub fn exit_hooks() -> ExitHooks {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    let task = &scheduler.tasks[scheduler.current];
+    ExitHooks {
+        tid: task.id,
+        clear_child_tid: task.clear_child_tid,
+        robust_list: task.robust_list,
+        user_start: task.user_start,
+        user_end: task.user_end,
+    }
+}
+
+pub fn set_clear_child_tid(address: u64) {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let current = scheduler.current;
+    scheduler.tasks[current].clear_child_tid = address;
+}
+
+pub fn set_robust_list(address: u64) {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let current = scheduler.current;
+    scheduler.tasks[current].robust_list = address;
+}
+
+pub fn robust_list() -> u64 {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    scheduler.tasks[scheduler.current].robust_list
+}
+
+/// The process (thread group) of the running task.
+pub fn current_group() -> u64 {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    scheduler.group(scheduler.current)
+}
+
+/// The nice value of a task, and a way to raise its priority for as long as
+/// a higher-priority task waits on a lock it holds.
+pub fn boost_nice(id: u64, nice: i8) -> Option<i8> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let task = scheduler
+        .tasks
+        .iter_mut()
+        .find(|task| task.id == id && task.state != TaskState::Empty && task.id != 0)?;
+    let previous = task.nice;
+    if nice < task.nice {
+        task.nice = nice;
+    }
+    Some(previous)
+}
+
+pub fn restore_nice(id: u64, nice: i8) {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    if let Some(task) = scheduler
+        .tasks
+        .iter_mut()
+        .find(|task| task.id == id && task.state != TaskState::Empty && task.id != 0)
+    {
+        task.nice = nice;
+    }
 }
 
 /// Non-blocking `wait_for_child`: `None` = no such task, `Some(None)` = still
@@ -656,7 +1488,8 @@ pub fn linux_brk_for_current_task(request: u64) -> Option<u64> {
     arch::disable_interrupts();
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     let current = scheduler.current;
-    let space = scheduler.tasks[current].process_space.as_mut()?;
+    let owner = scheduler.leader_slot(current);
+    let space = scheduler.tasks[owner].process_space.as_mut()?;
     let current_brk = arch::paging::process_brk(space, 0)?;
     if request == 0 || request <= current_brk {
         return Some(current_brk);
@@ -681,12 +1514,17 @@ pub fn linux_brk_for_current_task(request: u64) -> Option<u64> {
 pub fn any_other_task_shares_fd(matches: impl Fn(&crate::syscall::ProcessFd) -> bool) -> bool {
     arch::disable_interrupts();
     let scheduler = unsafe { &*SCHEDULER.0.get() };
-    let current = scheduler.current;
+    let current_group = scheduler.group(scheduler.current);
     scheduler.tasks.iter().enumerate().any(|(index, task)| {
-        index != current && task.state != TaskState::Exited && {
-            let fds = crate::syscall::process_state_fds(&task.process_state);
-            fds.iter().any(&matches)
-        }
+        let leader = task.tgid == 0 || task.tgid == task.id;
+        leader
+            && task.state != TaskState::Empty
+            && scheduler.group(index) != current_group
+            && (task.state != TaskState::Exited || scheduler.group_live(task.id))
+            && {
+                let fds = crate::syscall::process_state_fds(&task.process_state);
+                fds.iter().any(&matches)
+            }
     })
 }
 
@@ -697,7 +1535,8 @@ pub fn linux_mmap_for_current_task(pages: usize, protection: u8) -> Option<Optio
     arch::disable_interrupts();
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     let current = scheduler.current;
-    let space = scheduler.tasks[current].process_space.as_mut()?;
+    let owner = scheduler.leader_slot(current);
+    let space = scheduler.tasks[owner].process_space.as_mut()?;
     Some(arch::paging::process_mmap(space, pages, protection))
 }
 
@@ -711,7 +1550,8 @@ pub fn linux_mmap_write_for_current_task(
     arch::disable_interrupts();
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     let current = scheduler.current;
-    let space = scheduler.tasks[current].process_space.as_ref()?;
+    let owner = scheduler.leader_slot(current);
+    let space = scheduler.tasks[owner].process_space.as_mut()?;
     Some(arch::paging::process_mmap_write(
         space, address, offset, source,
     ))
@@ -721,7 +1561,8 @@ pub fn linux_mprotect_for_current_task(address: u64, pages: usize, protection: u
     arch::disable_interrupts();
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     let current = scheduler.current;
-    let space = scheduler.tasks[current].process_space.as_mut()?;
+    let owner = scheduler.leader_slot(current);
+    let space = scheduler.tasks[owner].process_space.as_mut()?;
     Some(arch::paging::process_mprotect(
         space, address, pages, protection,
     ))
@@ -731,7 +1572,8 @@ pub fn linux_munmap_for_current_task(address: u64, pages: usize) -> Option<bool>
     arch::disable_interrupts();
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     let current = scheduler.current;
-    let space = scheduler.tasks[current].process_space.as_mut()?;
+    let owner = scheduler.leader_slot(current);
+    let space = scheduler.tasks[owner].process_space.as_mut()?;
     Some(arch::paging::process_munmap(space, address, pages))
 }
 
@@ -739,7 +1581,8 @@ pub fn grow_current_heap(additional_pages: u64) -> Option<u64> {
     arch::disable_interrupts();
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     let current = scheduler.current;
-    let space = scheduler.tasks[current].process_space.as_mut()?;
+    let owner = scheduler.leader_slot(current);
+    let space = scheduler.tasks[owner].process_space.as_mut()?;
     arch::paging::process_brk(space, additional_pages as usize)
 }
 
@@ -747,12 +1590,15 @@ pub fn exec_current_user_task(program: &[u8]) -> Option<(u64, u64)> {
     arch::disable_interrupts();
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     let current = scheduler.current;
-    let space = scheduler.tasks[current].process_space.as_mut()?;
+    let owner = scheduler.leader_slot(current);
+    let space = scheduler.tasks[owner].process_space.as_mut()?;
     if !arch::paging::exec_process(space, program) {
         return None;
     }
+    let (entry, stack_top) = (space.entry, space.stack_top);
+    kill_other_threads();
     crate::syscall::exec_reset_process_state();
-    Some((space.entry, space.stack_top))
+    Some((entry, stack_top))
 }
 
 /// Raw probe: Linux mmap of 100 pages (past the old 32-page limit), touches
@@ -793,6 +1639,50 @@ pub const LINUX_EXECVE_PROBE: [u8; 46] = [
     0x69, 0x6e, 0x2f, 0x61, 0x65, 0x72, 0x6f, 0x73, 0x2d, 0x69, 0x6e, 0x69, 0x74, 0x00,
 ];
 
+/// Linux-ABI probe: `seccomp(SECCOMP_SET_MODE_STRICT, 0, NULL)`, then
+/// `write(1, "A", 1)` (allowed - proves strict mode doesn't also break the
+/// syscalls it's supposed to permit), then `getpid()` (NOT allowed - must
+/// destroy the process with SIGKILL right there). Only reaches its own
+/// `exit(99)` if that enforcement is broken; a working kernel never gets
+/// there; see `syscall::SECCOMP_STRICT`.
+pub const SECCOMP_STRICT_PROBE: [u8; 54] = [
+    0xb8, 0x3d, 0x01, 0x00, 0x00, 0x31, 0xff, 0x31, 0xf6, 0x31, 0xd2, 0x0f, 0x05, 0x6a, 0x41, 0xb8,
+    0x01, 0x00, 0x00, 0x00, 0xbf, 0x01, 0x00, 0x00, 0x00, 0x48, 0x89, 0xe6, 0xba, 0x01, 0x00, 0x00,
+    0x00, 0x0f, 0x05, 0xb8, 0x27, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xb8, 0x3c, 0x00, 0x00, 0x00, 0xbf,
+    0x63, 0x00, 0x00, 0x00, 0x0f, 0x05,
+];
+
+/// Linux-ABI probe: installs a seccomp filter that makes `getpid()` fail with
+/// EPERM and allows everything else, then checks that `getpid()` returns -1,
+/// that `getuid()` still works, and exits 21 (99 if either check fails).
+pub const SECCOMP_FILTER_PROBE: [u8; 120] = [
+    0x48, 0x83, 0xec, 0x10, 0x66, 0xc7, 0x04, 0x24, 0x04, 0x00, 0x48, 0x8d, 0x05, 0x47, 0x00, 0x00,
+    0x00, 0x48, 0x89, 0x44, 0x24, 0x08, 0xb8, 0x3d, 0x01, 0x00, 0x00, 0xbf, 0x01, 0x00, 0x00, 0x00,
+    0x31, 0xf6, 0x48, 0x89, 0xe2, 0x0f, 0x05, 0xb8, 0x27, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x83,
+    0xf8, 0xff, 0x75, 0x18, 0xb8, 0x66, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x85, 0xc0, 0x75, 0x0c,
+    0xbf, 0x15, 0x00, 0x00, 0x00, 0xb8, 0x3c, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xbf, 0x63, 0x00, 0x00,
+    0x00, 0xb8, 0x3c, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x15, 0x00, 0x00, 0x01, 0x27, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x01, 0x00, 0x05, 0x00,
+    0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x7f,
+];
+
+/// Linux-ABI probe: drops `CAP_KILL` and `CAP_SYS_NICE` with `capset`, then
+/// checks that raising its priority and signalling another process both fail
+/// with EPERM while lowering its priority still works; exits 22 (99 on any
+/// failed check).
+pub const CAPABILITY_PROBE: [u8; 176] = [
+    0x48, 0x83, 0xec, 0x20, 0xc7, 0x04, 0x24, 0x22, 0x05, 0x08, 0x20, 0xc7, 0x44, 0x24, 0x04, 0x00,
+    0x00, 0x00, 0x00, 0xc7, 0x44, 0x24, 0x08, 0xdf, 0xff, 0x7f, 0xff, 0xc7, 0x44, 0x24, 0x0c, 0xdf,
+    0xff, 0x7f, 0xff, 0xc7, 0x44, 0x24, 0x10, 0x00, 0x00, 0x00, 0x00, 0xc7, 0x44, 0x24, 0x14, 0xff,
+    0x01, 0x00, 0x00, 0xc7, 0x44, 0x24, 0x18, 0xff, 0x01, 0x00, 0x00, 0xc7, 0x44, 0x24, 0x1c, 0x00,
+    0x00, 0x00, 0x00, 0xb8, 0x7e, 0x00, 0x00, 0x00, 0x48, 0x89, 0xe7, 0x48, 0x8d, 0x74, 0x24, 0x08,
+    0x0f, 0x05, 0x48, 0x85, 0xc0, 0x75, 0x4d, 0xb8, 0x8d, 0x00, 0x00, 0x00, 0x31, 0xff, 0x31, 0xf6,
+    0x48, 0xc7, 0xc2, 0xfb, 0xff, 0xff, 0xff, 0x0f, 0x05, 0x48, 0x83, 0xf8, 0xff, 0x75, 0x35, 0xb8,
+    0x3e, 0x00, 0x00, 0x00, 0xbf, 0xa0, 0x0f, 0x00, 0x00, 0x31, 0xf6, 0x0f, 0x05, 0x48, 0x83, 0xf8,
+    0xff, 0x75, 0x21, 0xb8, 0x8d, 0x00, 0x00, 0x00, 0x31, 0xff, 0x31, 0xf6, 0xba, 0x05, 0x00, 0x00,
+    0x00, 0x0f, 0x05, 0x48, 0x85, 0xc0, 0x75, 0x0c, 0xbf, 0x16, 0x00, 0x00, 0x00, 0xb8, 0x3c, 0x00,
+    0x00, 0x00, 0x0f, 0x05, 0xbf, 0x63, 0x00, 0x00, 0x00, 0xb8, 0x3c, 0x00, 0x00, 0x00, 0x0f, 0x05,
+];
 /// Raw probe: SYS_EXEC_PATH("/bin/aeros-init"); exits 99 if exec fails.
 pub const EXEC_PATH_PROBE: [u8; 41] = [
     0xb8, 0x0b, 0x00, 0x00, 0x00, 0xbf, 0x0f, 0x00, 0x00, 0x00, 0x48, 0xbe, 0x2f, 0x62, 0x69, 0x6e,
@@ -813,6 +1703,13 @@ pub fn exec_current_user_task_path_with(
     args: &[&[u8]],
     env: &[&[u8]],
 ) -> Option<(u64, u64)> {
+    // On-execute protection: unlike `spawn_process_with`, this path (real
+    // Linux `execve`) had no such gate at all until now - a detected image
+    // was refused when spawned as a brand-new process, but not when an
+    // already-running process tried to exec into it.
+    if crate::antivirus::blocks_exec(program) {
+        return None;
+    }
     arch::disable_interrupts();
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     let current = scheduler.current;
@@ -830,18 +1727,36 @@ pub fn exec_current_user_task_path_with(
 }
 
 extern "C" fn forked_task_trampoline() -> ! {
-    let (snapshot, user_start, user_end) = unsafe {
+    let (snapshot, user_start, user_end, fs_base) = unsafe {
         let scheduler = &*SCHEDULER.0.get();
         let task = &scheduler.tasks[scheduler.current];
-        (task.fork_snapshot, task.user_start, task.user_end)
+        (
+            task.fork_snapshot,
+            task.user_start,
+            task.user_end,
+            task.fs_base,
+        )
     };
     let Some(snapshot) = snapshot else {
         arch::halt_forever();
     };
-    let exit_code = arch::user::resume_forked_child(&snapshot, user_start, user_end);
-    let current = unsafe { (*SCHEDULER.0.get()).current };
-    USER_TASK_EXIT[current].store(exit_code, Ordering::Release);
-    crate::syscall::close_all_process_fds();
+    let exit_code = arch::user::resume_forked_child(&snapshot, user_start, user_end, fs_base);
+    finish_user_task(exit_code)
+}
+
+/// The end of every user task: undo what a thread registered, report the
+/// status once the whole process is done, and let go of the descriptors only
+/// then.
+fn finish_user_task(exit_code: u64) -> ! {
+    let hooks = exit_hooks();
+    if hooks.clear_child_tid != 0 || hooks.robust_list != 0 {
+        arch::user::with_user_range(hooks.user_start, hooks.user_end, || {
+            crate::syscall::thread_exit_cleanup(&hooks);
+        });
+    }
+    if task_finished(exit_code) {
+        crate::syscall::close_all_process_fds();
+    }
     exit_current()
 }
 
@@ -869,15 +1784,16 @@ pub fn yield_now() -> bool {
     scheduler.fpu_switches = scheduler.fpu_switches.saturating_add(1);
     scheduler.tasks[current].user_context = arch::user::save_task_context();
     arch::user::restore_task_context(&scheduler.tasks[next].user_context);
-    scheduler.tasks[current].process_state = crate::syscall::save_process_state();
-    crate::syscall::restore_process_state(&scheduler.tasks[next].process_state);
+    scheduler.tasks[current].fs_base = arch::user::read_fs_base();
+    arch::user::write_fs_base(scheduler.tasks[next].fs_base);
+    scheduler.switch_state(current, next, false);
     arch::gdt::set_ring0_stack(RSP0_CPU, scheduler.tasks[next].interrupt_stack_top);
+    let next_has_space = scheduler.tasks[scheduler.leader_slot(next)]
+        .process_space
+        .is_some();
     arch::syscall_entry::set_syscall_stack(
         RSP0_CPU,
-        scheduler.tasks[next]
-            .process_space
-            .is_some()
-            .then_some(scheduler.tasks[next].interrupt_stack_top),
+        next_has_space.then_some(scheduler.tasks[next].interrupt_stack_top),
     );
     switch_cr3(&scheduler.tasks[next]);
     unsafe {
@@ -907,14 +1823,16 @@ pub fn exit_current() -> ! {
     let new_fpu = scheduler.tasks[next].fpu_base as *const u8;
     scheduler.fpu_switches = scheduler.fpu_switches.saturating_add(1);
     arch::user::restore_task_context(&scheduler.tasks[next].user_context);
-    crate::syscall::restore_process_state(&scheduler.tasks[next].process_state);
+    arch::user::write_fs_base(scheduler.tasks[next].fs_base);
+    let discard = !scheduler.group_has_others(current);
+    scheduler.switch_state(current, next, discard);
     arch::gdt::set_ring0_stack(RSP0_CPU, scheduler.tasks[next].interrupt_stack_top);
+    let next_has_space = scheduler.tasks[scheduler.leader_slot(next)]
+        .process_space
+        .is_some();
     arch::syscall_entry::set_syscall_stack(
         RSP0_CPU,
-        scheduler.tasks[next]
-            .process_space
-            .is_some()
-            .then_some(scheduler.tasks[next].interrupt_stack_top),
+        next_has_space.then_some(scheduler.tasks[next].interrupt_stack_top),
     );
     switch_cr3(&scheduler.tasks[next]);
     unsafe {
@@ -926,18 +1844,52 @@ pub fn exit_current() -> ! {
     arch::halt_forever()
 }
 
+/// Frees the slots of threads that have exited, which nothing waits for.
+pub fn reap_exited_threads() {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    for index in 0..MAX_TASKS {
+        let task = &scheduler.tasks[index];
+        let thread = task.tgid != 0 && task.tgid != task.id;
+        if thread && task.state == TaskState::Exited && task.stack_base != 0 {
+            let released = NonNull::new(task.stack_base as *mut u8)
+                .is_some_and(|pointer| heap::HEAP.deallocate(pointer))
+                && NonNull::new(task.fpu_base as *mut u8).is_some_and(release_fpu)
+                && (task.interrupt_stack_base == 0
+                    || NonNull::new(task.interrupt_stack_base as *mut u8)
+                        .is_some_and(|pointer| heap::HEAP.deallocate(pointer)));
+            if !released {
+                arch::halt_forever();
+            }
+            scheduler.tasks[index] = Task::EMPTY;
+        }
+    }
+}
+
 pub fn reap() -> usize {
     arch::disable_interrupts();
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     let mut reaped = 0;
-    for task in &mut scheduler.tasks {
-        if task.state != TaskState::Exited || task.stack_base == 0 {
+    for index in 0..MAX_TASKS {
+        let (exited, base, leader_id, tgid) = {
+            let task = &scheduler.tasks[index];
+            (
+                task.state == TaskState::Exited,
+                task.stack_base,
+                task.id,
+                task.tgid,
+            )
+        };
+        if !exited || base == 0 {
             continue;
         }
+        if (tgid == 0 || tgid == leader_id) && scheduler.group_live(leader_id) {
+            continue;
+        }
+        let task = &mut scheduler.tasks[index];
         let stack_released = NonNull::new(task.stack_base as *mut u8)
             .is_some_and(|pointer| heap::HEAP.deallocate(pointer));
-        let fpu_released = NonNull::new(task.fpu_base as *mut u8)
-            .is_some_and(|pointer| heap::HEAP.deallocate(pointer));
+        let fpu_released = NonNull::new(task.fpu_base as *mut u8).is_some_and(release_fpu);
         let interrupt_stack_released = task.interrupt_stack_base == 0
             || NonNull::new(task.interrupt_stack_base as *mut u8)
                 .is_some_and(|pointer| heap::HEAP.deallocate(pointer));
@@ -1125,10 +2077,7 @@ extern "C" fn user_task_trampoline() -> ! {
         task.user_start,
         task.user_end,
     );
-    let current = unsafe { (*SCHEDULER.0.get()).current };
-    USER_TASK_EXIT[current].store(exit_code, Ordering::Release);
-    crate::syscall::close_all_process_fds();
-    exit_current()
+    finish_user_task(exit_code)
 }
 
 #[derive(Clone, Copy)]
@@ -1221,6 +2170,292 @@ pub fn concurrent_user_self_test(
             && probe_reap_a.verified
             && probe_reap_b.verified,
     }
+}
+
+pub struct TaskExhaustionResult {
+    pub spawned_before_full: usize,
+    pub exhausted_cleanly: bool,
+    pub reaped: usize,
+    pub recovered: bool,
+    pub verified: bool,
+}
+
+fn failed_task_exhaustion_result() -> TaskExhaustionResult {
+    TaskExhaustionResult {
+        spawned_before_full: 0,
+        exhausted_cleanly: false,
+        reaped: 0,
+        recovered: false,
+        verified: false,
+    }
+}
+
+/// Spawns concurrent probes until *something* says no. Originally this was
+/// always `spawn()`'s 64 KB-per-task kernel stack allocation from
+/// `heap::HEAP` (then a fixed 1 MiB, only ~9 stacks' worth) running out well
+/// before the nominal `MAX_TASKS`-slot task table itself would; now that the
+/// heap is 16 MiB (`map_heap` in main.rs), the pre-sized `entries` array
+/// below (already capped at `MAX_TASKS - 1`) is expected to be the binding
+/// limit instead, with `spawned` landing right at that cap rather than short
+/// of it. Either way, this confirms that failure is a clean `None` from
+/// `spawn_process` (already the contract every existing caller relies on)
+/// rather than a panic or corrupted scheduler state. Then reaps everything
+/// and spawns one more probe to prove the resource is genuinely reusable
+/// afterward, not merely drained-but-poisoned.
+///
+/// Uses `spawn_process` (backed by the global physical-frame pool) rather
+/// than the lower-level `map_probe_code` (backed by the small boot-time
+/// `frames` arena `main` already mostly spends on earlier self-tests) so
+/// this measures the same limit a real workload would hit, not an
+/// artifact of a smaller, unrelated allocator running out first.
+pub fn task_exhaustion_self_test(state: &crate::arch::paging::PagingState) -> TaskExhaustionResult {
+    initialize();
+    if stats().tasks != 1 {
+        return failed_task_exhaustion_result();
+    }
+    for slot in USER_TASK_EXIT.iter() {
+        slot.store(u64::MAX, Ordering::Release);
+    }
+    let program = build_spin_probe(1, 42);
+    let mut entries: [Option<(usize, crate::arch::paging::ProcessAddressSpace)>; MAX_TASKS - 1] =
+        [None; MAX_TASKS - 1];
+    let mut spawned = 0usize;
+    for entry in entries.iter_mut() {
+        let Some((_, task_slot, space)) = spawn_process(state, &program) else {
+            break;
+        };
+        *entry = Some((task_slot, space));
+        spawned += 1;
+    }
+    let overflow_probe = spawn_process(state, &program);
+    let overflow_rejected = overflow_probe.is_none();
+    if let Some((_, _, space)) = overflow_probe {
+        arch::paging::destroy_process(&space);
+    }
+
+    PREEMPTION_ENABLED.store(1, Ordering::Release);
+    let timer_ok = arch::apic::start_timer(1000);
+    if timer_ok {
+        // Bounded, not an unconditional wait: this is the first time the
+        // task table has ever been driven to 100% occupancy (every other
+        // self-test leaves headroom), so if round-robin scheduling has a
+        // latent bug specific to that edge case, this must fail cleanly
+        // rather than hang the whole boot-test run forever.
+        let deadline = crate::time::monotonic_nanoseconds().saturating_add(5_000_000_000);
+        while crate::time::monotonic_nanoseconds() < deadline
+            && entries.iter().flatten().any(|(task_slot, _)| {
+                USER_TASK_EXIT[*task_slot].load(Ordering::Acquire) == u64::MAX
+            })
+        {
+            unsafe {
+                asm!("sti; hlt", options(nomem, nostack));
+            }
+        }
+    }
+    let all_exited = timer_ok
+        && entries
+            .iter()
+            .flatten()
+            .all(|(task_slot, _)| USER_TASK_EXIT[*task_slot].load(Ordering::Acquire) == 42);
+    let reaped = reap();
+    for (_, space) in entries.iter().flatten() {
+        arch::paging::destroy_process(space);
+    }
+
+    let recovered = if timer_ok {
+        // Every previous probe has already exited and been reaped by this
+        // point - nothing else can be racing to write these slots - so it's
+        // safe to reset them here, before spawning, rather than after
+        // (spawning first and resetting after would race a fast probe that
+        // finishes and records its real exit code before the reset lands,
+        // permanently erasing it and hanging the wait loop below).
+        for slot in USER_TASK_EXIT.iter() {
+            slot.store(u64::MAX, Ordering::Release);
+        }
+        let recovery_program = build_spin_probe(1, 43);
+        let recovery = spawn_process(state, &recovery_program);
+        let ok = if let Some((_, task_slot, _)) = recovery {
+            let deadline = crate::time::monotonic_nanoseconds().saturating_add(5_000_000_000);
+            while crate::time::monotonic_nanoseconds() < deadline
+                && USER_TASK_EXIT[task_slot].load(Ordering::Acquire) == u64::MAX
+            {
+                unsafe {
+                    asm!("sti; hlt", options(nomem, nostack));
+                }
+            }
+            USER_TASK_EXIT[task_slot].load(Ordering::Acquire) == 43
+        } else {
+            false
+        };
+        let _ = reap();
+        if let Some((_, _, space)) = recovery {
+            arch::paging::destroy_process(&space);
+        }
+        ok
+    } else {
+        false
+    };
+    arch::apic::stop_timer();
+    PREEMPTION_ENABLED.store(0, Ordering::Release);
+
+    let after = stats();
+    TaskExhaustionResult {
+        spawned_before_full: spawned,
+        // Inclusive of `MAX_TASKS - 1` (the `entries` array's own size, and
+        // now the expected outcome with a 16 MiB heap - see the doc comment)
+        // rather than requiring it be strictly short of that cap: whichever
+        // resource is scarcest is allowed to be the task table itself now,
+        // not necessarily the kernel stack heap.
+        exhausted_cleanly: (1..=MAX_TASKS - 1).contains(&spawned) && overflow_rejected,
+        reaped,
+        recovered,
+        verified: (1..=MAX_TASKS - 1).contains(&spawned)
+            && overflow_rejected
+            && all_exited
+            && reaped == spawned
+            && recovered
+            && after.tasks == 1,
+    }
+}
+
+/// Machine code for the growable-stack self-test: walks a pointer down
+/// `pages` pages below `rsp` one page at a time (writing a marker at each),
+/// which is exactly the "touch every guard page in order" pattern real
+/// compiler-generated stack probes use - a single jump straight past
+/// several unmapped guard pages is refused as a real overflow, by design,
+/// so the probe must not do that either. Then exits with `exit_code`.
+fn stack_growth_probe(pages: u32, exit_code: u32) -> [u8; 36] {
+    let exit_bytes = exit_code.to_le_bytes();
+    [
+        0x48,
+        0x89,
+        0xe0, // mov rax, rsp
+        0xb9,
+        pages.to_le_bytes()[0],
+        pages.to_le_bytes()[1],
+        pages.to_le_bytes()[2],
+        pages.to_le_bytes()[3], // mov ecx, pages
+        // loop_start:
+        0x48,
+        0x2d,
+        0x00,
+        0x10,
+        0x00,
+        0x00, // sub rax, 4096
+        0xc7,
+        0x00,
+        0xcc,
+        0xcc,
+        0xcc,
+        0xcc, // mov dword ptr [rax], 0xcccccccc
+        0xff,
+        0xc9, // dec ecx
+        0x75,
+        0xf0, // jnz loop_start
+        0xb8,
+        0x00,
+        0x00,
+        0x00,
+        0x00, // mov eax, 0 (SYS_EXIT)
+        0xbf,
+        exit_bytes[0],
+        exit_bytes[1],
+        exit_bytes[2],
+        exit_bytes[3], // mov edi, exit_code
+        0xcd,
+        0x80, // int 0x80
+    ]
+}
+
+/// Runs one `stack_growth_probe` process to completion and returns its exit
+/// code (or `None` if it never spawned).
+fn run_stack_growth_probe(
+    state: &crate::arch::paging::PagingState,
+    pages: u32,
+    exit_code: u32,
+) -> Option<(u64, usize)> {
+    let code = stack_growth_probe(pages, exit_code);
+    let (id, slot, _) = spawn_process(state, &code)?;
+    // reap() never resets a freed slot's USER_TASK_EXIT entry, so a reused
+    // slot (the common case here - this is the only task running) would
+    // otherwise still show the *previous* occupant's exit code and this
+    // loop would return instantly without this process having run at all.
+    USER_TASK_EXIT[slot].store(u64::MAX, Ordering::Release);
+    PREEMPTION_ENABLED.store(1, Ordering::Release);
+    if !arch::apic::start_timer(1000) {
+        PREEMPTION_ENABLED.store(0, Ordering::Release);
+        return None;
+    }
+    let exit = loop {
+        let value = USER_TASK_EXIT[slot].load(Ordering::Acquire);
+        if value != u64::MAX {
+            break value;
+        }
+        unsafe {
+            asm!("sti; hlt", options(nomem, nostack));
+        }
+    };
+    arch::apic::stop_timer();
+    PREEMPTION_ENABLED.store(0, Ordering::Release);
+    let _ = id;
+    Some((exit, slot))
+}
+
+#[derive(Clone, Copy)]
+pub struct StackGrowthSelfTestResult {
+    pub grown_exit: u64,
+    pub grown_pages: usize,
+    pub overflow_exit: u64,
+    pub verified: bool,
+}
+
+/// Proves growable user stacks two ways: a process that walks 40 pages below
+/// its initial 16 KiB stack (well past it, comfortably inside the 256 KiB
+/// growth budget) runs to completion and really did get fresh physical
+/// pages mapped for each one it touched - and a second process that tries
+/// to walk past the growth budget entirely does NOT get a clean exit,
+/// proving growth is bounded, not silently unlimited.
+pub fn stack_growth_self_test(
+    state: &crate::arch::paging::PagingState,
+) -> StackGrowthSelfTestResult {
+    initialize();
+    for slot in USER_TASK_EXIT.iter() {
+        slot.store(u64::MAX, Ordering::Release);
+    }
+    let mut result = StackGrowthSelfTestResult {
+        grown_exit: 0,
+        grown_pages: 0,
+        overflow_exit: 0,
+        verified: false,
+    };
+    let Some((grown_exit, grown_slot)) = run_stack_growth_probe(state, 40, 33) else {
+        return result;
+    };
+    result.grown_exit = grown_exit;
+    let grown_space = unsafe { (*SCHEDULER.0.get()).tasks[grown_slot].process_space };
+    let Some(grown_space) = grown_space else {
+        return result;
+    };
+    result.grown_pages = grown_space.stack_grown.iter().filter(|p| **p != 0).count();
+    let _ = reap();
+    let Some((overflow_exit, _)) = run_stack_growth_probe(
+        state,
+        arch::paging::PROCESS_STACK_MAX_GROWTH_PAGES as u32 + 20,
+        33,
+    ) else {
+        return result;
+    };
+    result.overflow_exit = overflow_exit;
+    let _ = reap();
+    // The walk starts at `rsp` (near the top of the last already-mapped
+    // page) and subtracts a page at a time, so its first 3 steps still land
+    // inside the existing 4-page/16 KiB block - only steps 4..40 (37 of
+    // them) actually cross into new, previously-unmapped territory.
+    result.verified = result.grown_exit == 33
+        && result.grown_pages == 37
+        && result.overflow_exit != 33
+        && result.overflow_exit != u64::MAX;
+    result
 }
 
 fn slot_for_id(id: u64) -> Option<usize> {
@@ -1772,7 +3007,21 @@ fn failed_kill_result() -> KillSelfTestResult {
     }
 }
 
+/// A timer tick can land between the probe's `fork` and `kill` and let the
+/// child run first (it then exits 99); that window is a few instructions, so
+/// only a repeated 99 counts as a failure.
 pub fn kill_self_test(state: &crate::arch::paging::PagingState) -> KillSelfTestResult {
+    let mut result = kill_attempt(state);
+    for _ in 0..4 {
+        if result.verified || result.parent_exit != 99 {
+            break;
+        }
+        result = kill_attempt(state);
+    }
+    result
+}
+
+fn kill_attempt(state: &crate::arch::paging::PagingState) -> KillSelfTestResult {
     initialize();
     for slot in USER_TASK_EXIT.iter() {
         slot.store(u64::MAX, Ordering::Release);
@@ -3149,6 +4398,66 @@ pub fn real_elf_self_test(
     }
 }
 
+/// Like `real_elf_self_test`, for a program that starts threads: the process
+/// must report `expected_exit` and, once everything is reaped, nothing but
+/// the kernel task may remain.
+pub fn threaded_elf_self_test(
+    state: &crate::arch::paging::PagingState,
+    code: &[u8],
+    expected_exit: u64,
+) -> RealElfSelfTestResult {
+    threaded_elf_self_test_with(state, code, expected_exit, || {})
+}
+
+/// `threaded_elf_self_test` that also runs `each_tick` every time the kernel
+/// task wakes up while the program runs.
+pub fn threaded_elf_self_test_with(
+    state: &crate::arch::paging::PagingState,
+    code: &[u8],
+    expected_exit: u64,
+    mut each_tick: impl FnMut(),
+) -> RealElfSelfTestResult {
+    initialize();
+    for slot in USER_TASK_EXIT.iter() {
+        slot.store(u64::MAX, Ordering::Release);
+    }
+    let Some((_id, slot, space)) = spawn_process(state, code) else {
+        return failed_real_elf_result();
+    };
+    if !space.verified {
+        return failed_real_elf_result();
+    }
+    PREEMPTION_ENABLED.store(1, Ordering::Release);
+    if !arch::apic::start_timer(1000) {
+        PREEMPTION_ENABLED.store(0, Ordering::Release);
+        return failed_real_elf_result();
+    }
+    let mut ticks = 0u32;
+    let exit_code = loop {
+        let value = USER_TASK_EXIT[slot].load(Ordering::Acquire);
+        if value != u64::MAX {
+            break value;
+        }
+        ticks += 1;
+        if ticks > 120_000 {
+            break u64::MAX;
+        }
+        each_tick();
+        unsafe {
+            asm!("sti; hlt", options(nomem, nostack));
+        }
+    };
+    arch::apic::stop_timer();
+    PREEMPTION_ENABLED.store(0, Ordering::Release);
+    let reaped = reap();
+    let after = stats();
+    RealElfSelfTestResult {
+        exit_code,
+        reaped,
+        verified: exit_code == expected_exit && reaped >= 1 && after.tasks == 1,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct RealElfForkSelfTestResult {
     pub parent_exit: u64,
@@ -3180,7 +4489,7 @@ fn failed_real_elf_fork_result() -> RealElfForkSelfTestResult {
 /// around) - `parent_exit == 11` alone already proves wait4() forwarded
 /// the real child status, since that is the only path to that exit code.
 /// The marker is read back from a HOST-COMPUTED physical address
-/// (`stack_physical + (stack_top - process_stack_base()) - 8`) rather
+/// (`stack_physical + (stack_top - process_stack_base(user_slot)) - 8`) rather
 /// than a hardcoded offset like the raw-blob probes use, because a real
 /// ELF's `stack_top` comes from `prepare_scheduled_process_stack`'s
 /// dynamic argv/auxv layout, not a fixed one.
@@ -3219,9 +4528,9 @@ pub fn real_elf_fork_self_test(
     // follows for reading a physical page back.
     let live_space = unsafe { (*SCHEDULER.0.get()).tasks[slot].process_space };
     let marker = live_space
-        .filter(|space| space.stack_top >= arch::paging::process_stack_base())
+        .filter(|space| space.stack_top >= arch::paging::process_stack_base(space.user_slot))
         .map(|space| {
-            let byte_offset = space.stack_top - arch::paging::process_stack_base();
+            let byte_offset = space.stack_top - arch::paging::process_stack_base(space.user_slot);
             let address = space.stack_physical + byte_offset - 8;
             unsafe { core::ptr::read_volatile(address as usize as *const u32) }
         })
@@ -3478,10 +4787,10 @@ pub fn linux_execve_args_self_test(
     arch::apic::stop_timer();
     PREEMPTION_ENABLED.store(0, Ordering::Release);
     let live_space = unsafe { (*SCHEDULER.0.get()).tasks[slot].process_space };
-    let base = arch::paging::process_stack_base();
     let (argc, arg1_matches) = live_space
-        .filter(|space| space.stack_top >= base)
+        .filter(|space| space.stack_top >= arch::paging::process_stack_base(space.user_slot))
         .map(|space| {
+            let base = arch::paging::process_stack_base(space.user_slot);
             let top = space.stack_physical + (space.stack_top - base);
             // SAFETY: the stack page is still owned by this task until reap().
             let read = |offset: u64| unsafe {

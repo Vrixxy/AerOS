@@ -116,7 +116,7 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> NicReport 
     }
     report.mac = mac;
     // The ring and the four transmit buffers must sit below 4 GiB.
-    let Some(dma) = frames.allocate_contiguous(RX_BUFFER_PAGES + 2, 1) else {
+    let Some(dma) = frames.allocate_dma(RX_BUFFER_PAGES + 2, 1) else {
         return report;
     };
     let rx = dma.address();

@@ -123,7 +123,7 @@ impl Legacy {
         let used_offset = (descriptors + available).next_multiple_of(PAGE_SIZE as usize);
         let total = used_offset + 6 + 8 * size;
         let pages = (total as u64).div_ceil(PAGE_SIZE);
-        let block = frames.allocate_contiguous(pages, 1)?;
+        let block = frames.allocate_dma(pages, 1)?;
         let base = block.address();
         if base + pages * PAGE_SIZE > 0x0fff_ffff_ffff {
             return None;
@@ -147,11 +147,14 @@ impl Legacy {
 #[derive(Clone, Copy)]
 pub struct Queue {
     pub size: usize,
-    descriptors: u64,
-    available: u64,
-    used: u64,
-    next_available: u16,
-    last_used: u16,
+    /// Crate-visible (not private) so `virtio_modern` can build one too -
+    /// the split-virtqueue ring layout is identical on both transports,
+    /// only how the device is told where it lives differs.
+    pub(crate) descriptors: u64,
+    pub(crate) available: u64,
+    pub(crate) used: u64,
+    pub(crate) next_available: u16,
+    pub(crate) last_used: u16,
 }
 
 impl Queue {

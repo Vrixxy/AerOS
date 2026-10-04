@@ -280,7 +280,7 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> NvmeReport
     if !wait_for(|| unsafe { read32(base, REG_CSTS) } & 1 == 0, READY_TIMEOUT) {
         return report;
     }
-    let Some(dma) = frames.allocate_contiguous(6, 1) else {
+    let Some(dma) = frames.allocate_dma(6, 1) else {
         return report;
     };
     let memory = dma.address();

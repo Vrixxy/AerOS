@@ -1,6 +1,6 @@
 [workspace]
 members = ["kernel"]
-exclude = ["userspace/init", "userspace/std-smoke", "userspace/fork-probe", "compat/agent"]
+exclude = ["userspace/init", "userspace/std-smoke", "userspace/fork-probe", "userspace/threads", "userspace/ptrace", "userspace/swap", "userspace/bench", "tools/aml-host", "compat/agent"]
 resolver = "3"
 
 [profile.dev]

@@ -484,7 +484,7 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> Ac97Report
         return report;
     }
     let pages = 1 + (BDL_ENTRIES * BUFFER_BYTES) as u64 / PAGE_SIZE;
-    let Some(block) = frames.allocate_contiguous(pages, 1) else {
+    let Some(block) = frames.allocate_dma(pages, 1) else {
         return report;
     };
     let base = block.address();

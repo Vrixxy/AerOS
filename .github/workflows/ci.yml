@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      boot_test:
+        description: Also run the QEMU boot-test (slow without hardware acceleration)
+        type: boolean
+        default: false
+
+jobs:
+  check:
+    name: Format, lint and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup show
+          rustup component add clippy rustfmt
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy (default features)
+        run: cargo clippy --manifest-path kernel/Cargo.toml --target x86_64-unknown-uefi -- -D warnings
+      - name: Clippy (boot-test)
+        run: cargo clippy --manifest-path kernel/Cargo.toml --target x86_64-unknown-uefi --features boot-test -- -D warnings
+      - name: Clippy (linux-headless)
+        run: cargo clippy --manifest-path kernel/Cargo.toml --target x86_64-unknown-uefi --features linux-headless -- -D warnings
+      - name: Release build
+        run: cargo build --release --manifest-path kernel/Cargo.toml --target x86_64-unknown-uefi
+      - name: Boot-test build
+        run: cargo build --release --manifest-path kernel/Cargo.toml --target x86_64-unknown-uefi --features boot-test
+
+  boot-test:
+    name: Boot-test in QEMU
+    if: github.event_name == 'workflow_dispatch' && inputs.boot_test
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU
+        run: choco install qemu -y --no-progress
+      - name: Run tools/test.ps1
+        shell: powershell
+        run: powershell.exe -NoProfile -File tools\test.ps1

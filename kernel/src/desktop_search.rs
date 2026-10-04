@@ -100,10 +100,12 @@ impl DesktopState {
                 self.search_len = self.search_len.saturating_sub(1);
                 self.search_focus = 0;
             }
-            DesktopKey::Character(byte)
-                if self.search_len < SEARCH_MAX && (byte.is_ascii_graphic() || byte == b' ') =>
+            DesktopKey::Character(ch)
+                if ch.is_ascii()
+                    && self.search_len < SEARCH_MAX
+                    && (ch.is_ascii_graphic() || ch == ' ') =>
             {
-                self.search_input[self.search_len] = byte;
+                self.search_input[self.search_len] = ch as u8;
                 self.search_len += 1;
                 self.search_focus = 0;
                 self.search_typed_ns = crate::time::monotonic_nanoseconds();

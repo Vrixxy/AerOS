@@ -122,7 +122,7 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> VirtioNetR
         return report;
     };
     let pages = (RX_BUFFERS * BUFFER) as u64 / 4096 + 1;
-    let Some(dma) = frames.allocate_contiguous(pages, 1) else {
+    let Some(dma) = frames.allocate_dma(pages, 1) else {
         return report;
     };
     device.driver_ok();

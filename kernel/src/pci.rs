@@ -217,6 +217,126 @@ impl PciInventory {
     }
 }
 
+/// One "vendor-specific" (id 0x09) PCI capability - the shape every modern
+/// (virtio 1.0+) virtio-pci device advertises one of per config region
+/// (common/notify/ISR/device), each pointing at a byte range inside one of
+/// the device's own BARs. `notify_multiplier` is only meaningful when
+/// `cfg_type == NOTIFY_CFG` (2); it is the capability's own extra trailing
+/// field, read from the 4 bytes right after the base 16-byte structure.
+#[derive(Clone, Copy)]
+pub struct VendorCapability {
+    pub cfg_type: u8,
+    pub bar: u8,
+    pub offset: u32,
+    pub length: u32,
+    pub notify_multiplier: u32,
+}
+
+/// Walks the capability list looking for vendor-specific (id 0x09)
+/// capabilities, calling `visit` with each one's raw bytes decoded. Same
+/// walk/loop-guard shape as `capability_count` (bounded, revisit-proof).
+pub fn walk_vendor_capabilities(device: &PciDevice, mut visit: impl FnMut(VendorCapability)) {
+    let status = read16(device.bus, device.slot, device.function, 0x06);
+    if status & 0x10 == 0 {
+        return;
+    }
+    let mut pointer = read8(device.bus, device.slot, device.function, 0x34) & 0xfc;
+    let mut visited = 0u64;
+    let mut steps = 0u8;
+    while (0x40..=0xfc).contains(&pointer) && steps < 48 {
+        let bit = ((pointer - 0x40) / 4) as u64;
+        if visited & (1u64 << bit) != 0 {
+            break;
+        }
+        visited |= 1u64 << bit;
+        steps += 1;
+        let id = read8(device.bus, device.slot, device.function, pointer);
+        if id == 0x09 {
+            let cap_len = read8(device.bus, device.slot, device.function, pointer + 2);
+            let cfg_type = read8(device.bus, device.slot, device.function, pointer + 3);
+            let bar = read8(device.bus, device.slot, device.function, pointer + 4);
+            let offset = read32(device.bus, device.slot, device.function, pointer + 8);
+            let length = read32(device.bus, device.slot, device.function, pointer + 12);
+            let notify_multiplier = if cfg_type == 2 && cap_len >= 20 {
+                read32(device.bus, device.slot, device.function, pointer + 16)
+            } else {
+                0
+            };
+            visit(VendorCapability {
+                cfg_type,
+                bar,
+                offset,
+                length,
+                notify_multiplier,
+            });
+        }
+        pointer = read8(
+            device.bus,
+            device.slot,
+            device.function,
+            pointer.saturating_add(1),
+        ) & 0xfc;
+    }
+}
+
+/// The physical address a capability's `bar`/`offset` resolves to, handling
+/// a 64-bit BAR pair (the low BAR's bit 2 set means the next BAR holds its
+/// high 32 bits, per the PCI spec) the way a 32-bit-only `bars[n]` read
+/// alone cannot.
+pub fn bar_address(device: &PciDevice, bar: u8, offset: u32) -> Option<u64> {
+    let index = bar as usize;
+    let raw = *device.bars.get(index)?;
+    if raw & 1 != 0 {
+        return None; // an I/O BAR, not a memory one - no modern virtio cap uses this
+    }
+    let base = if raw & 0b100 != 0 {
+        let high = *device.bars.get(index + 1)? as u64;
+        (raw as u64 & !0xf) | (high << 32)
+    } else {
+        raw as u64 & !0xf
+    };
+    Some(base + offset as u64)
+}
+
+/// Reads 1, 2 or 4 bytes of a function's configuration space (the first 256
+/// bytes; the extended space is not reachable through the legacy ports).
+pub fn config_read(bus: u8, slot: u8, function: u8, offset: u16, bytes: u8) -> u64 {
+    if offset > 0xff || !matches!(bytes, 1 | 2 | 4) {
+        return 0;
+    }
+    let word = read32(bus, slot, function, offset as u8) as u64;
+    let shifted = word >> ((offset & 3) * 8);
+    match bytes {
+        1 => shifted & 0xff,
+        2 => shifted & 0xffff,
+        _ => word,
+    }
+}
+
+pub fn config_write(bus: u8, slot: u8, function: u8, offset: u16, bytes: u8, value: u64) {
+    if offset > 0xff || !matches!(bytes, 1 | 2 | 4) {
+        return;
+    }
+    let aligned = (offset as u8) & 0xfc;
+    let shift = (offset & 3) * 8;
+    let mask = match bytes {
+        1 => 0xffu32,
+        2 => 0xffff,
+        _ => u32::MAX,
+    };
+    let mut current = read32(bus, slot, function, aligned);
+    current = (current & !(mask << shift)) | ((value as u32 & mask) << shift);
+    let address = 0x8000_0000u32
+        | (bus as u32) << 16
+        | (slot as u32) << 11
+        | (function as u32) << 8
+        | aligned as u32;
+    unsafe {
+        arch::outl(0xcf8, address);
+        arch::outl(0xcfc, current);
+    }
+}
+
 fn capability_count(bus: u8, slot: u8, function: u8) -> u8 {
     let status = read16(bus, slot, function, 0x06);
     if status & 0x10 == 0 {

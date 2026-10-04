@@ -251,7 +251,18 @@ pub fn decode(data: &[u8]) -> Result<Image, ImageError> {
         return Err(ImageError::Corrupt);
     }
 
-    // Gather the compressed data (IDAT chunks are one zlib stream).
+    // Gather the compressed data (IDAT chunks are one zlib stream). This
+    // walks the exact same chunk sequence as the first pass above, and must
+    // stay just as defensive about it: `idat_total` only accounts for the
+    // IDAT chunks the first pass actually reached before its own `IEND`
+    // break, so without the same `body_end` bound check and `IEND` break
+    // here, a malformed file with one small valid IDAT chunk (enough to
+    // pass the `idat_total == 0` guard above) followed by a premature
+    // `IEND` and then a bogus later chunk still claiming to be `IDAT`, with
+    // an oversized `length`, would walk straight into `target[at..at+length]`
+    // with both `at+length` and the matching `data[..]` read far past
+    // either buffer's real size - an out-of-bounds slice-index panic on a
+    // crafted or merely corrupted picture file, not just a rejected decode.
     let mut compressed = PageBuffer::new(idat_total).ok_or(ImageError::OutOfMemory)?;
     {
         let target = compressed.as_mut_slice();
@@ -263,11 +274,24 @@ pub fn decode(data: &[u8]) -> Result<Image, ImageError> {
                 data[offset + 2],
                 data[offset + 3],
             ]) as usize;
-            if &data[offset + 4..offset + 8] == b"IDAT" {
-                target[at..at + length].copy_from_slice(&data[offset + 8..offset + 8 + length]);
+            let kind = &data[offset + 4..offset + 8];
+            let Some(body_end) = (offset + 8).checked_add(length) else {
+                return Err(ImageError::Corrupt);
+            };
+            if body_end + 4 > data.len() {
+                return Err(ImageError::Corrupt);
+            }
+            if kind == b"IDAT" {
+                if at + length > target.len() {
+                    return Err(ImageError::Corrupt);
+                }
+                target[at..at + length].copy_from_slice(&data[offset + 8..body_end]);
                 at += length;
             }
-            offset += 12 + length;
+            if kind == b"IEND" {
+                break;
+            }
+            offset = body_end + 4;
         }
     }
     let expected = raw_size(&header);

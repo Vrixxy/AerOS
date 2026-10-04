@@ -1,0 +1,8 @@
+# The kernel is built with the compiler's stack protector (see
+# kernel/src/stackguard.rs). The flag is still unstable, so the stable
+# compiler is told to accept it.
+[env]
+RUSTC_BOOTSTRAP = "1"
+
+[target.x86_64-unknown-uefi]
+rustflags = ["-Zstack-protector=strong"]

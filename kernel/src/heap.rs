@@ -157,6 +157,19 @@ impl HeapState {
         if unsafe { self.overlaps_free(block_start, block_size) } {
             return false;
         }
+        // Wipe the whole block before it goes back on the free list. Callers
+        // hand this allocator process stacks, FPU save areas and other
+        // buffers that can carry sensitive data (key material, password
+        // bytes not yet reached by their own `wipe`, decrypted file
+        // contents); without this, that data sits untouched in memory that
+        // is nominally "free" until some unrelated future allocation
+        // happens to land on top of it and overwrite it. `insert_region`
+        // immediately writes its own `FreeNode { size, next }` over the
+        // first 16 bytes of this range, which is fine - that's free-list
+        // bookkeeping, not user data.
+        unsafe {
+            core::ptr::write_bytes(block_start as *mut u8, 0, block_size);
+        }
         unsafe {
             self.insert_region(block_start, block_size);
         }
@@ -295,7 +308,17 @@ impl KernelHeap {
         }
         let released = self.deallocate(second) && self.deallocate(first) && self.deallocate(third);
         let after = self.stats();
+        // The user pointer always sits at least `size_of::<AllocationHeader>()`
+        // (24 bytes) past the block's start, and `insert_region` only
+        // overwrites the first 16 bytes of a freed block with its
+        // `FreeNode` linkage - so if zero-on-free is working, the byte at
+        // each returned pointer's own address must read back as 0 even
+        // though we just filled it with a non-zero pattern above.
+        let wiped = unsafe {
+            first.as_ptr().read() == 0 && second.as_ptr().read() == 0 && third.as_ptr().read() == 0
+        };
         released
+            && wiped
             && after.total_bytes == before.total_bytes
             && after.free_bytes == before.free_bytes
             && after.active_allocations == 0

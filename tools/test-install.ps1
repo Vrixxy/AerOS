@@ -26,7 +26,7 @@ function Invoke-Qemu($arguments, $timeoutSeconds) {
     $psi.CreateNoWindow = $true
     $proc = [System.Diagnostics.Process]::Start($psi)
     if (-not $proc.WaitForExit($timeoutSeconds * 1000)) {
-        try { $proc.Kill($true) } catch { }
+        try { $proc.Kill() } catch { & taskkill /F /T /PID $proc.Id 2>$null | Out-Null }
         $proc.WaitForExit(3000) | Out-Null
     }
 }

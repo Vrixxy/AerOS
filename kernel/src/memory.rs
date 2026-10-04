@@ -164,11 +164,18 @@ pub struct FrameAllocator {
 /// Free pages of the tracked (main) allocator, readable from anywhere.
 pub static TRACKED_FREE_PAGES: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+/// Total pages the tracked allocator manages (free plus allocated at `track`).
+pub static TRACKED_TOTAL_PAGES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 impl FrameAllocator {
     /// Makes this allocator the one the system monitor reports on.
     pub fn track(&mut self) {
         self.tracked = true;
+        TRACKED_TOTAL_PAGES.store(
+            self.free_pages + self.allocated_pages,
+            core::sync::atomic::Ordering::Relaxed,
+        );
         self.publish();
     }
 
@@ -247,6 +254,17 @@ impl FrameAllocator {
         self.allocate_contiguous(1, 1)
     }
 
+    /// Like `allocate_contiguous`, for memory a device will read or write: the
+    /// IOMMU is told to let devices reach it.
+    pub fn allocate_dma(&mut self, pages: u64, alignment_pages: u64) -> Option<PhysFrame> {
+        let frame = self.allocate_contiguous(pages, alignment_pages)?;
+        if crate::iommu::allow(frame.address(), pages) {
+            return Some(frame);
+        }
+        self.release_contiguous(frame.address(), pages);
+        None
+    }
+
     pub fn allocate_contiguous(&mut self, pages: u64, alignment_pages: u64) -> Option<PhysFrame> {
         if pages == 0 || !alignment_pages.is_power_of_two() {
             return None;
@@ -301,6 +319,22 @@ impl FrameAllocator {
         let Some(allocated_pages) = self.allocated_pages.checked_sub(pages) else {
             return false;
         };
+        // Every frame handed back here comes from a process address space
+        // being torn down (`destroy_process`/exec-rollback in paging.rs) -
+        // its code, heap, anonymous-mmap or stack pages can hold anything
+        // that process had in memory (decrypted file contents, terminal
+        // input, key material). `allocate_contiguous` already zeroes fresh
+        // frames before handing them to a *new* owner, but that still
+        // leaves a window where a dead process's data sits untouched in
+        // "free" physical RAM until something happens to reuse that exact
+        // frame. Every caller only releases a frame once it has already
+        // unmapped it (the `frame_release`/`frame_share` refcounting in
+        // paging.rs guarantees a shared frame only reaches here from its
+        // last owner), so nothing can still be reading through this
+        // physical address - safe to wipe it right now instead of waiting.
+        unsafe {
+            core::ptr::write_bytes(start as usize as *mut u8, 0, bytes as usize);
+        }
         let left = self.free[..self.free_count]
             .iter()
             .position(|range| range.end == start);
@@ -350,11 +384,24 @@ impl FrameAllocator {
         if first == second || first.address() & (PAGE_SIZE - 1) != 0 {
             return false;
         }
+        unsafe {
+            core::ptr::write_bytes(
+                first.address() as usize as *mut u8,
+                0xa5,
+                PAGE_SIZE as usize,
+            );
+        }
         if !self.release(first) {
             return false;
         }
+        // `allocate`/`allocate_contiguous` don't zero on their own (callers
+        // in paging.rs do that explicitly for a *new* owner) - reading the
+        // physical byte back right here, before anything reallocates this
+        // exact frame, is what actually proves `release_contiguous` did.
+        let wiped = unsafe { core::ptr::read_volatile(first.address() as usize as *const u8) } == 0;
         let reused = self.allocate();
-        let first_stage = reused == Some(first) && self.release(second) && self.release(first);
+        let first_stage =
+            wiped && reused == Some(first) && self.release(second) && self.release(first);
         let Some(block) = self.allocate_contiguous(4, 4) else {
             return false;
         };
@@ -508,6 +555,11 @@ impl PageBuffer {
 
     pub fn len(&self) -> usize {
         self.bytes
+    }
+
+    #[cfg(feature = "boot-test")]
+    pub fn physical(&self) -> u64 {
+        self.address
     }
 
     pub fn as_slice(&self) -> &[u8] {

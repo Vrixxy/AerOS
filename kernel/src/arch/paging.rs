@@ -33,7 +33,6 @@ pub struct PagingState {
     pub nx_enabled: bool,
     pub write_protect_enabled: bool,
     pub verified: bool,
-    leaf_table_physical: u64,
 }
 
 /// A copy of the boot-time `PagingState`, stashed by `main.rs` right after
@@ -210,7 +209,6 @@ pub fn initialize(frames: &mut FrameAllocator, cpu: &CpuInfo) -> Option<PagingSt
         nx_enabled,
         write_protect_enabled,
         verified: observed == pattern,
-        leaf_table_physical: table,
     })
 }
 
@@ -278,6 +276,32 @@ fn kernel_image() -> Option<(u64, u64)> {
         page = page.checked_sub(PAGE_SIZE)?;
     }
     None
+}
+
+/// Whether every page of the physical range is mapped (present) at the same
+/// address in the kernel's current address space.
+pub fn kernel_range_mapped(address: u64, length: u64) -> bool {
+    const HUGE: u64 = 1 << 7;
+    let mut page = address & !(PAGE_SIZE - 1);
+    let end = address.saturating_add(length.max(1));
+    while page < end {
+        let mut table = read_cr3() & ADDRESS_MASK;
+        for level in 0..4u64 {
+            let index = ((page >> (39 - 9 * level)) & 0x1ff) as usize;
+            // SAFETY: `table` is a page-table page reached from CR3.
+            let entry =
+                unsafe { core::ptr::read_volatile((table as usize as *const u64).add(index)) };
+            if entry & PRESENT == 0 {
+                return false;
+            }
+            if (level == 1 || level == 2) && entry & HUGE != 0 {
+                break;
+            }
+            table = entry & ADDRESS_MASK;
+        }
+        page += PAGE_SIZE;
+    }
+    true
 }
 
 fn make_range_writable(root: u64, start: u64, end: u64) {
@@ -477,29 +501,81 @@ pub fn demand_self_test() -> bool {
         && final_stats.reserved_pages == DEMAND_REGION_PAGES
 }
 
+/// Maps a dedicated, contiguous virtual region for the kernel heap, sized in
+/// `pages`. Unlike the original version of this function (which squeezed the
+/// heap into the handful of spare leaf entries in `PagingState`'s own
+/// single-page "probe" table - a hard ceiling just under 2 MiB, since one
+/// leaf table only has `ENTRY_COUNT` entries total), this builds a full,
+/// dedicated PDPT/PD/multi-PT chain under its own fresh PML4 slot, the same
+/// shape `create_process_from_elf` already builds per-process just for
+/// kernel-only (no USER bit) mappings instead. `pages` may be anything up to
+/// `ENTRY_COUNT * ENTRY_COUNT` (one PD's worth of page tables, 512 GiB) -
+/// every size this kernel actually asks for fits in a single PD's worth of
+/// PTs. Physical pages are allocated one at a time (`frames.allocate()`),
+/// not as one big contiguous block, so a large heap never needs to find one
+/// huge run of contiguous physical memory this early in boot.
 pub fn map_heap(
     state: &PagingState,
     frames: &mut FrameAllocator,
     pages: usize,
 ) -> Option<HeapMapping> {
-    if pages == 0 || pages >= ENTRY_COUNT {
+    if pages == 0 {
         return None;
     }
-    let physical = frames.allocate_contiguous(pages as u64, 1)?.address();
-    let flags = PRESENT | WRITABLE | if state.nx_enabled { NO_EXECUTE } else { 0 };
-    let table = state.leaf_table_physical as usize as *mut u64;
-    for index in 0..pages {
-        let address = physical.checked_add(index as u64 * PAGE_SIZE)?;
+    let table_count = pages.div_ceil(ENTRY_COUNT);
+    if table_count == 0 || table_count > ENTRY_COUNT {
+        return None;
+    }
+    let root_table = state.root_physical as usize as *mut u64;
+    let heap_index = (256..ENTRY_COUNT)
+        .find(|index| unsafe { core::ptr::read_volatile(root_table.add(*index)) & PRESENT == 0 })?;
+    let block = frames
+        .allocate_contiguous(2 + table_count as u64, 1)?
+        .address();
+    let pdpt = block;
+    let directory = pdpt.checked_add(PAGE_SIZE)?;
+    let first_table = directory.checked_add(PAGE_SIZE)?;
+    unsafe {
+        zero_page(pdpt);
+        zero_page(directory);
+    }
+    let branch_flags = PRESENT | WRITABLE;
+    let leaf_flags = PRESENT | WRITABLE | if state.nx_enabled { NO_EXECUTE } else { 0 };
+    let mut first_physical = 0u64;
+    let mut mapped = 0usize;
+    for table_slot in 0..table_count {
+        let table = first_table.checked_add(table_slot as u64 * PAGE_SIZE)?;
         unsafe {
-            core::ptr::write_volatile(table.add(index + 1), address | flags);
+            zero_page(table);
+            core::ptr::write_volatile(
+                (directory as usize as *mut u64).add(table_slot),
+                table | branch_flags,
+            );
         }
+        let entries_here = (pages - mapped).min(ENTRY_COUNT);
+        for entry in 0..entries_here {
+            let physical = frames.allocate()?.address();
+            if mapped == 0 && entry == 0 {
+                first_physical = physical;
+            }
+            unsafe {
+                zero_page(physical);
+                core::ptr::write_volatile(
+                    (table as usize as *mut u64).add(entry),
+                    physical | leaf_flags,
+                );
+            }
+        }
+        mapped += entries_here;
     }
     unsafe {
+        core::ptr::write_volatile(root_table.add(heap_index), pdpt | branch_flags);
+        core::ptr::write_volatile(pdpt as usize as *mut u64, directory | branch_flags);
         write_cr3(state.root_physical);
     }
     Some(HeapMapping {
-        virtual_base: state.probe_virtual + PAGE_SIZE,
-        physical_base: physical,
+        virtual_base: canonical_base(heap_index),
+        physical_base: first_physical,
         size: pages * PAGE_SIZE as usize,
     })
 }
@@ -510,6 +586,33 @@ pub fn map_user_probe(state: &PagingState, frames: &mut FrameAllocator) -> Optio
         0x00, 0x00, 0xcd, 0x80,
     ];
     map_probe_code(state, frames, &program)
+}
+
+/// Proves `choose_user_index` genuinely produces different addresses across
+/// allocations, not a fixed slot that happens to look random. This covers
+/// `map_probe_code` / `map_user_probe` / `map_user_image`: the one-off
+/// pre-scheduler boot probes and the very first `/bin/init` load, all mapped
+/// before the scheduler exists. See `scheduled_process_aslr_self_test` for
+/// the equivalent proof on the scheduled multi-process path
+/// (`create_process`/`fork_process`/`exec_process`), which used to sit at
+/// the same fixed slot for every process until `ProcessAddressSpace::user_slot`
+/// replaced the old `PROCESS_USER_SLOT` constant.
+pub fn aslr_self_test(state: &PagingState, frames: &mut FrameAllocator) -> bool {
+    let program: [u8; 7] = [0xb8, 0x00, 0x00, 0x00, 0x00, 0xcd, 0x80];
+    let Some(first) = map_probe_code(state, frames, &program) else {
+        return false;
+    };
+    let Some(second) = map_probe_code(state, frames, &program) else {
+        destroy_user_probe(state, frames, &first);
+        return false;
+    };
+    // `choose_user_index` only ever returns a slot that's still free, and
+    // `first`'s slot is still marked present (not torn down yet) - so this
+    // is a deterministic proof, not a 1/255 chance of a false failure.
+    let distinct = first.entry != second.entry;
+    let first_reap = destroy_user_probe(state, frames, &first);
+    let second_reap = destroy_user_probe(state, frames, &second);
+    distinct && first_reap.verified && second_reap.verified
 }
 
 pub fn map_probe_code(
@@ -573,8 +676,6 @@ pub fn map_probe_code(
     })
 }
 
-const PROCESS_USER_SLOT: usize = 1;
-
 /// A process's whole address space (code/data, stack, heap, mmap) lives in
 /// ONE leaf page table (512 entries), the same design the original
 /// single-page `create_process` used - just with room reserved for a real,
@@ -586,11 +687,16 @@ const PROCESS_USER_SLOT: usize = 1;
 /// biggest real userspace binary in this repo, ~380 KB) with headroom.
 const PROCESS_CODE_PAGES: usize = 200;
 const PROCESS_GUARD_INDEX: usize = PROCESS_CODE_PAGES;
-const PROCESS_STACK_FIRST_INDEX: usize = PROCESS_CODE_PAGES + 1;
 // Tests that read a stack marker must use PROCESS_STACK_BYTES, not a
 // hardcoded one-page offset. Real std-linked ELFs need more than one page.
 pub const PROCESS_STACK_PAGES: usize = 4;
 pub const PROCESS_STACK_BYTES: u64 = PROCESS_STACK_PAGES as u64 * PAGE_SIZE;
+/// How many pages below the initial mapping the stack may grow into on
+/// demand (see `process_stack_fault`) - 256 KiB on top of the 16 KiB every
+/// process starts with. This is why the stack sits at the top of the
+/// table with its growth range below it, instead of right after code: there
+/// has to be room to grow into that nothing else already occupies.
+pub const PROCESS_STACK_MAX_GROWTH_PAGES: usize = 64;
 
 const FRAME_REF_SLOTS: usize = 8192;
 /// Software-available PTE bit: the page is shared copy-on-write (mapped
@@ -689,14 +795,29 @@ pub fn code_page_refcount(physical: u64) -> u32 {
 }
 
 const PROCESS_HEAP_PAGES: usize = 64;
-const PROCESS_HEAP_FIRST_INDEX: usize = PROCESS_STACK_FIRST_INDEX + PROCESS_STACK_PAGES;
+const PROCESS_HEAP_FIRST_INDEX: usize = PROCESS_GUARD_INDEX + 1;
 const PROCESS_MMAP_PAGES: usize = 128;
 const PROCESS_MMAP_FIRST_INDEX: usize = PROCESS_HEAP_FIRST_INDEX + PROCESS_HEAP_PAGES;
-const PROCESS_RESERVED_PAGES: usize = PROCESS_MMAP_FIRST_INDEX + PROCESS_MMAP_PAGES;
+/// The stack's growth range sits right after mmap, and the stack's initial
+/// (always-mapped) pages sit right after that - so growing it downward
+/// (smaller addresses) never collides with code, heap, or mmap.
+const PROCESS_STACK_LOWEST_INDEX: usize = PROCESS_MMAP_FIRST_INDEX + PROCESS_MMAP_PAGES;
+const PROCESS_STACK_FIRST_INDEX: usize =
+    PROCESS_STACK_LOWEST_INDEX + PROCESS_STACK_MAX_GROWTH_PAGES;
+const PROCESS_RESERVED_PAGES: usize = PROCESS_STACK_FIRST_INDEX + PROCESS_STACK_PAGES;
 
 #[derive(Clone, Copy)]
 pub struct ProcessAddressSpace {
     pub root_physical: u64,
+    /// Which PML4 index (of the 255 candidates `choose_user_index` picks
+    /// from) this process's whole user range hangs off - chosen fresh by
+    /// `create_process`, inherited unchanged by `fork_process` (the child
+    /// shares the parent's exact virtual layout, COW pages and all), and
+    /// left alone by `exec_process` (a new image reuses the same slot; see
+    /// `aslr_self_test`'s doc comment for why re-randomizing per-image was
+    /// judged not worth the added risk to the syscall bounds-checking that
+    /// caches `user_start`/`user_end` for a task's whole lifetime).
+    pub user_slot: usize,
     pub entry: u64,
     pub stack_top: u64,
     /// Physical address of each mapped code/data page, indexed by virtual
@@ -712,6 +833,12 @@ pub struct ProcessAddressSpace {
     /// re-deriving permissions from segment metadata it no longer has.
     code_flags: [u64; PROCESS_CODE_PAGES],
     pub stack_physical: u64,
+    /// Physical address of each on-demand stack-growth page, indexed by
+    /// depth below the initial mapping (0 = the page immediately below
+    /// `stack_physical`); 0 = not grown that deep yet. Shared copy-on-write
+    /// across `fork()` exactly like heap/mmap, unlike the initial fixed
+    /// `stack_physical` block, which `fork_process` still eager-copies.
+    pub stack_grown: [u64; PROCESS_STACK_MAX_GROWTH_PAGES],
     pub nx_enabled: bool,
     pub verified: bool,
     pub owns_code: bool,
@@ -724,16 +851,148 @@ pub struct ProcessAddressSpace {
     pub mmap_physical: [u64; PROCESS_MMAP_PAGES],
 }
 
-/// The virtual base every process's dedicated address space starts at.
-/// Fixed and identical across all processes (isolation comes from each
-/// having its own root page table at this same numeric address, not from
-/// the address itself varying) - callers that need the true start of a
-/// process's mapped range (e.g. syscall pointer-validation bounds) should
-/// use this instead of `ProcessAddressSpace::entry`, which can sit at a
-/// nonzero offset from the base for a real ELF image whose entry point
-/// isn't at the very first mapped page.
-pub fn process_virtual_base() -> u64 {
-    canonical_base(PROCESS_USER_SLOT)
+impl ProcessAddressSpace {
+    /// Pages currently backing this process: code, the initial stack page,
+    /// grown stack pages, heap and anonymous mappings. Copy-on-write pages
+    /// shared with a relative are counted in full.
+    /// Calls `visit(start, end, permissions, name)` for every contiguous
+    /// mapped region in ascending address order: image pages with equal
+    /// permissions, heap, anonymous mappings with equal protection, and the
+    /// stack including its grown pages. `permissions` is the four-letter form
+    /// `/proc/<pid>/maps` uses.
+    pub fn regions(&self, visit: &mut dyn FnMut(u64, u64, [u8; 4], &'static str)) {
+        let base = process_virtual_base(self.user_slot);
+        let permissions = |flags: u64| {
+            [
+                b'r',
+                if flags & WRITABLE != 0 { b'w' } else { b'-' },
+                if flags & NO_EXECUTE == 0 { b'x' } else { b'-' },
+                b'p',
+            ]
+        };
+        let walk = |pages: &[u64],
+                    first_slot: usize,
+                    key: &dyn Fn(usize) -> u64,
+                    name: &'static str,
+                    visit: &mut dyn FnMut(u64, u64, [u8; 4], &'static str)| {
+            let mut index = 0;
+            while index < pages.len() {
+                if pages[index] == 0 {
+                    index += 1;
+                    continue;
+                }
+                let start = index;
+                let flags = key(index);
+                while index < pages.len() && pages[index] != 0 && key(index) == flags {
+                    index += 1;
+                }
+                visit(
+                    base + (first_slot + start) as u64 * PAGE_SIZE,
+                    base + (first_slot + index) as u64 * PAGE_SIZE,
+                    permissions(flags),
+                    name,
+                );
+            }
+        };
+        walk(
+            &self.code_physical,
+            0,
+            &|index| self.code_flags[index],
+            "",
+            visit,
+        );
+        walk(
+            &self.heap_physical,
+            PROCESS_HEAP_FIRST_INDEX,
+            &|_| PRESENT | USER | WRITABLE | NO_EXECUTE,
+            "[heap]",
+            visit,
+        );
+        walk(
+            &self.mmap_physical,
+            PROCESS_MMAP_FIRST_INDEX,
+            &|index| translate_protection(self.mmap_protection[index], self.nx_enabled),
+            "",
+            visit,
+        );
+        let stack_base = process_stack_base(self.user_slot);
+        let grown = self
+            .stack_grown
+            .iter()
+            .rposition(|page| *page != 0)
+            .map_or(0, |depth| depth as u64 + 1);
+        if self.stack_physical != 0 {
+            visit(
+                stack_base - grown * PAGE_SIZE,
+                stack_base + PROCESS_STACK_BYTES,
+                permissions(PRESENT | USER | WRITABLE | NO_EXECUTE),
+                "[stack]",
+            );
+        }
+    }
+
+    pub fn resident_pages(&self) -> u64 {
+        let mapped = |pages: &[u64]| {
+            pages
+                .iter()
+                .filter(|page| **page != 0 && **page & SWAP_ENTRY == 0)
+                .count() as u64
+        };
+        mapped(&self.code_physical)
+            + u64::from(self.stack_physical != 0)
+            + mapped(&self.stack_grown)
+            + mapped(&self.heap_physical)
+            + mapped(&self.mmap_physical)
+    }
+}
+
+/// The virtual base of a process's dedicated address space, keyed by its own
+/// randomized `user_slot` (see `ProcessAddressSpace::user_slot`) rather than
+/// a fixed constant - two processes' `user_slot`s differ, so this genuinely
+/// varies between them. Callers that need the true start of a process's
+/// mapped range (e.g. syscall pointer-validation bounds) should use this
+/// instead of `ProcessAddressSpace::entry`, which can sit at a nonzero
+/// offset from the base for a real ELF image whose entry point isn't at the
+/// very first mapped page.
+pub fn process_virtual_base(user_slot: usize) -> u64 {
+    canonical_base(user_slot)
+}
+
+/// Checks `regions` against a freshly created process: ascending, inside the
+/// reserved range, no overlap, the image first and the stack last and ending
+/// at `stack_top`.
+pub fn regions_self_test(state: &PagingState) -> bool {
+    let program: [u8; 7] = [0xb8, 0x00, 0x00, 0x00, 0x00, 0xcd, 0x80];
+    let Some(space) = create_process(state, &program) else {
+        return false;
+    };
+    let base = process_virtual_base(space.user_slot);
+    let end = process_reserved_end(base);
+    let mut count = 0;
+    let mut previous_end = base;
+    let mut ascending = true;
+    let mut first_start = 0;
+    let mut last: Option<(u64, u64, &str)> = None;
+    space.regions(&mut |start, stop, _, name| {
+        if count == 0 {
+            first_start = start;
+        }
+        ascending &= start >= previous_end && stop > start && stop <= end;
+        previous_end = stop;
+        last = Some((start, stop, name));
+        count += 1;
+    });
+    let destroyed = destroy_process(&space);
+    count >= 2
+        && ascending
+        && first_start == base
+        && last
+            == Some((
+                process_stack_base(space.user_slot),
+                process_stack_base(space.user_slot) + PROCESS_STACK_BYTES,
+                "[stack]",
+            ))
+        && destroyed
 }
 
 pub fn process_reserved_end(base: u64) -> u64 {
@@ -743,8 +1002,41 @@ pub fn process_reserved_end(base: u64) -> u64 {
 /// Virtual base of a process's one-page stack region, for callers (the
 /// Linux-ABI argc/argv/envp/auxv stack builder) that need to write into
 /// `space.stack_physical` at the matching virtual addresses.
-pub fn process_stack_base() -> u64 {
-    process_virtual_base() + PROCESS_STACK_FIRST_INDEX as u64 * PAGE_SIZE
+pub fn process_stack_base(user_slot: usize) -> u64 {
+    process_virtual_base(user_slot) + PROCESS_STACK_FIRST_INDEX as u64 * PAGE_SIZE
+}
+
+/// Proves `create_process` gives processes genuinely randomized virtual
+/// layouts - the scheduled multi-process counterpart to `aslr_self_test`
+/// (see its doc comment). `fork_process` inherits its parent's `user_slot`
+/// unchanged (a forked child shares the parent's exact COW-mapped pages, so
+/// it must keep the same addresses) and `exec_process` never re-randomizes
+/// an existing process's slot either, so only creation needs checking here.
+///
+/// Unlike `aslr_self_test`, each `create_process` call gets its own fresh,
+/// independent PML4 (a copy of the kernel's template, not a shared table),
+/// so two calls' `choose_user_index` picks are genuinely independent draws -
+/// checking just two of them for inequality would have a real ~1/255 chance
+/// of a false failure on pure coincidence, exactly the false-positive risk
+/// `aslr_self_test`'s doc comment notes it *avoids* by sharing one table.
+/// Sampling `SAMPLES` independent draws and requiring at least one pair to
+/// differ instead makes an all-coincide false failure `(1/255)^(SAMPLES-1)`,
+/// not a realistic risk, while still only ever holding one process's worth
+/// of frames at a time (create, record, destroy, repeat).
+pub fn scheduled_process_aslr_self_test(state: &PagingState) -> bool {
+    let program: [u8; 7] = [0xb8, 0x00, 0x00, 0x00, 0x00, 0xcd, 0x80];
+    const SAMPLES: usize = 8;
+    let mut slots = [0usize; SAMPLES];
+    for slot in slots.iter_mut() {
+        let Some(space) = create_process(state, &program) else {
+            return false;
+        };
+        if !space.verified || !destroy_process(&space) {
+            return false;
+        }
+        *slot = space.user_slot;
+    }
+    slots.iter().any(|slot| *slot != slots[0])
 }
 
 /// Tries to load `code` as a real multi-segment ELF binary first; if that
@@ -779,6 +1071,7 @@ fn allocate_process_tables(stack_physical_pages: u64) -> Option<(u64, u64, u64, 
 
 fn link_process_root(
     nx_enabled: bool,
+    user_slot: usize,
     new_root: *mut u64,
     pdpt: u64,
     directory: u64,
@@ -788,7 +1081,7 @@ fn link_process_root(
     let branch_flags = PRESENT | WRITABLE | USER;
     let stack_flags = PRESENT | WRITABLE | USER | if nx_enabled { NO_EXECUTE } else { 0 };
     unsafe {
-        core::ptr::write_volatile(new_root.add(PROCESS_USER_SLOT), pdpt | branch_flags);
+        core::ptr::write_volatile(new_root.add(user_slot), pdpt | branch_flags);
         core::ptr::write_volatile(pdpt as usize as *mut u64, directory | branch_flags);
         core::ptr::write_volatile(directory as usize as *mut u64, table | branch_flags);
         for page in 0..PROCESS_STACK_PAGES as u64 {
@@ -827,6 +1120,7 @@ fn create_process_raw(state: &PagingState, code: &[u8]) -> Option<ProcessAddress
             code.len(),
         );
     }
+    let user_slot = choose_user_index(new_root)?;
     let code_page_flags = PRESENT | USER;
     unsafe {
         core::ptr::write_volatile(
@@ -836,6 +1130,7 @@ fn create_process_raw(state: &PagingState, code: &[u8]) -> Option<ProcessAddress
     }
     link_process_root(
         state.nx_enabled,
+        user_slot,
         new_root,
         pdpt,
         directory,
@@ -844,7 +1139,7 @@ fn create_process_raw(state: &PagingState, code: &[u8]) -> Option<ProcessAddress
     );
     let entries = unsafe {
         [
-            core::ptr::read_volatile(new_root.add(PROCESS_USER_SLOT)),
+            core::ptr::read_volatile(new_root.add(user_slot)),
             core::ptr::read_volatile(pdpt as usize as *const u64),
             core::ptr::read_volatile(directory as usize as *const u64),
             core::ptr::read_volatile(table as usize as *const u64),
@@ -858,9 +1153,10 @@ fn create_process_raw(state: &PagingState, code: &[u8]) -> Option<ProcessAddress
     let mut code_flags = [0u64; PROCESS_CODE_PAGES];
     code_physical[0] = code_physical_page;
     code_flags[0] = code_page_flags;
-    let virtual_base = canonical_base(PROCESS_USER_SLOT);
+    let virtual_base = canonical_base(user_slot);
     Some(ProcessAddressSpace {
         root_physical: pml4,
+        user_slot,
         entry: virtual_base,
         stack_top: virtual_base
             + (PROCESS_STACK_FIRST_INDEX + PROCESS_STACK_PAGES) as u64 * PAGE_SIZE
@@ -868,6 +1164,7 @@ fn create_process_raw(state: &PagingState, code: &[u8]) -> Option<ProcessAddress
         code_physical,
         code_flags,
         stack_physical,
+        stack_grown: [0; PROCESS_STACK_MAX_GROWTH_PAGES],
         nx_enabled: state.nx_enabled,
         verified: hierarchy_user && code_protected && stack_protected,
         owns_code: true,
@@ -922,6 +1219,7 @@ fn create_process_from_elf(
     let kernel_root = state.root_physical as usize as *const u64;
     let new_root = pml4 as usize as *mut u64;
     unsafe { core::ptr::copy_nonoverlapping(kernel_root, new_root, ENTRY_COUNT) };
+    let user_slot = choose_user_index(new_root)?;
 
     let mut code_physical = [0u64; PROCESS_CODE_PAGES];
     let mut code_flags = [0u64; PROCESS_CODE_PAGES];
@@ -969,6 +1267,7 @@ fn create_process_from_elf(
     }
     link_process_root(
         state.nx_enabled,
+        user_slot,
         new_root,
         pdpt,
         directory,
@@ -977,8 +1276,7 @@ fn create_process_from_elf(
     );
 
     let hierarchy_valid = unsafe {
-        core::ptr::read_volatile(new_root.add(PROCESS_USER_SLOT)) & (PRESENT | USER)
-            == PRESENT | USER
+        core::ptr::read_volatile(new_root.add(user_slot)) & (PRESENT | USER) == PRESENT | USER
             && core::ptr::read_volatile(pdpt as usize as *const u64) & (PRESENT | USER)
                 == PRESENT | USER
             && core::ptr::read_volatile(directory as usize as *const u64) & (PRESENT | USER)
@@ -1006,9 +1304,10 @@ fn create_process_from_elf(
         entry & (PRESENT | WRITABLE | USER) == PRESENT | WRITABLE | USER
             && (!state.nx_enabled || entry & NO_EXECUTE != 0)
     });
-    let virtual_base = canonical_base(PROCESS_USER_SLOT);
+    let virtual_base = canonical_base(user_slot);
     Some(ProcessAddressSpace {
         root_physical: pml4,
+        user_slot,
         entry: virtual_base.checked_add(image.entry())?,
         stack_top: virtual_base
             + (PROCESS_STACK_FIRST_INDEX + PROCESS_STACK_PAGES) as u64 * PAGE_SIZE
@@ -1016,6 +1315,7 @@ fn create_process_from_elf(
         code_physical,
         code_flags,
         stack_physical,
+        stack_grown: [0; PROCESS_STACK_MAX_GROWTH_PAGES],
         nx_enabled: state.nx_enabled,
         verified: hierarchy_valid && leaves_valid && guard_entry & PRESENT == 0 && stacks_valid,
         owns_code: true,
@@ -1050,8 +1350,8 @@ pub fn fork_process(parent: &ProcessAddressSpace) -> Option<ProcessAddressSpace>
     // become read-only copy-on-write in BOTH address spaces. The first write
     // by either process faults and gets its own private copy
     // (`process_cow_fault`), so fork() costs page-table work, not memory.
-    let parent_table = process_table_physical(parent.root_physical)?;
-    let virtual_base = canonical_base(PROCESS_USER_SLOT);
+    let parent_table = process_table_physical(parent.root_physical, parent.user_slot)?;
+    let virtual_base = canonical_base(parent.user_slot);
     let share_page = |slot: usize, physical: u64, logical_flags: u64| -> Option<u64> {
         let parent_entry_ptr = unsafe { (parent_table as usize as *mut u64).add(slot) };
         let mut entry = unsafe { core::ptr::read_volatile(parent_entry_ptr) };
@@ -1082,6 +1382,7 @@ pub fn fork_process(parent: &ProcessAddressSpace) -> Option<ProcessAddressSpace>
     }
     link_process_root(
         parent.nx_enabled,
+        parent.user_slot,
         new_root,
         pdpt,
         directory,
@@ -1111,8 +1412,21 @@ pub fn fork_process(parent: &ProcessAddressSpace) -> Option<ProcessAddressSpace>
             core::ptr::write_volatile((table as usize as *mut u64).add(slot), entry);
         }
     }
+    // Grown stack pages share the same COW treatment as heap/mmap (unlike
+    // the fixed initial block above, which stays eager-copied).
+    let stack_grown = parent.stack_grown;
+    for (depth, physical) in stack_grown.iter().enumerate() {
+        if *physical == 0 {
+            continue;
+        }
+        let slot = PROCESS_STACK_FIRST_INDEX - 1 - depth;
+        let entry = share_page(slot, *physical, *physical | stack_flags)?;
+        unsafe {
+            core::ptr::write_volatile((table as usize as *mut u64).add(slot), entry);
+        }
+    }
     let hierarchy_user = unsafe {
-        core::ptr::read_volatile(new_root.add(PROCESS_USER_SLOT)) & USER != 0
+        core::ptr::read_volatile(new_root.add(parent.user_slot)) & USER != 0
             && core::ptr::read_volatile(pdpt as usize as *const u64) & USER != 0
             && core::ptr::read_volatile(directory as usize as *const u64) & USER != 0
     };
@@ -1134,11 +1448,13 @@ pub fn fork_process(parent: &ProcessAddressSpace) -> Option<ProcessAddressSpace>
     });
     Some(ProcessAddressSpace {
         root_physical: pml4,
+        user_slot: parent.user_slot,
         entry: parent.entry,
         stack_top: parent.stack_top,
         code_physical,
         code_flags: parent.code_flags,
         stack_physical,
+        stack_grown,
         nx_enabled: parent.nx_enabled,
         verified: hierarchy_user && code_matches && stacks_valid,
         owns_code: false,
@@ -1152,10 +1468,10 @@ pub fn fork_process(parent: &ProcessAddressSpace) -> Option<ProcessAddressSpace>
     })
 }
 
-fn process_table_physical(root_physical: u64) -> Option<u64> {
+fn process_table_physical(root_physical: u64, user_slot: usize) -> Option<u64> {
     unsafe {
         let root = root_physical as usize as *const u64;
-        let pdpt_entry = core::ptr::read_volatile(root.add(PROCESS_USER_SLOT));
+        let pdpt_entry = core::ptr::read_volatile(root.add(user_slot));
         if pdpt_entry & PRESENT == 0 {
             return None;
         }
@@ -1187,7 +1503,7 @@ pub fn exec_process(space: &mut ProcessAddressSpace, code: &[u8]) -> bool {
 /// heap/mmap regions (execve() replaces the whole image), then leaves
 /// `space` ready for the caller to map the new pages into the same table.
 fn exec_teardown(space: &mut ProcessAddressSpace, table: u64) {
-    let virtual_base = canonical_base(PROCESS_USER_SLOT);
+    let virtual_base = canonical_base(space.user_slot);
     unsafe {
         for page in 0..PROCESS_CODE_PAGES {
             if space.code_physical[page] == 0 {
@@ -1216,6 +1532,17 @@ fn exec_teardown(space: &mut ProcessAddressSpace, table: u64) {
             );
             invalidate(virtual_base + (PROCESS_MMAP_FIRST_INDEX + index) as u64 * PAGE_SIZE);
         }
+        // Grown stack pages are potentially COW-shared (see fork_process),
+        // so - unlike the fixed block just zeroed above - they must be
+        // unmapped and refcount-released, never overwritten in place.
+        for (depth, physical) in space.stack_grown.iter().enumerate() {
+            if *physical == 0 {
+                continue;
+            }
+            let slot = PROCESS_STACK_FIRST_INDEX - 1 - depth;
+            core::ptr::write_volatile((table as usize as *mut u64).add(slot), 0);
+            invalidate(virtual_base + slot as u64 * PAGE_SIZE);
+        }
     }
     for page in space.code_physical.iter() {
         if *page != 0 {
@@ -1223,12 +1550,15 @@ fn exec_teardown(space: &mut ProcessAddressSpace, table: u64) {
         }
     }
     for page in space.heap_physical.iter().take(space.heap_mapped) {
-        frame_release(*page);
+        release_entry(*page);
     }
     for (index, used) in space.mmap_used.iter().enumerate() {
         if *used {
-            frame_release(space.mmap_physical[index]);
+            release_entry(space.mmap_physical[index]);
         }
+    }
+    for physical in space.stack_grown.iter() {
+        release_entry(*physical);
     }
     space.code_physical = [0; PROCESS_CODE_PAGES];
     space.code_flags = [0; PROCESS_CODE_PAGES];
@@ -1237,13 +1567,14 @@ fn exec_teardown(space: &mut ProcessAddressSpace, table: u64) {
     space.mmap_used = [false; PROCESS_MMAP_PAGES];
     space.mmap_protection = [0; PROCESS_MMAP_PAGES];
     space.mmap_physical = [0; PROCESS_MMAP_PAGES];
+    space.stack_grown = [0; PROCESS_STACK_MAX_GROWTH_PAGES];
 }
 
 fn exec_process_raw(space: &mut ProcessAddressSpace, code: &[u8]) -> bool {
     if code.is_empty() || code.len() > PAGE_SIZE as usize {
         return false;
     }
-    let Some(table) = process_table_physical(space.root_physical) else {
+    let Some(table) = process_table_physical(space.root_physical, space.user_slot) else {
         return false;
     };
     let Some(frame) = crate::memory::allocate_global() else {
@@ -1263,7 +1594,7 @@ fn exec_process_raw(space: &mut ProcessAddressSpace, code: &[u8]) -> bool {
     frame_retain(new_code_physical);
     unsafe {
         core::ptr::write_volatile(table as usize as *mut u64, new_code_physical | code_flags);
-        invalidate(canonical_base(PROCESS_USER_SLOT));
+        invalidate(canonical_base(space.user_slot));
     }
     space.code_physical[0] = new_code_physical;
     space.code_flags[0] = code_flags;
@@ -1303,7 +1634,7 @@ fn exec_process_elf(space: &mut ProcessAddressSpace, image: &crate::elf::ElfImag
     if entry_page >= PROCESS_CODE_PAGES || !executable[entry_page] || !required.iter().any(|n| *n) {
         return false;
     }
-    let Some(table) = process_table_physical(space.root_physical) else {
+    let Some(table) = process_table_physical(space.root_physical, space.user_slot) else {
         return false;
     };
 
@@ -1366,7 +1697,7 @@ fn exec_process_elf(space: &mut ProcessAddressSpace, image: &crate::elf::ElfImag
     }
 
     exec_teardown(space, table);
-    let virtual_base = canonical_base(PROCESS_USER_SLOT);
+    let virtual_base = canonical_base(space.user_slot);
     unsafe {
         for page in 0..PROCESS_CODE_PAGES {
             if new_physical[page] == 0 {
@@ -1394,19 +1725,23 @@ pub fn destroy_process(space: &ProcessAddressSpace) -> bool {
         }
     }
     for page in space.heap_physical.iter().take(space.heap_mapped) {
-        frame_release(*page);
+        release_entry(*page);
     }
     for (index, used) in space.mmap_used.iter().enumerate() {
         if *used {
-            frame_release(space.mmap_physical[index]);
+            release_entry(space.mmap_physical[index]);
         }
+    }
+    for physical in space.stack_grown.iter() {
+        release_entry(*physical);
     }
     crate::memory::release_global_contiguous(space.allocation_base, space.allocation_pages)
 }
 
 pub fn process_brk(space: &mut ProcessAddressSpace, additional_pages: usize) -> Option<u64> {
+    let user_slot = space.user_slot;
     let brk_address = |mapped: usize| {
-        process_virtual_base() + (PROCESS_HEAP_FIRST_INDEX + mapped) as u64 * PAGE_SIZE
+        process_virtual_base(user_slot) + (PROCESS_HEAP_FIRST_INDEX + mapped) as u64 * PAGE_SIZE
     };
     if additional_pages == 0 {
         return Some(brk_address(space.heap_mapped));
@@ -1414,7 +1749,7 @@ pub fn process_brk(space: &mut ProcessAddressSpace, additional_pages: usize) -> 
     if space.heap_mapped + additional_pages > PROCESS_HEAP_PAGES {
         return None;
     }
-    let table = process_table_physical(space.root_physical)?;
+    let table = process_table_physical(space.root_physical, space.user_slot)?;
     let flags = PRESENT | WRITABLE | USER | if space.nx_enabled { NO_EXECUTE } else { 0 };
     for _ in 0..additional_pages {
         let frame = crate::memory::allocate_global()?;
@@ -1444,12 +1779,12 @@ fn translate_protection(protection: u8, nx_enabled: bool) -> u64 {
     flags
 }
 
-fn mmap_address(index: usize) -> u64 {
-    process_virtual_base() + (PROCESS_MMAP_FIRST_INDEX + index) as u64 * PAGE_SIZE
+fn mmap_address(user_slot: usize, index: usize) -> u64 {
+    process_virtual_base(user_slot) + (PROCESS_MMAP_FIRST_INDEX + index) as u64 * PAGE_SIZE
 }
 
-fn mmap_index_for_address(address: u64) -> Option<usize> {
-    let base = mmap_address(0);
+fn mmap_index_for_address(user_slot: usize, address: u64) -> Option<usize> {
+    let base = mmap_address(user_slot, 0);
     if address < base || address & (PAGE_SIZE - 1) != 0 {
         return None;
     }
@@ -1474,7 +1809,7 @@ pub fn process_mmap(space: &mut ProcessAddressSpace, pages: usize, protection: u
             .iter()
             .all(|used| !used)
     })?;
-    let table = process_table_physical(space.root_physical)?;
+    let table = process_table_physical(space.root_physical, space.user_slot)?;
     let flags = translate_protection(protection, space.nx_enabled);
     for index in start..start + pages {
         let frame = crate::memory::allocate_global()?;
@@ -1485,13 +1820,13 @@ pub fn process_mmap(space: &mut ProcessAddressSpace, pages: usize, protection: u
                 (table as usize as *mut u64).add(PROCESS_MMAP_FIRST_INDEX + index),
                 page | flags,
             );
-            invalidate(mmap_address(index));
+            invalidate(mmap_address(space.user_slot, index));
         }
         space.mmap_used[index] = true;
         space.mmap_protection[index] = protection;
         space.mmap_physical[index] = page;
     }
-    Some(mmap_address(start))
+    Some(mmap_address(space.user_slot, start))
 }
 
 /// Writes file content into an already-mapped `process_mmap` region -
@@ -1501,7 +1836,7 @@ pub fn process_mmap(space: &mut ProcessAddressSpace, pages: usize, protection: u
 /// returned by `process_mmap`; `offset` is the byte offset within that
 /// mapping (not the file), so multi-chunk reads can call this repeatedly.
 pub fn process_mmap_write(
-    space: &ProcessAddressSpace,
+    space: &mut ProcessAddressSpace,
     address: u64,
     offset: usize,
     source: &[u8],
@@ -1509,7 +1844,8 @@ pub fn process_mmap_write(
     if source.is_empty() {
         return true;
     }
-    let Some(start_index) = mmap_index_for_address(address) else {
+    process_swap_in_all(space);
+    let Some(start_index) = mmap_index_for_address(space.user_slot, address) else {
         return false;
     };
     let Some(absolute_offset) = start_index
@@ -1552,7 +1888,7 @@ pub fn process_mprotect(
     pages: usize,
     protection: u8,
 ) -> bool {
-    let Some(start) = mmap_index_for_address(address) else {
+    let Some(start) = mmap_index_for_address(space.user_slot, address) else {
         return false;
     };
     if pages == 0 || start + pages > PROCESS_MMAP_PAGES {
@@ -1564,7 +1900,8 @@ pub fn process_mprotect(
     {
         return false;
     }
-    let Some(table) = process_table_physical(space.root_physical) else {
+    process_swap_in_all(space);
+    let Some(table) = process_table_physical(space.root_physical, space.user_slot) else {
         return false;
     };
     let flags = translate_protection(protection, space.nx_enabled);
@@ -1582,10 +1919,174 @@ pub fn process_mprotect(
         };
         unsafe {
             core::ptr::write_volatile(slot, space.mmap_physical[index] | flags);
-            invalidate(mmap_address(index));
+            invalidate(mmap_address(space.user_slot, index));
         }
     }
     true
+}
+
+/// A page-table entry of an evicted page: not present, holding its swap slot.
+const SWAPPED: u64 = 1 << 10;
+/// What `heap_physical`/`mmap_physical`/`stack_grown` hold for an evicted page.
+const SWAP_ENTRY: u64 = 1 << 63;
+const SWAP_CANDIDATES: usize =
+    PROCESS_HEAP_PAGES + PROCESS_MMAP_PAGES + PROCESS_STACK_MAX_GROWTH_PAGES;
+
+fn release_entry(entry: u64) {
+    if entry & SWAP_ENTRY != 0 {
+        crate::swap::release(entry & !SWAP_ENTRY);
+    } else if entry != 0 {
+        frame_release(entry);
+    }
+}
+
+/// Candidate `n` of the evictable pages (heap, then mmap, then grown stack):
+/// its page-table slot, what the process records for it and its flags.
+fn swap_page_info(space: &ProcessAddressSpace, n: usize) -> Option<(usize, u64, u64)> {
+    let nx = if space.nx_enabled { NO_EXECUTE } else { 0 };
+    if n < PROCESS_HEAP_PAGES {
+        return (n < space.heap_mapped).then(|| {
+            (
+                PROCESS_HEAP_FIRST_INDEX + n,
+                space.heap_physical[n],
+                PRESENT | WRITABLE | USER | nx,
+            )
+        });
+    }
+    let n = n - PROCESS_HEAP_PAGES;
+    if n < PROCESS_MMAP_PAGES {
+        return space.mmap_used[n].then(|| {
+            (
+                PROCESS_MMAP_FIRST_INDEX + n,
+                space.mmap_physical[n],
+                translate_protection(space.mmap_protection[n], space.nx_enabled),
+            )
+        });
+    }
+    let depth = n - PROCESS_MMAP_PAGES;
+    (space.stack_grown[depth] != 0).then(|| {
+        (
+            PROCESS_STACK_FIRST_INDEX - 1 - depth,
+            space.stack_grown[depth],
+            PRESENT | WRITABLE | USER | nx,
+        )
+    })
+}
+
+fn set_swap_entry(space: &mut ProcessAddressSpace, n: usize, value: u64) {
+    if n < PROCESS_HEAP_PAGES {
+        space.heap_physical[n] = value;
+    } else if n < PROCESS_HEAP_PAGES + PROCESS_MMAP_PAGES {
+        space.mmap_physical[n - PROCESS_HEAP_PAGES] = value;
+    } else {
+        space.stack_grown[n - PROCESS_HEAP_PAGES - PROCESS_MMAP_PAGES] = value;
+    }
+}
+
+fn swap_index_for_slot(slot: usize) -> Option<usize> {
+    if (PROCESS_HEAP_FIRST_INDEX..PROCESS_HEAP_FIRST_INDEX + PROCESS_HEAP_PAGES).contains(&slot) {
+        return Some(slot - PROCESS_HEAP_FIRST_INDEX);
+    }
+    if (PROCESS_MMAP_FIRST_INDEX..PROCESS_MMAP_FIRST_INDEX + PROCESS_MMAP_PAGES).contains(&slot) {
+        return Some(PROCESS_HEAP_PAGES + slot - PROCESS_MMAP_FIRST_INDEX);
+    }
+    if (PROCESS_STACK_LOWEST_INDEX..PROCESS_STACK_FIRST_INDEX).contains(&slot) {
+        return Some(
+            PROCESS_HEAP_PAGES + PROCESS_MMAP_PAGES + PROCESS_STACK_FIRST_INDEX - 1 - slot,
+        );
+    }
+    None
+}
+
+/// Writes one page of a process that is not running to swap and gives its
+/// frame back, trying candidates from `start` on. Returns where to continue,
+/// or `None` when nothing could be evicted (no swap, full, or nothing
+/// eligible: pages shared with a relative stay in memory).
+pub fn process_swap_out(space: &mut ProcessAddressSpace, start: usize) -> Option<usize> {
+    let table = process_table_physical(space.root_physical, space.user_slot)?;
+    let base = canonical_base(space.user_slot);
+    for step in 0..SWAP_CANDIDATES {
+        let n = (start + step) % SWAP_CANDIDATES;
+        let Some((slot, entry, _)) = swap_page_info(space, n) else {
+            continue;
+        };
+        if entry == 0 || entry & SWAP_ENTRY != 0 {
+            continue;
+        }
+        let pte_ptr = unsafe { (table as usize as *mut u64).add(slot) };
+        let pte = unsafe { core::ptr::read_volatile(pte_ptr) };
+        if pte & (PRESENT | COW) != PRESENT
+            || pte & ADDRESS_MASK != entry
+            || code_page_refcount(entry) > 1
+        {
+            continue;
+        }
+        let swap_slot = crate::swap::store(entry)?;
+        unsafe {
+            core::ptr::write_volatile(pte_ptr, SWAPPED | (swap_slot << 12));
+            invalidate(base + slot as u64 * PAGE_SIZE);
+        }
+        set_swap_entry(space, n, SWAP_ENTRY | swap_slot);
+        frame_release(entry);
+        return Some(n + 1);
+    }
+    None
+}
+
+/// Brings the evicted page at `address` back. False when it was not evicted
+/// or there is no memory or the disk fails.
+pub fn process_swap_in(space: &mut ProcessAddressSpace, address: u64) -> bool {
+    let base = canonical_base(space.user_slot);
+    if address < base {
+        return false;
+    }
+    let slot = ((address - base) / PAGE_SIZE) as usize;
+    let Some(n) = swap_index_for_slot(slot) else {
+        return false;
+    };
+    let Some(table) = process_table_physical(space.root_physical, space.user_slot) else {
+        return false;
+    };
+    let pte_ptr = unsafe { (table as usize as *mut u64).add(slot) };
+    let pte = unsafe { core::ptr::read_volatile(pte_ptr) };
+    if pte & (PRESENT | SWAPPED) != SWAPPED {
+        return false;
+    }
+    let swap_slot = (pte & ADDRESS_MASK) >> 12;
+    let Some((_, entry, flags)) = swap_page_info(space, n) else {
+        return false;
+    };
+    if entry != SWAP_ENTRY | swap_slot {
+        return false;
+    }
+    let Some(frame) = crate::memory::allocate_global() else {
+        return false;
+    };
+    let physical = frame.address();
+    if !crate::swap::load(swap_slot, physical) {
+        crate::memory::release_global_address(physical);
+        return false;
+    }
+    unsafe {
+        core::ptr::write_volatile(pte_ptr, physical | flags);
+        invalidate(base + slot as u64 * PAGE_SIZE);
+    }
+    set_swap_entry(space, n, physical);
+    crate::swap::release(swap_slot);
+    true
+}
+
+/// Brings every evicted page of the process back (before it is forked or
+/// its mappings are reshaped).
+pub fn process_swap_in_all(space: &mut ProcessAddressSpace) {
+    let base = canonical_base(space.user_slot);
+    for n in 0..SWAP_CANDIDATES {
+        if let Some((slot, entry, _)) = swap_page_info(space, n)
+            && entry & SWAP_ENTRY != 0
+        {
+            process_swap_in(space, base + slot as u64 * PAGE_SIZE);
+        }
+    }
 }
 
 static COW_FAULTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -1603,12 +2104,12 @@ pub fn cow_stats() -> (u64, u64) {
 /// give the writer a private copy (or, if it is the last owner, just make the
 /// page writable again). Returns false when the fault is not a COW fault.
 pub fn process_cow_fault(space: &mut ProcessAddressSpace, address: u64) -> bool {
-    let base = canonical_base(PROCESS_USER_SLOT);
+    let base = canonical_base(space.user_slot);
     if address < base {
         return false;
     }
     let slot = ((address - base) / PAGE_SIZE) as usize;
-    let Some(table) = process_table_physical(space.root_physical) else {
+    let Some(table) = process_table_physical(space.root_physical, space.user_slot) else {
         return false;
     };
     if slot >= PROCESS_RESERVED_PAGES {
@@ -1626,12 +2127,17 @@ pub fn process_cow_fault(space: &mut ProcessAddressSpace, address: u64) -> bool 
     let mmap_slot = slot
         .checked_sub(PROCESS_MMAP_FIRST_INDEX)
         .filter(|i| *i < PROCESS_MMAP_PAGES && space.mmap_used[*i]);
+    let stack_grown_slot = (PROCESS_STACK_LOWEST_INDEX..PROCESS_STACK_FIRST_INDEX)
+        .contains(&slot)
+        .then(|| PROCESS_STACK_FIRST_INDEX - 1 - slot);
     let owner_ok = if slot < PROCESS_CODE_PAGES {
         space.code_physical[slot] == old
     } else if let Some(index) = heap_slot {
         space.heap_physical[index] == old
     } else if let Some(index) = mmap_slot {
         space.mmap_physical[index] == old
+    } else if let Some(depth) = stack_grown_slot {
+        space.stack_grown[depth] == old
     } else {
         false
     };
@@ -1668,13 +2174,148 @@ pub fn process_cow_fault(space: &mut ProcessAddressSpace, address: u64) -> bool 
         space.heap_physical[index] = copy;
     } else if let Some(index) = mmap_slot {
         space.mmap_physical[index] = copy;
+    } else if let Some(depth) = stack_grown_slot {
+        space.stack_grown[depth] = copy;
     }
     frame_release(old);
     true
 }
 
+/// The physical address behind a user address of a process, if that page is
+/// present.
+pub fn process_translate(space: &ProcessAddressSpace, address: u64) -> Option<u64> {
+    let base = canonical_base(space.user_slot);
+    if address < base {
+        return None;
+    }
+    let slot = ((address - base) / PAGE_SIZE) as usize;
+    if slot >= PROCESS_RESERVED_PAGES {
+        return None;
+    }
+    let table = process_table_physical(space.root_physical, space.user_slot)?;
+    let entry = unsafe { core::ptr::read_volatile((table as usize as *const u64).add(slot)) };
+    (entry & PRESENT != 0).then(|| (entry & ADDRESS_MASK) + (address - base) % PAGE_SIZE)
+}
+
+/// Makes the page holding `address` the process's own, so a debugger can
+/// change it: a copy-on-write page is copied, and a read-only page still
+/// shared with another process (program text after a fork) gets a private
+/// copy with the same permissions.
+pub fn process_make_private(space: &mut ProcessAddressSpace, address: u64) -> bool {
+    let base = canonical_base(space.user_slot);
+    if address < base {
+        return false;
+    }
+    let slot = ((address - base) / PAGE_SIZE) as usize;
+    let Some(table) = process_table_physical(space.root_physical, space.user_slot) else {
+        return false;
+    };
+    if slot >= PROCESS_RESERVED_PAGES {
+        return false;
+    }
+    let entry_ptr = unsafe { (table as usize as *mut u64).add(slot) };
+    let entry = unsafe { core::ptr::read_volatile(entry_ptr) };
+    if entry & PRESENT == 0 {
+        return false;
+    }
+    if entry & COW != 0 {
+        return process_cow_fault(space, address);
+    }
+    let old = entry & ADDRESS_MASK;
+    if code_page_refcount(old) <= 1 {
+        return true;
+    }
+    let heap_slot = slot
+        .checked_sub(PROCESS_HEAP_FIRST_INDEX)
+        .filter(|i| *i < space.heap_mapped);
+    let mmap_slot = slot
+        .checked_sub(PROCESS_MMAP_FIRST_INDEX)
+        .filter(|i| *i < PROCESS_MMAP_PAGES && space.mmap_used[*i]);
+    let stack_grown_slot = (PROCESS_STACK_LOWEST_INDEX..PROCESS_STACK_FIRST_INDEX)
+        .contains(&slot)
+        .then(|| PROCESS_STACK_FIRST_INDEX - 1 - slot);
+    let owned = if slot < PROCESS_CODE_PAGES {
+        space.code_physical[slot] == old
+    } else if let Some(index) = heap_slot {
+        space.heap_physical[index] == old
+    } else if let Some(index) = mmap_slot {
+        space.mmap_physical[index] == old
+    } else if let Some(depth) = stack_grown_slot {
+        space.stack_grown[depth] == old
+    } else {
+        false
+    };
+    if !owned {
+        return false;
+    }
+    let Some(frame) = crate::memory::allocate_global() else {
+        return false;
+    };
+    let copy = frame.address();
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            old as usize as *const u8,
+            copy as usize as *mut u8,
+            PAGE_SIZE as usize,
+        );
+        core::ptr::write_volatile(entry_ptr, copy | (entry & !ADDRESS_MASK));
+        invalidate(base + slot as u64 * PAGE_SIZE);
+    }
+    if slot < PROCESS_CODE_PAGES {
+        space.code_physical[slot] = copy;
+    } else if let Some(index) = heap_slot {
+        space.heap_physical[index] = copy;
+    } else if let Some(index) = mmap_slot {
+        space.mmap_physical[index] = copy;
+    } else if let Some(depth) = stack_grown_slot {
+        space.stack_grown[depth] = copy;
+    }
+    frame_release(old);
+    true
+}
+
+/// On-demand user stack growth: a not-present fault just below whatever is
+/// currently mapped, still inside the reserved growth zone, gets a fresh
+/// zeroed frame instead of crashing the process. Growth only ever proceeds
+/// one page below whatever is already mapped - a fault further down (past
+/// an unmapped gap) is a genuine overflow past `PROCESS_STACK_MAX_GROWTH_PAGES`,
+/// not growth, and is refused so it falls through to the normal SIGSEGV path.
+pub fn process_stack_fault(space: &mut ProcessAddressSpace, address: u64) -> bool {
+    let base = canonical_base(space.user_slot);
+    if address < base {
+        return false;
+    }
+    let slot = ((address - base) / PAGE_SIZE) as usize;
+    if !(PROCESS_STACK_LOWEST_INDEX..PROCESS_STACK_FIRST_INDEX).contains(&slot) {
+        return false;
+    }
+    let depth = PROCESS_STACK_FIRST_INDEX - 1 - slot;
+    if space.stack_grown[depth] != 0 {
+        return false;
+    }
+    let already_mapped_above = depth == 0 || space.stack_grown[depth - 1] != 0;
+    if !already_mapped_above {
+        return false;
+    }
+    let Some(table) = process_table_physical(space.root_physical, space.user_slot) else {
+        return false;
+    };
+    let Some(frame) = crate::memory::allocate_global() else {
+        return false;
+    };
+    let physical = frame.address();
+    let flags = PRESENT | WRITABLE | USER | if space.nx_enabled { NO_EXECUTE } else { 0 };
+    unsafe {
+        zero_page(physical);
+        core::ptr::write_volatile((table as usize as *mut u64).add(slot), physical | flags);
+        invalidate(base + slot as u64 * PAGE_SIZE);
+    }
+    space.stack_grown[depth] = physical;
+    true
+}
+
 pub fn process_munmap(space: &mut ProcessAddressSpace, address: u64, pages: usize) -> bool {
-    let Some(start) = mmap_index_for_address(address) else {
+    let Some(start) = mmap_index_for_address(space.user_slot, address) else {
         return false;
     };
     if pages == 0 || start + pages > PROCESS_MMAP_PAGES {
@@ -1686,7 +2327,7 @@ pub fn process_munmap(space: &mut ProcessAddressSpace, address: u64, pages: usiz
     {
         return false;
     }
-    let Some(table) = process_table_physical(space.root_physical) else {
+    let Some(table) = process_table_physical(space.root_physical, space.user_slot) else {
         return false;
     };
     for index in start..start + pages {
@@ -1695,9 +2336,9 @@ pub fn process_munmap(space: &mut ProcessAddressSpace, address: u64, pages: usiz
                 (table as usize as *mut u64).add(PROCESS_MMAP_FIRST_INDEX + index),
                 0,
             );
-            invalidate(mmap_address(index));
+            invalidate(mmap_address(space.user_slot, index));
         }
-        frame_release(space.mmap_physical[index]);
+        release_entry(space.mmap_physical[index]);
         space.mmap_used[index] = false;
         space.mmap_protection[index] = 0;
         space.mmap_physical[index] = 0;
@@ -2224,6 +2865,12 @@ fn user_page_accessible(address: u64, write: bool) -> bool {
         // A copy-on-write page is writable once it has been un-shared; do
         // that now so a syscall can fill a buffer that is still shared
         // with a forked relative.
+        if level == indices.len() - 1
+            && entry & (PRESENT | SWAPPED) == SWAPPED
+            && crate::scheduler::handle_swap_fault_current(address)
+        {
+            entry = unsafe { core::ptr::read_volatile((table as usize as *const u64).add(*index)) };
+        }
         if write
             && level == indices.len() - 1
             && entry & (PRESENT | USER | WRITABLE | COW) == PRESENT | USER | COW

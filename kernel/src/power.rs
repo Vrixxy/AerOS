@@ -16,6 +16,8 @@ pub struct PowerReport {
     pub pm1a_control_block: u32,
     pub pm1b_control_block: u32,
     pub ready: bool,
+    /// The sleep type came from the AML interpreter.
+    pub s5_interpreted: bool,
 }
 
 impl PowerReport {
@@ -28,6 +30,7 @@ impl PowerReport {
         pm1a_control_block: 0,
         pm1b_control_block: 0,
         ready: false,
+        s5_interpreted: false,
     };
 }
 
@@ -53,6 +56,12 @@ pub fn inspect(acpi: &AcpiInfo) -> PowerReport {
     report.dsdt_present = true;
     if let Some((typ_a, typ_b)) = unsafe { scan_s5(base, length) } {
         report.s5_found = true;
+        report.slp_typ_a = typ_a;
+        report.slp_typ_b = typ_b;
+    }
+    if let Some((typ_a, typ_b)) = crate::acpi_ns::sleep_type(5) {
+        report.s5_found = true;
+        report.s5_interpreted = true;
         report.slp_typ_a = typ_a;
         report.slp_typ_b = typ_b;
     }

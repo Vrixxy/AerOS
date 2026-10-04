@@ -824,7 +824,7 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> XhciReport
     // ring + ERST, input context, per-device contexts/rings/buffers.
     let scratch_pages = ((params2 >> 21) & 0x1f) | (((params2 >> 27) & 0x1f) << 5);
     let total_pages = 6 + PAGES_PER_DEVICE * MAX_DEVICES as u64 + scratch_pages as u64;
-    let Some(dma) = frames.allocate_contiguous(total_pages, 1) else {
+    let Some(dma) = frames.allocate_dma(total_pages, 1) else {
         return report;
     };
     let memory = dma.address();

@@ -198,6 +198,24 @@ pub fn online_mask() -> u64 {
     ONLINE.load(Ordering::Acquire)
 }
 
+/// Sends the work interrupt to a processor, which wakes it from idle.
+pub fn wake(logical: usize) -> bool {
+    let Some(observed) = OBSERVED_IDS.get(logical) else {
+        return false;
+    };
+    let apic_id = observed.load(Ordering::Acquire);
+    apic_id != u32::MAX && arch::apic::send_fixed(apic_id, 51)
+}
+
+/// The logical number of the processor this runs on.
+#[cfg_attr(not(feature = "boot-test"), allow(dead_code))]
+pub fn current_logical() -> Option<usize> {
+    let apic_id = arch::apic::current_id();
+    OBSERVED_IDS
+        .iter()
+        .position(|observed| observed.load(Ordering::Acquire) == apic_id)
+}
+
 fn failed_report(discovered: u8, bsp_id: u32, trampoline: u64) -> SmpReport {
     SmpReport {
         discovered,
@@ -524,6 +542,10 @@ extern "sysv64" fn aeros_ap_entry(logical: u32, expected_apic_id: u32) -> ! {
     }
     IDLE.fetch_or(1 << (logical - 1), Ordering::AcqRel);
     loop {
+        arch::disable_interrupts();
+        if crate::smpsched::run_next(logical) {
+            continue;
+        }
         unsafe {
             core::arch::asm!("sti; hlt", options(nomem, nostack));
         }

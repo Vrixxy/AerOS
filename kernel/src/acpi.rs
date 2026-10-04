@@ -188,6 +188,60 @@ pub unsafe fn inspect(rsdp_address: u64) -> AcpiInfo {
     info
 }
 
+/// Calls `visit(signature, address, length)` for every valid table the root
+/// table lists.
+pub unsafe fn each_table(info: &AcpiInfo, mut visit: impl FnMut([u8; 4], u64, usize)) {
+    if !info.valid {
+        return;
+    }
+    let root = info.root_table as usize as *const u8;
+    let entry_size = if info.revision >= 2 { 8 } else { 4 };
+    let length = unsafe { read_u32(root.add(4)) } as usize;
+    let count = (length.saturating_sub(SDT_HEADER_SIZE) / entry_size).min(MAX_ROOT_ENTRIES);
+    for index in 0..count {
+        let entry = unsafe { root.add(SDT_HEADER_SIZE + index * entry_size) };
+        let address = if entry_size == 8 {
+            unsafe { read_u64(entry) }
+        } else {
+            unsafe { read_u32(entry) as u64 }
+        };
+        if address == 0 {
+            continue;
+        }
+        let table = address as usize as *const u8;
+        if let Some(length) = unsafe { validate_sdt(table, None) } {
+            visit(unsafe { read_signature4(table) }, address, length);
+        }
+    }
+}
+
+/// The address and length of the first valid table named `signature`.
+pub unsafe fn find_table(info: &AcpiInfo, signature: [u8; 4]) -> Option<(u64, usize)> {
+    if !info.valid {
+        return None;
+    }
+    let root = info.root_table as usize as *const u8;
+    let entry_size = if info.revision >= 2 { 8 } else { 4 };
+    let length = unsafe { read_u32(root.add(4)) } as usize;
+    let count = (length.saturating_sub(SDT_HEADER_SIZE) / entry_size).min(MAX_ROOT_ENTRIES);
+    for index in 0..count {
+        let entry = unsafe { root.add(SDT_HEADER_SIZE + index * entry_size) };
+        let address = if entry_size == 8 {
+            unsafe { read_u64(entry) }
+        } else {
+            unsafe { read_u32(entry) as u64 }
+        };
+        if address == 0 {
+            continue;
+        }
+        let table = address as usize as *const u8;
+        if let Some(length) = unsafe { validate_sdt(table, Some(signature)) } {
+            return Some((address, length));
+        }
+    }
+    None
+}
+
 unsafe fn parse_fadt(info: &mut AcpiInfo) {
     let base = info.facp_address as usize as *const u8;
     let Some(length) = (unsafe { validate_sdt(base, Some(*b"FACP")) }) else {

@@ -118,10 +118,38 @@ impl Clipboard {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    /// Drops every entry and wipes their bytes - not just `count`/`lens`.
+    /// The desktop calls this on lock specifically so a locked screen
+    /// cannot read what was copied, so leaving the actual text sitting
+    /// untouched in `data` (readable again the moment something reused the
+    /// same `count`/`lens` bookkeeping, or by anything reading raw memory)
+    /// would defeat half the point.
     pub fn clear(&mut self) {
         self.count = 0;
         self.lens = [0; CLIP_HISTORY];
+        crate::auth::wipe(&mut self.data);
     }
+}
+
+/// Exercises the real global clipboard (a fresh local `Clipboard` would put
+/// `CLIP_ENTRY * CLIP_HISTORY` (128 KiB) on the stack, which this kernel's
+/// stacks are not sized for) - safe to run this early in boot, before the
+/// desktop or anything else has touched it, and it leaves the clipboard
+/// empty afterward, which is the correct state at boot anyway.
+pub fn self_test() -> bool {
+    let clipboard = get();
+    clipboard.clear();
+    let empty = clipboard.len() == 0 && clipboard.current().is_none();
+    let pushed = clipboard.push(b"AerOS clipboard self-test secret");
+    let visible = clipboard.current() == Some(b"AerOS clipboard self-test secret".as_slice());
+    // The byte just below the entry it was stored in - proof `clear` really
+    // wipes `data`, not just the `count`/`lens` bookkeeping that `current`
+    // reads through.
+    let raw_byte_before_clear = clipboard.data[0];
+    clipboard.clear();
+    let cleared = clipboard.len() == 0 && clipboard.current().is_none();
+    let wiped = clipboard.data.iter().all(|&byte| byte == 0);
+    empty && pushed && visible && raw_byte_before_clear != 0 && cleared && wiped
 }
 
 fn trim_to_char_edge(bytes: &[u8], max: usize) -> &[u8] {

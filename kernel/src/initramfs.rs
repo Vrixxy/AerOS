@@ -7,9 +7,13 @@ pub static FAULT_ELF: [u8; 0x1002] = make_fault_elf();
 pub static COMPILED_INIT: &[u8] = include_bytes!("../../assets/userspace/aeros-init");
 pub static STD_SMOKE: &[u8] = include_bytes!("../../assets/userspace/aeros-std-smoke");
 pub static FORK_PROBE: &[u8] = include_bytes!("../../assets/userspace/aeros-fork-probe");
+pub static THREADS: &[u8] = include_bytes!("../../assets/userspace/aeros-threads");
+pub static PTRACE: &[u8] = include_bytes!("../../assets/userspace/aeros-ptrace");
+pub static SWAP: &[u8] = include_bytes!("../../assets/userspace/aeros-swap");
+pub static BENCH: &[u8] = include_bytes!("../../assets/userspace/aeros-bench");
 pub static RELEASE: &[u8] = b"AerOS 0.1.0 x86_64\n";
 
-pub fn entries() -> [InitramfsEntry; 6] {
+pub fn entries() -> [InitramfsEntry; 10] {
     [
         InitramfsEntry {
             path: "/bin/init",
@@ -39,6 +43,26 @@ pub fn entries() -> [InitramfsEntry; 6] {
         InitramfsEntry {
             path: "/bin/aeros-fork-probe",
             data: FORK_PROBE,
+            mode: 0o555,
+        },
+        InitramfsEntry {
+            path: "/bin/aeros-threads",
+            data: THREADS,
+            mode: 0o555,
+        },
+        InitramfsEntry {
+            path: "/bin/aeros-ptrace",
+            data: PTRACE,
+            mode: 0o555,
+        },
+        InitramfsEntry {
+            path: "/bin/aeros-swap",
+            data: SWAP,
+            mode: 0o555,
+        },
+        InitramfsEntry {
+            path: "/bin/aeros-bench",
+            data: BENCH,
             mode: 0o555,
         },
     ]

@@ -182,6 +182,18 @@ impl InterruptFrame {
         }
     }
 
+    /// A trap or fault of a traced task in user mode goes to its tracer first.
+    fn user_trap(&mut self, signal: u64, fault: bool) -> crate::syscall::Trap {
+        let Some(mut regs) = self.user_regs() else {
+            return crate::syscall::Trap::Fault;
+        };
+        let outcome = crate::syscall::debug_trap(&mut regs, signal, fault);
+        if matches!(outcome, crate::syscall::Trap::Resume) {
+            self.set_user_regs(&regs);
+        }
+        outcome
+    }
+
     pub fn set_return(&mut self, rip: u64, rsp: u64) {
         self.rip = rip;
         let base = self as *mut InterruptFrame as *mut u64;
@@ -415,6 +427,15 @@ pub fn self_test() -> bool {
 extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
     let frame = unsafe { &mut *frame };
     match frame.vector {
+        1 | 3 if frame.cs & 3 == 3 && crate::scheduler::is_traced() => {
+            match frame.user_trap(5, false) {
+                crate::syscall::Trap::Exit(code) => {
+                    user::set_exit_code(code);
+                    1
+                }
+                _ => 0,
+            }
+        }
         3 => {
             BREAKPOINT_HIT.store(true, Ordering::Release);
             0
@@ -549,7 +570,9 @@ extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
             let fault_address = if frame.vector == 14 { read_cr2() } else { 0 };
             if frame.vector == 14
                 && frame.error & 1 == 0
-                && super::paging::handle_demand_fault(fault_address)
+                && (super::paging::handle_demand_fault(fault_address)
+                    || crate::scheduler::handle_swap_fault_current(fault_address)
+                    || crate::scheduler::handle_stack_growth_fault_current(fault_address))
             {
                 return 0;
             }
@@ -561,7 +584,39 @@ extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
             {
                 return 0;
             }
+            if frame.cs & 3 == 3 && frame.vector < 32 && crate::scheduler::is_traced() {
+                let signal = match frame.vector {
+                    0 | 16 | 19 => 8,
+                    6 => 4,
+                    17 => 7,
+                    _ => 11,
+                };
+                match frame.user_trap(signal, true) {
+                    crate::syscall::Trap::Resume => return 0,
+                    crate::syscall::Trap::Exit(code) => {
+                        user::set_exit_code(code);
+                        return 1;
+                    }
+                    crate::syscall::Trap::Fault => {}
+                }
+            }
             if frame.cs & 3 == 3 && frame.vector < 32 {
+                #[cfg(feature = "boot-test")]
+                serial::format(format_args!(
+                    "AEROS_USER_FAULT task={} vector={} error={:#x} address={:#x} rip={:#x}\n",
+                    crate::scheduler::current_task_id(),
+                    frame.vector,
+                    frame.error,
+                    fault_address,
+                    frame.rip
+                ));
+                crate::crash::record(
+                    crate::scheduler::current_task_id(),
+                    frame.vector,
+                    frame.error,
+                    fault_address,
+                    frame.rip,
+                );
                 user::terminate_fault(frame.vector, frame.error, fault_address);
                 return 1;
             }

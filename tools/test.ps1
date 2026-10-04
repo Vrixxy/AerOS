@@ -1,6 +1,7 @@
 param(
-    [ValidateRange(2, 8)]
-    [int]$CpuCount = 2
+    [ValidateRange(1, 8)]
+    [int]$CpuCount = 2,
+    [int]$MemoryMiB = 512
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,8 +22,9 @@ if (Test-Path -LiteralPath $serial) {
 # from a previous run so the VFS node/byte-count assertions below stay
 # deterministic regardless of prior test history (these only become visible
 # to a *later* boot's /data enumeration, since they're written after that
-# boot's own VFS mount).
-foreach ($name in @("aerosfs.txt", "persist.txt")) {
+# boot's own VFS mount). The audit log (kernel/src/audit.rs) persists to
+# /data too and otherwise grows across every run, same reason.
+foreach ($name in @("aerosfs.txt", "persist.txt", "audit.log", "CRASHT.BIN")) {
     $artifact = Join-Path $root "build\esp\$name"
     if (Test-Path -LiteralPath $artifact) {
         Remove-Item -Force -LiteralPath $artifact
@@ -31,6 +33,13 @@ foreach ($name in @("aerosfs.txt", "persist.txt")) {
 $testDirArtifact = Join-Path $root "build\esp\testdir"
 if (Test-Path -LiteralPath $testDirArtifact) {
     Remove-Item -Force -Recurse -LiteralPath $testDirArtifact
+}
+# AerOS Shield's quarantine now lives on /data (so it survives a restart)
+# instead of /tmp; a leftover from an earlier live/manual run would likewise
+# throw off the VFS node count.
+$quarantineArtifact = Join-Path $root "build\esp\quar"
+if (Test-Path -LiteralPath $quarantineArtifact) {
+    Remove-Item -Force -Recurse -LiteralPath $quarantineArtifact
 }
 
 # A 4 MiB scratch NVMe namespace: sector 0 carries the signature the driver
@@ -63,21 +72,26 @@ $homeMarker = [System.Text.Encoding]::ASCII.GetBytes("AEROS-DATA-BLANK")
 $audioCapture = Join-Path $root "build\audio-test.wav"
 Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $audioCapture
 $virtioImage = Join-Path $root "build\virtio-blk-test.img"
-$virtioBytes = New-Object byte[] (1MB)
+$virtioBytes = New-Object byte[] (8MB)
 $virtioSignature = [System.Text.Encoding]::ASCII.GetBytes("AEROS-VIRTIO-BLK")
 [Array]::Copy($virtioSignature, $virtioBytes, $virtioSignature.Length)
+# A swap area from sector 4096: the first page carries the swap signature.
+$swapSignature = [System.Text.Encoding]::ASCII.GetBytes("SWAPSPACE2")
+[Array]::Copy($swapSignature, 0, $virtioBytes, 4096 * 512 + 4086, $swapSignature.Length)
 [System.IO.File]::WriteAllBytes($virtioImage, $virtioBytes)
 $hdaCapture = Join-Path $root "build\hda-test.wav"
 Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $hdaCapture
 $arguments = @(
     "-machine", "q35,accel=whpx:tcg",
-    "-m", "512M",
+    "-m", "${MemoryMiB}M",
     "-smp", "$CpuCount",
     "-cpu", "qemu64,+nx,+smep,+smap,+xsave,+xsaveopt,+rdrand,+rdtscp,+pdpe1gb",
     "-drive", "if=pflash,format=raw,unit=0,readonly=on,file=$firmware",
     "-drive", "if=pflash,format=raw,unit=1,file=$variables",
     "-drive", "format=raw,file=fat:rw:$esp",
     "-drive", "file=$homeImage,format=raw,if=ide,index=1",
+    "-device", "amd-iommu,dma-remap=on",
+    "-device", "edu",
     "-device", "virtio-vga",
     "-drive", "file=$nvmeImage,if=none,id=nvm0,format=raw",
     "-device", "nvme,drive=nvm0,serial=aeros0",
@@ -96,13 +110,17 @@ $arguments = @(
     "-drive", "file=$sdImage,if=none,id=sd0,format=raw",
     "-device", "sdhci-pci",
     "-device", "sd-card,drive=sd0",
-    "-nic", "user,model=e1000e",
+    "-nic", "user,model=e1000e,hostfwd=tcp::17654-:17654,hostfwd=tcp::17655-:17655",
     "-netdev", "user,id=rtlnet,net=10.10.0.0/24",
     "-device", "rtl8139,netdev=rtlnet",
     "-netdev", "user,id=vnet0,net=10.9.0.0/24",
     "-device", "virtio-net-pci,netdev=vnet0,disable-modern=on,disable-legacy=off",
     "-drive", "file=$virtioImage,if=none,id=vblk0,format=raw",
     "-device", "virtio-blk-pci,drive=vblk0,disable-modern=on,disable-legacy=off",
+    # Modern-transport-only (no legacy fallback exists for this device type),
+    # unlike virtio-net/virtio-blk above - exercises virtio_modern.rs/
+    # virtio_input.rs, the real touchscreen driver.
+    "-device", "virtio-multitouch-pci,disable-modern=off,disable-legacy=on",
     "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
     "-display", "none",
     "-serial", "file:$serial",
@@ -118,7 +136,145 @@ $start.Arguments = $quoted -join " "
 $start.UseShellExecute = $false
 $start.CreateNoWindow = $true
 $process = [System.Diagnostics.Process]::Start($start)
-$deadline = [DateTime]::UtcNow.AddSeconds(90)
+
+# Real end-to-end proof of the TCP server self-test (kernel/src/net.rs):
+# connect in from the host over the hostfwd rule above, send bytes, and
+# check the kernel echoed them back - the guest's own serial log is checked
+# separately below. Bounded per-attempt so "not listening yet" fails fast
+# instead of hanging on the OS's own connect timeout.
+function Test-AerosTcpEcho {
+    param([int]$Port, [int]$TimeoutMs)
+    $client = [System.Net.Sockets.TcpClient]::new()
+    try {
+        $result = $client.BeginConnect("127.0.0.1", $Port, $null, $null)
+        if (-not $result.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+            return $null
+        }
+        $client.EndConnect($result)
+        $stream = $client.GetStream()
+        $stream.ReadTimeout = 3000
+        $message = [System.Text.Encoding]::ASCII.GetBytes("AEROS-TCP-SERVER-TEST")
+        $stream.Write($message, 0, $message.Length)
+        $buffer = New-Object byte[] 64
+        $read = $stream.Read($buffer, 0, $buffer.Length)
+        if ($read -eq 0) {
+            # The connection closed (or raced) before any echo arrived - not
+            # a definitive failure, just try again like a failed connect.
+            return $null
+        }
+        return [System.Text.Encoding]::ASCII.GetString($buffer, 0, $read)
+    } catch {
+        return $null
+    } finally {
+        $client.Close()
+    }
+}
+# Pushes a patterned buffer through the guest's socket-API echo server and
+# checks every byte comes back in order: multi-segment send, window updates,
+# and an orderly close, all over the real card.
+function Test-AerosTcpBulk {
+    param([int]$Port, [int]$Bytes, [int]$TimeoutMs)
+    $client = [System.Net.Sockets.TcpClient]::new()
+    try {
+        $result = $client.BeginConnect("127.0.0.1", $Port, $null, $null)
+        if (-not $result.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+            return $null
+        }
+        $client.EndConnect($result)
+        $stream = $client.GetStream()
+        $stream.ReadTimeout = 15000
+        $data = New-Object byte[] $Bytes
+        for ($index = 0; $index -lt $Bytes; $index++) {
+            $data[$index] = (($index * 31) + 7) -band 255
+        }
+        $sender = $stream.WriteAsync($data, 0, $Bytes)
+        $received = New-Object byte[] $Bytes
+        $total = 0
+        while ($total -lt $Bytes) {
+            $read = $stream.Read($received, $total, $Bytes - $total)
+            if ($read -eq 0) { break }
+            $total += $read
+        }
+        $sender.Wait(15000) | Out-Null
+        $client.Client.Shutdown([System.Net.Sockets.SocketShutdown]::Send)
+        $extra = $stream.Read((New-Object byte[] 16), 0, 16)
+        $same = ($total -eq $Bytes)
+        if ($same) {
+            for ($index = 0; $index -lt $Bytes; $index++) {
+                if ($received[$index] -ne $data[$index]) { $same = $false; break }
+            }
+        }
+        return ($same -and $extra -eq 0)
+    } catch {
+        return $null
+    } finally {
+        $client.Close()
+    }
+}
+# A one-shot HTTP server on the host's loopback for the guest's HTTP client to
+# download from through the card (the guest reaches the host as 10.0.2.2).
+$httpScript = {
+    param($address, $port)
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse($address), $port)
+    $listener.Start()
+    try {
+        $deadline = [DateTime]::UtcNow.AddSeconds(420)
+        while (-not $listener.Pending() -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 50 }
+        if (-not $listener.Pending()) { return "no connection" }
+        $client = $listener.AcceptTcpClient()
+        $stream = $client.GetStream()
+        $request = New-Object System.Text.StringBuilder
+        $buffer = New-Object byte[] 512
+        while (-not $request.ToString().Contains("`r`n`r`n")) {
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            if ($read -eq 0) { break }
+            [void]$request.Append([System.Text.Encoding]::ASCII.GetString($buffer, 0, $read))
+        }
+        $body = New-Object byte[] 6000
+        for ($index = 0; $index -lt 6000; $index++) { $body[$index] = 97 + ($index % 26) }
+        $head = [System.Text.Encoding]::ASCII.GetBytes("HTTP/1.1 200 OK`r`nContent-Type: text/plain`r`nContent-Length: 6000`r`nConnection: close`r`n`r`n")
+        $stream.Write($head, 0, $head.Length)
+        $stream.Write($body, 0, $body.Length)
+        $stream.Flush()
+        $client.Close()
+        return ($request.ToString() -split "`r`n")[0]
+    } finally {
+        $listener.Stop()
+    }
+}
+$httpServer = Start-Job -ArgumentList "127.0.0.1", 18080 -ScriptBlock $httpScript
+$httpServer6 = Start-Job -ArgumentList "::1", 18081 -ScriptBlock $httpScript
+$tcpServerEcho = $null
+# The guest's listener is single-shot and latches onto the first SYN it sees.
+# Connections opened while it was still booting leave slirp retrying a SYN for
+# a host socket that is already gone, so only start once the guest says it is
+# listening.
+$listenDeadline = [DateTime]::UtcNow.AddSeconds(180)
+while ([DateTime]::UtcNow -lt $listenDeadline -and -not $process.HasExited) {
+    if ((Test-Path -LiteralPath $serial) -and
+        ([string](Get-Content -Raw -LiteralPath $serial)) -match "AEROS_TCP_LISTENING") { break }
+    Start-Sleep -Milliseconds 100
+}
+$tcpServerDeadline = [DateTime]::UtcNow.AddSeconds(10)
+while ([DateTime]::UtcNow -lt $tcpServerDeadline -and $null -eq $tcpServerEcho) {
+    $tcpServerEcho = Test-AerosTcpEcho -Port 17654 -TimeoutMs 1000
+    if ($null -eq $tcpServerEcho) { Start-Sleep -Milliseconds 300 }
+}
+
+$netListenDeadline = [DateTime]::UtcNow.AddSeconds(60)
+while ([DateTime]::UtcNow -lt $netListenDeadline -and -not $process.HasExited) {
+    if ((Test-Path -LiteralPath $serial) -and
+        ([string](Get-Content -Raw -LiteralPath $serial)) -match "AEROS_TCP_NET_LISTENING") { break }
+    Start-Sleep -Milliseconds 100
+}
+$tcpBulk = $null
+$bulkDeadline = [DateTime]::UtcNow.AddSeconds(20)
+while ([DateTime]::UtcNow -lt $bulkDeadline -and $null -eq $tcpBulk -and -not $process.HasExited) {
+    $tcpBulk = Test-AerosTcpBulk -Port 17655 -Bytes 30000 -TimeoutMs 1000
+    if ($null -eq $tcpBulk) { Start-Sleep -Milliseconds 300 }
+}
+
+$deadline = [DateTime]::UtcNow.AddSeconds(240)
 $output = ""
 
 while ([DateTime]::UtcNow -lt $deadline) {
@@ -139,7 +295,7 @@ if (-not $process.HasExited) {
     $process.WaitForExit()
 }
 if ($output -notmatch "AEROS_READY") {
-    throw "AerOS did not reach the ready state`n$output"
+    throw "AerOS did not reach the ready state (QEMU exited: $($process.HasExited), exit code: $(if ($process.HasExited) { $process.ExitCode } else { 'still running' }))`n$output"
 }
 if ($output -notmatch "allocator_test=true") {
     throw "AerOS allocator self-test failed`n$output"
@@ -177,7 +333,7 @@ if ($output -notmatch "AEROS_HPET present=true base=0x[1-9a-f][0-9a-f]* period_f
 if ($output -notmatch "AEROS_RTC year=20[2-9][0-9] month=([1-9]|1[0-2]) day=([1-9]|[12][0-9]|3[01]) hour=([0-9]|1[0-9]|2[0-3]) minute=([0-9]|[1-5][0-9]) second=([0-9]|[1-5][0-9]) unix_seconds=[1-9][0-9]{9,} verified=true") {
     throw "AerOS RTC wall-clock validation failed`n$output"
 }
-if ($output -notmatch "AEROS_ENTROPY .* hardware_words=([8-9]|[1-9][0-9]+) sample_a_nonzero=true sample_b_nonzero=true distinct=true chacha20=true aslr=true verified=true") {
+if ($output -notmatch "AEROS_ENTROPY .* hardware_words=([8-9]|[1-9][0-9]+) sample_a_nonzero=true sample_b_nonzero=true distinct=true chacha20=true aslr=true process_aslr=true verified=true") {
     throw "AerOS entropy and ASLR validation failed`n$output"
 }
 if ($output -notmatch "AEROS_COMPAT guest=debian13-amd64 vmx=(true|false) svm=(true|false) npt=(true|false) nested=(true|false) hardware_acceleration=(true|false) software_emulation=false static=native dynamic=guest script=guest malformed=reject readonly_base=true per_app_overlay=true host_files_default_deny=true devices_default_deny=true bridge_protocol=true verified=true") {
@@ -210,7 +366,7 @@ if ($output -notmatch "AEROS_HEAP .* active=0 verified=true") {
 if ($output -notmatch "AEROS_USER .* exit=42 smep=true smap=true mapped=true verified=true") {
     throw "AerOS ring-3 transition failed`n$output"
 }
-if ($output -notmatch "AEROS_VFS nodes=[0-9]+ directories=7 files=[0-9]+ bytes=[0-9]+ handles=0 mutable_files=0 mutable_bytes=0 readonly_root=true verified=true") {
+if ($output -notmatch "AEROS_VFS nodes=[0-9]+ directories=11 files=[0-9]+ bytes=[0-9]+ handles=0 mutable_files=0 mutable_bytes=0 readonly_root=true verified=true") {
     throw "AerOS VFS validation failed`n$output"
 }
 if ($output -notmatch "AEROS_ELF type=pie machine=x86_64 segments=3 .* wx=false verified=true") {
@@ -237,7 +393,7 @@ if ($output -notmatch "AEROS_REAP mappings=5 released_pages=[1-9][0-9]* free_bef
 if ($output -notmatch "AEROS_PROCESSES spawned=4 reaped=4 highest_pid=4 ready=0 running=0 zombies=0 generations=true init_exit=73 compiled_exit=74 std_exit=75 fault_exit=132 verified=true") {
     throw "AerOS process table validation failed`n$output"
 }
-if ($output -notmatch "AEROS_TMPFS path=/tmp nodes=[0-9]+ directories=7 files=[0-9]+ mutable_files=1 mutable_bytes=6 handles=0 verified=true") {
+if ($output -notmatch "AEROS_TMPFS path=/tmp nodes=[0-9]+ directories=11 files=[0-9]+ mutable_files=1 mutable_bytes=6 handles=0 verified=true") {
     throw "AerOS writable tmpfs validation failed`n$output"
 }
 if ($output -notmatch "AEROS_SYSCALL .* calls=161 bootstrap=2 linux=159 exits=4 unknown=0 opens=13 reads=12 writes=10 closes=17 io_bytes=264 clocks=1 random_calls=1 random_bytes=32 compat_calls=73 memory_calls=15 mmaps=5 file_mmaps=1 mprotects=2 munmaps=4 metadata=9 seeks=2 paths=12 resources=1 rseq=1 futex=1 fd_calls=10 dup_calls=4 last_fd=3 signals=12 runtime=8 directories=1 sockets=4 datagrams=2 network_bytes=[3-9][0-9]+ vectored=2 positional=1 access=1 statx=1 wall_clock=2 sleeps=2 chdir=1 relative_paths=5 polls=1 creates=2 renames=2 removes=5 syncs=2 truncates=1 chmods=1 verified=true") {
@@ -260,6 +416,12 @@ if ($output -notmatch "AEROS_VIRTIO_BLK present=true .* read=true write_probe=tr
 }
 if ($output -notmatch "AEROS_VIRTIO_NET present=true .* arp_reply=true verified=true") {
     throw "AerOS virtio-net driver validation failed`n$output"
+}
+if ($output -notmatch "AEROS_VIRTIO_INPUT present=true queue_ready=true abs_x_span=[1-9][0-9]* abs_y_span=[1-9][0-9]* verified=true") {
+    throw "AerOS virtio-input (touchscreen) driver validation failed`n$output"
+}
+if ($output -notmatch "AEROS_VIRTIO_GPU present=true queue_ready=true display_width=[1-9][0-9]* display_height=[1-9][0-9]* resource_created=true backing_attached=true transfer_ok=true flush_ok=true verified=true") {
+    throw "AerOS virtio-gpu driver validation failed`n$output"
 }
 if ($output -notmatch "AEROS_RTL8139 present=true .* link=true tx=true arp_reply=true gateway=10\.10\.0\.2 verified=true") {
     throw "AerOS RTL8139 driver validation failed`n$output"
@@ -420,11 +582,90 @@ if ($output -notmatch "AEROS_PWRITE created=true verified=true") {
 if ($output -notmatch "AEROS_PIPE verified=true") {
     throw "AerOS pipe validation failed`n$output"
 }
+if ($output -notmatch "AEROS_TCP_ENGINE clean=true lossy=true burst_loss=true slow_reader=true refused=true unreachable=true hostile=true sack_receiver=true sack_recovery=true retransmits=[1-9][0-9]* fast_retransmits=[1-9][0-9]* peak_cwnd=[0-9]+ verified=true") {
+    throw "AerOS TCP engine validation failed`n$output"
+}
+if ($output -notmatch "AEROS_SYSCALL_FUZZ exit=0 reaped=1 elapsed_ms=[0-9]+ verified=true") {
+    throw "AerOS in-process syscall fuzzing failed`n$output"
+}
+if ($output -notmatch "AEROS_PKG verified=true") {
+    throw "AerOS package manager validation failed`n$output"
+}
+if ($output -notmatch "AEROS_UDP table=true sockets=true verified=true") {
+    throw "AerOS UDP port table / sockets validation failed`n$output"
+}
+if ($output -notmatch "AEROS_PROC_MAPS verified=true") {
+    throw "AerOS address-space region listing failed`n$output"
+}
+if ($output -notmatch "AEROS_SHELL_FUZZ lines=2500 elapsed_ms=[0-9]+ verified=true") {
+    throw "AerOS shell command fuzzing failed`n$output"
+}
+if ($output -notmatch "AEROS_SMP_SCHED cpus=$CpuCount placement=true stealing=true priority_order=true affinity=true refused=true balanced=true work_stolen=true steals=[0-9]+ verified=true") {
+    throw "AerOS SMP job scheduler self-test failed`n$output"
+}
+if ($output -notmatch "AEROS_SLAB verified=true") {
+    throw "AerOS slab allocator self-test failed`n$output"
+}
+if ($output -notmatch "AEROS_BLOCK .* verified=true") {
+    throw "AerOS block layer self-test failed`n$output"
+}
+if ($output -notmatch "AEROS_INSTALLER verified=true") {
+    throw "AerOS installer self-test failed`n$output"
+}
+if ($output -notmatch "AEROS_PROCFS verified=true") {
+    throw "AerOS /proc validation failed`n$output"
+}
+if ($output -notmatch "AEROS_TCP_SOCKET verified=true") {
+    throw "AerOS TCP socket API validation failed`n$output"
+}
+if ($output -notmatch "AEROS_SYSCALL_MISC verified=true") {
+    throw "AerOS flock/close_range/fallocate/preadv validation failed`n$output"
+}
 if ($output -notmatch "AEROS_SYSINFO verified=true") {
     throw "AerOS sysinfo validation failed`n$output"
 }
 if ($output -notmatch "AEROS_NETWORK driver=e1000e present=true .* mac=([0-9a-f]{2}:){5}[0-9a-f]{2} link=true speed_mbps=(100|1000) duplex=true tx=true rx=true rx_bytes=[1-9][0-9]* arp_gateway=true verified=true") {
     throw "AerOS e1000e network validation failed`n$output"
+}
+if ($output -notmatch "AEROS_TCP_SERVER syn_received=true handshake_completed=true echoed_bytes=[1-9][0-9]* closed_cleanly=(true|false) verified=true") {
+    throw "AerOS TCP server self-test failed`n$output"
+}
+if ($tcpServerEcho -ne "AEROS-TCP-SERVER-TEST") {
+    throw "AerOS TCP server did not echo real bytes back to a host-side client (got: '$tcpServerEcho')`n$output"
+}
+if ($output -notmatch "AEROS_HTTP_CLIENT connected=true status=200 bytes=[0-9]+ body_ok=true verified=true") {
+    throw "AerOS HTTP client over the TCP engine failed`n$output"
+}
+$httpRequestLine = if (Wait-Job $httpServer -Timeout 5) { Receive-Job $httpServer } else { "" }
+Remove-Job $httpServer -Force
+$httpRequestLine6 = if (Wait-Job $httpServer6 -Timeout 5) { Receive-Job $httpServer6 } else { "" }
+Remove-Job $httpServer6 -Force
+if ($httpRequestLine -ne "GET /big HTTP/1.1") {
+    throw "AerOS HTTP client sent an unexpected request line to the host server ('$httpRequestLine')`n$output"
+}
+if ($output -notmatch "AEROS_IPV6_OFFLINE addresses_and_frames=true sockets=true verified=true") {
+    throw "AerOS IPv6 offline self-test failed`n$output"
+}
+if ($output -notmatch "AEROS_SOCKOPT verified=true") {
+    throw "AerOS socket options self-test failed`n$output"
+}
+if ($output -notmatch "AEROS_DNS6 found=true address=\[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1\]") {
+    throw "AerOS AAAA lookup through the host resolver failed`n$output"
+}
+if ($output -notmatch "AEROS_HTTP6 connected=true status=200 bytes=[0-9]+ body_ok=true verified=true") {
+    throw "AerOS HTTP client over IPv6 failed`n$output"
+}
+if ($httpRequestLine6 -ne "GET /big6 HTTP/1.1") {
+    throw "AerOS IPv6 HTTP client sent an unexpected request line to the host server ('$httpRequestLine6')`n$output"
+}
+if ($output -notmatch "AEROS_TCP_NET accepted=true echoed_bytes=30000 closed=true verified=true") {
+    throw "AerOS socket-layer TCP echo over the network failed`n$output"
+}
+if ($tcpBulk -ne $true) {
+    throw "AerOS socket-layer TCP server did not echo 30000 bytes back intact to a host-side client (got: '$tcpBulk')`n$output"
+}
+if ($output -notmatch "AEROS_FIREWALL empty_passes=true port_match_blocks=true port_mismatch_passes=true protocol_mismatch_passes=true any_port_blocks_all=true cleared_passes_again=true dropped_counted=true verified=true") {
+    throw "AerOS firewall self-test failed`n$output"
 }
 if ($output -notmatch "AEROS_DHCP discover=true request=true ack=true address=10\.0\.2\.15 gateway=10\.0\.2\.2 dns=10\.0\.2\.3 lease_seconds=[1-9][0-9]* verified=true") {
     throw "AerOS DHCP lease validation failed`n$output"
@@ -435,6 +676,14 @@ if ($output -notmatch "AEROS_IPV4 local=10.0.2.15 gateway=10.0.2.2 tx=true rx=tr
 if ($output -notmatch "AEROS_UDP_DNS server=10.0.2.3 tx=true rx=true udp_checksum=true response=true answers=[1-9][0-9]* address=([0-9]{1,3}\.){3}[0-9]{1,3} verified=true") {
     throw "AerOS UDP and DNS validation failed`n$output"
 }
+# Router discovery, neighbour discovery, a link-local echo, SLAAC from the
+# advertised prefix and an echo to the router's global address all have to
+# work. (This used to be lenient because no IPv6 frame ever arrived; the
+# e1000 receive filter was dropping multicast, which router advertisements
+# use.)
+if ($output -notmatch "AEROS_IPV6 .* router_advertised=true .* neighbor_resolved=true echo_tx=true echo_rx=true prefix_found=true global=\[fe, c0.* global_echo_rx=true verified=true") {
+    throw "AerOS IPv6 (SLAAC and global echo) validation failed`n$output"
+}
 if ($output -notmatch "AEROS_SCHEDULER tasks=1 ready=0 running=1 exited=0 switches=([8-9]|[1-9][0-9]+) stack_bytes=0 fpu_tasks=1 fpu_bytes=[5-9][0-9][0-9]+ fpu_switches=([8-9]|[1-9][0-9]+) fpu_isolation=true highest_id=0 verified=true") {
     throw "AerOS scheduler validation failed`n$output"
 }
@@ -444,8 +693,74 @@ if ($output -notmatch "AEROS_PREEMPT source=lapic ticks=([8-9]|[1-9][0-9]+) work
 if ($output -notmatch "AEROS_CONCURRENT_USER exit_a=77 exit_b=88 switches=[1-9][0-9]* reaped=2 verified=true") {
     throw "AerOS concurrent user-task scheduling validation failed`n$output"
 }
+if ($output -notmatch "AEROS_TASK_EXHAUSTION spawned=[1-9][0-9]* exhausted_cleanly=true reaped=[1-9][0-9]* recovered=true verified=true") {
+    throw "AerOS task-table exhaustion validation failed`n$output"
+}
 if ($output -notmatch "AEROS_FORK parent_exit=11 child_exit=22 parent_stack=0xaaaaaaaa child_stack=0xbbbbbbbb reaped=2 verified=true") {
     throw "AerOS fork validation failed`n$output"
+}
+if ($output -notmatch "AEROS_STACK_GROWTH grown_exit=33 grown_pages=37 overflow_exit=[1-9][0-9]* verified=true") {
+    throw "AerOS growable-stack validation failed`n$output"
+}
+if ($output -notmatch "AEROS_EPOLL verified=true") {
+    throw "AerOS epoll validation failed`n$output"
+}
+if ($output -notmatch "AEROS_UNIX_SOCKETPAIR verified=true") {
+    throw "AerOS unix socketpair validation failed`n$output"
+}
+if ($output -notmatch "AEROS_UNIX_DOMAIN_SOCKET verified=true") {
+    throw "AerOS unix domain socket (bind/listen/connect/accept) validation failed`n$output"
+}
+if ($output -notmatch "AEROS_RLIMIT_NOFILE verified=true") {
+    throw "AerOS RLIMIT_NOFILE enforcement validation failed`n$output"
+}
+if ($output -notmatch "AEROS_CAPABILITY exit=22 reaped=1 pure=true verified=true") {
+    throw "AerOS capability sets validation failed`n$output"
+}
+if ($output -notmatch "AEROS_SECCOMP_FILTER exit=21 reaped=1 bpf=true verified=true") {
+    throw "AerOS seccomp filter (BPF) validation failed`n$output"
+}
+if ($output -notmatch "AEROS_ED25519 vectors=3 elapsed_ms=[0-9]+ verified=true") {
+    throw "AerOS Ed25519 / SHA-512 validation failed`n$output"
+}
+if ($output -notmatch "AEROS_STATFS verified=true") {
+    throw "AerOS statfs helper validation failed`n$output"
+}
+if ($output -notmatch "AEROS_SELECT verified=true") {
+    throw "AerOS select/pselect6 core validation failed`n$output"
+}
+if ($output -notmatch "AEROS_SOCKET_API verified=true") {
+    throw "AerOS socket API helper validation failed`n$output"
+}
+if ($output -notmatch "AEROS_FAT_CRASH cases=[1-9][0-9]* elapsed_ms=[0-9]+ dangling=0 cross_linked=0 short=0 torn=0 lost=0 verified=true") {
+    throw "AerOS FAT power-loss consistency test failed`n$output"
+}
+if ($output -notmatch "AEROS_FATFS_CRASH cases=[1-9][0-9]* structural=0 torn=0 leaks_repaired=[0-9]+ repair_failures=0 verified=true") {
+    throw "AerOS /home filesystem power-loss consistency test failed`n$output"
+}
+if ($output -notmatch "AEROS_MOUNTS bound=[0-9]+ same_file=true listing=true rename=true protected=true refused=true unbind=true persists=true verified=true") {
+    throw "AerOS mount table self-test failed`n$output"
+}
+if ($output -notmatch "AEROS_HOME_FSCK files=[0-9]+ directories=[0-9]+ orphans=0 damaged=false") {
+    throw "AerOS home volume mount-time fsck did not report a clean volume`n$output"
+}
+if ($output -notmatch "AEROS_FUZZ iterations=[1-9][0-9]* elapsed_ms=[0-9]+ verified=true") {
+    throw "AerOS parser fuzzing did not complete`n$output"
+}
+if ($output -notmatch "AEROS_OOM pressure=normal verified=true") {
+    throw "AerOS memory pressure / OOM policy validation failed`n$output"
+}
+if ($output -notmatch "AEROS_SERVICES verified=true") {
+    throw "AerOS service table validation failed`n$output"
+}
+if ($output -notmatch "AEROS_KERNEL_LOG verified=true") {
+    throw "AerOS kernel log ring validation failed`n$output"
+}
+if ($output -notmatch "AEROS_SYMLINK_SYSCALL verified=true") {
+    throw "AerOS symlink syscall plumbing validation failed`n$output"
+}
+if ($output -notmatch "AEROS_PROCESS_GROUP verified=true") {
+    throw "AerOS process group (setpgid/getpgid/setsid/getsid) validation failed`n$output"
 }
 if ($output -notmatch "AEROS_FORK_CHAIN exit_a=1 exit_b=2 exit_c=3 reaped=3 verified=true") {
     throw "AerOS fork-chain validation failed`n$output"
@@ -501,6 +816,44 @@ if ($output -notmatch "AEROS_SCHEDULED_STD_ELF exit=75 reaped=1 verified=true") 
 if ($output -notmatch "AEROS_EXEC_PATH exit=74 reaped=1 verified=true") {
     throw "AerOS path-based exec validation failed`n$output"
 }
+if ($output -notmatch "AEROS_THREADS exit=76 reaped=[0-9]+ verified=true") {
+    throw "AerOS threads test failed`n$output"
+}
+if ($output -notmatch "AEROS_MEASURE entries=2 image_measured=true status=no-reference register=[0-9a-f]{64}") {
+    throw "AerOS boot measurement failed`n$output"
+}
+if ($output -notmatch "AEROS_MEASURE_TEST entries=2 image_measured=true register_chain=true file_hash=true seal_matches=true tamper_detected=true no_reference=true verified=true") {
+    throw "AerOS measured-boot self-test failed`n$output"
+}
+if ($output -notmatch "AEROS_UPDATE applied=true previous_kept=true bad_signature_rejected=true tampered_rejected=true untrusted_rejected=true rollback=true crash_cases=[0-9]+ torn=0 verified=true") {
+    throw "AerOS signed update test failed`n$output"
+}
+if ($output -notmatch "AEROS_STACK_PROTECTOR cookie_random=true instrumented=true intact_passes=true smash_detected=true verified=true") {
+    throw "AerOS stack protector check failed`n$output"
+}
+if ($output -notmatch "AEROS_AML loaded=true tables=1 nodes=[0-9]+ devices=[0-9]+ methods=[0-9]+ load_errors=0 apic_mode=true s5_interpreted=true") {
+    throw "AerOS AML namespace load failed`n$output"
+}
+if ($output -notmatch "AEROS_AML_QUERIES s5=Some\(\([0-9]+, [0-9]+\)\) matches_scan=true pci_root=true crs_ok=true prt_entries=[0-9]+ prt_links=true com1_ok=true link_crs_ok=true sta_ok=[0-9]+ sta_errors=0 verified=true") {
+    throw "AerOS AML queries failed`n$output"
+}
+if ($output -notmatch "AEROS_IOMMU present=true base=0x[0-9a-f]+ devices=[0-9]+ unity=[0-9]+ enabled=true mapped_pages=[0-9]+ edu=true mapped=true blocked_write=true blocked_read=true revoked=true faults=[0-9]+ other_events=[0-9]+ last_fault=0x[0-9a-f]+/0x[0-9a-f]+ verified=true") {
+    throw "AerOS IOMMU test failed`n$output"
+}
+if ($output -notmatch "AEROS_BENCH_RESULT exit=0 reaped=[0-9]+ verified=true") {
+    throw "AerOS benchmark program failed`n$output"
+}
+foreach ($name in @("cpu_xorshift", "getpid", "clock_gettime", "memcpy_64k", "mmap_touch_munmap_8_pages", "tmpfs_create_write_read_unlink_4k", "fork_exit_wait", "pipe_round_trip")) {
+    if ($output -notmatch "AEROS_BENCH $name ops=[0-9]+ total_ns=[0-9]+ ns_per_op=[0-9]+") {
+        throw "AerOS benchmark $name did not report`n$output"
+    }
+}
+if ($output -notmatch "AEROS_SWAP slots=[0-9]+ exit=88 reaped=[0-9]+ evicted=[0-9]+ written=[0-9]+ read=[0-9]+ in_use=0 failures=0 verified=true") {
+    throw "AerOS swap test failed`n$output"
+}
+if ($output -notmatch "AEROS_PTRACE exit=77 reaped=[0-9]+ verified=true") {
+    throw "AerOS ptrace test failed`n$output"
+}
 if ($output -notmatch "AEROS_BIG_MMAP exit=55 reaped=1 verified=true") {
     throw "AerOS large mmap validation failed`n$output"
 }
@@ -512,6 +865,9 @@ if ($output -notmatch "AEROS_LINUX_EXECVE exit=74 reaped=1 verified=true") {
 }
 if ($output -notmatch "AEROS_LINUX_KILL exit=11 reaped=1 verified=true") {
     throw "AEROS_LINUX_KILL validation failed`n$output"
+}
+if ($output -notmatch "AEROS_SECCOMP_STRICT exit=137 reaped=1 verified=true") {
+    throw "AerOS seccomp strict-mode validation failed`n$output"
 }
 if ($output -notmatch "AEROS_LINUX_EXECVE_ARGS exit=121 argc=2 arg1=true reaped=1 verified=true") {
     throw "AEROS_LINUX_EXECVE_ARGS validation failed`n$output"
@@ -552,10 +908,13 @@ if ($output -notmatch "AEROS_LINUX_WNOHANG exit=11 reaped=1 verified=true") {
 if ($output -notmatch "AEROS_SCHEDULED_REAL_ELF_FORK parent_exit=11 marker=0xaaaa0001 reaped=1 verified=true") {
     throw "AerOS scheduled real ELF fork validation failed`n$output"
 }
-if ($output -notmatch "AEROS_AV signatures=[1-9][0-9]* self_test=true quarantine_flow=true realtime=true scanned_files=[0-9]+ threats=0 unreadable=[0-9]+ verified=true") {
+if ($output -notmatch "AEROS_AV signatures=[1-9][0-9]* self_test=true quarantine_flow=true quarantine_encrypted=true realtime=true home_realtime=true shred=true scanned_files=[0-9]+ threats=0 unreadable=[0-9]+ verified=true") {
     throw "AerOS Shield antivirus validation failed`n$output"
 }
-if ($output -notmatch "AEROS_COMMANDS count=53 shell=aersh elevation=ear unique=true parser=true privilege=true filesystem=true verified=true") {
+if ($output -notmatch "AEROS_AUDIT verified=true") {
+    throw "AerOS audit log validation failed`n$output"
+}
+if ($output -notmatch "AEROS_COMMANDS count=83 shell=aersh elevation=ear unique=true parser=true privilege=true filesystem=true reauth=true redirection=true startup=true symlinks=true background_jobs=true firewall_command=true dmesg_command=true service_command=true text_tools=true priority_command=true crashes_command=true bench_command=true sigcheck_command=true pipelines=true strace_command=true fsck_command=true verified=true") {
     throw "AerOS command registry validation failed`n$output"
 }
 if ($output -notmatch "AEROS_UI_CORE geometry=true scaling=true interaction=true frost=true max_frost_pixels=1048576 verified=true") {

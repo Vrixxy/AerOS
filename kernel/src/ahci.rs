@@ -178,7 +178,7 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> AhciReport
         }
         report.sata_devices += 1;
 
-        let Some(dma) = frames.allocate_contiguous(4, 1) else {
+        let Some(dma) = frames.allocate_dma(4, 1) else {
             continue;
         };
         let dma_base = dma.address();
@@ -436,6 +436,9 @@ fn disk_write_sector_state(disk: &Disk, lba: u64, source: &[u8; 512]) -> bool {
 }
 
 fn dma_command(disk: &Disk, lba: u64, sectors: u32, buffer_phys: u64, write: bool) -> bool {
+    let Some(_window) = crate::iommu::window(buffer_phys, sectors as u64 * 512) else {
+        return false;
+    };
     let _io = IO_LOCK.lock();
     let port = disk.port;
     let command_list = disk.command_list;

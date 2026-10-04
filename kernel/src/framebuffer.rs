@@ -91,6 +91,41 @@ impl FrameBuffer {
         self.pack(color)
     }
 
+    /// Converts every visible pixel (`width * height`, tightly packed - NOT
+    /// `stride * height`, since a GPU resource's backing memory has no row
+    /// padding) into B8G8R8X8 bytes in `destination`:
+    /// `VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM`'s exact memory layout, so
+    /// `virtio_gpu`'s resource stays correct regardless of which native
+    /// `PixelFormat` the firmware's GOP actually reported, and regardless of
+    /// whether this framebuffer's `stride` happens to exceed its `width`.
+    /// Returns false (does nothing) if `destination` is too small.
+    pub fn copy_bgrx8888(&self, destination: &mut [u8]) -> bool {
+        let Some(bytes) = self
+            .width
+            .checked_mul(self.height)
+            .and_then(|p| p.checked_mul(4))
+        else {
+            return false;
+        };
+        if destination.len() < bytes {
+            return false;
+        }
+        for row in 0..self.height {
+            let row_base = row * self.stride;
+            let destination_base = row * self.width * 4;
+            for col in 0..self.width {
+                let value = unsafe { core::ptr::read_volatile(self.address.add(row_base + col)) };
+                let color = self.unpack(value);
+                let offset = destination_base + col * 4;
+                destination[offset] = color.blue;
+                destination[offset + 1] = color.green;
+                destination[offset + 2] = color.red;
+                destination[offset + 3] = 0xff;
+            }
+        }
+        true
+    }
+
     pub fn blit_packed(&mut self, packed: &[u32]) -> bool {
         let active_pixels = self.stride.saturating_mul(self.height);
         if active_pixels > self.pixels || active_pixels > packed.len() {

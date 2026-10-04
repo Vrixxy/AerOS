@@ -354,7 +354,7 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> HdaReport 
 
     // One DMA block: the buffer descriptor list, then the audio buffers.
     let buffer_pages = (BDL_ENTRIES * BUFFER_BYTES) as u64 / PAGE_SIZE;
-    let Some(dma) = frames.allocate_contiguous(1 + buffer_pages, 1) else {
+    let Some(dma) = frames.allocate_dma(1 + buffer_pages, 1) else {
         return report;
     };
     let memory = dma.address();

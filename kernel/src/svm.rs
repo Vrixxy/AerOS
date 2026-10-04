@@ -739,6 +739,11 @@ mod linux {
                         let lba = job.sector + sent as u64;
                         let phys = job.dest_phys + sent as u64 * 512;
                         let done = if job.write {
+                            crate::block::invalidate(
+                                crate::block::Disk::Ahci(disk),
+                                lba,
+                                batch as u64,
+                            );
                             crate::ahci::write_disk(disk, lba, batch, phys)
                         } else {
                             crate::ahci::read_disk(disk, lba, batch, phys)
@@ -3749,6 +3754,11 @@ mod linux {
             let mut done = 0u32;
             while done < total {
                 let batch = (total - done).min(8192);
+                crate::block::invalidate(
+                    crate::block::Disk::Ahci(self.rootfs_disk),
+                    sector + done as u64,
+                    batch as u64,
+                );
                 if !crate::ahci::write_disk(
                     self.rootfs_disk,
                     sector + done as u64,

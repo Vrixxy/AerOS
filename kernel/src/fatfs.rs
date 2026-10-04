@@ -3,8 +3,6 @@
 //! delete. It sits on any disk the kernel has a driver for (`Disk`) and is
 //! write-through (every change is on the disk when the call returns).
 
-use crate::{ahci, nvme, sdhci, virtio_blk, xhci};
-
 pub const NAME_MAX: usize = 255;
 const SECTOR: usize = 512;
 const CACHE_SLOTS: usize = 16;
@@ -32,88 +30,11 @@ pub enum FsError {
     TooLarge,
 }
 
-/// AHCI DMA needs a 2-byte-aligned buffer; callers' buffers (stack arrays,
-/// cache slots) have no alignment guarantee, so transfers bounce through this.
-#[repr(align(4096))]
-struct Bounce([u8; 4096]);
-
-static BOUNCE: crate::sync::TicketLock<Bounce> = crate::sync::TicketLock::new(Bounce([0; 4096]));
-
-fn bounce(
-    disk: usize,
-    lba: u64,
-    count: usize,
-    read: Option<&mut [u8]>,
-    write: Option<&[u8]>,
-) -> bool {
-    let mut area = BOUNCE.lock();
-    let address = area.0.as_mut_ptr() as u64;
-    let bytes = count * SECTOR;
-    if let Some(source) = write {
-        area.0[..bytes].copy_from_slice(&source[..bytes]);
-        return ahci::write_disk(disk, lba, count as u32, address);
-    }
-    if !ahci::read_disk(disk, lba, count as u32, address) {
-        return false;
-    }
-    if let Some(destination) = read {
-        destination[..bytes].copy_from_slice(&area.0[..bytes]);
-    }
-    true
-}
-
-/// A block device the filesystem can live on.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Disk {
-    Ahci(usize),
-    Nvme,
-    Usb,
-    Sd,
-    Virtio,
-}
-
-impl Disk {
-    pub fn sectors(self) -> u64 {
-        match self {
-            Disk::Ahci(index) => ahci::disk_sectors(index),
-            Disk::Nvme => {
-                if nvme::sector_bytes() == 512 {
-                    nvme::sectors()
-                } else {
-                    0
-                }
-            }
-            Disk::Usb => xhci::storage_sectors(),
-            Disk::Sd => sdhci::sectors(),
-            Disk::Virtio => virtio_blk::sectors(),
-        }
-    }
-
-    /// Reads 1..=8 sectors into `buffer`.
-    fn read_run(self, lba: u64, count: usize, buffer: &mut [u8]) -> bool {
-        match self {
-            Disk::Ahci(index) => bounce(index, lba, count, Some(buffer), None),
-            Disk::Nvme => nvme::read(lba, count as u32, buffer),
-            Disk::Usb => xhci::storage_read(lba, count, buffer),
-            Disk::Sd => sdhci::read(lba, count, buffer),
-            Disk::Virtio => virtio_blk::read(lba, count, buffer),
-        }
-    }
-
-    fn write_run(self, lba: u64, count: usize, buffer: &[u8]) -> bool {
-        match self {
-            Disk::Ahci(index) => bounce(index, lba, count, None, Some(buffer)),
-            Disk::Nvme => nvme::write(lba, count as u32, buffer),
-            Disk::Usb => xhci::storage_write(lba, count, buffer),
-            Disk::Sd => sdhci::write(lba, count, buffer),
-            Disk::Virtio => virtio_blk::write(lba, count, buffer),
-        }
-    }
-}
+pub use crate::block::Disk;
 
 /// Reads one sector of `disk` (used to sniff a disk before mounting it).
 pub fn read_sector_raw(disk: Disk, lba: u64, out: &mut [u8; SECTOR]) -> bool {
-    disk.read_run(lba, 1, out)
+    crate::block::read(disk, lba, 1, out)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -139,6 +60,10 @@ pub struct Fs {
     data_start: u32,
     clusters: u32,
     free_hint: u32,
+    /// Where the last directory-chain walk stopped: (directory, hops from
+    /// its first cluster, cluster reached). Sequential listing resumes from
+    /// here instead of re-walking the chain for every entry.
+    dir_cursor: Option<(u32, u32, u32)>,
     cache_lba: [u64; CACHE_SLOTS],
     cache: [[u8; SECTOR]; CACHE_SLOTS],
 }
@@ -203,6 +128,38 @@ pub struct Listed {
 impl Listed {
     pub fn name(&self) -> &[u8] {
         &self.name[..self.name_len]
+    }
+}
+
+const MAX_DIRECTORY_SECTORS: u32 = 4096;
+const FSCK_MAP_BYTES: usize = 131072;
+static FSCK_MAP: crate::sync::TicketLock<[u8; FSCK_MAP_BYTES]> =
+    crate::sync::TicketLock::new([0; FSCK_MAP_BYTES]);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChainEnd {
+    Good,
+    Broken,
+    Shared,
+}
+
+/// What `Fs::fsck` found (and, with repair, fixed).
+#[derive(Clone, Copy, Default)]
+pub struct FsckReport {
+    pub files: u32,
+    pub directories: u32,
+    pub broken_chains: u32,
+    pub cross_linked: u32,
+    pub duplicates: u32,
+    pub size_mismatches: u32,
+    pub orphan_clusters: u32,
+    pub chains_cut: u32,
+}
+
+impl FsckReport {
+    /// Problems that only a repair run can fix (leaks are harmless).
+    pub fn damaged(&self) -> bool {
+        self.broken_chains + self.cross_linked + self.duplicates + self.size_mismatches != 0
     }
 }
 
@@ -353,7 +310,7 @@ impl Fs {
         let slot = (lba as usize) % CACHE_SLOTS;
         if self.cache_lba[slot] != lba {
             let mut sector = [0u8; SECTOR];
-            if !self.disk.read_run(lba, 1, &mut sector) {
+            if !crate::block::read(self.disk, lba, 1, &mut sector) {
                 return Err(FsError::Io);
             }
             self.cache[slot] = sector;
@@ -365,30 +322,12 @@ impl Fs {
 
     fn write_sector(&mut self, relative: u32, data: &[u8; SECTOR]) -> Result<(), FsError> {
         let lba = self.absolute(relative);
-        if !self.disk.write_run(lba, 1, data) {
+        if !crate::block::write(self.disk, lba, 1, data) {
             return Err(FsError::Io);
         }
         let slot = (lba as usize) % CACHE_SLOTS;
         self.cache[slot] = *data;
         self.cache_lba[slot] = lba;
-        Ok(())
-    }
-
-    /// Reads whole sectors straight into `out` (multiples of 512 bytes).
-    fn read_run(&mut self, relative: u32, out: &mut [u8]) -> Result<(), FsError> {
-        let mut done = 0usize;
-        let total = out.len() / SECTOR;
-        while done < total {
-            let count = (total - done).min(8);
-            let lba = self.absolute(relative + done as u32);
-            if !self
-                .disk
-                .read_run(lba, count, &mut out[done * SECTOR..(done + count) * SECTOR])
-            {
-                return Err(FsError::Io);
-            }
-            done += count;
-        }
         Ok(())
     }
 
@@ -398,10 +337,12 @@ impl Fs {
         while done < total {
             let count = (total - done).min(8);
             let lba = self.absolute(relative + done as u32);
-            if !self
-                .disk
-                .write_run(lba, count, &data[done * SECTOR..(done + count) * SECTOR])
-            {
+            if !crate::block::write(
+                self.disk,
+                lba,
+                count,
+                &data[done * SECTOR..(done + count) * SECTOR],
+            ) {
                 return Err(FsError::Io);
             }
             // Keep the cache coherent with what was just written.
@@ -446,6 +387,7 @@ impl Fs {
     }
 
     fn fat_set(&mut self, cluster: u32, value: u32) -> Result<(), FsError> {
+        self.dir_cursor = None;
         let per_entry = if self.fat_type == FatType::Fat16 {
             2
         } else {
@@ -549,14 +491,28 @@ impl Fs {
         if dir == 0 {
             return Ok((sector_index < self.root_sectors).then_some(self.root_start + sector_index));
         }
+        // A directory holds at most 65536 entries (4096 sectors); anything
+        // longer is a looping or corrupt chain.
+        if sector_index >= MAX_DIRECTORY_SECTORS {
+            return Ok(None);
+        }
         let hops = sector_index / self.sectors_per_cluster;
-        let mut cluster = dir;
-        for _ in 0..hops {
+        let (mut cluster, mut walked) = match self.dir_cursor {
+            Some((cached_dir, cached_hops, cached_cluster))
+                if cached_dir == dir && cached_hops <= hops =>
+            {
+                (cached_cluster, cached_hops)
+            }
+            _ => (dir, 0),
+        };
+        while walked < hops {
             match self.next_cluster(cluster)? {
                 Some(next) => cluster = next,
                 None => return Ok(None),
             }
+            walked += 1;
         }
+        self.dir_cursor = Some((dir, hops, cluster));
         Ok(Some(
             self.cluster_lba(cluster) + sector_index % self.sectors_per_cluster,
         ))
@@ -595,8 +551,13 @@ impl Fs {
         let new = self.alloc_cluster()?;
         self.zero_cluster(new)?;
         let mut last = dir;
+        let mut hops = 0u32;
         while let Some(next) = self.next_cluster(last)? {
             last = next;
+            hops += 1;
+            if hops > self.clusters {
+                return Err(FsError::Corrupt);
+            }
         }
         self.fat_set(last, new)
     }
@@ -1118,6 +1079,9 @@ impl Fs {
         let want = out.len().min((node.size as u64 - offset) as usize);
         let cluster_bytes = self.cluster_bytes() as u64;
         let mut done = 0usize;
+        let mut extents = [(0u64, 0usize); 16];
+        let mut queued = 0usize;
+        let mut queued_from = 0usize;
         while done < want {
             let position = offset + done as u64;
             let chain = (position / cluster_bytes) as u32;
@@ -1130,11 +1094,24 @@ impl Fs {
             let base = self.cluster_lba(cluster) + sector_in_cluster;
             let first_offset = within % SECTOR;
             if first_offset == 0 && span >= SECTOR {
-                // Whole sectors straight into the caller's buffer.
+                // Whole sectors go straight into the caller's buffer, queued
+                // so one scheduled batch can read several clusters.
                 let bytes = span / SECTOR * SECTOR;
-                self.read_run(base, &mut out[done..done + bytes])?;
+                if queued == 0 {
+                    queued_from = done;
+                }
+                extents[queued] = (self.absolute(base), bytes / SECTOR);
+                queued += 1;
                 done += bytes;
+                if queued == extents.len() {
+                    self.flush_extents(&extents[..queued], &mut out[queued_from..done])?;
+                    queued = 0;
+                }
             } else {
+                if queued != 0 {
+                    self.flush_extents(&extents[..queued], &mut out[queued_from..done])?;
+                    queued = 0;
+                }
                 let mut sector = [0u8; SECTOR];
                 self.read_sector(base, &mut sector)?;
                 let count = (SECTOR - first_offset).min(span);
@@ -1143,7 +1120,18 @@ impl Fs {
                 done += count;
             }
         }
+        if queued != 0 {
+            self.flush_extents(&extents[..queued], &mut out[queued_from..done])?;
+        }
         Ok(done)
+    }
+
+    fn flush_extents(&self, extents: &[(u64, usize)], out: &mut [u8]) -> Result<(), FsError> {
+        if crate::block::read_scatter(self.disk, extents, out) {
+            Ok(())
+        } else {
+            Err(FsError::Io)
+        }
     }
 
     pub fn write_at(
@@ -1223,6 +1211,148 @@ impl Fs {
         Ok(())
     }
 
+    /// Checks every directory and file chain on the volume; with `repair` it
+    /// also fixes what can be fixed safely: a chain that runs into a free or
+    /// invalid cluster is cut at its last good cluster, a size larger than its
+    /// chain is lowered to fit, and clusters no entry owns are freed.
+    /// Clusters shared between two entries are only reported.
+    pub fn fsck(&mut self, repair: bool) -> Result<FsckReport, FsError> {
+        let mut map = FSCK_MAP.lock();
+        if self.clusters as usize + 2 > FSCK_MAP_BYTES * 8 {
+            return Err(FsError::Unsupported);
+        }
+        map.fill(0);
+        let mut report = FsckReport::default();
+        let root = if self.fat_type == FatType::Fat32 {
+            let (_, outcome) = self.fsck_chain(self.root_cluster, &mut map[..])?;
+            if outcome != ChainEnd::Good && repair {
+                self.fsck_cut(self.root_cluster, &mut report)?;
+            }
+            self.root_cluster
+        } else {
+            0
+        };
+        self.fsck_directory(root, &mut map[..], &mut report, repair, 0)?;
+        for cluster in 2..self.clusters + 2 {
+            let (byte, bit) = (cluster as usize / 8, cluster % 8);
+            if map[byte] & (1 << bit) == 0 && self.fat_get(cluster)? != 0 {
+                report.orphan_clusters += 1;
+                if repair {
+                    self.fat_set(cluster, 0)?;
+                }
+            }
+        }
+        if repair {
+            self.free_hint = 2;
+        }
+        Ok(report)
+    }
+
+    /// Walks the chain starting at `first`, marking its clusters in `map`.
+    /// Returns how many good clusters it has and how it ended.
+    fn fsck_chain(&mut self, first: u32, map: &mut [u8]) -> Result<(u32, ChainEnd), FsError> {
+        let (mut cluster, mut length) = (first, 0u32);
+        loop {
+            if cluster < 2 || cluster >= self.clusters + 2 {
+                return Ok((length, ChainEnd::Broken));
+            }
+            let (byte, bit) = (cluster as usize / 8, cluster % 8);
+            if map[byte] & (1 << bit) != 0 {
+                return Ok((length, ChainEnd::Shared));
+            }
+            let value = self.fat_get(cluster)?;
+            if value == 0 {
+                return Ok((length, ChainEnd::Broken));
+            }
+            map[byte] |= 1 << bit;
+            length += 1;
+            if self.is_end(value) {
+                return Ok((length, ChainEnd::Good));
+            }
+            cluster = value;
+        }
+    }
+
+    /// Ends the chain at `first`'s last good cluster, as `fsck_chain` found it.
+    fn fsck_cut(&mut self, first: u32, report: &mut FsckReport) -> Result<(), FsError> {
+        let (mut cluster, mut previous) = (first, 0u32);
+        while cluster >= 2 && cluster < self.clusters + 2 {
+            let value = self.fat_get(cluster)?;
+            if value == 0 {
+                break;
+            }
+            previous = cluster;
+            if self.is_end(value) {
+                return Ok(());
+            }
+            cluster = value;
+        }
+        if previous >= 2 {
+            self.fat_set(previous, self.end_marker())?;
+            report.chains_cut += 1;
+        }
+        Ok(())
+    }
+
+    fn fsck_directory(
+        &mut self,
+        dir: u32,
+        map: &mut [u8],
+        report: &mut FsckReport,
+        repair: bool,
+        depth: u32,
+    ) -> Result<(), FsError> {
+        let mut cursor = 0u32;
+        while let Some(listed) = self.list_next(dir, &mut cursor)? {
+            let mut node = listed.node;
+            let cluster_bytes = self.cluster_bytes() as u64;
+            let is_directory = node.is_directory();
+            if is_directory {
+                report.directories += 1;
+            } else {
+                report.files += 1;
+            }
+            let mut good = 0u32;
+            if node.first_cluster >= 2 {
+                let (length, outcome) = self.fsck_chain(node.first_cluster, map)?;
+                good = length;
+                match outcome {
+                    ChainEnd::Good => {}
+                    ChainEnd::Shared if length == 0 => {
+                        report.duplicates += 1;
+                        if repair {
+                            self.delete_entries(&node)?;
+                        }
+                        continue;
+                    }
+                    ChainEnd::Shared => report.cross_linked += 1,
+                    ChainEnd::Broken => {
+                        report.broken_chains += 1;
+                        if repair {
+                            if length == 0 {
+                                node.first_cluster = 0;
+                                self.update_entry(&node)?;
+                            } else {
+                                self.fsck_cut(node.first_cluster, report)?;
+                            }
+                        }
+                    }
+                }
+            }
+            if !is_directory && node.size as u64 > good as u64 * cluster_bytes {
+                report.size_mismatches += 1;
+                if repair {
+                    node.size = (good as u64 * cluster_bytes) as u32;
+                    self.update_entry(&node)?;
+                }
+            }
+            if is_directory && node.first_cluster >= 2 && depth < 8 {
+                self.fsck_directory(node.first_cluster, map, report, repair, depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Shrinks or grows (zero-filling) a file to `length` bytes.
     pub fn truncate(&mut self, node: &mut Node, length: u64) -> Result<(), FsError> {
         if node.is_directory() {
@@ -1231,32 +1361,45 @@ impl Fs {
         if length > u32::MAX as u64 {
             return Err(FsError::TooLarge);
         }
+        let (date, time) = fat_now();
         if length > node.size as u64 {
             let old = node.size as u64;
             self.fill_zero(node, old, length)?;
             node.size = length as u32;
-        } else {
-            let cluster_bytes = self.cluster_bytes() as u64;
-            let keep = length.div_ceil(cluster_bytes) as u32;
-            if keep == 0 {
-                if node.first_cluster != 0 {
-                    self.free_chain(node.first_cluster)?;
-                }
-                node.first_cluster = 0;
-            } else if let Some(last) = self.cluster_at(node, keep - 1, false)? {
-                if let Some(rest) = self.next_cluster(last)? {
-                    self.free_chain(rest)?;
-                }
-                self.fat_set(last, self.end_marker())?;
-            }
-            node.size = length as u32;
-            node.cursor_index = 0;
-            node.cursor_cluster = 0;
+            node.date = date;
+            node.time = time;
+            return self.update_entry(node);
         }
-        let (date, time) = fat_now();
+        // Shrinking: publish the new size first, then cut the chain, then free
+        // the tail. A power cut between any two steps leaves a chain at least
+        // as long as the size says (leaking clusters at worst), never a size
+        // that runs past the chain or a chain ending in a freed cluster.
+        let cluster_bytes = self.cluster_bytes() as u64;
+        let keep = length.div_ceil(cluster_bytes) as u32;
+        let mut cut_after = None;
+        let mut doomed = None;
+        if keep == 0 {
+            if node.first_cluster != 0 {
+                doomed = Some(node.first_cluster);
+            }
+            node.first_cluster = 0;
+        } else if let Some(last) = self.cluster_at(node, keep - 1, false)? {
+            doomed = self.next_cluster(last)?;
+            cut_after = Some(last);
+        }
+        node.size = length as u32;
+        node.cursor_index = 0;
+        node.cursor_cluster = 0;
         node.date = date;
         node.time = time;
-        self.update_entry(node)
+        self.update_entry(node)?;
+        if let Some(last) = cut_after {
+            self.fat_set(last, self.end_marker())?;
+        }
+        if let Some(rest) = doomed {
+            self.free_chain(rest)?;
+        }
+        Ok(())
     }
 
     pub fn set_read_only(&mut self, node: &mut Node, read_only: bool) -> Result<(), FsError> {
@@ -1320,6 +1463,8 @@ impl Fs {
                 self.delete_entries(node)?;
             } else if !replace || existing.is_directory() {
                 return Err(FsError::Exists);
+            } else if !node.is_directory() {
+                return self.rename_over(node, &existing);
             } else {
                 self.remove(&existing)?;
             }
@@ -1371,6 +1516,28 @@ impl Fs {
         Ok(kept)
     }
 
+    /// Renames the file `node` over the existing file `existing` in a
+    /// crash-safe order: the destination's entry is re-pointed at the source's
+    /// data in one sector write, then the source name is removed, then the
+    /// destination's old data is freed. A power cut can briefly leave both
+    /// names pointing at the same data (which `fsck` resolves) or leak the old
+    /// data, but never loses the file.
+    fn rename_over(&mut self, node: &Node, existing: &Node) -> Result<Node, FsError> {
+        let mut taken = *existing;
+        taken.first_cluster = node.first_cluster;
+        taken.size = node.size;
+        taken.attributes = node.attributes;
+        taken.date = node.date;
+        taken.time = node.time;
+        taken.cursor_index = 0;
+        taken.cursor_cluster = 0;
+        self.update_entry(&taken)?;
+        self.delete_entries(node)?;
+        if existing.first_cluster >= 2 && existing.first_cluster != node.first_cluster {
+            self.free_chain(existing.first_cluster)?;
+        }
+        Ok(taken)
+    }
     // ------------------------------------------------------------- volume
 
     /// The volume label (space padded, as stored in the boot sector).
@@ -1465,6 +1632,7 @@ impl Fs {
             data_start,
             clusters,
             free_hint: 2,
+            dir_cursor: None,
             cache_lba: [u64::MAX; CACHE_SLOTS],
             cache: [[0; SECTOR]; CACHE_SLOTS],
         });
@@ -1603,9 +1771,9 @@ impl Fs {
 /// it lives in a caller-provided static slot instead of on the stack.
 pub struct Box64(&'static mut Fs);
 
-static mut SLOTS: [Option<Fs>; 4] = [None, None, None, None];
-static SLOT_USED: [core::sync::atomic::AtomicBool; 4] =
-    [const { core::sync::atomic::AtomicBool::new(false) }; 4];
+static mut SLOTS: [Option<Fs>; 5] = [None, None, None, None, None];
+static SLOT_USED: [core::sync::atomic::AtomicBool; 5] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; 5];
 
 impl Box64 {
     fn new(fs: Fs) -> Self {
@@ -1630,7 +1798,7 @@ impl Box64 {
 impl Drop for Box64 {
     fn drop(&mut self) {
         let pointer = self.0 as *mut Fs as usize;
-        for index in 0..4 {
+        for index in 0..5 {
             // SAFETY: comparing addresses only.
             let slot = unsafe { &mut *core::ptr::addr_of_mut!(SLOTS[index]) };
             if let Some(fs) = slot.as_mut()

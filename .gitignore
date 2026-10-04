@@ -4,3 +4,4 @@
 *.log
 *.png
 *.ppm
+/tools/aml-host/target/

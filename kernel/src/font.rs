@@ -1,6 +1,6 @@
 use crate::framebuffer::{Color, FrameBuffer};
 use crate::sync::TicketLock;
-use crate::truetype::{GlyphBitmap, TrueType};
+use crate::truetype::{GlyphBitmap, MAX_EDGE, TrueType};
 
 const HEADER_SIZE: usize = 32;
 const MAGIC: &[u8; 8] = b"AERFNT01";
@@ -25,7 +25,8 @@ pub struct RasterFont {
     baseline_row: i32,
 }
 
-/// A rendered non-atlas glyph kept for reuse (bitmaps up to 64x64).
+/// A rendered non-atlas glyph kept for reuse (bitmaps up to MAX_EDGE x
+/// MAX_EDGE - the largest the rasterizer itself ever produces).
 #[derive(Clone, Copy)]
 struct CachedGlyph {
     font: usize,
@@ -36,7 +37,7 @@ struct CachedGlyph {
     left: i32,
     top: i32,
     advance: i32,
-    coverage: [u8; 64 * 64],
+    coverage: [u8; MAX_EDGE * MAX_EDGE],
 }
 
 const EMPTY_GLYPH: CachedGlyph = CachedGlyph {
@@ -48,7 +49,7 @@ const EMPTY_GLYPH: CachedGlyph = CachedGlyph {
     left: 0,
     top: 0,
     advance: 0,
-    coverage: [0; 64 * 64],
+    coverage: [0; MAX_EDGE * MAX_EDGE],
 };
 
 struct GlyphCache {
@@ -136,11 +137,11 @@ impl RasterFont {
             left: bitmap.left,
             top: bitmap.top,
             advance: (ttf.advance(glyph) as i32 * pixels_per_em / ttf.units_per_em as i32).max(1),
-            coverage: [0; 64 * 64],
+            coverage: [0; MAX_EDGE * MAX_EDGE],
         };
-        if bitmap.width <= 64 && bitmap.height <= 64 {
+        if bitmap.width <= MAX_EDGE && bitmap.height <= MAX_EDGE {
             for row in 0..bitmap.height {
-                entry.coverage[row * 64..row * 64 + bitmap.width].copy_from_slice(
+                entry.coverage[row * MAX_EDGE..row * MAX_EDGE + bitmap.width].copy_from_slice(
                     &bitmap.coverage[row * bitmap.width..(row + 1) * bitmap.width],
                 );
             }
@@ -150,7 +151,9 @@ impl RasterFont {
             return Some(entry);
         }
         // Too big to cache: draw straight from the rendering (width/height
-        // beyond 64 are reported as an empty bitmap here).
+        // beyond MAX_EDGE are reported as an empty bitmap here - in practice
+        // this never happens, since the rasterizer itself refuses anything
+        // that would not fit in MAX_EDGE).
         entry.width = 0;
         entry.height = 0;
         Some(entry)
@@ -173,7 +176,7 @@ impl RasterFont {
         let baseline = y + self.baseline_row * height / self.source_height as i32;
         for row in 0..glyph.height {
             for column in 0..glyph.width {
-                let alpha = glyph.coverage[row * 64 + column];
+                let alpha = glyph.coverage[row * MAX_EDGE + column];
                 if alpha != 0 {
                     frame.blend(
                         pen_x + glyph.left + column as i32,
@@ -497,6 +500,21 @@ pub fn truetype_self_test() {
     };
     serial::format(format_args!("AEROS_TEXT_UNICODE layout={}\n", layout_ok));
     all_ok &= layout_ok;
+    // A non-ASCII glyph rendered large enough to have needed more than the
+    // font cache's old 64x64 ceiling (everything past that used to be
+    // silently dropped - see the `MAX_EDGE` history in `truetype_glyph`)
+    // still rasterizes and gets cached, not just measured for layout.
+    let large_glyph_ok = match catalog.ui() {
+        Some(ui) => ui.truetype_glyph('é', 120).is_some_and(|glyph| {
+            glyph.width > 0 && glyph.height > 0 && (glyph.width > 64 || glyph.height > 64)
+        }),
+        None => false,
+    };
+    serial::format(format_args!(
+        "AEROS_TEXT_LARGE_GLYPH cached={}\n",
+        large_glyph_ok
+    ));
+    all_ok &= large_glyph_ok;
     if !all_ok {
         serial::line("AEROS_TRUETYPE_INVARIANT_FAILURE");
         crate::arch::halt_forever();

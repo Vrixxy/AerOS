@@ -4,25 +4,40 @@
 
 mod ac97;
 mod acpi;
+mod acpi_ns;
 pub mod aerui;
 mod ahci;
+mod aml;
 mod antivirus;
 mod arch;
 mod audio;
+mod audit;
 mod auth;
+mod bench;
+mod block;
 mod blockdev;
 pub mod button;
+mod capability;
 mod clipboard;
 mod compat;
+mod crash;
 mod datafs;
 mod deflate;
 mod desktop;
 mod e1000;
+mod ed25519;
 mod elf;
 mod fat;
+#[cfg(feature = "boot-test")]
+mod fat_crash;
 mod fatfs;
+#[cfg(feature = "boot-test")]
+mod fatfs_crash;
+mod firewall;
 mod font;
 mod framebuffer;
+#[cfg(feature = "boot-test")]
+mod fuzz;
 mod hda;
 mod heap;
 mod image;
@@ -30,23 +45,33 @@ mod inflate;
 mod initramfs;
 mod installer;
 mod ioapic;
+mod iommu;
+mod ip;
+mod ipv6;
 mod jpeg;
 mod keyboard;
 mod keymap;
 mod loading;
 mod logo;
+mod measure;
 mod memory;
+mod mounts;
 mod mouse;
 mod net;
 mod nic;
 mod notify;
 mod ntp;
 mod nvme;
+mod oom;
 mod partition;
 mod pci;
+mod pkg;
+#[cfg(feature = "boot-test")]
+mod pkg_vectors;
 mod png;
 mod power;
 mod process;
+mod procfs;
 mod random;
 mod rtc;
 mod rtl8139;
@@ -54,24 +79,41 @@ mod rtl8168;
 mod scheduler;
 mod screenshot;
 mod sdhci;
+mod seccomp;
 mod serial;
+mod services;
 mod settings;
 mod sfx;
 mod shell;
+mod slab;
 mod smp;
+mod smpsched;
+mod sockopt;
+mod stackguard;
 mod store;
 mod svm;
+mod swap;
 mod sync;
 mod syscall;
+#[cfg(feature = "boot-test")]
+mod syscall_fuzz_probe;
 mod sysmon;
+mod tcp;
+mod tcpnet;
 mod time;
 mod timezone;
+mod trace;
 mod truetype;
+mod udp;
 mod uefi;
 mod ui;
+mod update;
 mod vfs;
 mod virtio;
 mod virtio_blk;
+mod virtio_gpu;
+mod virtio_input;
+mod virtio_modern;
 mod virtio_net;
 mod web;
 mod xhci;
@@ -107,6 +149,25 @@ unsafe impl Sync for BootStack {}
 
 static BOOT_STACK: BootStack = BootStack(core::cell::UnsafeCell::new([0; BOOT_STACK_SIZE]));
 
+/// Turns the IOMMU on, and leaves it on only if the boot disk reads back the
+/// same sector through it.
+fn enable_iommu() -> bool {
+    if !iommu::present() {
+        return false;
+    }
+    let mut before = [0u8; 512];
+    let readable = blockdev::read_sector(0, &mut before);
+    if !iommu::enable() {
+        return false;
+    }
+    let mut after = [0u8; 512];
+    if readable && !(blockdev::read_sector(0, &mut after) && after == before) {
+        iommu::disable();
+        return false;
+    }
+    true
+}
+
 /// UEFI entry point: moves to `BOOT_STACK` and continues in `kernel_entry`
 /// (both take the same two arguments in the Microsoft x64 convention).
 #[unsafe(no_mangle)]
@@ -127,6 +188,7 @@ extern "efiapi" fn efi_main(_image: Handle, _table: *mut SystemTable) -> Status 
 }
 
 extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Status {
+    stackguard::randomize();
     *BOOT_PHASE.lock() = 1;
     serial::init();
     serial::format(format_args!("AEROS_BOOT version={VERSION}\n"));
@@ -204,6 +266,26 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         serial::line("AEROS_HPET_FAILURE");
         arch::halt_forever();
     }
+    #[cfg(feature = "boot-test")]
+    {
+        let test = stackguard::self_test();
+        let verified =
+            test.cookie_random && test.instrumented && test.intact_passes && test.smash_detected;
+        serial::format(format_args!(
+            "AEROS_STACK_PROTECTOR cookie_random={} instrumented={} intact_passes={} smash_detected={} verified={}
+",
+            test.cookie_random,
+            test.instrumented,
+            test.intact_passes,
+            test.smash_detected,
+            verified
+        ));
+        if !verified {
+            serial::line("AEROS_STACK_PROTECTOR_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+    }
+    let namespace = acpi_ns::initialize(&acpi);
     let rtc = rtc::initialize();
     if !rtc.verified {
         serial::line("AEROS_RTC_FAILURE");
@@ -285,7 +367,13 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         serial::line("AEROS_SMP_FAILURE");
         arch::halt_forever();
     }
-    let heap_mapping = match arch::paging::map_heap(&paging, &mut frames, 256) {
+    // 4096 pages = 16 MiB - up from the original 1 MiB, now that `map_heap`
+    // builds a real multi-page-table region instead of squeezing into the
+    // handful of spare slots in the paging probe's single leaf table (see
+    // its doc comment). Concretely unblocks `spawn()`'s 64 KB-per-task
+    // kernel-stack allocations (`heap::HEAP`) well past the ~9-task ceiling
+    // the old 1 MiB heap hit in `AEROS_TASK_EXHAUSTION` earlier this session.
+    let heap_mapping = match arch::paging::map_heap(&paging, &mut frames, 4096) {
         Some(mapping) => mapping,
         None => {
             serial::line("AEROS_HEAP_MAPPING_FAILURE");
@@ -295,9 +383,19 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     let heap_initialized =
         unsafe { heap::HEAP.initialize(heap_mapping.virtual_base as usize, heap_mapping.size) };
     let heap_valid = heap_initialized && heap::HEAP.self_test();
+    #[cfg(feature = "boot-test")]
+    {
+        let verified = slab::self_test();
+        serial::format(format_args!("AEROS_SLAB verified={}\n", verified));
+        if !verified {
+            serial::line("AEROS_SLAB_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+    }
     let heap_stats = heap::HEAP.stats();
     let pci = pci::PciInventory::scan();
     let pci_summary = pci.summary();
+    let iommu_report = iommu::initialize(&acpi, &pci, &mut frames);
     let ahci = ahci::initialize(&pci, &mut frames);
     let nvme = nvme::initialize(&pci, &mut frames);
     let audio = ac97::initialize(&pci, &mut frames);
@@ -306,17 +404,69 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     let sd = sdhci::initialize(&pci);
     let virtio_disk = virtio_blk::initialize(&pci, &mut frames);
     let virtio_nic = virtio_net::initialize(&pci, &mut frames);
+    let virtio_touch = virtio_input::initialize(&pci, &mut frames);
+    let virtio_gpu = virtio_gpu::initialize(&pci, &mut frames);
     let partitions = partition::inspect(if ahci.sectors != 0 {
         ahci.sectors
     } else {
         blockdev::boot_sectors()
     });
+    if ahci.sectors != 0 {
+        for partition in partitions.entries().iter().filter(|part| part.kind == 0x82) {
+            if swap::configure_partition(
+                block::Disk::Ahci(ahci::boot_disk()),
+                partition.first_lba,
+                partition.sectors,
+            ) != 0
+            {
+                break;
+            }
+        }
+    }
     let fat = fat::inspect(&partitions);
-    let install = installer::install(&mut frames);
+    let install = installer::install(installer::unattended_allowed(), &mut frames);
     let mut network = e1000::initialize(&pci, &mut frames);
     let rtl8139_nic = rtl8139::initialize(&pci, &mut frames);
     let rtl8168_nic = rtl8168::initialize(&pci, &mut frames);
     nic::select_primary(network.verified, &rtl8139_nic, &rtl8168_nic);
+    let iommu_active = enable_iommu();
+    #[cfg(feature = "boot-test")]
+    {
+        let test = iommu::self_test(&pci);
+        let status = iommu::status();
+        let verified = !iommu_report.present || (iommu_active && test.verified());
+        serial::format(format_args!(
+            "AEROS_IOMMU present={} base={:#x} devices={} unity={} enabled={} mapped_pages={} edu={} mapped={} blocked_write={} blocked_read={} revoked={} faults={} other_events={} last_fault={:#x}/{:#x} verified={}\n",
+            iommu_report.present,
+            iommu_report.base,
+            iommu_report.devices,
+            iommu_report.unity_ranges,
+            iommu_active,
+            status.mapped_pages,
+            test.edu,
+            test.mapped,
+            test.blocked_write,
+            test.blocked_read,
+            test.revoked,
+            status.faults,
+            status.other_events,
+            status.last_fault.raw[0],
+            status.last_fault.raw[1],
+            verified
+        ));
+        if !verified {
+            serial::line("AEROS_IOMMU_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+    }
+    serial::format(format_args!(
+        "AEROS_IOMMU_UNIT present={} base={:#x} devices={} unity={} enabled={}\n",
+        iommu_report.present,
+        iommu_report.base,
+        iommu_report.devices,
+        iommu_report.unity_ranges,
+        iommu_active
+    ));
     if !network.verified {
         // No Intel NIC: the stack runs on the first Realtek one that reached
         // the default gateway.
@@ -327,6 +477,89 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         }
     }
     let internet = net::self_test(&network);
+    #[cfg(feature = "boot-test")]
+    {
+        // The host side of this connects in over a QEMU hostfwd rule
+        // (tools/test.ps1) and exchanges real bytes - the only way to prove
+        // a genuine passive-open TCP server, not just the existing client.
+        serial::line("AEROS_TCP_LISTENING");
+        let server = net::tcp_server_self_test(17_654, 12_000_000_000);
+        serial::format(format_args!(
+            "AEROS_TCP_SERVER syn_received={} handshake_completed={} echoed_bytes={} closed_cleanly={} verified={}\n",
+            server.syn_received,
+            server.handshake_completed,
+            server.echoed_bytes,
+            server.closed_cleanly,
+            server.verified
+        ));
+        if !server.verified {
+            serial::line("AEROS_TCP_SERVER_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+        serial::line("AEROS_TCP_NET_LISTENING");
+        let (accepted, echoed, closed) = syscall::tcp_net_echo_self_test(17_655, 20_000_000_000);
+        serial::format(format_args!(
+            "AEROS_TCP_NET accepted={} echoed_bytes={} closed={} verified={}
+",
+            accepted,
+            echoed,
+            closed,
+            accepted && echoed > 0 && closed
+        ));
+        if !(accepted && echoed > 0 && closed) {
+            serial::line("AEROS_TCP_NET_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+        tcpnet::reset();
+        let mut response = [0u8; 8192];
+        let http = net::http_get_port(
+            ip::v4([10, 0, 2, 2]),
+            18_080,
+            "10.0.2.2",
+            "/big",
+            &mut response,
+        );
+        let body_start = response[..http.bytes]
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map_or(0, |position| position + 4);
+        let body = &response[body_start..http.bytes];
+        let body_ok = body.len() == 6_000
+            && body
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| *byte == b'a' + (index % 26) as u8);
+        serial::format(format_args!(
+            "AEROS_HTTP_CLIENT connected={} status={} bytes={} body_ok={} verified={}\n",
+            http.connected,
+            http.status,
+            http.bytes,
+            body_ok,
+            http.connected && http.status == 200 && body_ok
+        ));
+        if !(http.connected && http.status == 200 && body_ok) {
+            serial::line("AEROS_HTTP_CLIENT_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+        tcpnet::reset();
+    }
+    let firewall_report = firewall::self_test();
+    serial::format(format_args!(
+        "AEROS_FIREWALL empty_passes={} port_match_blocks={} port_mismatch_passes={} protocol_mismatch_passes={} any_port_blocks_all={} cleared_passes_again={} dropped_counted={} verified={}\n",
+        firewall_report.empty_passes,
+        firewall_report.port_match_blocks,
+        firewall_report.port_mismatch_passes,
+        firewall_report.protocol_mismatch_passes,
+        firewall_report.any_port_blocks_all,
+        firewall_report.cleared_passes_again,
+        firewall_report.dropped_counted,
+        firewall_report.verified
+    ));
+    if !firewall_report.verified {
+        serial::line("AEROS_FIREWALL_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
     let initramfs_entries = initramfs::entries();
     let vfs_stats = vfs::initialize(&initramfs_entries);
     let home = datafs::initialize();
@@ -358,6 +591,23 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
             ));
             if !home.verified || !result.verified {
                 serial::line("AEROS_HOME_INVARIANT_FAILURE");
+                arch::halt_forever();
+            }
+            let mounts = mounts::self_test();
+            serial::format(format_args!(
+                "AEROS_MOUNTS bound={} same_file={} listing={} rename={} protected={} refused={} unbind={} persists={} verified={}\n",
+                mounts.bound,
+                mounts.same_file,
+                mounts.listing,
+                mounts.rename_inside,
+                mounts.protected,
+                mounts.refused,
+                mounts.unbind,
+                mounts.persists,
+                mounts.verified
+            ));
+            if !mounts.verified {
+                serial::line("AEROS_MOUNTS_INVARIANT_FAILURE");
                 arch::halt_forever();
             }
         }
@@ -554,7 +804,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     let runtime_vfs = vfs::stats();
     let tmpfs_valid = runtime_vfs.verified
         && runtime_vfs.nodes == runtime_vfs.directories + runtime_vfs.files
-        && runtime_vfs.directories == 7
+        && runtime_vfs.directories == 11
         && runtime_vfs.files == initramfs::entries().len() + 1
         && runtime_vfs.mutable_files == 1
         && runtime_vfs.mutable_bytes == 6
@@ -734,16 +984,37 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         rtc.unix_seconds,
         rtc.verified
     ));
+    let chacha20_verified = random::chacha20_self_test();
+    let aslr_verified = arch::paging::aslr_self_test(&paging, &mut frames);
+    let process_aslr_verified = arch::paging::scheduled_process_aslr_self_test(&paging);
     serial::format(format_args!(
-        "AEROS_ENTROPY rdrand={} rdseed={} hardware_words={} sample_a_nonzero={} sample_b_nonzero={} distinct={} chacha20=true aslr=true verified={}\n",
+        "AEROS_ENTROPY rdrand={} rdseed={} hardware_words={} sample_a_nonzero={} sample_b_nonzero={} distinct={} chacha20={} aslr={} process_aslr={} verified={}\n",
         entropy.rdrand,
         entropy.rdseed,
         entropy.hardware_words,
         entropy.sample_a != 0,
         entropy.sample_b != 0,
         entropy.sample_a != entropy.sample_b,
-        entropy.verified
+        chacha20_verified,
+        aslr_verified,
+        process_aslr_verified,
+        entropy.verified && chacha20_verified && aslr_verified && process_aslr_verified
     ));
+    if !chacha20_verified {
+        serial::line("AEROS_ENTROPY_CHACHA20_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    if !aslr_verified {
+        serial::line("AEROS_ENTROPY_ASLR_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    if !process_aslr_verified {
+        serial::line("AEROS_ENTROPY_PROCESS_ASLR_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
     serial::format(format_args!(
         "AEROS_MEMORY regions={} usable_pages={} reclaimable_pages={} dropped={} free_pages={} allocator_test={}\n",
         boot.memory.region_count(),
@@ -778,6 +1049,12 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     ));
     if !heap_valid {
         serial::line("AEROS_HEAP_INVARIANT_FAILURE");
+        arch::halt_forever();
+    }
+    let clipboard_valid = clipboard::self_test();
+    serial::format(format_args!("AEROS_CLIPBOARD verified={clipboard_valid}\n"));
+    if !clipboard_valid {
+        serial::line("AEROS_CLIPBOARD_INVARIANT_FAILURE");
         arch::halt_forever();
     }
     serial::format(format_args!(
@@ -1342,19 +1619,45 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         virtio_nic.arp_reply,
         virtio_nic.verified
     ));
+    serial::format(format_args!(
+        "AEROS_VIRTIO_INPUT present={} queue_ready={} abs_x_span={} abs_y_span={} verified={}\n",
+        virtio_touch.present,
+        virtio_touch.queue_ready,
+        virtio_touch.abs_x_span,
+        virtio_touch.abs_y_span,
+        virtio_touch.verified
+    ));
+    serial::format(format_args!(
+        "AEROS_VIRTIO_GPU present={} queue_ready={} display_width={} display_height={} resource_created={} backing_attached={} transfer_ok={} flush_ok={} verified={}\n",
+        virtio_gpu.present,
+        virtio_gpu.queue_ready,
+        virtio_gpu.display_width,
+        virtio_gpu.display_height,
+        virtio_gpu.resource_created,
+        virtio_gpu.backing_attached,
+        virtio_gpu.transfer_ok,
+        virtio_gpu.flush_ok,
+        virtio_gpu.verified
+    ));
     #[cfg(feature = "boot-test")]
     if (virtio_disk.present && !virtio_disk.verified)
         || (virtio_nic.present && !virtio_nic.verified)
+        || !virtio_touch.verified
+        || !virtio_gpu.verified
     {
         serial::line("AEROS_VIRTIO_INVARIANT_FAILURE");
         arch::halt_forever();
     }
     serial::format(format_args!(
-        "AEROS_INSTALL attempted={} target_disk={} target_sectors={} target_blank={} source_bytes={} gpt={} formatted={} kernel_written={} marker_written={} readback_ok={} verified={}\n",
+        "AEROS_INSTALL attempted={} target_disk={} target_sectors={} target_blank={} existing_table={} preserved={} refusal={:?} stage={} source_bytes={} gpt={} formatted={} kernel_written={} marker_written={} readback_ok={} verified={}\n",
         install.attempted,
         install.target_disk,
         install.target_sectors,
         install.target_blank,
+        install.existing_table,
+        install.preserved,
+        install.refusal,
+        install.stage,
         install.source_bytes,
         install.gpt,
         install.formatted,
@@ -1363,6 +1666,15 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         install.readback_ok,
         install.verified,
     ));
+    #[cfg(feature = "boot-test")]
+    {
+        let verified = installer::self_test();
+        serial::format(format_args!("AEROS_INSTALLER verified={}\n", verified));
+        if !verified {
+            serial::line("AEROS_INSTALLER_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+    }
     if !ahci.verified {
         serial::line("AEROS_AHCI_INVARIANT_FAILURE");
         arch::halt_forever();
@@ -1529,6 +1841,312 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         #[cfg(feature = "boot-test")]
         arch::halt_forever();
     }
+    #[cfg(feature = "boot-test")]
+    {
+        let tcp = tcp::self_test();
+        serial::format(format_args!(
+            "AEROS_TCP_ENGINE clean={} lossy={} burst_loss={} slow_reader={} refused={} unreachable={} hostile={} sack_receiver={} sack_recovery={} retransmits={} fast_retransmits={} peak_cwnd={} verified={}
+",
+            tcp.clean,
+            tcp.lossy,
+            tcp.burst_loss,
+            tcp.slow_reader,
+            tcp.refused,
+            tcp.unreachable,
+            tcp.hostile,
+            tcp.sack_receiver,
+            tcp.sack_recovery,
+            tcp.retransmits,
+            tcp.fast_retransmits,
+            tcp.peak_cwnd,
+            tcp.verified
+        ));
+        if !tcp.verified {
+            serial::line("AEROS_TCP_ENGINE_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+    }
+    #[cfg(feature = "boot-test")]
+    {
+        let pkg_verified = pkg::self_test();
+        serial::format(format_args!(
+            "AEROS_PKG verified={}
+",
+            pkg_verified
+        ));
+        if !pkg_verified {
+            serial::line("AEROS_PKG_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+    }
+    #[cfg(feature = "boot-test")]
+    {
+        let table_verified = udp::self_test();
+        let socket_verified = syscall::udp_socket_self_test();
+        serial::format(format_args!(
+            "AEROS_UDP table={} sockets={} verified={}\n",
+            table_verified,
+            socket_verified,
+            table_verified && socket_verified
+        ));
+        if !(table_verified && socket_verified) {
+            serial::line("AEROS_UDP_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+    }
+    let maps_verified = arch::paging::regions_self_test(&paging);
+    serial::format(format_args!("AEROS_PROC_MAPS verified={}\n", maps_verified));
+    if !maps_verified {
+        serial::line("AEROS_PROC_MAPS_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    #[cfg(feature = "boot-test")]
+    {
+        let report = block::self_test();
+        serial::format(format_args!(
+            "AEROS_BLOCK fifo_seek={} elevator_seek={} fifo_commands={} elevator_commands={} merged={} barrier={} hazard={} intact={} cache_hit={} write_through={} failed_write={} eviction={} readahead={} reclaimed={} verified={}\n",
+            report.fifo_seek,
+            report.elevator_seek,
+            report.fifo_commands,
+            report.elevator_commands,
+            report.merged,
+            report.barrier_order,
+            report.hazard_order,
+            report.data_intact,
+            report.cache_hit,
+            report.write_through,
+            report.failed_write,
+            report.eviction,
+            report.readahead,
+            report.reclaimed,
+            report.verified
+        ));
+        if !report.verified {
+            serial::line("AEROS_BLOCK_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+    }
+    #[cfg(feature = "boot-test")]
+    {
+        let report = smpsched::self_test();
+        serial::format(format_args!(
+            "AEROS_SMP_SCHED cpus={} placement={} stealing={} priority_order={} affinity={} refused={} balanced={} work_stolen={} steals={} verified={}\n",
+            report.cpus,
+            report.placement,
+            report.stealing,
+            report.priority_order,
+            report.affinity,
+            report.refused,
+            report.balanced,
+            report.work_stolen,
+            smpsched::steals(),
+            report.verified
+        ));
+        if !report.verified {
+            serial::line("AEROS_SMP_SCHED_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+    }
+    let procfs_verified = procfs::self_test();
+    serial::format(format_args!("AEROS_PROCFS verified={}\n", procfs_verified));
+    if !procfs_verified {
+        serial::line("AEROS_PROCFS_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    let tcp_socket_verified = syscall::tcp_socket_self_test();
+    serial::format(format_args!(
+        "AEROS_TCP_SOCKET verified={}
+",
+        tcp_socket_verified
+    ));
+    if !tcp_socket_verified {
+        serial::line("AEROS_TCP_SOCKET_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    #[cfg(feature = "boot-test")]
+    {
+        let verified = syscall::socket_options_self_test();
+        serial::format(format_args!("AEROS_SOCKOPT verified={}\n", verified));
+        if !verified {
+            serial::line("AEROS_SOCKOPT_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+    }
+    let misc_syscalls_verified = syscall::misc_syscalls_self_test();
+    serial::format(format_args!(
+        "AEROS_SYSCALL_MISC verified={}\n",
+        misc_syscalls_verified
+    ));
+    if !misc_syscalls_verified {
+        serial::line("AEROS_SYSCALL_MISC_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    let epoll_verified = syscall::epoll_self_test();
+    serial::format(format_args!("AEROS_EPOLL verified={}\n", epoll_verified));
+    if !epoll_verified {
+        serial::line("AEROS_EPOLL_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    let unix_socketpair_verified = syscall::unix_socketpair_self_test();
+    serial::format(format_args!(
+        "AEROS_UNIX_SOCKETPAIR verified={}\n",
+        unix_socketpair_verified
+    ));
+    if !unix_socketpair_verified {
+        serial::line("AEROS_UNIX_SOCKETPAIR_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    let unix_domain_socket_verified = syscall::unix_domain_socket_self_test();
+    serial::format(format_args!(
+        "AEROS_UNIX_DOMAIN_SOCKET verified={}\n",
+        unix_domain_socket_verified
+    ));
+    if !unix_domain_socket_verified {
+        serial::line("AEROS_UNIX_DOMAIN_SOCKET_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    let rlimit_nofile_verified = syscall::rlimit_nofile_self_test();
+    serial::format(format_args!(
+        "AEROS_RLIMIT_NOFILE verified={}\n",
+        rlimit_nofile_verified
+    ));
+    if !rlimit_nofile_verified {
+        serial::line("AEROS_RLIMIT_NOFILE_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    #[cfg(feature = "boot-test")]
+    {
+        let crash = fat_crash::run();
+        serial::format(format_args!(
+            "AEROS_FAT_CRASH cases={} elapsed_ms={} dangling={} cross_linked={} short={} torn={} lost={} verified={}\n",
+            crash.cases,
+            crash.elapsed_ms,
+            crash.dangling,
+            crash.cross_linked,
+            crash.short,
+            crash.torn,
+            crash.lost,
+            crash.verified
+        ));
+        if !crash.verified {
+            serial::line("AEROS_FAT_CRASH_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+        let home_crash = fatfs_crash::run();
+        serial::format(format_args!(
+            "AEROS_FATFS_CRASH cases={} structural={} torn={} leaks_repaired={} repair_failures={} verified={}\n",
+            home_crash.cases,
+            home_crash.structural,
+            home_crash.torn,
+            home_crash.leaks_repaired,
+            home_crash.repair_failures,
+            home_crash.verified
+        ));
+        if !home_crash.verified {
+            serial::line("AEROS_FATFS_CRASH_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+        let fuzz = fuzz::run();
+        serial::format(format_args!(
+            "AEROS_FUZZ iterations={} elapsed_ms={} verified={}\n",
+            fuzz.iterations, fuzz.elapsed_ms, fuzz.verified
+        ));
+    }
+    let oom_verified = oom::self_test();
+    serial::format(format_args!(
+        "AEROS_OOM pressure={} verified={}\n",
+        oom::pressure().label(),
+        oom_verified
+    ));
+    if !oom_verified {
+        serial::line("AEROS_OOM_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    let services_verified = services::self_test();
+    serial::format(format_args!(
+        "AEROS_SERVICES verified={}\n",
+        services_verified
+    ));
+    if !services_verified {
+        serial::line("AEROS_SERVICES_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    let kernel_log_verified = serial::log_self_test();
+    serial::format(format_args!(
+        "AEROS_KERNEL_LOG verified={}\n",
+        kernel_log_verified
+    ));
+    if !kernel_log_verified {
+        serial::line("AEROS_KERNEL_LOG_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    let ed25519_started = time::monotonic_nanoseconds();
+    let ed25519_verified = ed25519::self_test();
+    serial::format(format_args!(
+        "AEROS_ED25519 vectors=3 elapsed_ms={} verified={}\n",
+        (time::monotonic_nanoseconds() - ed25519_started) / 1_000_000,
+        ed25519_verified
+    ));
+    if !ed25519_verified {
+        serial::line("AEROS_ED25519_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    let statfs_verified = syscall::statfs_self_test();
+    serial::format(format_args!("AEROS_STATFS verified={}\n", statfs_verified));
+    if !statfs_verified {
+        serial::line("AEROS_STATFS_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    let select_verified = syscall::select_self_test();
+    serial::format(format_args!("AEROS_SELECT verified={}\n", select_verified));
+    if !select_verified {
+        serial::line("AEROS_SELECT_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    let socket_api_verified = syscall::socket_helpers_self_test();
+    serial::format(format_args!(
+        "AEROS_SOCKET_API verified={}\n",
+        socket_api_verified
+    ));
+    if !socket_api_verified {
+        serial::line("AEROS_SOCKET_API_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    let symlink_syscall_verified = syscall::symlink_syscall_self_test();
+    serial::format(format_args!(
+        "AEROS_SYMLINK_SYSCALL verified={}\n",
+        symlink_syscall_verified
+    ));
+    if !symlink_syscall_verified {
+        serial::line("AEROS_SYMLINK_SYSCALL_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    let process_group_verified = syscall::process_group_self_test();
+    serial::format(format_args!(
+        "AEROS_PROCESS_GROUP verified={}\n",
+        process_group_verified
+    ));
+    if !process_group_verified {
+        serial::line("AEROS_PROCESS_GROUP_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
     let sysinfo_verified = syscall::sysinfo_self_test();
     serial::format(format_args!(
         "AEROS_SYSINFO verified={}\n",
@@ -1650,6 +2268,79 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     if !internet.dns_verified {
         serial::line("AEROS_DNS_DEGRADED");
     }
+    let ipv6 = net::ipv6_self_test(&network);
+    serial::format(format_args!(
+        "AEROS_IPV6 link_local={:x?} router_solicited={} router_advertised={} router_ip={:x?} neighbor_solicited={} neighbor_resolved={} echo_tx={} echo_rx={} prefix_found={} global={:x?} global_echo_rx={} verified={}\n",
+        ipv6.link_local,
+        ipv6.router_solicited,
+        ipv6.router_advertised,
+        ipv6.router_ip,
+        ipv6.neighbor_solicited,
+        ipv6.neighbor_resolved,
+        ipv6.echo_tx,
+        ipv6.echo_rx,
+        ipv6.prefix_found,
+        ipv6.global_address,
+        ipv6.global_echo_rx,
+        ipv6.verified
+    ));
+    if !ipv6.verified {
+        // Real exchanges over a real network: on a machine without IPv6 the
+        // boot goes on and the harness is what insists on success.
+        serial::line("AEROS_IPV6_DEGRADED");
+    }
+    #[cfg(feature = "boot-test")]
+    {
+        let offline = ip::self_test() && ipv6::offline_self_test();
+        let sockets = syscall::inet6_socket_self_test();
+        serial::format(format_args!(
+            "AEROS_IPV6_OFFLINE addresses_and_frames={} sockets={} verified={}\n",
+            offline,
+            sockets,
+            offline && sockets
+        ));
+        if !(offline && sockets) {
+            serial::line("AEROS_IPV6_OFFLINE_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+        tcpnet::reset();
+        if ipv6.verified {
+            let mut gateway = ipv6.global_address;
+            gateway[8..].fill(0);
+            gateway[15] = 2;
+            let mut response = [0u8; 8192];
+            let http = net::http_get_port(gateway, 18_081, "[fec0::2]", "/big6", &mut response);
+            let body_start = response[..http.bytes]
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map_or(0, |position| position + 4);
+            let body = &response[body_start..http.bytes];
+            let body_ok = body.len() == 6_000
+                && body
+                    .iter()
+                    .enumerate()
+                    .all(|(index, byte)| *byte == b'a' + (index % 26) as u8);
+            serial::format(format_args!(
+                "AEROS_HTTP6 connected={} status={} bytes={} body_ok={} verified={}\n",
+                http.connected,
+                http.status,
+                http.bytes,
+                body_ok,
+                http.connected && http.status == 200 && body_ok
+            ));
+            if !(http.connected && http.status == 200 && body_ok) {
+                serial::line("AEROS_HTTP6_INVARIANT_FAILURE");
+                arch::halt_forever();
+            }
+            tcpnet::reset();
+            let aaaa = net::resolve6("localhost");
+            serial::format(format_args!(
+                "AEROS_DNS6 found={} address={:x?}\n",
+                aaaa.is_some(),
+                aaaa.unwrap_or([0; 16])
+            ));
+        }
+    }
     serial::format(format_args!(
         "AEROS_SCHEDULER tasks={} ready={} running={} exited={} switches={} stack_bytes={} fpu_tasks={} fpu_bytes={} fpu_switches={} fpu_isolation={} highest_id={} verified={}\n",
         scheduler_stats.tasks,
@@ -1706,6 +2397,20 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         #[cfg(feature = "boot-test")]
         arch::halt_forever();
     }
+    let task_exhaustion = scheduler::task_exhaustion_self_test(&paging);
+    serial::format(format_args!(
+        "AEROS_TASK_EXHAUSTION spawned={} exhausted_cleanly={} reaped={} recovered={} verified={}\n",
+        task_exhaustion.spawned_before_full,
+        task_exhaustion.exhausted_cleanly,
+        task_exhaustion.reaped,
+        task_exhaustion.recovered,
+        task_exhaustion.verified
+    ));
+    if !task_exhaustion.verified {
+        serial::line("AEROS_TASK_EXHAUSTION_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
     let fork_result = scheduler::fork_self_test(&paging);
     serial::format(format_args!(
         "AEROS_FORK parent_exit={} child_exit={} parent_stack={:#x} child_stack={:#x} reaped={} verified={}\n",
@@ -1718,6 +2423,19 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     ));
     if !fork_result.verified {
         serial::line("AEROS_FORK_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    let stack_growth_result = scheduler::stack_growth_self_test(&paging);
+    serial::format(format_args!(
+        "AEROS_STACK_GROWTH grown_exit={} grown_pages={} overflow_exit={} verified={}\n",
+        stack_growth_result.grown_exit,
+        stack_growth_result.grown_pages,
+        stack_growth_result.overflow_exit,
+        stack_growth_result.verified
+    ));
+    if !stack_growth_result.verified {
+        serial::line("AEROS_STACK_GROWTH_INVARIANT_FAILURE");
         #[cfg(feature = "boot-test")]
         arch::halt_forever();
     }
@@ -1925,6 +2643,84 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         #[cfg(feature = "boot-test")]
         arch::halt_forever();
     }
+    let threads_result = match vfs::file("/bin/aeros-threads") {
+        Ok(file) => scheduler::threaded_elf_self_test(&paging, file.data, 76),
+        Err(_) => scheduler::threaded_elf_self_test(&paging, &[], 76),
+    };
+    serial::format(format_args!(
+        "AEROS_THREADS exit={} reaped={} verified={}\n",
+        threads_result.exit_code, threads_result.reaped, threads_result.verified
+    ));
+    if !threads_result.verified {
+        serial::line("AEROS_THREADS_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    let ptrace_result = match vfs::file("/bin/aeros-ptrace") {
+        Ok(file) => scheduler::threaded_elf_self_test(&paging, file.data, 77),
+        Err(_) => scheduler::threaded_elf_self_test(&paging, &[], 77),
+    };
+    serial::format(format_args!(
+        "AEROS_PTRACE exit={} reaped={} verified={}\n",
+        ptrace_result.exit_code, ptrace_result.reaped, ptrace_result.verified
+    ));
+    if !ptrace_result.verified {
+        serial::line("AEROS_PTRACE_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    #[cfg(feature = "boot-test")]
+    {
+        let before = swap::stats();
+        let was_active = swap::active();
+        let slots = swap::configure_partition(block::Disk::Virtio, 4096, 12288);
+        let mut evicted = 0;
+        let result = match vfs::file("/bin/aeros-swap") {
+            Ok(file) => scheduler::threaded_elf_self_test_with(&paging, file.data, 88, || {
+                evicted += scheduler::swap_out_pages(8)
+            }),
+            Err(_) => scheduler::threaded_elf_self_test(&paging, &[], 88),
+        };
+        let stats = swap::stats();
+        swap::configure(block::Disk::Virtio, 0, 0);
+        let verified = slots >= 1000
+            && result.verified
+            && evicted > 0
+            && stats.written > before.written
+            && stats.read > before.read
+            && stats.in_use == 0
+            && stats.failures == 0;
+        serial::format(format_args!(
+            "AEROS_SWAP slots={slots} exit={} reaped={} evicted={evicted} written={} read={} in_use={} failures={} verified={verified}\n",
+            result.exit_code,
+            result.reaped,
+            stats.written - before.written,
+            stats.read - before.read,
+            stats.in_use,
+            stats.failures
+        ));
+        let _ = was_active;
+        if !verified {
+            serial::line("AEROS_SWAP_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+    }
+    #[cfg(feature = "boot-test")]
+    {
+        let result = match vfs::file("/bin/aeros-bench") {
+            Ok(file) => scheduler::threaded_elf_self_test(&paging, file.data, 0),
+            Err(_) => scheduler::threaded_elf_self_test(&paging, &[], 0),
+        };
+        serial::format(format_args!(
+            "AEROS_BENCH_RESULT exit={} reaped={} verified={}
+",
+            result.exit_code, result.reaped, result.verified
+        ));
+        if !result.verified {
+            serial::line("AEROS_BENCH_RESULT_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+    }
     let big_mmap_result = scheduler::real_elf_self_test(&paging, &scheduler::BIG_MMAP_PROBE, 55);
     serial::format(format_args!(
         "AEROS_BIG_MMAP exit={} reaped={} verified={}\n",
@@ -1967,6 +2763,64 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         serial::line("AEROS_LINUX_KILL_INVARIANT_FAILURE");
         #[cfg(feature = "boot-test")]
         arch::halt_forever();
+    }
+    let seccomp_result =
+        scheduler::real_elf_self_test(&paging, &scheduler::SECCOMP_STRICT_PROBE, 137);
+    serial::format(format_args!(
+        "AEROS_SECCOMP_STRICT exit={} reaped={} verified={}\n",
+        seccomp_result.exit_code, seccomp_result.reaped, seccomp_result.verified
+    ));
+    if !seccomp_result.verified {
+        serial::line("AEROS_SECCOMP_STRICT_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    let seccomp_filter_result =
+        scheduler::real_elf_self_test(&paging, &scheduler::SECCOMP_FILTER_PROBE, 21);
+    serial::format(format_args!(
+        "AEROS_SECCOMP_FILTER exit={} reaped={} bpf={} verified={}\n",
+        seccomp_filter_result.exit_code,
+        seccomp_filter_result.reaped,
+        seccomp::self_test(),
+        seccomp_filter_result.verified && seccomp::self_test()
+    ));
+    if !(seccomp_filter_result.verified && seccomp::self_test()) {
+        serial::line("AEROS_SECCOMP_FILTER_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    let capability_result =
+        scheduler::real_elf_self_test(&paging, &scheduler::CAPABILITY_PROBE, 22);
+    let capability_pure = capability::self_test() && syscall::capability_enforcement_self_test();
+    serial::format(format_args!(
+        "AEROS_CAPABILITY exit={} reaped={} pure={} verified={}\n",
+        capability_result.exit_code,
+        capability_result.reaped,
+        capability_pure,
+        capability_result.verified && capability_pure
+    ));
+    if !(capability_result.verified && capability_pure) {
+        serial::line("AEROS_CAPABILITY_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    #[cfg(feature = "boot-test")]
+    {
+        let started = time::monotonic_nanoseconds();
+        let fuzz_probe =
+            scheduler::real_elf_self_test(&paging, &syscall_fuzz_probe::SYSCALL_FUZZ_PROBE, 0);
+        serial::format(format_args!(
+            "AEROS_SYSCALL_FUZZ exit={} reaped={} elapsed_ms={} verified={}
+",
+            fuzz_probe.exit_code,
+            fuzz_probe.reaped,
+            (time::monotonic_nanoseconds() - started) / 1_000_000,
+            fuzz_probe.verified
+        ));
+        if !fuzz_probe.verified {
+            serial::line("AEROS_SYSCALL_FUZZ_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
     }
     let exec_args_result =
         scheduler::linux_execve_args_self_test(&paging, &scheduler::LINUX_EXECVE_ARGS_PROBE);
@@ -2165,13 +3019,83 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         #[cfg(feature = "boot-test")]
         arch::halt_forever();
     }
+    // `run`/execve can also load a program straight from a persistent
+    // volume (`/home`), not just the embedded `/bin/*` binaries: the same
+    // real fork-capable ELF above, planted on `/home` and read back through
+    // `vfs::with_home_file` instead of a `'static` slice. Skipped (treated
+    // as passing) when no home volume is mounted.
+    let (home_exec_planted, home_exec_ran) = if datafs::route("/home").is_some() {
+        let planted = vfs::open_file("/home/EXECTEST", true, true, true, 0o755, true)
+            .ok()
+            .is_some_and(|descriptor| {
+                let ok = vfs::write(descriptor, fork_probe_file.data, false)
+                    == Ok(fork_probe_file.data.len());
+                let _ = vfs::close(descriptor);
+                ok
+            });
+        let ran = planted
+            && vfs::with_home_file("/home/EXECTEST", |data, _mode| {
+                scheduler::spawn_process_with(&paging, data, "/home/EXECTEST", &[b"/home/EXECTEST"])
+            })
+            .ok()
+            .flatten()
+            .is_some_and(|(id, _slot, _space)| scheduler::wait_for_child(id).is_some());
+        let _ = vfs::remove("/home/EXECTEST", false);
+        (planted, ran)
+    } else {
+        (true, true)
+    };
+    let home_exec_verified = home_exec_planted && home_exec_ran;
     serial::format(format_args!(
-        "AEROS_COMMANDS count={} shell=aersh elevation=ear unique={} parser={} privilege={} filesystem={} verified={}\n",
+        "AEROS_HOME_EXEC planted={} ran={} verified={}\n",
+        home_exec_planted, home_exec_ran, home_exec_verified
+    ));
+    if !home_exec_verified {
+        serial::line("AEROS_HOME_EXEC_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    // A separate, pre-existing gap noticed while adding /home exec support
+    // above: the real Linux `execve` path had no antivirus gate at all
+    // (unlike spawning a brand-new process, which already refused a
+    // detected image) - an already-running process could `execve()` into
+    // malware. `exec_current_user_task_path` refuses a detected image
+    // before it ever touches scheduler state, so this is safe to call here
+    // without a real running task to exec from.
+    let execve_blocked =
+        scheduler::exec_current_user_task_path(&antivirus::eicar(), "/tmp/x").is_none();
+    serial::format(format_args!(
+        "AEROS_EXECVE_AV_GATE blocked={}\n",
+        execve_blocked
+    ));
+    if !execve_blocked {
+        serial::line("AEROS_EXECVE_AV_GATE_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    serial::format(format_args!(
+        "AEROS_COMMANDS count={} shell=aersh elevation=ear unique={} parser={} privilege={} filesystem={} reauth={} redirection={} startup={} symlinks={} background_jobs={} firewall_command={} dmesg_command={} service_command={} text_tools={} priority_command={} crashes_command={} bench_command={} sigcheck_command={} pipelines={} strace_command={} fsck_command={} verified={}\n",
         commands.commands,
         commands.unique,
         commands.parser,
         commands.privilege,
         commands.filesystem,
+        commands.reauth,
+        commands.redirection,
+        commands.startup,
+        commands.symlinks,
+        commands.background_jobs,
+        commands.firewall_command,
+        commands.dmesg_command,
+        commands.service_command,
+        commands.text_tools,
+        commands.priority_command,
+        commands.crashes_command,
+        commands.bench_command,
+        commands.sigcheck_command,
+        commands.pipelines,
+        commands.strace_command,
+        commands.fsck_command,
         commands.verified
     ));
     if !commands.verified {
@@ -2234,6 +3158,53 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     }
     let power_report = power::inspect(&acpi);
     serial::format(format_args!(
+        "AEROS_AML loaded={} tables={} nodes={} devices={} methods={} load_errors={} apic_mode={} s5_interpreted={}\n",
+        namespace.loaded,
+        namespace.tables,
+        namespace.nodes,
+        namespace.devices,
+        namespace.methods,
+        namespace.load_errors,
+        namespace.apic_mode,
+        power_report.s5_interpreted
+    ));
+    #[cfg(feature = "boot-test")]
+    {
+        let test = acpi_ns::self_test();
+        let scan_matches = test.s5 == Some((power_report.slp_typ_a, power_report.slp_typ_b));
+        let verified = namespace.loaded
+            && namespace.load_errors == 0
+            && namespace.apic_mode
+            && test.pci_root
+            && test.crs_ok
+            && test.prt_entries >= 16
+            && test.prt_links
+            && test.com1_ok
+            && test.link_crs_ok
+            && test.sta_errors == 0
+            && test.sta_ok > 0
+            && scan_matches
+            && power_report.s5_interpreted;
+        serial::format(format_args!(
+            "AEROS_AML_QUERIES s5={:?} matches_scan={} pci_root={} crs_ok={} prt_entries={} prt_links={} com1_ok={} link_crs_ok={} sta_ok={} sta_errors={} verified={}\n",
+            test.s5,
+            scan_matches,
+            test.pci_root,
+            test.crs_ok,
+            test.prt_entries,
+            test.prt_links,
+            test.com1_ok,
+            test.link_crs_ok,
+            test.sta_ok,
+            test.sta_errors,
+            verified
+        ));
+        if !verified {
+            serial::line("AEROS_AML_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+    }
+    serial::format(format_args!(
         "AEROS_POWER fadt={} dsdt={} s5_found={} slp_typ_a={} slp_typ_b={} pm1a_cnt={:#x} pm1b_cnt={:#x} ready={}\n",
         power_report.fadt_present,
         power_report.dsdt_present,
@@ -2245,9 +3216,78 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         power_report.ready
     ));
     power::set(power_report);
+    let image_measured = measure::measure_boot();
+    let measured_status = measure::compare(measure::REFERENCE_PATH);
+    serial::format(format_args!(
+        "AEROS_MEASURE entries=2 image_measured={image_measured} status={} register={}\n",
+        measured_status.label(),
+        measure::hex_text(&measure::register()).as_str()
+    ));
+    if measured_status == measure::Status::Changed {
+        audit::record(
+            "MEASURE",
+            format_args!("ALERT: the boot image differs from the sealed one"),
+        );
+    }
+    #[cfg(feature = "boot-test")]
+    {
+        let test = measure::self_test(image_measured);
+        let verified = test.entries == 2
+            && test.image_measured
+            && test.register_chain
+            && test.file_hash
+            && test.seal_matches
+            && test.tamper_detected
+            && test.no_reference
+            && measured_status != measure::Status::Changed;
+        serial::format(format_args!(
+            "AEROS_MEASURE_TEST entries={} image_measured={} register_chain={} file_hash={} seal_matches={} tamper_detected={} no_reference={} verified={verified}\n",
+            test.entries,
+            test.image_measured,
+            test.register_chain,
+            test.file_hash,
+            test.seal_matches,
+            test.tamper_detected,
+            test.no_reference
+        ));
+        let update = update::self_test();
+        let verified = update.applied
+            && update.previous_kept
+            && update.bad_signature_rejected
+            && update.tampered_rejected
+            && update.untrusted_rejected
+            && update.rollback
+            && update.torn == 0
+            && update.crash_cases >= 10;
+        serial::format(format_args!(
+            "AEROS_UPDATE applied={} previous_kept={} bad_signature_rejected={} tampered_rejected={} untrusted_rejected={} rollback={} crash_cases={} torn={} verified={verified}\n",
+            update.applied,
+            update.previous_kept,
+            update.bad_signature_rejected,
+            update.tampered_rejected,
+            update.untrusted_rejected,
+            update.rollback,
+            update.crash_cases,
+            update.torn
+        ));
+        if !verified {
+            serial::line("AEROS_UPDATE_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+    }
 
-    // AerOS Shield: primitives, then a real scan -> quarantine -> restore
-    // round trip through the VFS, then a scan of the whole filesystem.
+    // AerOS Shield: load any signature updates left on the data volume
+    // (absent on a fresh install; never fails the boot either way), then
+    // primitives, a real scan -> quarantine -> restore round trip through
+    // the VFS, and a scan of the whole filesystem.
+    if let Some(loaded) = antivirus::load_default_signatures() {
+        serial::format(format_args!(
+            "AEROS_AV_SIGNATURES loaded={} skipped={} path={}\n",
+            loaded.added,
+            loaded.skipped,
+            antivirus::DEFAULT_SIGNATURE_PATH
+        ));
+    }
     let av_self = antivirus::self_test();
     // The manual flow below needs the realtime hooks out of the way.
     antivirus::set_realtime(false);
@@ -2295,18 +3335,92 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         }
         wrote && gone && logged && leftover
     };
+    // The same realtime check, but through a real mounted /home volume
+    // (datafs), which used to bypass every antivirus hook entirely - a
+    // descriptor whose top bit is set (see `vfs::is_mounted_descriptor`)
+    // returned early out of `vfs::open_file`/`write_at`/`close` before any
+    // of the scanning code was reached. Skipped when no home volume is
+    // mounted (e.g. real hardware with no second disk).
+    let av_home_realtime = if datafs::route("/home").is_some() {
+        let created = vfs::open_file("/home/RT_HOME_TEST", true, true, false, 0o644, true).ok();
+        let events_before = antivirus::event_seq();
+        let wrote = created.is_some_and(|descriptor| {
+            let ok = vfs::write(descriptor, &antivirus::eicar(), false) == Ok(68);
+            let _ = vfs::close(descriptor);
+            ok
+        });
+        let gone = vfs::metadata("/home/RT_HOME_TEST").is_err();
+        let logged = antivirus::event_seq() > events_before;
+        let mut found_id = None;
+        antivirus::quarantine_list(|entry| {
+            if entry.original.as_str() == "/home/RT_HOME_TEST" {
+                found_id = Some(entry.id);
+            }
+        });
+        let leftover = found_id.is_some();
+        if let Some(id) = found_id {
+            let _ = antivirus::delete(id);
+        }
+        wrote && gone && logged && leftover
+    } else {
+        true
+    };
+    // `av delete` is supposed to make a quarantined file's bytes actually
+    // gone, not just unlink the directory entry while the content sits
+    // recoverable in its old disk sectors - checks that directly by
+    // shredding a known non-zero payload and reading it back.
+    let av_shred = {
+        let path = "/tmp/AV_SHRED_TEST";
+        // tmpfs (where /tmp lives) caps a single file at MUTABLE_FILE_BYTES
+        // (4096) - this is the largest payload that fits, and it exactly
+        // fills `shred`'s own 4096-byte zero buffer, so the write-in-place
+        // path is exercised right up to that boundary.
+        let payload = [0xa5u8; 4096];
+        let created = vfs::open_file(path, true, true, false, 0o644, true).ok();
+        let wrote = created.is_some_and(|descriptor| {
+            let ok = vfs::write(descriptor, &payload, false) == Ok(payload.len());
+            let _ = vfs::close(descriptor);
+            ok
+        });
+        antivirus::shred(path);
+        let zeroed = vfs::open_file_raw(path).is_ok_and(|descriptor| {
+            let mut buffer = [0xffu8; 4096];
+            let mut total = 0usize;
+            while total < buffer.len() {
+                match vfs::read(descriptor, &mut buffer[total..]) {
+                    Ok(0) => break,
+                    Ok(count) => total += count,
+                    Err(_) => break,
+                }
+            }
+            let _ = vfs::close(descriptor);
+            total == buffer.len() && buffer.iter().all(|&byte| byte == 0)
+        });
+        let _ = vfs::remove(path, false);
+        wrote && zeroed
+    };
+    let av_quarantine_encrypted = antivirus::quarantine_encryption_self_test();
     let mut av_report = antivirus::Report::new();
     antivirus::scan_path("/", false, &mut av_report);
     serial::format(format_args!(
-        "AEROS_AV signatures={} self_test={} quarantine_flow={} realtime={} scanned_files={} threats={} unreadable={} verified={}\n",
+        "AEROS_AV signatures={} self_test={} quarantine_flow={} quarantine_encrypted={} realtime={} home_realtime={} shred={} scanned_files={} threats={} unreadable={} verified={}\n",
         antivirus::signature_count(),
         av_self,
         av_flow,
+        av_quarantine_encrypted,
         av_realtime,
+        av_home_realtime,
+        av_shred,
         av_report.files,
         av_report.threats,
         av_report.errors,
-        av_self && av_flow && av_realtime && av_report.threats == 0
+        av_self
+            && av_flow
+            && av_quarantine_encrypted
+            && av_realtime
+            && av_home_realtime
+            && av_shred
+            && av_report.threats == 0
     ));
     for finding in av_report.findings.iter().flatten() {
         serial::format(format_args!(
@@ -2316,8 +3430,22 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
             finding.path.as_str()
         ));
     }
-    if !(av_self && av_flow && av_realtime) {
+    if !(av_self
+        && av_flow
+        && av_quarantine_encrypted
+        && av_realtime
+        && av_home_realtime
+        && av_shred)
+    {
         serial::line("AEROS_AV_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+
+    let audit_verified = audit::self_test();
+    serial::format(format_args!("AEROS_AUDIT verified={}\n", audit_verified));
+    if !audit_verified {
+        serial::line("AEROS_AUDIT_INVARIANT_FAILURE");
         #[cfg(feature = "boot-test")]
         arch::halt_forever();
     }
@@ -2404,6 +3532,13 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     };
     ui::draw_boot_complete(&mut framebuffer, &fonts, health);
 
+    // Harmless to do even in a `test.ps1` boot-test run (which exits via
+    // `debug_exit` below before `desktop::run` is ever reached, so nothing
+    // further checks the result there) - keeping this call unconditional
+    // avoids needing a `#[cfg]` split just to dodge a dead-code warning on
+    // the `bind`/`SET_SCANOUT` path in that build.
+    virtio_gpu::bind(&framebuffer, &mut frames);
+
     memory::install_primary(frames);
     #[cfg(feature = "boot-test")]
     image::self_test();
@@ -2415,6 +3550,17 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     screenshot::self_test(&framebuffer);
     #[cfg(feature = "boot-test")]
     logo::self_test();
+    #[cfg(feature = "boot-test")]
+    {
+        let started = time::monotonic_nanoseconds();
+        let lines = shell::fuzz_commands(shell_info, 2_500);
+        serial::format(format_args!(
+            "AEROS_SHELL_FUZZ lines={} elapsed_ms={} verified={}\n",
+            lines,
+            (time::monotonic_nanoseconds() - started) / 1_000_000,
+            lines == 2_500
+        ));
+    }
     serial::line("AEROS_READY");
 
     #[cfg(feature = "boot-test")]

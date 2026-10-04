@@ -2,21 +2,38 @@ use crate::datafs;
 use crate::fat;
 use crate::sync::TicketLock;
 
-const MAX_NODES: usize = 32;
+const MAX_NODES: usize = 96;
 const MAX_HANDLES: usize = 24;
 pub const MAX_NAME: usize = 255;
 const MAX_DEPTH: usize = 16;
 const ROOT_NODE: u16 = 0;
 const READ_BITS: u16 = 0o444;
-const MAX_MUTABLE_FILES: usize = 8;
+// Was 8; the quarantine store's at-rest encryption key (antivirus.rs) added
+// one permanent consumer of this pool (previously only ever /tmp scratch
+// files and quarantine entries, all transient), and self-tests that
+// exercise encryption need their own scratch file on top of that. /proc and /sys keep
+// about twenty-five generated files here, hence 56.
+const MAX_MUTABLE_FILES: usize = 56;
 const MUTABLE_FILE_BYTES: usize = 4096;
 const STATIC_STORAGE: u8 = u8::MAX;
+/// How many symlink hops `resolve_following` will chase before giving up -
+/// generous for any real use, tight enough that a cycle (`ln -s a b; ln -s
+/// b a`) fails fast instead of spinning.
+const MAX_SYMLINK_HOPS: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NodeKind {
     Empty,
     Directory,
     File,
+    /// A symbolic link. Its target string lives in the same `MUTABLE_FILES`
+    /// pool a regular mutable file's content does (see `create_symlink`),
+    /// capped at `MAX_NAME` bytes rather than the pool's full per-slot
+    /// capacity - real symlink targets are always short paths. Only ever
+    /// created in the in-memory tmpfs subtree (`/tmp`); `/data`, `/home` and
+    /// `/media` refuse `symlink()` outright since FAT has no on-disk
+    /// representation for one.
+    Symlink,
 }
 
 #[derive(Clone, Copy)]
@@ -233,6 +250,10 @@ pub enum VfsError {
     /// "invalid path" that gives no clue what was actually wrong with an
     /// otherwise perfectly normal-looking name like `report.txt`.
     PersistNameUnsupported,
+    /// A symlink chain exceeded `MAX_SYMLINK_HOPS` while being followed -
+    /// either a genuine cycle or just a chain deeper than any legitimate
+    /// use needs; either way, resolution stops instead of looping forever.
+    TooManyLinks,
 }
 
 #[derive(Clone, Copy)]
@@ -351,6 +372,9 @@ impl Vfs {
         self.mount_directory("/data", 0o777)?;
         self.mount_directory("/home", 0o755)?;
         self.mount_directory("/media", 0o755)?;
+        for path in ["/var", "/opt", "/srv", "/root"] {
+            self.mount_directory(path, 0o755)?;
+        }
         self.load_persisted_files();
         Ok(())
     }
@@ -550,7 +574,7 @@ impl Vfs {
         if directory && stored.kind != NodeKind::Directory {
             return Err(VfsError::NotDirectory);
         }
-        if !directory && stored.kind != NodeKind::File {
+        if !directory && stored.kind != NodeKind::File && stored.kind != NodeKind::Symlink {
             return Err(VfsError::IsDirectory);
         }
         if stored.kind == NodeKind::Directory
@@ -801,6 +825,11 @@ impl Vfs {
     }
 
     fn metadata(&self, path: &str) -> Result<Metadata, VfsError> {
+        let node = self.resolve_following(path)?;
+        Ok(self.node_metadata(node))
+    }
+
+    fn symlink_metadata(&self, path: &str) -> Result<Metadata, VfsError> {
         let node = self.resolve(path)?;
         Ok(self.node_metadata(node))
     }
@@ -815,6 +844,7 @@ impl Vfs {
         let kind = match node.kind {
             NodeKind::Directory => 0o040000,
             NodeKind::File => 0o100000,
+            NodeKind::Symlink => 0o120000,
             NodeKind::Empty => 0,
         };
         Metadata {
@@ -842,7 +872,7 @@ impl Vfs {
         mode: u16,
         write: bool,
     ) -> Result<u32, VfsError> {
-        let node = match self.resolve(path) {
+        let node = match self.resolve_following(path) {
             Ok(_) if create && exclusive => return Err(VfsError::Exists),
             Ok(node) => node,
             Err(VfsError::NotFound) if create => self.create_file(path, mode)?,
@@ -935,12 +965,129 @@ impl Vfs {
         }
     }
 
+    /// Creates a symlink at `path` whose target is the literal string
+    /// `target`, unresolved and unvalidated (matching real `symlink()`: the
+    /// target need not exist, and can be relative or absolute). Refused
+    /// under `/data` since a symlink has no FAT on-disk form to persist it
+    /// as - unlike a mutable file, there is no degraded fallback here, only
+    /// silently losing the link across the next remount, so it is rejected
+    /// up front instead.
+    fn create_symlink(&mut self, path: &str, target: &str) -> Result<u16, VfsError> {
+        if target.is_empty() || target.len() > MAX_NAME {
+            return Err(VfsError::NameTooLong);
+        }
+        let parsed = ParsedPath::parse(path)?;
+        if parsed.count == 0 {
+            return Err(VfsError::IsDirectory);
+        }
+        let (parent, name) = self.resolve_parent(&parsed)?;
+        if !self.mutable_subtree(parent) || self.nodes[parent as usize].mode & 0o222 == 0 {
+            return Err(VfsError::PermissionDenied);
+        }
+        if self.find_child(ROOT_NODE, "data") == Some(parent) {
+            return Err(VfsError::PermissionDenied);
+        }
+        if self.find_child(parent, name).is_some() {
+            return Err(VfsError::Exists);
+        }
+        let slot = {
+            let mut files = MUTABLE_FILES.lock();
+            let Some(slot) = files.iter().position(|file| !file.used) else {
+                return Err(VfsError::NodeLimit);
+            };
+            let mut file = MutableFile {
+                used: true,
+                ..MutableFile::EMPTY
+            };
+            file.data[..target.len()].copy_from_slice(target.as_bytes());
+            file.length = target.len();
+            files[slot] = file;
+            slot
+        };
+        match self.add_node(NodeKind::Symlink, parent, name, 0o777, &[]) {
+            Ok(node) => {
+                self.nodes[node as usize].storage = slot as u8;
+                Ok(node)
+            }
+            Err(failure) => {
+                MUTABLE_FILES.lock()[slot] = MutableFile::EMPTY;
+                Err(failure)
+            }
+        }
+    }
+
+    /// The raw target string a symlink was created with - `path` itself
+    /// must be the symlink (unlike `open_file`/`metadata`, this never
+    /// follows), matching real `readlink()`.
+    fn readlink(&self, path: &str, buffer: &mut [u8]) -> Result<usize, VfsError> {
+        let node = self.resolve(path)?;
+        let stored = self.nodes[node as usize];
+        if stored.kind != NodeKind::Symlink {
+            return Err(VfsError::InvalidPath);
+        }
+        let files = MUTABLE_FILES.lock();
+        let file = &files[stored.storage as usize];
+        let length = file.length.min(buffer.len());
+        buffer[..length].copy_from_slice(&file.data[..length]);
+        Ok(length)
+    }
+
+    /// Like `resolve`, but if the final component is a symlink, follows it
+    /// (relative targets are joined against the symlink's own parent
+    /// directory via `node_path`) up to `MAX_SYMLINK_HOPS` times. Symlinks
+    /// named by a non-final path component are deliberately not followed,
+    /// since `resolve`'s per-component loop already requires every component
+    /// but the last to be a real `Directory`, so a symlink there surfaces as
+    /// the existing `NotDirectory` error rather than silently working
+    /// sometimes.
+    fn resolve_following(&self, path: &str) -> Result<u16, VfsError> {
+        let mut current = self.resolve(path)?;
+        for _ in 0..MAX_SYMLINK_HOPS {
+            let stored = self.nodes[current as usize];
+            if stored.kind != NodeKind::Symlink {
+                return Ok(current);
+            }
+            let (target_buf, target_len) = {
+                let files = MUTABLE_FILES.lock();
+                let file = &files[stored.storage as usize];
+                let mut buf = [0u8; MAX_NAME];
+                buf[..file.length].copy_from_slice(&file.data[..file.length]);
+                (buf, file.length)
+            };
+            let target = core::str::from_utf8(&target_buf[..target_len])
+                .map_err(|_| VfsError::InvalidPath)?;
+            let mut joined = [0u8; 128];
+            let resolved = if target.starts_with('/') {
+                target
+            } else {
+                // A symlink only ever exists under a writable mount (never
+                // at the root itself), so `parent_len` is always a real,
+                // non-empty path like "/tmp" here, never the 0 `node_path`
+                // uses to mean "root" or "didn't fit".
+                let parent_len = self.node_path(stored.parent, &mut joined);
+                if parent_len == 0 {
+                    return Err(VfsError::NameTooLong);
+                }
+                let bytes = target.as_bytes();
+                if parent_len + 1 + bytes.len() > joined.len() {
+                    return Err(VfsError::NameTooLong);
+                }
+                joined[parent_len] = b'/';
+                joined[parent_len + 1..parent_len + 1 + bytes.len()].copy_from_slice(bytes);
+                let len = parent_len + 1 + bytes.len();
+                core::str::from_utf8(&joined[..len]).map_err(|_| VfsError::InvalidPath)?
+            };
+            current = self.resolve(resolved)?;
+        }
+        Err(VfsError::TooManyLinks)
+    }
+
     fn open_directory(&mut self, path: &str) -> Result<u32, VfsError> {
         self.open_kind(path, true)
     }
 
     fn open_kind(&mut self, path: &str, directory: bool) -> Result<u32, VfsError> {
-        let node_index = self.resolve(path)?;
+        let node_index = self.resolve_following(path)?;
         let node = self.nodes[node_index as usize];
         if directory && node.kind != NodeKind::Directory {
             return Err(VfsError::NotDirectory);
@@ -995,6 +1142,7 @@ impl Vfs {
             kind: match node.kind {
                 NodeKind::Directory => 4,
                 NodeKind::File => 8,
+                NodeKind::Symlink => 10,
                 NodeKind::Empty => 0,
             },
             name: node.name,
@@ -1220,6 +1368,18 @@ impl Vfs {
         length
     }
 
+    fn handle_path(&mut self, descriptor: u32) -> Option<([u8; 128], usize)> {
+        let node = self.handle_mut(descriptor).ok()?.node;
+        let mut buffer = [0u8; 128];
+        let length = self.node_path(node, &mut buffer);
+        Some(if node == ROOT_NODE {
+            buffer[0] = b'/';
+            (buffer, 1)
+        } else {
+            (buffer, length)
+        })
+    }
+
     /// If the handle was written to, clears that and returns the file's path.
     fn take_dirty_path(&mut self, descriptor: u32) -> Option<([u8; 128], usize)> {
         let handle = self.handle_mut(descriptor).ok()?;
@@ -1258,7 +1418,7 @@ impl Vfs {
                         MUTABLE_FILES.lock()[node.storage as usize].length
                     };
                 }
-                NodeKind::Empty => {}
+                NodeKind::Symlink | NodeKind::Empty => {}
             }
         }
         let mutable = MUTABLE_FILES.lock();
@@ -1379,10 +1539,30 @@ pub fn file(path: &str) -> Result<FileView, VfsError> {
 }
 
 pub fn metadata(path: &str) -> Result<Metadata, VfsError> {
+    if let Some(mapped) = crate::procfs::resolve(path) {
+        return metadata(mapped.as_str());
+    }
+    if let Some(mapped) = crate::mounts::resolve(path) {
+        return metadata(mapped.as_str());
+    }
     if let Some((mount, rest)) = home(path) {
         return datafs::metadata(mount, rest);
     }
     FILESYSTEM.lock().metadata(path)
+}
+
+/// Like `metadata`, but a final-component symlink is described, not followed.
+pub fn symlink_metadata(path: &str) -> Result<Metadata, VfsError> {
+    if let Some(mapped) = crate::procfs::resolve(path) {
+        return symlink_metadata(mapped.as_str());
+    }
+    if let Some(mapped) = crate::mounts::resolve(path) {
+        return symlink_metadata(mapped.as_str());
+    }
+    if let Some((mount, rest)) = home(path) {
+        return datafs::metadata(mount, rest);
+    }
+    FILESYSTEM.lock().symlink_metadata(path)
 }
 
 pub fn descriptor_metadata(descriptor: u32) -> Result<Metadata, VfsError> {
@@ -1390,6 +1570,14 @@ pub fn descriptor_metadata(descriptor: u32) -> Result<Metadata, VfsError> {
         return datafs::descriptor_metadata(descriptor);
     }
     FILESYSTEM.lock().descriptor_metadata(descriptor)
+}
+
+/// The path an open descriptor was opened with, for `fstatfs`.
+pub fn descriptor_path(descriptor: u32) -> Option<([u8; 128], usize)> {
+    if is_mounted_descriptor(descriptor) {
+        return datafs::descriptor_path(descriptor);
+    }
+    FILESYSTEM.lock().handle_path(descriptor)
 }
 
 pub fn open_file(
@@ -1400,8 +1588,21 @@ pub fn open_file(
     mode: u16,
     write: bool,
 ) -> Result<u32, VfsError> {
+    if crate::procfs::is_virtual_path(path) {
+        if create || truncate || write {
+            return Err(VfsError::PermissionDenied);
+        }
+        let mapped = crate::procfs::resolve(path).ok_or(VfsError::NotFound)?;
+        return open_file(mapped.as_str(), false, false, false, 0, false);
+    }
+    if let Some(mapped) = crate::mounts::resolve(path) {
+        return open_file(mapped.as_str(), create, exclusive, truncate, mode, write);
+    }
     if let Some((mount, rest)) = home(path) {
-        let descriptor = datafs::open_file(mount, rest, create, exclusive, truncate, write)?;
+        let descriptor = datafs::open_file(mount, rest, create, exclusive, truncate, write, path)?;
+        if write || truncate {
+            datafs::mark_dirty(descriptor);
+        }
         // Realtime protection: a file is scanned before anyone reads it.
         if !create && !write && !truncate && !crate::antivirus::on_open(path) {
             let _ = datafs::close(descriptor);
@@ -1427,11 +1628,74 @@ pub fn open_file(
     Ok(descriptor)
 }
 
+/// Bounded scratch space for reading a whole persistent-volume file into
+/// memory at once - used by `with_home_file` below. `/home`/`/media` have no
+/// `'static` in-memory copy the way the initramfs and tmpfs do (their bytes
+/// live in this process's own storage arrays already), so there is nothing
+/// for `file()` to hand out a zero-copy view into; the bytes have to be read
+/// off the FAT volume into *something* first.
+const HOME_FILE_MAX: usize = 4 * 1024 * 1024;
+
+struct HomeFileBuffer(core::cell::UnsafeCell<[u8; HOME_FILE_MAX]>);
+unsafe impl Sync for HomeFileBuffer {}
+
+static HOME_FILE_BUFFER: HomeFileBuffer =
+    HomeFileBuffer(core::cell::UnsafeCell::new([0; HOME_FILE_MAX]));
+/// Serializes every use of `HOME_FILE_BUFFER`: held for the whole call below,
+/// not just the read, so two callers (e.g. two CPUs both running programs
+/// out of `/home`) can never see or overwrite each other's bytes.
+static HOME_FILE_LOCK: TicketLock<()> = TicketLock::new(());
+
+/// Reads the whole contents of a `/home` or `/media` file into a shared
+/// scratch buffer and calls `action` with them plus the file's mode -
+/// the persistent-volume equivalent of `file()`, for callers (running a
+/// program, `execve`) that just need to look at the bytes once and are
+/// happy with an ordinary borrowed lifetime rather than `file()`'s `'static`
+/// one. Goes through the same realtime-protection open-time scan as any
+/// other read of a `/home` path. `action` must not itself open another
+/// `/home`/`/media` file (that would deadlock on `HOME_FILE_LOCK`).
+pub fn with_home_file<R>(path: &str, action: impl FnOnce(&[u8], u16) -> R) -> Result<R, VfsError> {
+    if let Some(mapped) = crate::mounts::resolve(path) {
+        return with_home_file(mapped.as_str(), action);
+    }
+    if home(path).is_none() {
+        return Err(VfsError::NotFound);
+    }
+    let _guard = HOME_FILE_LOCK.lock();
+    let descriptor = open_file(path, false, false, false, 0, false)?;
+    let mode = descriptor_metadata(descriptor)
+        .map(|metadata| metadata.mode as u16)
+        .unwrap_or(0o755);
+    // SAFETY: `_guard` gives this call exclusive use of the buffer for as
+    // long as it is held (through the end of `action`), and every other
+    // accessor holds the same lock for as long as it touches the buffer.
+    let buffer = unsafe { &mut *HOME_FILE_BUFFER.0.get() };
+    let mut total = 0usize;
+    let outcome = loop {
+        match read(descriptor, &mut buffer[total..]) {
+            Ok(0) => break Ok(()),
+            Ok(count) => {
+                total += count;
+                if total >= buffer.len() {
+                    break Err(VfsError::FileTooLarge);
+                }
+            }
+            Err(failure) => break Err(failure),
+        }
+    };
+    let _ = close(descriptor);
+    outcome?;
+    Ok(action(&buffer[..total], mode))
+}
+
 /// Opens a file for reading without realtime scanning: for the scanner's own
 /// use, which must not recurse into itself.
 pub fn open_file_raw(path: &str) -> Result<u32, VfsError> {
+    if let Some(mapped) = crate::mounts::resolve(path) {
+        return open_file_raw(mapped.as_str());
+    }
     if let Some((mount, rest)) = home(path) {
-        return datafs::open_file(mount, rest, false, false, false, false);
+        return datafs::open_file(mount, rest, false, false, false, false, path);
     }
     FILESYSTEM
         .lock()
@@ -1439,6 +1703,12 @@ pub fn open_file_raw(path: &str) -> Result<u32, VfsError> {
 }
 
 pub fn open_directory(path: &str) -> Result<u32, VfsError> {
+    if let Some(mapped) = crate::procfs::resolve(path) {
+        return open_directory(mapped.as_str());
+    }
+    if let Some(mapped) = crate::mounts::resolve(path) {
+        return open_directory(mapped.as_str());
+    }
     if let Some((mount, rest)) = home(path) {
         return datafs::open_directory(mount, rest);
     }
@@ -1511,13 +1781,45 @@ pub fn close(descriptor: u32) -> Result<(), VfsError> {
 }
 
 pub fn create_directory(path: &str, mode: u16) -> Result<(), VfsError> {
+    if crate::mounts::is_mount_point(path) {
+        return Err(VfsError::Exists);
+    }
+    if let Some(mapped) = crate::mounts::resolve(path) {
+        return create_directory(mapped.as_str(), mode);
+    }
     if let Some((mount, rest)) = home(path) {
         return datafs::create_directory(mount, rest);
     }
     FILESYSTEM.lock().create_directory(path, mode)
 }
 
+/// Creates a symlink at `path` pointing at `target`. `/home` and `/media`
+/// are FAT-backed exactly like `/data` and refused for the same reason (see
+/// `Filesystem::create_symlink`): only the in-memory tmpfs subtree (`/tmp`)
+/// can hold one.
+pub fn symlink(path: &str, target: &str) -> Result<(), VfsError> {
+    if home(path).is_some() || crate::mounts::resolve(path).is_some() {
+        return Err(VfsError::PermissionDenied);
+    }
+    FILESYSTEM.lock().create_symlink(path, target).map(|_| ())
+}
+
+/// The literal target string a symlink at `path` was created with - `path`
+/// itself must name the symlink, since this never follows it.
+pub fn readlink(path: &str, buffer: &mut [u8]) -> Result<usize, VfsError> {
+    if home(path).is_some() || crate::mounts::resolve(path).is_some() {
+        return Err(VfsError::NotFound);
+    }
+    FILESYSTEM.lock().readlink(path, buffer)
+}
+
 pub fn remove(path: &str, directory: bool) -> Result<(), VfsError> {
+    if crate::mounts::is_mount_point(path) {
+        return Err(VfsError::Busy);
+    }
+    if let Some(mapped) = crate::mounts::resolve(path) {
+        return remove(mapped.as_str(), directory);
+    }
     if let Some((mount, rest)) = home(path) {
         return datafs::remove(mount, rest, directory);
     }
@@ -1568,7 +1870,30 @@ fn move_across(source: &str, destination: &str, replace: bool) -> Result<(), Vfs
     remove(source, false)
 }
 
+/// Rewrites a rename's paths through the bind table; `None` when neither is
+/// under a bind. Errors when either is itself a mount point.
+fn bound_rename_paths(
+    source: &str,
+    destination: &str,
+) -> Result<Option<(crate::mounts::Mapped, crate::mounts::Mapped)>, VfsError> {
+    if crate::mounts::is_mount_point(source) || crate::mounts::is_mount_point(destination) {
+        return Err(VfsError::Busy);
+    }
+    let from = crate::mounts::resolve(source);
+    let to = crate::mounts::resolve(destination);
+    if from.is_none() && to.is_none() {
+        return Ok(None);
+    }
+    let copy = |mapped: Option<crate::mounts::Mapped>, original: &str| {
+        mapped.unwrap_or_else(|| crate::mounts::Mapped::of(original))
+    };
+    Ok(Some((copy(from, source), copy(to, destination))))
+}
+
 pub fn rename(source: &str, destination: &str) -> Result<(), VfsError> {
+    if let Some((from, to)) = bound_rename_paths(source, destination)? {
+        return rename(from.as_str(), to.as_str());
+    }
     match (home(source), home(destination)) {
         (Some((from_mount, from)), Some((to_mount, to))) if from_mount == to_mount => {
             datafs::rename(from_mount, from, to, true)
@@ -1579,6 +1904,9 @@ pub fn rename(source: &str, destination: &str) -> Result<(), VfsError> {
 }
 
 pub fn rename_noreplace(source: &str, destination: &str) -> Result<(), VfsError> {
+    if let Some((from, to)) = bound_rename_paths(source, destination)? {
+        return rename_noreplace(from.as_str(), to.as_str());
+    }
     match (home(source), home(destination)) {
         (Some((from_mount, from)), Some((to_mount, to))) if from_mount == to_mount => {
             datafs::rename(from_mount, from, to, false)
@@ -1589,6 +1917,9 @@ pub fn rename_noreplace(source: &str, destination: &str) -> Result<(), VfsError>
 }
 
 pub fn chmod(path: &str, mode: u16) -> Result<(), VfsError> {
+    if let Some(mapped) = crate::mounts::resolve(path) {
+        return chmod(mapped.as_str(), mode);
+    }
     if let Some((mount, rest)) = home(path) {
         return datafs::chmod(mount, rest, mode);
     }
@@ -1604,7 +1935,11 @@ pub fn fchmod(descriptor: u32, mode: u16) -> Result<(), VfsError> {
 
 pub fn truncate(descriptor: u32, length: usize) -> Result<(), VfsError> {
     if is_mounted_descriptor(descriptor) {
-        return datafs::truncate(descriptor, length);
+        let result = datafs::truncate(descriptor, length);
+        if result.is_ok() {
+            datafs::mark_dirty(descriptor);
+        }
+        return result;
     }
     let result = FILESYSTEM.lock().truncate(descriptor, length);
     if result.is_ok() {
