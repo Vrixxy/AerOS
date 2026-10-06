@@ -831,10 +831,8 @@ pub fn offline_self_test() -> bool {
     };
     let sent = send_tcp(&tcp_out);
     let framed = capture_next().is_some_and(|(frame, frame_length)| {
-        let mut flipped = frame;
         let parsed = handle_frame(&frame[..frame_length]);
         // Looped back at us it is addressed to the peer, so it is not ours.
-        let _ = flipped.iter_mut().next();
         sent && frame_length == 54 + 20 + 7
             && frame[20] == 6
             && frame[22..38] == link_local

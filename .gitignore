@@ -3,5 +3,6 @@
 /userspace/**/target/
 *.log
 *.png
+!/assets/wallpapers/aeros-mountains.png
 *.ppm
 /tools/aml-host/target/

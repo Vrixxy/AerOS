@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
+#![allow(clippy::chunks_exact_to_as_chunks)]
 
 mod ac97;
 mod acpi;
