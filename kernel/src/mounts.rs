@@ -15,7 +15,18 @@ const MAX_BINDS: usize = 8;
 const PATH: usize = 96;
 const MAPPED: usize = 160;
 const ROOT_DIRECTORY: &str = "/home/.root";
-const PERSISTENT: [&str; 4] = ["var", "opt", "srv", "root"];
+const PERSISTENT: [&str; 5] = ["var", "opt", "srv", "root", "etc"];
+/// Files `/etc` starts with on a new home volume (the image's own copy is
+/// read-only and hidden once the persistent directory is bound over it).
+const ETC_DEFAULTS: [(&str, &[u8]); 4] = [
+    ("aeros-release", crate::initramfs::RELEASE),
+    ("hostname", b"aeros\n"),
+    ("hosts", b"127.0.0.1 localhost\n::1 localhost\n"),
+    (
+        "os-release",
+        b"NAME=AerOS\nID=aeros\nVERSION_ID=0.1.0\nPRETTY_NAME=\"AerOS 0.1.0\"\n",
+    ),
+];
 
 #[derive(Clone, Copy)]
 struct Bind {
@@ -222,9 +233,32 @@ pub fn persistent_root() -> usize {
             let _ = bind(target, source);
         }
     }
+    seed_etc();
     let mut active = 0;
     each_bind(|_, _| active += 1);
     active
+}
+
+/// Writes the files `/etc` starts with, leaving any that already exist alone.
+fn seed_etc() {
+    for (name, content) in ETC_DEFAULTS {
+        let mut path = [0u8; 40];
+        let mut length = 0;
+        for part in ["/etc/", name] {
+            path[length..length + part.len()].copy_from_slice(part.as_bytes());
+            length += part.len();
+        }
+        let Ok(path) = core::str::from_utf8(&path[..length]) else {
+            continue;
+        };
+        if vfs::metadata(path).is_ok() {
+            continue;
+        }
+        if let Ok(handle) = vfs::open_file(path, true, true, false, 0o644, true) {
+            let _ = vfs::write(handle, content, false);
+            let _ = vfs::close(handle);
+        }
+    }
 }
 
 pub fn procfs_text(out: &mut impl Write) {
@@ -251,6 +285,7 @@ pub struct Report {
     pub refused: bool,
     pub unbind: bool,
     pub persists: bool,
+    pub etc: bool,
     pub verified: bool,
 }
 
@@ -318,15 +353,32 @@ pub fn self_test() -> Report {
         && bind("/srv", "/home/.root/srv").is_ok()
         && resolve("/srv/x").is_some_and(|mapped| mapped.as_str() == "/home/.root/srv/x");
 
+    let mut etc_written = false;
+    if let Ok(handle) = vfs::open_file("/etc/aerostest.conf", true, true, false, 0o644, true) {
+        etc_written = vfs::write(handle, &payload, false) == Ok(700);
+        etc_written &= vfs::close(handle).is_ok();
+    }
+    report.etc = etc_written
+        && read_all("/etc/hostname", b"aeros\n")
+        && read_all("/etc/aeros-release", crate::initramfs::RELEASE)
+        && vfs::metadata("/home/.root/etc/aerostest.conf")
+            .is_ok_and(|metadata| metadata.size == 700);
+
     datafs::unmount(0);
     let again = datafs::initialize();
     report.persists = again.verified
         && !again.formatted
         && read_all("/var/log/mounts.txt", &payload)
+        && read_all("/etc/aerostest.conf", &payload)
         && persistent_root() >= PERSISTENT.len();
     let cleaned = vfs::remove("/var/log/mounts.txt", false).is_ok()
         && vfs::remove("/var/log", true).is_ok()
-        && matches!(vfs::metadata("/var/log"), Err(VfsError::NotFound));
+        && vfs::remove("/etc/aerostest.conf", false).is_ok()
+        && matches!(vfs::metadata("/var/log"), Err(VfsError::NotFound))
+        && matches!(
+            vfs::metadata("/etc/aerostest.conf"),
+            Err(VfsError::NotFound)
+        );
     report.verified = report.bound >= PERSISTENT.len()
         && report.same_file
         && report.listing
@@ -335,6 +387,7 @@ pub fn self_test() -> Report {
         && report.refused
         && report.unbind
         && report.persists
+        && report.etc
         && cleaned;
     report
 }

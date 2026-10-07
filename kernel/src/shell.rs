@@ -3268,11 +3268,12 @@ impl Shell<'_> {
         };
         match result {
             Ok((mount, length)) => {
-                let _ = writeln!(
-                    output,
-                    "{name} is AerFS, mounted at /media/{}",
-                    core::str::from_utf8(&mount[..length]).unwrap_or("?")
-                );
+                let mount = core::str::from_utf8(&mount[..length]).unwrap_or("?");
+                if mount == "home" {
+                    let _ = writeln!(output, "{name} is AerFS, mounted as /home");
+                } else {
+                    let _ = writeln!(output, "{name} is AerFS, mounted at /media/{mount}");
+                }
             }
             Err(failure) => self.fail_vfs(output, "aerfs", failure),
         }

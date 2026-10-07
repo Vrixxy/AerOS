@@ -376,3 +376,95 @@ pub fn through_vfs() -> VfsReport {
         && report.persists;
     report
 }
+
+pub struct HomeReport {
+    pub adopted: bool,
+    pub folders: bool,
+    pub system_directories: bool,
+    pub written: bool,
+    pub fsck_clean: bool,
+    pub persists: bool,
+    pub restored: bool,
+    pub verified: bool,
+}
+
+fn read_text(path: &str, expected: &[u8]) -> bool {
+    let Ok(handle) = vfs::open_file(path, false, false, false, 0, false) else {
+        return false;
+    };
+    let mut buffer = [0u8; 128];
+    let count = vfs::read(handle, &mut buffer).unwrap_or(0);
+    let _ = vfs::close(handle);
+    &buffer[..count] == expected
+}
+
+/// An AerFS volume labelled `AEROSHOME` becomes `/home` when none is mounted:
+/// the usual folders and the persistent system directories appear on it, data
+/// survives a remount, and the FAT home comes back afterwards.
+pub fn as_home() -> HomeReport {
+    let mut report = HomeReport {
+        adopted: false,
+        folders: false,
+        system_directories: false,
+        written: false,
+        fsck_clean: false,
+        persists: false,
+        restored: false,
+        verified: false,
+    };
+    let is_directory =
+        |path: &str| vfs::metadata(path).is_ok_and(|metadata| metadata.mode & 0o170000 == 0o040000);
+    datafs::unmount(0);
+    let attached = datafs::format_aerfs(Disk::Ram, b"AEROSHOME");
+    report.adopted = matches!(attached, Ok((name, 4)) if &name[..4] == b"home")
+        && datafs::mount_info(0).is_some_and(|mount| mount.kind == "aerfs");
+    report.folders = is_directory("/home/Documents") && is_directory("/home/Trash");
+    report.system_directories = is_directory("/home/.root/etc")
+        && is_directory("/home/.root/var")
+        && read_text("/etc/hostname", b"aeros\n")
+        && read_text(
+            "/home/.root/etc/hosts",
+            b"127.0.0.1 localhost\n::1 localhost\n",
+        );
+
+    let target = "/var/aerhome.bin";
+    let mut written = false;
+    if let Ok(handle) = vfs::open_file(target, true, true, false, 0o644, true) {
+        let mut chunk = [0u8; 700];
+        let mut done = 0;
+        written = true;
+        while done < 9000 {
+            let count = (9000 - done).min(700);
+            for (offset, byte) in chunk[..count].iter_mut().enumerate() {
+                *byte = pattern(9, done + offset);
+            }
+            written &= vfs::write(handle, &chunk[..count], false) == Ok(count);
+            done += count;
+        }
+        written &= vfs::close(handle).is_ok();
+    }
+    report.written = written && read_and_check(target, 9, 9000);
+    report.fsck_clean =
+        datafs::fsck(0, false).is_ok_and(|found| !found.damaged() && found.files >= 1);
+
+    datafs::unmount(0);
+    report.persists = datafs::mount_aerfs(Disk::Ram).is_ok()
+        && datafs::mount_info(0).is_some_and(|mount| mount.kind == "aerfs")
+        && read_and_check(target, 9, 9000)
+        && read_text("/etc/hostname", b"aeros\n");
+    let _ = vfs::remove(target, false);
+
+    datafs::unmount(0);
+    let again = datafs::initialize();
+    report.restored = again.verified
+        && datafs::mount_info(0).is_some_and(|mount| mount.kind == "vfat")
+        && read_text("/etc/hostname", b"aeros\n");
+    report.verified = report.adopted
+        && report.folders
+        && report.system_directories
+        && report.written
+        && report.fsck_clean
+        && report.persists
+        && report.restored;
+    report
+}

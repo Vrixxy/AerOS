@@ -238,59 +238,89 @@ pub fn initialize() -> HomeReport {
         verified: false,
     };
     for disk in candidates().into_iter().flatten() {
-        let mut first = [0u8; 512];
-        if !disk_read(disk, 0, &mut first) {
-            continue;
+        if adopt_home(disk, &mut report) {
+            break;
         }
-        let blank = first[..16] == BLANK_MARKER[..];
-        let fat_label = if is_boot_sector(&first) {
-            // FAT16 keeps the label at 43, FAT32 at 71.
-            let at = if u16::from_le_bytes([first[22], first[23]]) != 0 {
-                43
-            } else {
-                71
-            };
-            first[at..at + 9] == HOME_LABEL[..]
-        } else {
-            false
-        };
-        if !blank && !fat_label {
-            continue;
-        }
-        report.present = true;
-        if blank {
-            if fatfs::Fs::format(disk, 0, disk.sectors(), HOME_LABEL).is_err() {
-                continue;
-            }
-            report.formatted = true;
-        }
-        let Ok(mut fs) = fatfs::Fs::mount(disk, 0) else {
-            continue;
-        };
-        if let Ok(info) = fs.info() {
-            report.fat32 = info.fat32;
-            report.clusters = info.clusters;
-            report.free_clusters = info.free_clusters;
-        }
-        check_home(&mut fs);
-        install(HOME_MOUNT, disk, b"home", Volume::Fat(fs));
-        // The usual folders exist from the first run.
-        for folder in [
-            "/home/Documents",
-            "/home/Downloads",
-            "/home/Notes",
-            "/home/Pictures",
-            "/home/Music",
-            "/home/Trash",
-        ] {
-            let _ = crate::vfs::create_directory(folder, 0o755);
-        }
-        crate::mounts::persistent_root();
-        report.verified = true;
-        break;
     }
     scan_media();
     report
+}
+
+/// Tries `disk` as the home volume: a blank-marked disk (formatted as FAT), a
+/// FAT volume labelled `AEROSHOME`, or an AerFS volume with that label.
+pub(crate) fn adopt_home(disk: Disk, report: &mut HomeReport) -> bool {
+    let mut first = [0u8; 512];
+    if !disk_read(disk, 0, &mut first) {
+        return false;
+    }
+    if Volume::sniff_aerfs(&first) {
+        return adopt_aerfs_home(disk, report);
+    }
+    let blank = first[..16] == BLANK_MARKER[..];
+    let fat_label = if is_boot_sector(&first) {
+        // FAT16 keeps the label at 43, FAT32 at 71.
+        let at = if u16::from_le_bytes([first[22], first[23]]) != 0 {
+            43
+        } else {
+            71
+        };
+        first[at..at + 9] == HOME_LABEL[..]
+    } else {
+        false
+    };
+    if !blank && !fat_label {
+        return false;
+    }
+    report.present = true;
+    if blank {
+        if fatfs::Fs::format(disk, 0, disk.sectors(), HOME_LABEL).is_err() {
+            return false;
+        }
+        report.formatted = true;
+    }
+    let Ok(mut fs) = fatfs::Fs::mount(disk, 0) else {
+        return false;
+    };
+    if let Ok(info) = fs.info() {
+        report.fat32 = info.fat32;
+        report.clusters = info.clusters;
+        report.free_clusters = info.free_clusters;
+    }
+    check_home(&mut fs);
+    install(HOME_MOUNT, disk, b"home", Volume::Fat(fs));
+    finish_home();
+    report.verified = true;
+    true
+}
+
+fn adopt_aerfs_home(disk: Disk, report: &mut HomeReport) -> bool {
+    let Ok(volume) = Volume::mount_aerfs(disk, 0, disk.sectors()) else {
+        return false;
+    };
+    if volume.label()[..9] != HOME_LABEL[..] {
+        return false;
+    }
+    report.present = true;
+    install(HOME_MOUNT, disk, b"home", volume);
+    finish_home();
+    report.verified = true;
+    true
+}
+
+/// The usual folders exist from the first run, and the persistent system
+/// directories are bound over the read-only image's.
+fn finish_home() {
+    for folder in [
+        "/home/Documents",
+        "/home/Downloads",
+        "/home/Notes",
+        "/home/Pictures",
+        "/home/Music",
+        "/home/Trash",
+    ] {
+        let _ = crate::vfs::create_directory(folder, 0o755);
+    }
+    crate::mounts::persistent_root();
 }
 
 /// Checks the home volume as it is mounted and repairs it if it is damaged
@@ -1053,6 +1083,14 @@ pub fn mount_aerfs(disk: Disk) -> Result<([u8; NAME_BYTES], usize), VfsError> {
 /// Mounts `volume` under `/media/<name>` in a free slot.
 fn attach_media(disk: Disk, volume: Volume) -> Result<([u8; NAME_BYTES], usize), VfsError> {
     let label = *volume.label();
+    // A volume labelled like the home volume becomes `/home` when there is none.
+    if label[..9] == HOME_LABEL[..] && !STATE.lock().mounts[HOME_MOUNT].used {
+        install(HOME_MOUNT, disk, b"home", volume);
+        finish_home();
+        let mut name = [0u8; NAME_BYTES];
+        name[..4].copy_from_slice(b"home");
+        return Ok((name, 4));
+    }
     let (name, length) = unique_media_name(&label, disk);
     let free = STATE
         .lock()

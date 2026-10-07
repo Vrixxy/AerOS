@@ -837,10 +837,13 @@ if ($output -notmatch "AEROS_AERFS_CRASH cases=[0-9]+ mount_failures=0 fsck_fail
 if ($output -notmatch "AEROS_AERFS_VFS written=true read_back=true listing=true renamed=true truncated=true fsck_clean=true persists=true verified=true") {
     throw "AerFS through the VFS failed`n$output"
 }
+if ($output -notmatch "AEROS_AERFS_HOME adopted=true folders=true system_directories=true written=true fsck_clean=true persists=true restored=true verified=true") {
+    throw "AerFS as the home volume failed`n$output"
+}
 if ($output -notmatch "AEROS_FATFS_CRASH cases=[1-9][0-9]* structural=0 torn=0 leaks_repaired=[0-9]+ repair_failures=0 verified=true") {
     throw "AerOS /home filesystem power-loss consistency test failed`n$output"
 }
-if ($output -notmatch "AEROS_MOUNTS bound=[0-9]+ same_file=true listing=true rename=true protected=true refused=true unbind=true persists=true verified=true") {
+if ($output -notmatch "AEROS_MOUNTS bound=[0-9]+ same_file=true listing=true rename=true protected=true refused=true unbind=true persists=true etc=true verified=true") {
     throw "AerOS mount table self-test failed`n$output"
 }
 if ($output -notmatch "AEROS_HOME_FSCK files=[0-9]+ directories=[0-9]+ orphans=0 damaged=false") {

@@ -699,7 +699,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
             }
             let mounts = mounts::self_test();
             serial::format(format_args!(
-                "AEROS_MOUNTS bound={} same_file={} listing={} rename={} protected={} refused={} unbind={} persists={} verified={}\n",
+                "AEROS_MOUNTS bound={} same_file={} listing={} rename={} protected={} refused={} unbind={} persists={} etc={} verified={}\n",
                 mounts.bound,
                 mounts.same_file,
                 mounts.listing,
@@ -708,6 +708,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
                 mounts.refused,
                 mounts.unbind,
                 mounts.persists,
+                mounts.etc,
                 mounts.verified
             ));
             if !mounts.verified {
@@ -2213,6 +2214,22 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         ));
         if !aerfs_vfs.verified {
             serial::line("AEROS_AERFS_VFS_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+        let aerfs_home = aerfs_test::as_home();
+        serial::format(format_args!(
+            "AEROS_AERFS_HOME adopted={} folders={} system_directories={} written={} fsck_clean={} persists={} restored={} verified={}\n",
+            aerfs_home.adopted,
+            aerfs_home.folders,
+            aerfs_home.system_directories,
+            aerfs_home.written,
+            aerfs_home.fsck_clean,
+            aerfs_home.persists,
+            aerfs_home.restored,
+            aerfs_home.verified
+        ));
+        if !aerfs_home.verified {
+            serial::line("AEROS_AERFS_HOME_INVARIANT_FAILURE");
             arch::halt_forever();
         }
         perf::run();
