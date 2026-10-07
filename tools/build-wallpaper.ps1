@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$source = Join-Path $root "assets\wallpapers\aeros-mountains.jpeg"
-$destination = Join-Path $root "assets\wallpapers\aeros-mountains.rgb565"
+$source = Join-Path $root "assets\wallpapers\aeros-valley.jpeg"
+$destination = Join-Path $root "assets\wallpapers\aeros-valley.rgb565"
 
 Add-Type -AssemblyName System.Drawing
 $bitmap = [System.Drawing.Bitmap]::new($source)

@@ -28,8 +28,14 @@ pub enum Error {
 
 #[derive(Clone, Copy)]
 pub enum PublicKey<'a> {
-    Rsa { modulus: &'a [u8], exponent: &'a [u8] },
-    Ec { curve: Curve, point: &'a [u8] },
+    Rsa {
+        modulus: &'a [u8],
+        exponent: &'a [u8],
+    },
+    Ec {
+        curve: Curve,
+        point: &'a [u8],
+    },
     Ed25519(&'a [u8]),
 }
 
@@ -186,7 +192,14 @@ fn parse_time(element: der::Tlv<'_>) -> Option<u64> {
         (der::UTC_TIME, 13) if text[12] == b'Z' => {
             let two = digits(0, 2)?;
             let year = if two >= 50 { 1900 + two } else { 2000 + two };
-            unix_time(year, digits(2, 2)?, digits(4, 2)?, digits(6, 2)?, digits(8, 2)?, digits(10, 2)?)
+            unix_time(
+                year,
+                digits(2, 2)?,
+                digits(4, 2)?,
+                digits(6, 2)?,
+                digits(8, 2)?,
+                digits(10, 2)?,
+            )
         }
         (der::GENERALIZED_TIME, 15) if text[14] == b'Z' => unix_time(
             digits(0, 4)?,
@@ -344,7 +357,10 @@ fn parse_ipv4(host: &str) -> Option<[u8; 4]> {
     let mut octets = [0u8; 4];
     let mut count = 0;
     for part in host.split('.') {
-        if count == 4 || part.is_empty() || part.len() > 3 || !part.bytes().all(|b| b.is_ascii_digit())
+        if count == 4
+            || part.is_empty()
+            || part.len() > 3
+            || !part.bytes().all(|b| b.is_ascii_digit())
         {
             return None;
         }
@@ -390,7 +406,10 @@ pub fn verify_signature(
             ecdsa::verify(*curve, point, &digest[..length], signature)
         }
         (PublicKey::Ed25519(public), SignatureAlgorithm::Ed25519) => {
-            match (<&[u8; 32]>::try_from(*public), <&[u8; 64]>::try_from(signature)) {
+            match (
+                <&[u8; 32]>::try_from(*public),
+                <&[u8; 64]>::try_from(signature),
+            ) {
                 (Ok(public), Ok(signature)) => crate::ed25519::verify(public, message, signature),
                 _ => false,
             }

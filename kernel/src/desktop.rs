@@ -25,9 +25,9 @@ mod shellui;
 
 const DESIGN_WIDTH: i32 = 752;
 const DESIGN_HEIGHT: i32 = 458;
-const WALLPAPER_WIDTH: usize = 4_148;
-const WALLPAPER_HEIGHT: usize = 2_228;
-const WALLPAPER: &[u8] = include_bytes!("../../assets/wallpapers/aeros-mountains.rgb565");
+const WALLPAPER_WIDTH: usize = 1_237;
+const WALLPAPER_HEIGHT: usize = 751;
+const WALLPAPER: &[u8] = include_bytes!("../../assets/wallpapers/aeros-valley.rgb565");
 /// Hand-designed dock/app-grid icon art (built by tools\build-desktop-icons.ps1
 /// from assets\icons\src\*.png), straight-alpha RGBA, one 64x64 tile per icon:
 /// 0 apps, 1 terminal, 2 files (dock), 3 browser, 4 notes, 5 trash,

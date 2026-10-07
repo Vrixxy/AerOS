@@ -61,7 +61,8 @@ impl Stream {
         let index = tcpnet::with_tcp(|tcp, _, _| tcp.socket())?;
         tcpnet::activate();
         let stream = Self { index };
-        if tcpnet::with_tcp(|tcp, sink, now| tcp.connect(index, address, port, now, sink)).is_err() {
+        if tcpnet::with_tcp(|tcp, sink, now| tcp.connect(index, address, port, now, sink)).is_err()
+        {
             return None;
         }
         let deadline = tcpnet::now().saturating_add(CONNECT_NS);
@@ -163,7 +164,9 @@ pub fn https_get(
         anchors,
         random: fill_random,
     };
-    session.connect(&mut stream, &config).map_err(Failure::Tls)?;
+    session
+        .connect(&mut stream, &config)
+        .map_err(Failure::Tls)?;
 
     let mut request = [0u8; 512];
     let mut length = 0;
@@ -223,7 +226,9 @@ impl NetReport {
 
 #[cfg(feature = "boot-test")]
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 /// A root certificate the harness left on the virtio test disk: a 32-bit
@@ -282,18 +287,28 @@ pub fn self_test() -> NetReport {
 
     report.rsa_chacha = https_get(gateway, 18_443, "10.0.2.2", "/", &mut page, &rsa_anchor)
         .is_ok_and(|reply| {
-            reply.status == 200 && contains(&page[..reply.bytes], b"Cipher is TLS_CHACHA20_POLY1305_SHA256")
+            reply.status == 200
+                && contains(
+                    &page[..reply.bytes],
+                    b"Cipher is TLS_CHACHA20_POLY1305_SHA256",
+                )
         });
-    report.ec_aes = https_get(gateway, 18_444, "10.0.2.2", "/", &mut page, &ec_anchor).is_ok_and(
-        |reply| reply.status == 200 && contains(&page[..reply.bytes], b"Cipher is TLS_AES_128_GCM_SHA256"),
-    );
+    report.ec_aes =
+        https_get(gateway, 18_444, "10.0.2.2", "/", &mut page, &ec_anchor).is_ok_and(|reply| {
+            reply.status == 200
+                && contains(&page[..reply.bytes], b"Cipher is TLS_AES_128_GCM_SHA256")
+        });
     report.wrong_host_refused = matches!(
         https_get(gateway, 18_444, "evil.example", "/", &mut page, &ec_anchor),
-        Err(Failure::Tls(TlsError::Certificate(crate::tls::x509::Error::HostName)))
+        Err(Failure::Tls(TlsError::Certificate(
+            crate::tls::x509::Error::HostName
+        )))
     );
     report.untrusted_refused = matches!(
         https_get(gateway, 18_444, "10.0.2.2", "/", &mut page, &rsa_anchor),
-        Err(Failure::Tls(TlsError::Certificate(crate::tls::x509::Error::Untrusted)))
+        Err(Failure::Tls(TlsError::Certificate(
+            crate::tls::x509::Error::Untrusted
+        )))
     );
     report
 }

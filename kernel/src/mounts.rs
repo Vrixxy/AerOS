@@ -232,7 +232,7 @@ pub fn procfs_text(out: &mut impl Write) {
     let _ = write!(out, "proc /proc proc ro 0 0\nsysfs /sys sysfs ro 0 0\n");
     for index in 0..4 {
         if let Some(mount) = datafs::mount_info(index) {
-            let _ = writeln!(out, "none {} vfat rw 0 0", mount.path());
+            let _ = writeln!(out, "none {} {} rw 0 0", mount.path(), mount.kind);
         }
     }
     each_bind(|target, source| {

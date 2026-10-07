@@ -113,7 +113,9 @@ fn ciphers() -> bool {
     for (index, byte) in key.iter_mut().enumerate() {
         *byte = 0x80 + index as u8;
     }
-    let nonce = [0x07, 0, 0, 0, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47];
+    let nonce = [
+        0x07, 0, 0, 0, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+    ];
     let mut aad = [0u8; 12];
     unhex("50515253c0c1c2c3c4c5c6c7", &mut aad);
     let text = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
@@ -125,7 +127,14 @@ fn ciphers() -> bool {
         && data == *text;
     let mut flipped = tag;
     flipped[3] ^= 1;
-    let chacha_rejects = !aead::open(Suite::ChaCha20Poly1305, &key, &nonce, &aad, &mut data, &flipped);
+    let chacha_rejects = !aead::open(
+        Suite::ChaCha20Poly1305,
+        &key,
+        &nonce,
+        &aad,
+        &mut data,
+        &flipped,
+    );
 
     // NIST GCM test cases 2 and 4.
     let zero_key = [0u8; 16];
@@ -147,7 +156,14 @@ fn ciphers() -> bool {
     );
     let tag = aead::seal(Suite::Aes128Gcm, &gcm_key, &gcm_nonce, &gcm_aad, &mut plain);
     let gcm_four = matches("5bc94fbc3221a5db94fae95ae7121a47", &tag)
-        && aead::open(Suite::Aes128Gcm, &gcm_key, &gcm_nonce, &gcm_aad, &mut plain, &tag);
+        && aead::open(
+            Suite::Aes128Gcm,
+            &gcm_key,
+            &gcm_nonce,
+            &gcm_aad,
+            &mut plain,
+            &tag,
+        );
     chacha && chacha_rejects && gcm_two && gcm_four
 }
 

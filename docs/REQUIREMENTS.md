@@ -31,7 +31,7 @@ So the practical floor for the desktop alone is about 176 MiB. Anything on top o
 - The kernel image is about 24 MiB on disk and about 93 MiB once loaded (about 70 MiB of zero-initialised statics), so the firmware needs more than that free before the kernel runs at all.
 - About 61 MiB of that is `.bss` sized for a 1920x1080 screen whatever the real resolution: the desktop, shadow, wallpaper, panel, window and setup caches (about 7.9 MiB each for the first four, 6.9 and 4.6 MiB for the others), the frost-blur scratch (6 MiB), the 4 MiB home file buffer and the 4 MiB boot stack. Allocating the screen buffers from the real mode at boot would lower the floor; it has not been done.
 - The kernel heap is 16 MiB.
-- Decoding the 4148x2228 wallpaper JPEG is the largest single allocation at run time.
+- Decoding the 4148x2228 test JPEG (the boot-test checks the picture decoders on it) is the largest single allocation at run time; the desktop wallpaper itself is pre-converted (1237x751) and is not decoded.
 
 ## Practical minimums
 

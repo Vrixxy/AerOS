@@ -103,6 +103,29 @@ impl Node {
         cursor_cluster: 0,
     };
 
+    /// A node for a volume that is not FAT (`first_cluster` carries its own
+    /// object number and `dir` the parent's).
+    pub fn from_parts(
+        dir: u32,
+        first_cluster: u32,
+        size: u32,
+        directory: bool,
+        read_only: bool,
+        date: u16,
+        time: u16,
+    ) -> Node {
+        Node {
+            dir,
+            first_cluster,
+            size,
+            attributes: if directory { ATTR_DIRECTORY } else { 0 }
+                | if read_only { ATTR_READ_ONLY } else { 0 },
+            date,
+            time,
+            ..Node::EMPTY
+        }
+    }
+
     pub fn is_directory(&self) -> bool {
         self.attributes & ATTR_DIRECTORY != 0
     }
@@ -188,7 +211,11 @@ fn put32(bytes: &mut [u8], at: usize, value: u32) {
 
 /// Current time as FAT (date, time).
 fn fat_now() -> (u16, u16) {
-    let seconds = crate::rtc::unix_seconds();
+    unix_to_fat(crate::rtc::unix_seconds())
+}
+
+/// Unix seconds (UTC) as FAT (date, time); 1980-01-01 for anything earlier.
+pub fn unix_to_fat(seconds: u64) -> (u16, u16) {
     let days = (seconds / 86_400) as i64;
     let of_day = seconds % 86_400;
     // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).

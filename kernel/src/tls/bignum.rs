@@ -176,9 +176,8 @@ impl<const N: usize> Mont<N> {
             let value = u128::from(m) * u128::from(self.n.0[0]) + u128::from(t[0]);
             let mut carry = (value >> 64) as u64;
             for j in 1..N {
-                let value = u128::from(m) * u128::from(self.n.0[j])
-                    + u128::from(t[j])
-                    + u128::from(carry);
+                let value =
+                    u128::from(m) * u128::from(self.n.0[j]) + u128::from(t[j]) + u128::from(carry);
                 t[j - 1] = value as u64;
                 carry = (value >> 64) as u64;
             }

@@ -13,31 +13,31 @@ const FS_BASE_MSR: u32 = 0xc000_0100;
 const GS_BASE_MSR: u32 = 0xc000_0101;
 const KERNEL_GS_BASE_MSR: u32 = 0xc000_0102;
 
-const PAGE_SIZE: u64 = 4096;
+pub(crate) const PAGE_SIZE: u64 = 4096;
 const PAGE_2M: u64 = 0x20_0000;
-const GUEST_RAM_PAGES: u64 = 8192;
+pub(crate) const GUEST_RAM_PAGES: u64 = 8192;
 const NPT_PAGES: u64 = 3;
 const IOPM_PAGES: u64 = 3;
 const MSRPM_PAGES: u64 = 2;
-const GUEST_ENTRY: u64 = 0x2000;
-const GUEST_STACK: u64 = 0x1000;
-const LONG_ENTRY: u64 = 0x2_0000;
-const LONG_STACK: u64 = 0x8000;
-const LONG_PML4: u64 = 0x1000;
+pub(crate) const GUEST_ENTRY: u64 = 0x2000;
+pub(crate) const GUEST_STACK: u64 = 0x1000;
+pub(crate) const LONG_ENTRY: u64 = 0x2_0000;
+pub(crate) const LONG_STACK: u64 = 0x8000;
+pub(crate) const LONG_PML4: u64 = 0x1000;
 const LONG_PDPT: u64 = 0x4000;
 const LONG_PD: u64 = 0x5000;
-const CR0_LONG: u64 = 0x8000_0031;
-const CR4_PAE: u64 = 1 << 5;
-const EFER_LME: u64 = 1 << 8;
-const EFER_LMA: u64 = 1 << 10;
-const GUEST_MARKER_ADDR: u64 = 0x9000;
-const GUEST_MARKER: u32 = 0xae05_2d05;
-const GUEST_HIGH_ADDR: u64 = 0x0140_0000;
-const GUEST_HIGH_VALUE: u32 = 0xcafe_f00d;
-const GUEST_HIGH_MARKER_ADDR: u64 = 0x9004;
-const COM1: u16 = 0x3f8;
-const MAX_EXITS: u32 = 4096;
-const GUEST_LOG_MAX: usize = 64;
+pub(crate) const CR0_LONG: u64 = 0x8000_0031;
+pub(crate) const CR4_PAE: u64 = 1 << 5;
+pub(crate) const EFER_LME: u64 = 1 << 8;
+pub(crate) const EFER_LMA: u64 = 1 << 10;
+pub(crate) const GUEST_MARKER_ADDR: u64 = 0x9000;
+pub(crate) const GUEST_MARKER: u32 = 0xae05_2d05;
+pub(crate) const GUEST_HIGH_ADDR: u64 = 0x0140_0000;
+pub(crate) const GUEST_HIGH_VALUE: u32 = 0xcafe_f00d;
+pub(crate) const GUEST_HIGH_MARKER_ADDR: u64 = 0x9004;
+pub(crate) const COM1: u16 = 0x3f8;
+pub(crate) const MAX_EXITS: u32 = 4096;
+pub(crate) const GUEST_LOG_MAX: usize = 64;
 
 const EXIT_IOIO: u64 = 0x07b;
 const EXIT_HLT: u64 = 0x078;
@@ -243,14 +243,14 @@ fn run_mode(frames: &mut FrameAllocator, mode: GuestMode, npt_supported: bool) -
     }
 }
 
-const LINUX_LOAD: u64 = 0x10_0000;
-const LINUX_BOOT_PARAMS: u64 = 0x7000;
+pub(crate) const LINUX_LOAD: u64 = 0x10_0000;
+pub(crate) const LINUX_BOOT_PARAMS: u64 = 0x7000;
 const LINUX_CMDLINE: u64 = 0x1_0000;
-const LINUX_STACK: u64 = 0xf000;
-const LINUX_MESSAGE: &[u8] = b"LINUX\n";
+pub(crate) const LINUX_STACK: u64 = 0xf000;
+pub(crate) const LINUX_MESSAGE: &[u8] = b"LINUX\n";
 const LINUX_CMDLINE_TEXT: &[u8] = b"console=ttyS0,115200 earlyprintk=serial,ttyS0,115200\0";
 
-static LINUX_PROBE: [u8; 2048] = make_linux_probe();
+pub(crate) static LINUX_PROBE: [u8; 2048] = make_linux_probe();
 
 const fn make_linux_probe() -> [u8; 2048] {
     let mut img = [0u8; 2048];
@@ -279,7 +279,7 @@ const fn make_linux_probe() -> [u8; 2048] {
     img
 }
 
-fn linux_image() -> (&'static [u8], &'static str) {
+pub(crate) fn linux_image() -> (&'static [u8], &'static str) {
     match crate::vfs::file("/boot/vmlinuz") {
         Ok(view) if view.data.len() >= 0x268 => (view.data, "/boot/vmlinuz"),
         _ => (&LINUX_PROBE, "embedded-probe"),
@@ -339,8 +339,8 @@ fn run_linux(frames: &mut FrameAllocator) {
     ));
 }
 
-const GUEST_MESSAGE: &[u8] = b"AER-GUEST\n";
-const COM1_END: u16 = COM1 + 7;
+pub(crate) const GUEST_MESSAGE: &[u8] = b"AER-GUEST\n";
+pub(crate) const COM1_END: u16 = COM1 + 7;
 
 #[cfg(feature = "linux-guest")]
 pub fn boot_linux(frames: &mut FrameAllocator) {
@@ -3962,43 +3962,7 @@ impl Vm {
     }
 
     fn load_linux(&mut self, image: &[u8]) -> Option<usize> {
-        if image.len() < 0x268 || image[0x1fe] != 0x55 || image[0x1ff] != 0xaa {
-            return None;
-        }
-        if image[0x202..0x206] != *b"HdrS" {
-            return None;
-        }
-        let setup_sects = if image[0x1f1] == 0 {
-            4usize
-        } else {
-            image[0x1f1] as usize
-        };
-        let pm_offset = (setup_sects + 1) * 512;
-        if pm_offset >= image.len() {
-            return None;
-        }
-        let ram = self.guest_ram;
-        for (index, byte) in image[pm_offset..].iter().enumerate() {
-            unsafe { write_u8(ram, LINUX_LOAD + index as u64, *byte) };
-        }
-        zero_region(ram + LINUX_BOOT_PARAMS, PAGE_SIZE);
-        for (index, byte) in image.iter().enumerate().take(0x268).skip(0x1f1) {
-            unsafe { write_u8(ram, LINUX_BOOT_PARAMS + index as u64, *byte) };
-        }
-        unsafe {
-            write_u8(ram, LINUX_BOOT_PARAMS + 0x210, 0xff);
-            write_u8(ram, LINUX_BOOT_PARAMS + 0x211, image[0x211] | 0x81);
-            write_u32(ram, LINUX_BOOT_PARAMS + 0x228, LINUX_CMDLINE as u32);
-            write_u8(ram, LINUX_BOOT_PARAMS + 0x1e8, 1);
-            let entry = ram + LINUX_BOOT_PARAMS + 0x2d0;
-            write_u64(entry, 0, 0);
-            write_u64(entry, 8, GUEST_RAM_PAGES * PAGE_SIZE);
-            write_u32(entry, 16, 1);
-        }
-        for (index, byte) in LINUX_CMDLINE_TEXT.iter().enumerate() {
-            unsafe { write_u8(ram, LINUX_CMDLINE + index as u64, *byte) };
-        }
-        build_guest_paging(ram, GUEST_RAM_PAGES * PAGE_SIZE);
+        let pm_offset = load_linux_memory(self.guest_ram, image)?;
         unsafe {
             write_u64(self.vmcb, 0x578, LINUX_LOAD + 0x200);
             write_u64(self.vmcb, 0x5d8, LINUX_STACK);
@@ -4008,58 +3972,7 @@ impl Vm {
     }
 
     fn load_long_guest(&mut self) {
-        let mk = GUEST_MARKER;
-        let high = GUEST_HIGH_VALUE;
-        let hi_addr = GUEST_HIGH_ADDR as u32;
-        let mut code = [0u8; 128];
-        let written = {
-            let mut n = 0usize;
-            let mut put = |bytes: &[u8]| {
-                for byte in bytes {
-                    code[n] = *byte;
-                    n += 1;
-                }
-            };
-            put(&[0xba, 0xf8, 0x03, 0x00, 0x00]);
-            for byte in GUEST_MESSAGE {
-                put(&[0xb0, *byte, 0xee]);
-            }
-            put(&[0x48, 0xc7, 0xc0, 0x00, 0x90, 0x00, 0x00]);
-            put(&[
-                0xc7,
-                0x00,
-                mk as u8,
-                (mk >> 8) as u8,
-                (mk >> 16) as u8,
-                (mk >> 24) as u8,
-            ]);
-            put(&[
-                0x48,
-                0xc7,
-                0xc3,
-                hi_addr as u8,
-                (hi_addr >> 8) as u8,
-                (hi_addr >> 16) as u8,
-                (hi_addr >> 24) as u8,
-            ]);
-            put(&[
-                0xc7,
-                0x03,
-                high as u8,
-                (high >> 8) as u8,
-                (high >> 16) as u8,
-                (high >> 24) as u8,
-            ]);
-            put(&[0x8b, 0x0b]);
-            put(&[0x48, 0xc7, 0xc0, 0x04, 0x90, 0x00, 0x00]);
-            put(&[0x89, 0x08]);
-            put(&[0xb8, 0x01, 0x00, 0x00, 0x00]);
-            put(&[0x0f, 0xa2]);
-            put(&[0xb9, 0x80, 0x00, 0x00, 0xc0]);
-            put(&[0x0f, 0x32]);
-            put(&[0xf4]);
-            n
-        };
+        let (code, written) = long_guest_code();
         for (offset, byte) in code.iter().take(written).enumerate() {
             unsafe {
                 core::ptr::write_volatile(
@@ -4071,75 +3984,7 @@ impl Vm {
     }
 
     fn load_real_guest(&mut self) {
-        let marker_lo = GUEST_MARKER_ADDR as u16;
-        let marker_hi = marker_lo + 2;
-        let mk = GUEST_MARKER;
-        let mut code = [0u8; 128];
-        let written = {
-            let mut n = 0usize;
-            let mut put = |bytes: &[u8]| {
-                for byte in bytes {
-                    code[n] = *byte;
-                    n += 1;
-                }
-            };
-            put(&[0xba, 0xf8, 0x03]);
-            for byte in GUEST_MESSAGE {
-                put(&[0xb0, *byte, 0xee]);
-            }
-            put(&[
-                0xc7,
-                0x06,
-                marker_lo as u8,
-                (marker_lo >> 8) as u8,
-                mk as u8,
-                (mk >> 8) as u8,
-            ]);
-            put(&[
-                0xc7,
-                0x06,
-                marker_hi as u8,
-                (marker_hi >> 8) as u8,
-                (mk >> 16) as u8,
-                (mk >> 24) as u8,
-            ]);
-            let high = GUEST_HIGH_VALUE;
-            let addr = GUEST_HIGH_ADDR as u32;
-            let mark = GUEST_HIGH_MARKER_ADDR as u16;
-            put(&[
-                0x66,
-                0xb8,
-                high as u8,
-                (high >> 8) as u8,
-                (high >> 16) as u8,
-                (high >> 24) as u8,
-            ]);
-            put(&[
-                0x67,
-                0x66,
-                0xa3,
-                addr as u8,
-                (addr >> 8) as u8,
-                (addr >> 16) as u8,
-                (addr >> 24) as u8,
-            ]);
-            put(&[
-                0x67,
-                0x66,
-                0xa1,
-                addr as u8,
-                (addr >> 8) as u8,
-                (addr >> 16) as u8,
-                (addr >> 24) as u8,
-            ]);
-            put(&[0x66, 0xa3, mark as u8, (mark >> 8) as u8]);
-            put(&[0x66, 0xb8, 0x01, 0x00, 0x00, 0x00]);
-            put(&[0x0f, 0xa2]);
-            put(&[0x66, 0xb9, 0x80, 0x00, 0x00, 0xc0]);
-            put(&[0x0f, 0x32]);
-            put(&[0xf4]);
-            n
-        };
+        let (code, written) = real_guest_code();
         for (offset, byte) in code.iter().take(written).enumerate() {
             unsafe {
                 core::ptr::write_volatile(
@@ -4252,6 +4097,183 @@ impl Vm {
     }
 }
 
+/// The 64-bit smoke guest: prints a message on COM1, stores two markers
+/// (one above 16 MiB), runs CPUID and RDMSR, then halts. Shared with the VT-x
+/// backend.
+pub(crate) fn long_guest_code() -> ([u8; 128], usize) {
+    let mk = GUEST_MARKER;
+    let high = GUEST_HIGH_VALUE;
+    let hi_addr = GUEST_HIGH_ADDR as u32;
+    let mut code = [0u8; 128];
+    let written = {
+        let mut n = 0usize;
+        let mut put = |bytes: &[u8]| {
+            for byte in bytes {
+                code[n] = *byte;
+                n += 1;
+            }
+        };
+        put(&[0xba, 0xf8, 0x03, 0x00, 0x00]);
+        for byte in GUEST_MESSAGE {
+            put(&[0xb0, *byte, 0xee]);
+        }
+        put(&[0x48, 0xc7, 0xc0, 0x00, 0x90, 0x00, 0x00]);
+        put(&[
+            0xc7,
+            0x00,
+            mk as u8,
+            (mk >> 8) as u8,
+            (mk >> 16) as u8,
+            (mk >> 24) as u8,
+        ]);
+        put(&[
+            0x48,
+            0xc7,
+            0xc3,
+            hi_addr as u8,
+            (hi_addr >> 8) as u8,
+            (hi_addr >> 16) as u8,
+            (hi_addr >> 24) as u8,
+        ]);
+        put(&[
+            0xc7,
+            0x03,
+            high as u8,
+            (high >> 8) as u8,
+            (high >> 16) as u8,
+            (high >> 24) as u8,
+        ]);
+        put(&[0x8b, 0x0b]);
+        put(&[0x48, 0xc7, 0xc0, 0x04, 0x90, 0x00, 0x00]);
+        put(&[0x89, 0x08]);
+        put(&[0xb8, 0x01, 0x00, 0x00, 0x00]);
+        put(&[0x0f, 0xa2]);
+        put(&[0xb9, 0x80, 0x00, 0x00, 0xc0]);
+        put(&[0x0f, 0x32]);
+        put(&[0xf4]);
+        n
+    };
+    (code, written)
+}
+
+/// The real-mode smoke guest: the same program in 16-bit code. Shared with
+/// the VT-x backend.
+pub(crate) fn real_guest_code() -> ([u8; 128], usize) {
+    let marker_lo = GUEST_MARKER_ADDR as u16;
+    let marker_hi = marker_lo + 2;
+    let mk = GUEST_MARKER;
+    let mut code = [0u8; 128];
+    let written = {
+        let mut n = 0usize;
+        let mut put = |bytes: &[u8]| {
+            for byte in bytes {
+                code[n] = *byte;
+                n += 1;
+            }
+        };
+        put(&[0xba, 0xf8, 0x03]);
+        for byte in GUEST_MESSAGE {
+            put(&[0xb0, *byte, 0xee]);
+        }
+        put(&[
+            0xc7,
+            0x06,
+            marker_lo as u8,
+            (marker_lo >> 8) as u8,
+            mk as u8,
+            (mk >> 8) as u8,
+        ]);
+        put(&[
+            0xc7,
+            0x06,
+            marker_hi as u8,
+            (marker_hi >> 8) as u8,
+            (mk >> 16) as u8,
+            (mk >> 24) as u8,
+        ]);
+        let high = GUEST_HIGH_VALUE;
+        let addr = GUEST_HIGH_ADDR as u32;
+        let mark = GUEST_HIGH_MARKER_ADDR as u16;
+        put(&[
+            0x66,
+            0xb8,
+            high as u8,
+            (high >> 8) as u8,
+            (high >> 16) as u8,
+            (high >> 24) as u8,
+        ]);
+        put(&[
+            0x67,
+            0x66,
+            0xa3,
+            addr as u8,
+            (addr >> 8) as u8,
+            (addr >> 16) as u8,
+            (addr >> 24) as u8,
+        ]);
+        put(&[
+            0x67,
+            0x66,
+            0xa1,
+            addr as u8,
+            (addr >> 8) as u8,
+            (addr >> 16) as u8,
+            (addr >> 24) as u8,
+        ]);
+        put(&[0x66, 0xa3, mark as u8, (mark >> 8) as u8]);
+        put(&[0x66, 0xb8, 0x01, 0x00, 0x00, 0x00]);
+        put(&[0x0f, 0xa2]);
+        put(&[0x66, 0xb9, 0x80, 0x00, 0x00, 0xc0]);
+        put(&[0x0f, 0x32]);
+        put(&[0xf4]);
+        n
+    };
+    (code, written)
+}
+
+/// Copies a Linux boot-protocol image into guest RAM and fills in the boot
+/// parameters; returns the protected-mode offset. Shared with the VT-x
+/// backend.
+pub(crate) fn load_linux_memory(ram: u64, image: &[u8]) -> Option<usize> {
+    if image.len() < 0x268 || image[0x1fe] != 0x55 || image[0x1ff] != 0xaa {
+        return None;
+    }
+    if image[0x202..0x206] != *b"HdrS" {
+        return None;
+    }
+    let setup_sects = if image[0x1f1] == 0 {
+        4usize
+    } else {
+        image[0x1f1] as usize
+    };
+    let pm_offset = (setup_sects + 1) * 512;
+    if pm_offset >= image.len() {
+        return None;
+    }
+    for (index, byte) in image[pm_offset..].iter().enumerate() {
+        unsafe { write_u8(ram, LINUX_LOAD + index as u64, *byte) };
+    }
+    zero_region(ram + LINUX_BOOT_PARAMS, PAGE_SIZE);
+    for (index, byte) in image.iter().enumerate().take(0x268).skip(0x1f1) {
+        unsafe { write_u8(ram, LINUX_BOOT_PARAMS + index as u64, *byte) };
+    }
+    unsafe {
+        write_u8(ram, LINUX_BOOT_PARAMS + 0x210, 0xff);
+        write_u8(ram, LINUX_BOOT_PARAMS + 0x211, image[0x211] | 0x81);
+        write_u32(ram, LINUX_BOOT_PARAMS + 0x228, LINUX_CMDLINE as u32);
+        write_u8(ram, LINUX_BOOT_PARAMS + 0x1e8, 1);
+        let entry = ram + LINUX_BOOT_PARAMS + 0x2d0;
+        write_u64(entry, 0, 0);
+        write_u64(entry, 8, GUEST_RAM_PAGES * PAGE_SIZE);
+        write_u32(entry, 16, 1);
+    }
+    for (index, byte) in LINUX_CMDLINE_TEXT.iter().enumerate() {
+        unsafe { write_u8(ram, LINUX_CMDLINE + index as u64, *byte) };
+    }
+    build_guest_paging(ram, GUEST_RAM_PAGES * PAGE_SIZE);
+    Some(pm_offset)
+}
+
 fn build_npt(npt: u64, guest_ram: u64, bytes: u64) {
     let pdpt = npt + PAGE_SIZE;
     let pd = pdpt + PAGE_SIZE;
@@ -4270,7 +4292,7 @@ fn build_npt(npt: u64, guest_ram: u64, bytes: u64) {
     }
 }
 
-fn build_guest_paging(guest_ram: u64, bytes: u64) {
+pub(crate) fn build_guest_paging(guest_ram: u64, bytes: u64) {
     let flags = 0b11u64;
     let entries = bytes.div_ceil(PAGE_2M).min(512);
     unsafe {
@@ -4427,7 +4449,7 @@ unsafe fn vmentry(vmcb: u64, host_vmcb: u64, ctx: *mut u64) {
     }
 }
 
-fn zero_region(address: u64, bytes: u64) {
+pub(crate) fn zero_region(address: u64, bytes: u64) {
     fill_u64(address, bytes, 0);
 }
 
@@ -4450,11 +4472,11 @@ unsafe fn write_u16(base: u64, offset: u64, value: u16) {
     unsafe { core::ptr::write_volatile((base + offset) as usize as *mut u16, value) };
 }
 
-unsafe fn write_u32(base: u64, offset: u64, value: u32) {
+pub(crate) unsafe fn write_u32(base: u64, offset: u64, value: u32) {
     unsafe { core::ptr::write_volatile((base + offset) as usize as *mut u32, value) };
 }
 
-unsafe fn write_u64(base: u64, offset: u64, value: u64) {
+pub(crate) unsafe fn write_u64(base: u64, offset: u64, value: u64) {
     unsafe { core::ptr::write_volatile((base + offset) as usize as *mut u64, value) };
 }
 
@@ -4477,7 +4499,7 @@ fn read_u32(base: u64, offset: u64) -> u32 {
     unsafe { core::ptr::read_volatile((base + offset) as usize as *const u32) }
 }
 
-fn read_msr(register: u32) -> u64 {
+pub(crate) fn read_msr(register: u32) -> u64 {
     let low: u32;
     let high: u32;
     unsafe {
@@ -4492,7 +4514,7 @@ fn read_msr(register: u32) -> u64 {
     low as u64 | (high as u64) << 32
 }
 
-unsafe fn write_msr(register: u32, value: u64) {
+pub(crate) unsafe fn write_msr(register: u32, value: u64) {
     unsafe {
         asm!(
             "wrmsr",

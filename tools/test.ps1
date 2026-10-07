@@ -69,6 +69,15 @@ foreach ($server in @(
             "-ciphersuites", $server.Suite, "-groups", "X25519")
 }
 
+# Whatever makes this script stop, the helper servers must not outlive it: they
+# would keep the caller's output pipe open and the run would never return.
+trap {
+    foreach ($leftover in $tlsServers) {
+        if (-not $leftover.HasExited) { Stop-Process -Id $leftover.Id -Force }
+    }
+    throw $_
+}
+
 # A 4 MiB scratch NVMe namespace: sector 0 carries the signature the driver
 # checks, sector 2 is overwritten by its write/read-back probe.
 $nvmeImage = Join-Path $root "build\nvme-test.img"
@@ -381,6 +390,12 @@ if ($output -notmatch "AEROS_VM64 guest_ram_bytes=33554432 .* halted=true consol
 }
 if ($output -notmatch "AEROS_VM_LINUX source=embedded-probe bytes=2048 pm_offset=1024 loaded=true .* halted=true console_len=6 console_ok=true boot_flag=0xaa55 marker=0xae052d05 verified=true") {
     throw "AerOS Linux boot-protocol handoff failed`n$output"
+}
+# VT-x: QEMU here cannot offer VMX, so on this machine the line is a skip. On an
+# Intel host that does offer it the smoke guests must all pass.
+if ($output -notmatch "AEROS_VMX supported=false verified=skipped" -and
+    $output -notmatch "AEROS_VMX supported=true locked_off=false enabled=true ept=true .* real_mode_ok=true long_mode_ok=true linux_probe_ok=true exits=[0-9]+ instruction_error=0 last_exit=0x[0-9a-f]+ qualification=0x[0-9a-f]+ verified=true") {
+    throw "AerOS VT-x backend failed`n$output"
 }
 if ($output -notmatch "AEROS_PAGING .* nx=true wp=true verified=true") {
     throw "AerOS virtual-memory validation failed`n$output"
@@ -778,6 +793,12 @@ if ($output -notmatch "AEROS_SOCKET_API verified=true") {
 if ($output -notmatch "AEROS_FAT_CRASH cases=[1-9][0-9]* elapsed_ms=[0-9]+ dangling=0 cross_linked=0 short=0 torn=0 lost=0 verified=true") {
     throw "AerOS FAT power-loss consistency test failed`n$output"
 }
+if ($output -notmatch "AEROS_AERFS_CRASH cases=[0-9]+ mount_failures=0 fsck_failures=0 torn=0 verified=true") {
+    throw "AerFS crash-consistency test failed`n$output"
+}
+if ($output -notmatch "AEROS_AERFS_VFS written=true read_back=true listing=true renamed=true truncated=true fsck_clean=true persists=true verified=true") {
+    throw "AerFS through the VFS failed`n$output"
+}
 if ($output -notmatch "AEROS_FATFS_CRASH cases=[1-9][0-9]* structural=0 torn=0 leaks_repaired=[0-9]+ repair_failures=0 verified=true") {
     throw "AerOS /home filesystem power-loss consistency test failed`n$output"
 }
@@ -957,7 +978,7 @@ if ($output -notmatch "AEROS_AV signatures=[1-9][0-9]* self_test=true quarantine
 if ($output -notmatch "AEROS_AUDIT verified=true") {
     throw "AerOS audit log validation failed`n$output"
 }
-if ($output -notmatch "AEROS_COMMANDS count=84 shell=aersh elevation=ear unique=true parser=true privilege=true filesystem=true reauth=true redirection=true startup=true symlinks=true background_jobs=true firewall_command=true dmesg_command=true service_command=true text_tools=true priority_command=true crashes_command=true bench_command=true sigcheck_command=true pipelines=true strace_command=true fsck_command=true verified=true") {
+if ($output -notmatch "AEROS_COMMANDS count=85 shell=aersh elevation=ear unique=true parser=true privilege=true filesystem=true reauth=true redirection=true startup=true symlinks=true background_jobs=true firewall_command=true dmesg_command=true service_command=true text_tools=true priority_command=true crashes_command=true bench_command=true sigcheck_command=true pipelines=true strace_command=true fsck_command=true verified=true") {
     throw "AerOS command registry validation failed`n$output"
 }
 if ($output -notmatch "AEROS_UI_CORE geometry=true scaling=true interaction=true frost=true max_frost_pixels=1048576 verified=true") {

@@ -62,6 +62,8 @@ pub const RAM_DISK_SECTORS: u64 = 16384;
 static RAM_DISK: crate::sync::TicketLock<[u8; RAM_DISK_SECTORS as usize * 512]> =
     crate::sync::TicketLock::new([0; RAM_DISK_SECTORS as usize * 512]);
 #[cfg(feature = "boot-test")]
+static RAM_WRITES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "boot-test")]
 static RAM_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 #[cfg(feature = "boot-test")]
@@ -100,8 +102,21 @@ pub fn ram_write(lba: u64, data: &[u8]) -> bool {
         }
         let start = (lba as usize + index) * 512;
         RAM_DISK.lock()[start..start + 512].copy_from_slice(&data[index * 512..(index + 1) * 512]);
+        RAM_WRITES.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     }
     true
+}
+
+/// Sector writes the RAM disk has taken so far.
+#[cfg(feature = "boot-test")]
+pub fn ram_writes() -> u64 {
+    RAM_WRITES.load(core::sync::atomic::Ordering::SeqCst)
+}
+
+/// True once an injected power loss has used up its allowed writes.
+#[cfg(feature = "boot-test")]
+pub fn power_is_out() -> bool {
+    WRITES_ALLOWED.load(core::sync::atomic::Ordering::SeqCst) == 0
 }
 
 pub fn read_sector(lba: u64, destination: &mut [u8; 512]) -> bool {

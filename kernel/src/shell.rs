@@ -99,6 +99,7 @@ enum Handler {
     Svc,
     Pkg,
     Fsck,
+    Aerfs,
     Install,
     Acpi,
     Swap,
@@ -173,7 +174,7 @@ const fn command(
     }
 }
 
-static COMMANDS: [CommandSpec; 84] = [
+static COMMANDS: [CommandSpec; 85] = [
     command(
         "notify",
         "notify <message...>",
@@ -448,6 +449,13 @@ static COMMANDS: [CommandSpec; 84] = [
         "list the disks the system can be installed on, or install onto one",
         true,
         Handler::Install,
+    ),
+    command(
+        "aerfs",
+        "aerfs format|mount <disk> [label]",
+        "format a whole disk as AerFS (crash-safe, checksummed) or mount one, under /media",
+        true,
+        Handler::Aerfs,
     ),
     command(
         "fsck",
@@ -1561,6 +1569,7 @@ impl<'a> Shell<'a> {
             Handler::Ping => self.command_ping(arguments, offset, output),
             Handler::Dns => self.command_dns(arguments, offset, output),
             Handler::Https => self.command_https(arguments, offset, output),
+            Handler::Aerfs => self.command_aerfs(arguments, offset, output),
             Handler::Route => self.command_route(output),
             Handler::Arp => self.command_arp(output),
             Handler::Netstat => self.command_netstat(output),
@@ -3076,6 +3085,40 @@ impl Shell<'_> {
                 "install",
                 "failed part way; the old partitions were not touched",
             );
+        }
+    }
+
+    fn command_aerfs(
+        &mut self,
+        arguments: &Arguments,
+        offset: usize,
+        output: &mut Text<MAX_OUTPUT>,
+    ) {
+        let (Some(action @ ("format" | "mount")), Some(name)) =
+            (arguments.get(offset), arguments.get(offset + 1))
+        else {
+            self.usage_named(output, "aerfs");
+            return;
+        };
+        let Some(disk) = crate::datafs::disk_by_name(name) else {
+            self.fail(output, "aerfs", "no such disk (see lsblk)");
+            return;
+        };
+        let result = if action == "format" {
+            let label = arguments.get(offset + 2).unwrap_or("AEROS");
+            crate::datafs::format_aerfs(disk, label.as_bytes())
+        } else {
+            crate::datafs::mount_aerfs(disk)
+        };
+        match result {
+            Ok((mount, length)) => {
+                let _ = writeln!(
+                    output,
+                    "{name} is AerFS, mounted at /media/{}",
+                    core::str::from_utf8(&mount[..length]).unwrap_or("?")
+                );
+            }
+            Err(failure) => self.fail_vfs(output, "aerfs", failure),
         }
     }
 
@@ -5511,7 +5554,7 @@ pub fn self_test(info: SystemInfo<'_>) -> ShellReport {
         pipelines,
         strace_command,
         fsck_command,
-        verified: COMMANDS.len() == 84
+        verified: COMMANDS.len() == 85
             && unique
             && parser
             && privilege

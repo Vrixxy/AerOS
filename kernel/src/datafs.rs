@@ -7,9 +7,10 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use crate::fatfs::{self, Box64, Disk, FsError, Node};
+use crate::fatfs::{self, Disk, FsError, Node};
 use crate::sync::TicketLock;
 use crate::vfs::{DirectoryEntry, Metadata, VfsError};
+use crate::volume::Volume;
 
 pub const HANDLE_FLAG: u32 = 0x8000_0000;
 const MAX_HANDLES: usize = 24;
@@ -33,7 +34,7 @@ struct Mount {
     epoch: u32,
     name: [u8; NAME_BYTES],
     name_len: usize,
-    fs: Option<Box64>,
+    fs: Option<Volume>,
 }
 
 const EMPTY_MOUNT: Mount = Mount {
@@ -272,7 +273,7 @@ pub fn initialize() -> HomeReport {
             report.free_clusters = info.free_clusters;
         }
         check_home(&mut fs);
-        install(HOME_MOUNT, disk, b"home", fs);
+        install(HOME_MOUNT, disk, b"home", Volume::Fat(fs));
         // The usual folders exist from the first run.
         for folder in [
             "/home/Documents",
@@ -315,7 +316,7 @@ fn check_home(fs: &mut fatfs::Fs) {
     }
 }
 
-fn install(slot: usize, disk: Disk, name: &[u8], fs: Box64) {
+fn install(slot: usize, disk: Disk, name: &[u8], fs: Volume) {
     let mut state = STATE.lock();
     let mount = &mut state.mounts[slot];
     mount.used = true;
@@ -337,6 +338,44 @@ pub(crate) fn unmount(slot: usize) {
         }
     }
     state.mounts[slot] = EMPTY_MOUNT;
+}
+
+/// A mount name from a volume label (lower-case letters, digits, `_`, `-`),
+/// made unique among the current mounts.
+fn unique_media_name(label: &[u8], disk: Disk) -> ([u8; NAME_BYTES], usize) {
+    let mut name = [0u8; NAME_BYTES];
+    let mut length = 0;
+    for byte in label.iter().take_while(|byte| **byte != 0) {
+        if length < NAME_BYTES - 3
+            && (byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'-')
+        {
+            name[length] = byte.to_ascii_lowercase();
+            length += 1;
+        }
+    }
+    if length == 0 {
+        let fallback: &[u8] = if disk == Disk::Sd { b"sd" } else { b"usb" };
+        name[..fallback.len()].copy_from_slice(fallback);
+        length = fallback.len();
+    }
+    // Make the name unique among the mounts.
+    let taken = |candidate: &[u8]| {
+        STATE
+            .lock()
+            .mounts
+            .iter()
+            .any(|mount| mount.used && names_equal(&mount.name[..mount.name_len], candidate))
+    };
+    let base = length;
+    let mut suffix = 2u8;
+    while taken(&name[..length]) && suffix < 10 {
+        length = base;
+        name[length] = b'-';
+        name[length + 1] = b'0' + suffix;
+        length += 2;
+        suffix += 1;
+    }
+    (name, length)
 }
 
 /// Mounts removable FAT disks that appeared and drops those that vanished.
@@ -376,49 +415,26 @@ pub fn scan_media() {
         if !disk_read(disk, 0, &mut first) {
             continue;
         }
-        let Some(start) = volume_start(&first) else {
-            continue;
-        };
-        let Ok(fs) = fatfs::Fs::mount(disk, start) else {
+        let volume = if let Some(start) = volume_start(&first) {
+            let Ok(fs) = fatfs::Fs::mount(disk, start) else {
+                continue;
+            };
+            Volume::Fat(fs)
+        } else if Volume::sniff_aerfs(&first) {
+            let Ok(volume) = Volume::mount_aerfs(disk, 0, disk.sectors()) else {
+                continue;
+            };
+            volume
+        } else {
             continue;
         };
         // A stick labelled like the home volume is the home volume.
-        let label = fs.label();
+        let label = *volume.label();
         if label[..9] == HOME_LABEL[..] && !STATE.lock().mounts[HOME_MOUNT].used {
-            install(HOME_MOUNT, disk, b"home", fs);
+            install(HOME_MOUNT, disk, b"home", volume);
             continue;
         }
-        let mut name = [0u8; NAME_BYTES];
-        let mut length = 0;
-        for byte in label.iter().take_while(|byte| **byte != 0) {
-            if length < NAME_BYTES - 3
-                && (byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'-')
-            {
-                name[length] = byte.to_ascii_lowercase();
-                length += 1;
-            }
-        }
-        if length == 0 {
-            let fallback: &[u8] = if disk == Disk::Sd { b"sd" } else { b"usb" };
-            name[..fallback.len()].copy_from_slice(fallback);
-            length = fallback.len();
-        }
-        // Make the name unique among the mounts.
-        let taken =
-            |candidate: &[u8]| {
-                STATE.lock().mounts.iter().any(|mount| {
-                    mount.used && names_equal(&mount.name[..mount.name_len], candidate)
-                })
-            };
-        let base = length;
-        let mut suffix = 2u8;
-        while taken(&name[..length]) && suffix < 10 {
-            length = base;
-            name[length] = b'-';
-            name[length + 1] = b'0' + suffix;
-            length += 2;
-            suffix += 1;
-        }
+        let (name, length) = unique_media_name(&label, disk);
         let free = STATE
             .lock()
             .mounts
@@ -426,7 +442,7 @@ pub fn scan_media() {
             .skip(1)
             .position(|mount| !mount.used);
         if let Some(index) = free {
-            install(index + 1, disk, &name[..length], fs);
+            install(index + 1, disk, &name[..length], volume);
             crate::serial::format(format_args!(
                 "AEROS_MEDIA mounted /media/{}\n",
                 core::str::from_utf8(&name[..length]).unwrap_or("?")
@@ -444,7 +460,7 @@ pub fn poll() {
 
 fn with_fs<T>(
     mount: usize,
-    operation: impl FnOnce(&mut fatfs::Fs) -> Result<T, FsError>,
+    operation: impl FnOnce(&mut Volume) -> Result<T, FsError>,
 ) -> Result<T, VfsError> {
     let mut state = STATE.lock();
     let Some(fs) = state
@@ -515,7 +531,7 @@ fn lookup(state: &mut State, descriptor: u32) -> Result<&mut Handle, VfsError> {
 fn with_handle_fs<T>(
     state: &mut State,
     mount: usize,
-    operation: impl FnOnce(&mut fatfs::Fs) -> Result<T, FsError>,
+    operation: impl FnOnce(&mut Volume) -> Result<T, FsError>,
 ) -> Result<T, VfsError> {
     let Some(fs) = state
         .mounts
@@ -892,6 +908,8 @@ pub struct MountInfo {
     pub total_bytes: u64,
     pub free_bytes: u64,
     pub fat32: bool,
+    /// `vfat` or `aerfs`, as `/proc/mounts` shows it.
+    pub kind: &'static str,
 }
 
 impl MountInfo {
@@ -937,6 +955,7 @@ pub fn mount_info(index: usize) -> Option<MountInfo> {
     path[prefix.len()..prefix.len() + name.len()].copy_from_slice(name);
     let length = prefix.len() + name.len();
     let device = device_name(mount.disk);
+    let kind = mount.fs.as_ref()?.type_name();
     let info = mount.fs.as_mut()?.info().ok()?;
     let cluster = info.bytes_per_cluster as u64;
     Some(MountInfo {
@@ -946,6 +965,7 @@ pub fn mount_info(index: usize) -> Option<MountInfo> {
         total_bytes: info.clusters as u64 * cluster,
         free_bytes: info.free_clusters as u64 * cluster,
         fat32: info.fat32,
+        kind,
     })
 }
 
@@ -979,6 +999,70 @@ pub fn eject(name: &str) -> Result<(), VfsError> {
         *entry = Some(disk);
     }
     Ok(())
+}
+
+/// The disk a device name such as `sdu` or `nvme0n1` stands for.
+pub fn disk_by_name(name: &str) -> Option<Disk> {
+    [
+        Disk::Ahci(0),
+        Disk::Ahci(1),
+        Disk::Ahci(2),
+        Disk::Nvme,
+        Disk::Usb,
+        Disk::Sd,
+        Disk::Virtio,
+    ]
+    .into_iter()
+    .find(|disk| device_name(*disk) == name)
+}
+
+/// Formats a whole disk as AerFS and mounts it under `/media`. Refuses the
+/// boot disk, a disk that is already mounted, and one too small to hold it.
+/// Returns the mount name.
+pub fn format_aerfs(disk: Disk, label: &[u8]) -> Result<([u8; NAME_BYTES], usize), VfsError> {
+    if disk.sectors() < 128 {
+        return Err(VfsError::NotFound);
+    }
+    if crate::blockdev::boot_disk() == Some(disk)
+        || STATE
+            .lock()
+            .mounts
+            .iter()
+            .any(|mount| mount.used && mount.disk == disk)
+    {
+        return Err(VfsError::Busy);
+    }
+    let volume = Volume::format_aerfs(disk, 0, disk.sectors(), label).map_err(map_error)?;
+    attach_media(disk, volume)
+}
+
+/// Mounts the AerFS volume that is already on `disk` under `/media`.
+pub fn mount_aerfs(disk: Disk) -> Result<([u8; NAME_BYTES], usize), VfsError> {
+    if STATE
+        .lock()
+        .mounts
+        .iter()
+        .any(|mount| mount.used && mount.disk == disk)
+    {
+        return Err(VfsError::Busy);
+    }
+    let volume = Volume::mount_aerfs(disk, 0, disk.sectors()).map_err(map_error)?;
+    attach_media(disk, volume)
+}
+
+/// Mounts `volume` under `/media/<name>` in a free slot.
+fn attach_media(disk: Disk, volume: Volume) -> Result<([u8; NAME_BYTES], usize), VfsError> {
+    let label = *volume.label();
+    let (name, length) = unique_media_name(&label, disk);
+    let free = STATE
+        .lock()
+        .mounts
+        .iter()
+        .skip(1)
+        .position(|mount| !mount.used)
+        .ok_or(VfsError::NodeLimit)?;
+    install(free + 1, disk, &name[..length], volume);
+    Ok((name, length))
 }
 
 /// Checks (and with `repair` fixes) the filesystem of mount slot `mount`.

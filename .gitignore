@@ -8,3 +8,5 @@
 /tools/aml-host/target/
 /tools/tls-host/target/
 /tools/tls-host/tests/chain_data.rs
+/tools/vmx-host/target/
+/tools/aerfs-host/target/

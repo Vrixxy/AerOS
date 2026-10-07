@@ -6,6 +6,9 @@
 mod ac97;
 mod acpi;
 mod acpi_ns;
+mod aerfs;
+#[cfg(feature = "boot-test")]
+mod aerfs_test;
 pub mod aerui;
 mod ahci;
 mod aml;
@@ -118,6 +121,11 @@ mod virtio_gpu;
 mod virtio_input;
 mod virtio_modern;
 mod virtio_net;
+#[cfg(feature = "boot-test")]
+mod vmx;
+#[cfg(feature = "boot-test")]
+mod vmx_logic;
+mod volume;
 mod web;
 mod xhci;
 
@@ -704,6 +712,31 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         svm.guest_marker,
         svm.verified
     ));
+    // Boot-test builds only: the backend has not run on Intel hardware yet,
+    // so an ordinary boot must not depend on it (see docs/VTX.md).
+    #[cfg(feature = "boot-test")]
+    {
+        let vmx = vmx::self_test(&mut frames);
+        if vmx.skipped() {
+            serial::line("AEROS_VMX supported=false verified=skipped");
+        } else {
+            serial::format(format_args!(
+                "AEROS_VMX supported=true locked_off={} enabled={} ept={} unrestricted_guest={} real_mode_ok={} long_mode_ok={} linux_probe_ok={} exits={} instruction_error={} last_exit={:#x} qualification={:#x} verified={}\n",
+                vmx.locked_off,
+                vmx.enabled,
+                vmx.ept,
+                vmx.unrestricted_guest,
+                vmx.real_mode_ok,
+                vmx.long_mode_ok,
+                vmx.linux_probe_ok,
+                vmx.exits,
+                vmx.instruction_error,
+                vmx.last_exit,
+                vmx.qualification,
+                vmx.verified
+            ));
+        }
+    }
     #[cfg(feature = "linux-guest")]
     svm::boot_linux(&mut frames);
     process::initialize();
@@ -2102,6 +2135,37 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         ));
         if !home_crash.verified {
             serial::line("AEROS_FATFS_CRASH_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+        let aerfs_crash = aerfs_test::crash();
+        serial::format(format_args!(
+            "AEROS_AERFS_CRASH cases={} mount_failures={} fsck_failures={} torn={} verified={}
+",
+            aerfs_crash.cases,
+            aerfs_crash.mount_failures,
+            aerfs_crash.fsck_failures,
+            aerfs_crash.torn,
+            aerfs_crash.verified
+        ));
+        if !aerfs_crash.verified {
+            serial::line("AEROS_AERFS_CRASH_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+        let aerfs_vfs = aerfs_test::through_vfs();
+        serial::format(format_args!(
+            "AEROS_AERFS_VFS written={} read_back={} listing={} renamed={} truncated={} fsck_clean={} persists={} verified={}
+",
+            aerfs_vfs.written,
+            aerfs_vfs.read_back,
+            aerfs_vfs.listing,
+            aerfs_vfs.renamed,
+            aerfs_vfs.truncated,
+            aerfs_vfs.fsck_clean,
+            aerfs_vfs.persists,
+            aerfs_vfs.verified
+        ));
+        if !aerfs_vfs.verified {
+            serial::line("AEROS_AERFS_VFS_INVARIANT_FAILURE");
             arch::halt_forever();
         }
         let fuzz = fuzz::run();

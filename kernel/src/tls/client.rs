@@ -10,9 +10,11 @@ use core::cmp::min;
 
 use super::aead::{self, Suite, TAG_LEN};
 use super::ecdsa::Curve;
-use super::hash::{HASH_LEN, HashAlg, constant_time_eq, derive_secret, expand_label, hkdf_extract, hmac_sha256};
-use super::x25519;
+use super::hash::{
+    HASH_LEN, HashAlg, constant_time_eq, derive_secret, expand_label, hkdf_extract, hmac_sha256,
+};
 use super::x509::{self, PublicKey, SignatureAlgorithm, TrustAnchor};
+use super::x25519;
 use crate::auth::Sha256;
 
 pub const MAX_RECORD: usize = 16384;
@@ -179,9 +181,8 @@ impl<'a> Writer<'a> {
 }
 
 const HELLO_RETRY_MAGIC: [u8; 32] = [
-    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8,
-    0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8,
-    0x33, 0x9c,
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
 ];
 
 const TYPE_CHANGE_CIPHER_SPEC: u8 = 20;
@@ -283,12 +284,18 @@ fn scheme_algorithm(scheme: u16, key: &PublicKey<'_>) -> Option<SignatureAlgorit
         (0x0804, PublicKey::Rsa { .. }) => Some(SignatureAlgorithm::RsaPss(HashAlg::Sha256)),
         (0x0805, PublicKey::Rsa { .. }) => Some(SignatureAlgorithm::RsaPss(HashAlg::Sha384)),
         (0x0806, PublicKey::Rsa { .. }) => Some(SignatureAlgorithm::RsaPss(HashAlg::Sha512)),
-        (0x0403, PublicKey::Ec { curve: Curve::P256, .. }) => {
-            Some(SignatureAlgorithm::Ecdsa(HashAlg::Sha256))
-        }
-        (0x0503, PublicKey::Ec { curve: Curve::P384, .. }) => {
-            Some(SignatureAlgorithm::Ecdsa(HashAlg::Sha384))
-        }
+        (
+            0x0403,
+            PublicKey::Ec {
+                curve: Curve::P256, ..
+            },
+        ) => Some(SignatureAlgorithm::Ecdsa(HashAlg::Sha256)),
+        (
+            0x0503,
+            PublicKey::Ec {
+                curve: Curve::P384, ..
+            },
+        ) => Some(SignatureAlgorithm::Ecdsa(HashAlg::Sha384)),
         (0x0807, PublicKey::Ed25519(_)) => Some(SignatureAlgorithm::Ed25519),
         _ => None,
     }
@@ -306,7 +313,9 @@ fn read_exact<T: Transport>(transport: &mut T, mut buffer: &mut [u8]) -> Result<
 }
 
 fn is_ip_literal(host: &str) -> bool {
-    host.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.') || host.contains(':')
+    host.bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        || host.contains(':')
 }
 
 impl Session {
@@ -341,7 +350,10 @@ impl Session {
 
     /// The next record's content type and where its payload sits in
     /// `self.record`. Change-cipher-spec records are skipped.
-    fn read_record<T: Transport>(&mut self, transport: &mut T) -> Result<(u8, usize, usize), Error> {
+    fn read_record<T: Transport>(
+        &mut self,
+        transport: &mut T,
+    ) -> Result<(u8, usize, usize), Error> {
         loop {
             read_exact(transport, &mut self.record[..5])?;
             let outer = self.record[0];
@@ -411,13 +423,7 @@ impl Session {
         }
         let total = if self.write.active {
             let length = data.len() + 1 + TAG_LEN;
-            let header = [
-                TYPE_APPLICATION,
-                3,
-                3,
-                (length >> 8) as u8,
-                length as u8,
-            ];
+            let header = [TYPE_APPLICATION, 3, 3, (length >> 8) as u8, length as u8];
             self.out[..5].copy_from_slice(&header);
             self.out[5..5 + data.len()].copy_from_slice(data);
             self.out[5 + data.len()] = content_type;
@@ -551,7 +557,11 @@ impl Session {
         length
     }
 
-    pub fn connect<T: Transport>(&mut self, transport: &mut T, config: &Config<'_>) -> Result<(), Error> {
+    pub fn connect<T: Transport>(
+        &mut self,
+        transport: &mut T,
+        config: &Config<'_>,
+    ) -> Result<(), Error> {
         self.reset();
         if config.host.is_empty() || config.host.len() > 253 {
             return Err(Error::Unsupported);
@@ -648,7 +658,11 @@ impl Session {
         self.write_record(transport, TYPE_CHANGE_CIPHER_SPEC, &[1])?;
         self.write = client_handshake;
         if client_certificate_requested {
-            self.write_record(transport, TYPE_HANDSHAKE, &[HS_CERTIFICATE, 0, 0, 4, 0, 0, 0, 0])?;
+            self.write_record(
+                transport,
+                TYPE_HANDSHAKE,
+                &[HS_CERTIFICATE, 0, 0, 4, 0, 0, 0, 0],
+            )?;
         }
         let mut client_finished_key = [0u8; 32];
         expand_label(&client_secret, b"finished", b"", &mut client_finished_key);
@@ -681,7 +695,11 @@ impl Session {
     }
 
     /// Reads application data; `Ok(0)` after the server's close_notify.
-    pub fn read<T: Transport>(&mut self, transport: &mut T, out: &mut [u8]) -> Result<usize, Error> {
+    pub fn read<T: Transport>(
+        &mut self,
+        transport: &mut T,
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
         loop {
             if self.pending.0 < self.pending.1 {
                 let count = min(out.len(), self.pending.1 - self.pending.0);
@@ -953,7 +971,11 @@ mod tests {
 
             // The server rotates its keys and asks the client to do the same.
             server
-                .write_record(&mut server_wire, TYPE_HANDSHAKE, &[HS_KEY_UPDATE, 0, 0, 1, 1])
+                .write_record(
+                    &mut server_wire,
+                    TYPE_HANDSHAKE,
+                    &[HS_KEY_UPDATE, 0, 0, 1, 1],
+                )
                 .unwrap();
             server.write = next_keys(&server.write, suite);
             server.write(&mut server_wire, b"after the update").unwrap();
@@ -986,14 +1008,20 @@ mod tests {
         bad[last] ^= 1;
         server_wire.inbound = bad;
         let mut buffer = [0u8; 16];
-        assert_eq!(server.read(&mut server_wire, &mut buffer), Err(Error::Decrypt));
+        assert_eq!(
+            server.read(&mut server_wire, &mut buffer),
+            Err(Error::Decrypt)
+        );
 
         let (_, mut server) = pair(Suite::ChaCha20Poly1305);
         server_wire.inbound = record.clone();
         assert_eq!(server.read(&mut server_wire, &mut buffer), Ok(6));
         // The same record again carries the old sequence number.
         server_wire.inbound = record;
-        assert_eq!(server.read(&mut server_wire, &mut buffer), Err(Error::Decrypt));
+        assert_eq!(
+            server.read(&mut server_wire, &mut buffer),
+            Err(Error::Decrypt)
+        );
     }
 
     #[test]
