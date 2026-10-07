@@ -291,10 +291,27 @@ impl Scheduler {
     /// nice value; a task passed over for long enough gains priority, so no
     /// ready task starves.
     fn next_ready(&mut self) -> Option<usize> {
+        self.pick_ready(false)
+    }
+
+    /// Next task for one that gives up the CPU by itself (a blocked read, a
+    /// wait, an exit). Real work comes first: the boot task idles with `hlt`
+    /// and would sleep a whole timer tick if it were handed the CPU while
+    /// another task could run. It still gets its turn when nothing else is
+    /// ready, and the timer tick schedules it normally, so it is never
+    /// starved.
+    fn next_ready_for_yield(&mut self) -> Option<usize> {
+        self.pick_ready(true).or_else(|| self.pick_ready(false))
+    }
+
+    fn pick_ready(&mut self, skip_boot_task: bool) -> Option<usize> {
         let mut candidates = [(0usize, 0i8, 0u8); MAX_TASKS];
         let mut count = 0;
         for distance in 1..=MAX_TASKS {
             let index = (self.current + distance) % MAX_TASKS;
+            if skip_boot_task && index == BOOT_TASK_SLOT {
+                continue;
+            }
             let task = &self.tasks[index];
             if task.state == TaskState::Ready {
                 candidates[count] = (index, task.nice, task.skipped);
@@ -313,6 +330,10 @@ impl Scheduler {
         Some(chosen)
     }
 }
+
+/// The slot of the kernel's own boot context (the desktop loop), which waits
+/// with `hlt` when idle.
+const BOOT_TASK_SLOT: usize = 0;
 
 const AGING_STEP: u8 = 4;
 
@@ -1760,13 +1781,30 @@ fn finish_user_task(exit_code: u64) -> ! {
     exit_current()
 }
 
+/// Gives the CPU to the next ready task in fair round-robin order (what the
+/// timer tick does).
 pub fn yield_now() -> bool {
+    yield_with(false)
+}
+
+/// Like `yield_now` for a task that blocks: other work runs before the idle
+/// boot task does.
+pub fn yield_to_work() -> bool {
+    yield_with(true)
+}
+
+fn yield_with(work_first: bool) -> bool {
     arch::disable_interrupts();
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     if !scheduler.initialized {
         return false;
     }
-    let Some(next) = scheduler.next_ready() else {
+    let next = if work_first {
+        scheduler.next_ready_for_yield()
+    } else {
+        scheduler.next_ready()
+    };
+    let Some(next) = next else {
         return false;
     };
     let current = scheduler.current;
@@ -1810,7 +1848,7 @@ pub fn exit_current() -> ! {
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     let current = scheduler.current;
     scheduler.tasks[current].state = TaskState::Exited;
-    let Some(next) = scheduler.next_ready() else {
+    let Some(next) = scheduler.next_ready_for_yield() else {
         arch::halt_forever();
     };
     scheduler.tasks[next].state = TaskState::Running;

@@ -675,6 +675,98 @@ fn looks_high_entropy(histogram: &[u32; 256], total: u64) -> bool {
     used >= 250 && max_permille <= 20
 }
 
+/// Needles grouped by their first byte: the entries for byte `b` are
+/// `entries[start[b]..start[b + 1]]`, each `(pattern index, needle bit)`.
+/// Scanning then looks at a needle only where its first byte occurs, instead
+/// of sliding every needle over every position.
+const MAX_INDEXED: usize = 192;
+
+struct NeedleIndex {
+    start: [u16; 257],
+    entries: [(u8, u8); MAX_INDEXED],
+}
+
+impl NeedleIndex {
+    const EMPTY: NeedleIndex = NeedleIndex {
+        start: [0; 257],
+        entries: [(0, 0); MAX_INDEXED],
+    };
+
+    /// Builds the index from `(first byte, pattern, bit)` triples; anything
+    /// past `MAX_INDEXED` is left out of the index and so cannot match, which
+    /// the sizes below make impossible for the compiled-in patterns.
+    fn build(needles: impl Iterator<Item = (u8, u8, u8)> + Clone) -> Self {
+        let mut index = Self::EMPTY;
+        let mut counts = [0u16; 256];
+        for (first, _, _) in needles.clone().take(MAX_INDEXED) {
+            counts[first as usize] += 1;
+        }
+        let mut total = 0u16;
+        for (slot, count) in index.start.iter_mut().zip(counts) {
+            *slot = total;
+            total += count;
+        }
+        index.start[256] = total;
+        let mut next = [0u16; 256];
+        for (first, pattern, bit) in needles.take(MAX_INDEXED) {
+            let slot = index.start[first as usize] + next[first as usize];
+            index.entries[slot as usize] = (pattern, bit);
+            next[first as usize] += 1;
+        }
+        index
+    }
+
+    fn scan(
+        &self,
+        window: &[u8],
+        hits: &mut [u8],
+        needle: impl Fn(usize, usize) -> &'static [u8] + Copy,
+    ) {
+        for (position, &byte) in window.iter().enumerate() {
+            let from = self.start[byte as usize] as usize;
+            let to = self.start[byte as usize + 1] as usize;
+            if from == to {
+                continue;
+            }
+            let rest = &window[position..];
+            for &(pattern, bit) in &self.entries[from..to] {
+                let mask = 1u8 << bit;
+                if hits[pattern as usize] & mask == 0
+                    && rest.starts_with(needle(pattern as usize, bit as usize))
+                {
+                    hits[pattern as usize] |= mask;
+                }
+            }
+        }
+    }
+}
+
+static STATIC_INDEX_READY: AtomicBool = AtomicBool::new(false);
+static STATIC_INDEX_BUILD: TicketLock<()> = TicketLock::new(());
+static mut STATIC_INDEX: NeedleIndex = NeedleIndex::EMPTY;
+
+fn static_index() -> &'static NeedleIndex {
+    if !STATIC_INDEX_READY.load(Ordering::Acquire) {
+        let _build = STATIC_INDEX_BUILD.lock();
+        if !STATIC_INDEX_READY.load(Ordering::Acquire) {
+            let built =
+                NeedleIndex::build(PATTERNS.iter().enumerate().flat_map(|(pattern, entry)| {
+                    entry
+                        .all
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, needle)| !needle.is_empty())
+                        .map(move |(bit, needle)| (needle[0], pattern as u8, bit as u8))
+                }));
+            // SAFETY: written once under the build lock, before the flag.
+            unsafe { *core::ptr::addr_of_mut!(STATIC_INDEX) = built };
+            STATIC_INDEX_READY.store(true, Ordering::Release);
+        }
+    }
+    // SAFETY: never written again once the flag is set.
+    unsafe { &*core::ptr::addr_of!(STATIC_INDEX) }
+}
+
 /// Streaming scanner: feed the file in any chunking, then `finish`.
 pub struct Scanner {
     hash: Sha256,
@@ -737,27 +829,32 @@ impl Scanner {
         if !self.eicar_hit && contains(window, &self.eicar) {
             self.eicar_hit = true;
         }
-        for (index, pattern) in PATTERNS.iter().enumerate() {
-            for (bit, needle) in pattern.all.iter().enumerate() {
-                if self.hits[index] & (1 << bit) == 0 && contains(window, needle) {
-                    self.hits[index] |= 1 << bit;
-                }
-            }
-        }
+        static_index().scan(window, &mut self.hits, |pattern, bit| {
+            PATTERNS[pattern].all[bit]
+        });
         {
             let db = DYN_DB.lock();
-            for index in 0..db.pattern_count {
-                let Some(pattern) = &db.patterns[index] else {
-                    continue;
-                };
-                for bit in 0..pattern.needle_count as usize {
-                    if self.dyn_hits[index] & (1 << bit) == 0
-                        && contains(window, pattern.needle(bit))
-                    {
-                        self.dyn_hits[index] |= 1 << bit;
-                    }
-                }
-            }
+            let index =
+                NeedleIndex::build(db.patterns[..db.pattern_count].iter().enumerate().flat_map(
+                    |(pattern, entry)| {
+                        entry.iter().flat_map(move |entry| {
+                            (0..entry.needle_count as usize).filter_map(move |bit| {
+                                entry
+                                    .needle(bit)
+                                    .first()
+                                    .map(|first| (*first, pattern as u8, bit as u8))
+                            })
+                        })
+                    },
+                ));
+            // The needles live in the database, which the lock keeps in
+            // place for the duration of the scan.
+            let database: &'static DynDb = unsafe { &*(&*db as *const DynDb) };
+            index.scan(window, &mut self.dyn_hits, |pattern, bit| {
+                database.patterns[pattern]
+                    .as_ref()
+                    .map_or(&[][..], |entry| entry.needle(bit))
+            });
         }
         let keep = window.len().min(TAIL);
         let start = window.len() - keep;

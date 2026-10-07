@@ -586,13 +586,13 @@ fn yield_in_syscall() {
         crate::tcpnet::poll();
     }
     if crate::scheduler::current_task_pid_for_linux().is_none() {
-        crate::scheduler::yield_now();
+        crate::scheduler::yield_to_work();
         return;
     }
     let saved_user_rsp = user_stack_pointer();
     // SAFETY: paired swapgs around the yield restore the in-syscall GS state.
     unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
-    crate::scheduler::yield_now();
+    crate::scheduler::yield_to_work();
     unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
     set_user_stack_pointer(saved_user_rsp);
 }

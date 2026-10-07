@@ -1,5 +1,6 @@
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::framebuffer::{FrameBufferInfo, PixelFormat};
 use crate::memory::BootMemoryMap;
@@ -403,4 +404,288 @@ fn failure(stage: BootStage, code: usize) -> BootError {
         stage,
         status: (1usize << (usize::BITS - 1)) | code,
     }
+}
+
+// ---------------------------------------------------------------- image ASLR
+
+/// What the relocation did. The fields live in the image's own data, so the
+/// copy gets them written before it starts and the original keeps its own
+/// (all zero, with `reason` set) when it did not move.
+#[repr(C)]
+pub struct Relocation {
+    /// Where the image was before it moved (0 = it did not move).
+    origin: AtomicUsize,
+    relocations: AtomicU32,
+    slots: AtomicU32,
+    /// 0 = hardware random numbers, 1 = the timestamp counter only.
+    entropy: AtomicU32,
+    /// Why it did not move (0 = it did).
+    reason: AtomicU32,
+    freed: AtomicU32,
+}
+
+static RELOCATION: Relocation = Relocation {
+    origin: AtomicUsize::new(0),
+    relocations: AtomicU32::new(0),
+    slots: AtomicU32::new(0),
+    entropy: AtomicU32::new(0),
+    reason: AtomicU32::new(0),
+    freed: AtomicU32::new(0),
+};
+
+pub struct RelocationReport {
+    pub moved: bool,
+    pub origin: usize,
+    pub relocations: u32,
+    pub slots: u32,
+    pub entropy: &'static str,
+    pub reason: &'static str,
+}
+
+pub fn relocation_report() -> RelocationReport {
+    let reason = RELOCATION.reason.load(Ordering::Relaxed);
+    RelocationReport {
+        moved: RELOCATION.origin.load(Ordering::Relaxed) != 0,
+        origin: RELOCATION.origin.load(Ordering::Relaxed),
+        relocations: RELOCATION.relocations.load(Ordering::Relaxed),
+        slots: RELOCATION.slots.load(Ordering::Relaxed),
+        entropy: if RELOCATION.entropy.load(Ordering::Relaxed) == 0 {
+            "rdrand"
+        } else {
+            "tsc"
+        },
+        reason: match reason {
+            0 => "none",
+            1 => "no-boot-services",
+            2 => "image-not-found",
+            3 => "no-relocation-table",
+            4 => "no-free-slot",
+            5 => "allocation-failed",
+            6 => "relocation-failed",
+            7 => "memory-map-failed",
+            _ => "unknown",
+        },
+    }
+}
+
+fn hardware_random() -> (u64, bool) {
+    let cpuid = core::arch::x86_64::__cpuid(1);
+    let mut mixed = 0u64;
+    let mut hardware = false;
+    if cpuid.ecx & (1 << 30) != 0 {
+        for _ in 0..16 {
+            let value: u64;
+            let valid: u8;
+            unsafe {
+                core::arch::asm!("rdrand {}", "setc {}", out(reg) value, out(reg_byte) valid, options(nomem, nostack));
+            }
+            if valid != 0 {
+                mixed ^= value;
+                hardware = true;
+                break;
+            }
+        }
+    }
+    let tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    // The counter is mixed in either way, so a weak generator still varies.
+    (
+        mixed ^ tsc.rotate_left(17).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+        hardware,
+    )
+}
+
+/// The start of the loaded image whose entry point is `entry`, found by
+/// walking back page by page to a PE header that says so.
+pub fn image_base(entry: usize) -> Option<usize> {
+    let mut page = entry & !0xfff;
+    for _ in 0..(160 * 1024 * 1024 / 4096) {
+        let header = unsafe { core::slice::from_raw_parts(page as *const u8, 4096) };
+        if let Some(pe) = crate::aslr::parse(header)
+            && page + pe.entry_rva == entry
+        {
+            return Some(page);
+        }
+        page = page.checked_sub(4096)?;
+    }
+    None
+}
+
+/// Copies the image to a random free place and re-applies its relocations
+/// there. Returns the entry point inside the copy, or `None` (and the reason
+/// in the report) if the image stays where the firmware put it. Must run
+/// before anything else has touched the image data, on the old stack.
+///
+/// # Safety
+/// Firmware boot services must still be running.
+pub unsafe fn relocate(system_table: *mut SystemTable, entry: usize) -> Option<usize> {
+    if RELOCATION.origin.load(Ordering::Relaxed) != 0 {
+        return None;
+    }
+    let fail = |reason: u32| {
+        RELOCATION.reason.store(reason, Ordering::Relaxed);
+        None
+    };
+    if system_table.is_null()
+        || unsafe { (*system_table).header.signature } != SYSTEM_TABLE_SIGNATURE
+    {
+        return fail(1);
+    }
+    let services = unsafe { (*system_table).boot_services };
+    if services.is_null() {
+        return fail(1);
+    }
+    let Some(base) = image_base(entry) else {
+        return fail(2);
+    };
+    let Some(pe) =
+        crate::aslr::parse(unsafe { core::slice::from_raw_parts(base as *const u8, 4096) })
+    else {
+        return fail(2);
+    };
+    if pe.reloc_rva == 0 || pe.reloc_size == 0 {
+        return fail(3);
+    }
+    let size = pe.size_of_image.next_multiple_of(4096);
+
+    let mut map_size = MAP_CAPACITY;
+    let mut map_key = 0usize;
+    let mut descriptor_size = 0usize;
+    let mut descriptor_version = 0u32;
+    let map_pointer = MEMORY_MAP.0.get().cast::<MemoryDescriptor>();
+    let status = unsafe {
+        ((*services).get_memory_map)(
+            &mut map_size,
+            map_pointer,
+            &mut map_key,
+            &mut descriptor_size,
+            &mut descriptor_version,
+        )
+    };
+    if status != SUCCESS || descriptor_size < core::mem::size_of::<MemoryDescriptor>() {
+        return fail(7);
+    }
+    // Free regions at or above 16 MiB; low memory is left alone.
+    const FLOOR: u64 = 16 * 1024 * 1024;
+    let mut regions = [(0u64, 0u64); 192];
+    let mut count = 0;
+    let map_base = MEMORY_MAP.0.get().cast::<u8>();
+    for index in 0..map_size / descriptor_size {
+        let descriptor = unsafe {
+            core::ptr::read_unaligned(
+                map_base
+                    .add(index * descriptor_size)
+                    .cast::<MemoryDescriptor>(),
+            )
+        };
+        if descriptor.memory_type == 7 && count < regions.len() {
+            let start = descriptor.physical_start.max(FLOOR);
+            let end = descriptor.physical_start + descriptor.number_of_pages * 4096;
+            if end > start {
+                regions[count] = (start, end);
+                count += 1;
+            }
+        }
+    }
+    let (mut random, hardware) = hardware_random();
+    RELOCATION
+        .entropy
+        .store(u32::from(!hardware), Ordering::Relaxed);
+    let mut chosen = None;
+    let mut slots = 0u64;
+    for _ in 0..8 {
+        let Some((start, total)) =
+            crate::aslr::pick_slot(regions[..count].iter().copied(), size as u64, random)
+        else {
+            return fail(4);
+        };
+        slots = total;
+        let mut address = start;
+        // Address allocation, as loader code (so it stays executable).
+        let status =
+            unsafe { ((*services).allocate_pages)(2, 1, size / 4096, &mut address as *mut u64) };
+        if status == SUCCESS && address == start {
+            chosen = Some(start as usize);
+            break;
+        }
+        random = random
+            .rotate_left(23)
+            .wrapping_mul(0x2545_f491_4f6c_dd1d)
+            .wrapping_add(1);
+    }
+    let Some(new_base) = chosen else {
+        return fail(5);
+    };
+
+    // Copy what the image holds (headers and each section's data); the rest,
+    // including the large zeroed working memory, is zero in the new place.
+    unsafe {
+        core::ptr::write_bytes(new_base as *mut u8, 0, size);
+        core::ptr::copy_nonoverlapping(base as *const u8, new_base as *mut u8, pe.size_of_headers);
+        for section in &pe.sections[..pe.section_count] {
+            let bytes = section.raw_size.min(section.virtual_size);
+            core::ptr::copy_nonoverlapping(
+                (base + section.rva) as *const u8,
+                (new_base + section.rva) as *mut u8,
+                bytes,
+            );
+        }
+    }
+    let delta = (new_base as u64).wrapping_sub(base as u64);
+    let applied = match unsafe {
+        crate::aslr::apply_relocations(
+            new_base as *mut u8,
+            pe.size_of_image,
+            pe.reloc_rva,
+            pe.reloc_size,
+            delta,
+        )
+    } {
+        Ok(applied) => applied,
+        Err(_) => {
+            let free_pages: unsafe extern "efiapi" fn(u64, usize) -> Status =
+                unsafe { core::mem::transmute((*services).free_pages) };
+            unsafe { free_pages(new_base as u64, size / 4096) };
+            return fail(6);
+        }
+    };
+    // The copy starts with its own record filled in.
+    let record = (core::ptr::addr_of!(RELOCATION) as usize - base + new_base) as *const Relocation;
+    unsafe {
+        (*record).origin.store(base, Ordering::Relaxed);
+        (*record).relocations.store(applied, Ordering::Relaxed);
+        (*record)
+            .slots
+            .store(slots.min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+        (*record)
+            .entropy
+            .store(u32::from(!hardware), Ordering::Relaxed);
+        (*record).reason.store(0, Ordering::Relaxed);
+    }
+    Some(new_base + pe.entry_rva)
+}
+
+/// In the copy: hands the firmware the pages of the original image back.
+///
+/// # Safety
+/// Firmware boot services must still be running.
+pub unsafe fn release_origin(system_table: *mut SystemTable) {
+    let origin = RELOCATION.origin.load(Ordering::Relaxed);
+    if origin == 0 || RELOCATION.freed.swap(1, Ordering::Relaxed) != 0 || system_table.is_null() {
+        return;
+    }
+    let services = unsafe { (*system_table).boot_services };
+    if services.is_null() {
+        return;
+    }
+    let Some(base) = image_base(release_origin as *const () as usize) else {
+        return;
+    };
+    let Some(pe) =
+        crate::aslr::parse(unsafe { core::slice::from_raw_parts(base as *const u8, 4096) })
+    else {
+        return;
+    };
+    let free_pages: unsafe extern "efiapi" fn(u64, usize) -> Status =
+        unsafe { core::mem::transmute((*services).free_pages) };
+    unsafe { free_pages(origin as u64, pe.size_of_image.div_ceil(4096)) };
 }

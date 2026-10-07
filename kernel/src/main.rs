@@ -14,6 +14,7 @@ mod ahci;
 mod aml;
 mod antivirus;
 mod arch;
+mod aslr;
 mod audio;
 mod audit;
 mod auth;
@@ -69,6 +70,8 @@ mod nvme;
 mod oom;
 mod partition;
 mod pci;
+#[cfg(feature = "boot-test")]
+mod perf;
 mod pkg;
 #[cfg(feature = "boot-test")]
 mod pkg_vectors;
@@ -198,11 +201,47 @@ extern "efiapi" fn efi_main(_image: Handle, _table: *mut SystemTable) -> Status 
     )
 }
 
+/// This pointer is only right in a copied image if the copy's relocations
+/// were applied: the boot report checks it.
+static RELOCATION_MARKER: u8 = 0xa5;
+static RELOCATION_SELF: &u8 = &RELOCATION_MARKER;
+
 extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Status {
+    // First of all, before anything has used the image data: move to a
+    // random place and carry on from there.
+    if let Some(entry) = unsafe { uefi::relocate(table, efi_main as *const () as usize) } {
+        unsafe {
+            core::arch::asm!(
+                "jmp {entry}",
+                entry = in(reg) entry,
+                in("rcx") image,
+                in("rdx") table,
+                options(noreturn)
+            );
+        }
+    }
     stackguard::randomize();
+    unsafe { uefi::release_origin(table) };
     *BOOT_PHASE.lock() = 1;
     serial::init();
     serial::format(format_args!("AEROS_BOOT version={VERSION}\n"));
+    let relocation = uefi::relocation_report();
+    let base = uefi::image_base(efi_main as *const () as usize).unwrap_or(0);
+    let pointers_fixed = core::ptr::eq(RELOCATION_SELF, &RELOCATION_MARKER);
+    serial::format(format_args!(
+        "AEROS_KASLR relocated={} origin={:#x} base={:#x} aligned={} slots={} relocations={} entropy={} reason={} pointers_fixed={} verified={}\n",
+        relocation.moved,
+        relocation.origin,
+        base,
+        base.is_multiple_of(0x20_0000),
+        relocation.slots,
+        relocation.relocations,
+        relocation.entropy,
+        relocation.reason,
+        pointers_fixed,
+        pointers_fixed
+            && (!relocation.moved || (base != relocation.origin && base.is_multiple_of(0x20_0000)))
+    ));
 
     let fonts = font::FontCatalog::load();
     if let Some(mut phase) = BOOT_PHASE.try_lock() {
@@ -276,6 +315,10 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         ));
         serial::line("AEROS_HPET_FAILURE");
         arch::halt_forever();
+    }
+    match time::tsc_hz() {
+        Some(hz) => serial::format(format_args!("AEROS_CLOCK source=tsc hz={hz}\n")),
+        None => serial::line("AEROS_CLOCK source=hpet hz=0"),
     }
     #[cfg(feature = "boot-test")]
     {
@@ -2168,6 +2211,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
             serial::line("AEROS_AERFS_VFS_INVARIANT_FAILURE");
             arch::halt_forever();
         }
+        perf::run();
         let fuzz = fuzz::run();
         serial::format(format_args!(
             "AEROS_FUZZ iterations={} elapsed_ms={} verified={}\n",

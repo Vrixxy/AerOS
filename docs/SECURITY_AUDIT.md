@@ -37,7 +37,7 @@ Every run exercises ASLR, SMEP/SMAP set-up, seccomp strict and filter modes, cap
 
 ## Known weaknesses
 
-- No kernel address-space layout randomisation: the kernel is loaded by the firmware at a fixed-per-boot address inside the firmware's identity map, and all physical memory is identity-mapped. A kernel read primitive reveals everything.
+- Kernel image randomisation covers the image only: at boot the kernel copies itself to a random 2 MiB-aligned place in free memory and relocates there (about 7 bits of entropy in a 512 MiB machine, 13 or more on a real one). Physical memory is still mapped at its own addresses (the kernel runs on an identity map, with no higher-half or randomised direct map), so the layout of RAM is known and a read primitive that can scan RAM would still find the image. If there is no hardware random generator the move uses the timestamp counter, which is weak. If firmware has no free region large enough (the image is 71 MiB in memory) it stays where it was loaded.
 - The kernel's stack protector (`-Zstack-protector=strong`, a random cookie per boot) catches overwritten return addresses in functions with buffers, but it is a mitigation, not a guarantee, and there is `unsafe` code throughout the drivers. It depends on an unstable compiler flag.
 - Swap writes user pages to the swap partition unencrypted and does not wipe slots when they are freed.
 - Nothing verifies the kernel image the firmware loads: updates are signature-checked and a changed image is reported at the next boot (software measurement), but there is no UEFI Secure Boot signing and no TPM driver, so an attacker who can write the boot volume can replace both the image and its sealed digest.

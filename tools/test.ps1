@@ -688,6 +688,16 @@ if ($output -notmatch "AEROS_HTTP_CLIENT connected=true status=200 bytes=[0-9]+ 
 foreach ($tlsServer in $tlsServers) {
     if (-not $tlsServer.HasExited) { Stop-Process -Id $tlsServer.Id -Force }
 }
+# The kernel copied itself to a random 2 MiB-aligned place and relocated there:
+# the whole rest of this run is the proof that it still works from there.
+if ($output -notmatch "AEROS_KASLR relocated=true origin=0x[0-9a-f]+ base=0x[0-9a-f]+ aligned=true slots=[1-9][0-9]* relocations=[1-9][0-9]{3,} entropy=rdrand reason=none pointers_fixed=true verified=true") {
+    throw "AerOS kernel image randomisation failed`n$output"
+}
+# The clock must be the calibrated counter, not the HPET: the HPET is read over
+# memory-mapped I/O and costs tens of microseconds per read under a hypervisor.
+if ($output -notmatch "AEROS_CLOCK source=tsc hz=[0-9]{8,}") {
+    throw "AerOS is not using the calibrated counter as its clock`n$output"
+}
 if ($output -notmatch "AEROS_TLS_KAT hashes=true key_schedule=true x25519=true aead=true signatures=4 rejects_bad=true verified=true") {
     throw "AerOS TLS known-answer self-test failed`n$output"
 }

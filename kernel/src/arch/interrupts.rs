@@ -444,6 +444,7 @@ extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
             TIMER_TICKS.fetch_add(1, Ordering::Release);
             end_legacy_interrupt(32);
             crate::scheduler::on_timer_tick();
+            crate::time::tick();
             frame.deliver_user_signal()
         }
         33..=47 => {
@@ -454,6 +455,7 @@ extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
             LOCAL_TIMER_TICKS.fetch_add(1, Ordering::Release);
             crate::arch::apic::end_interrupt();
             crate::scheduler::on_timer_tick();
+            crate::time::tick();
             frame.deliver_user_signal()
         }
         49 => {
