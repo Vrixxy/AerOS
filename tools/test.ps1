@@ -167,6 +167,7 @@ $arguments = @(
     "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
     "-display", "none",
     "-serial", "file:$serial",
+    "-monitor", "tcp:127.0.0.1:17656,server,nowait",
     "-no-reboot",
     "-no-shutdown"
 )
@@ -317,12 +318,33 @@ while ([DateTime]::UtcNow -lt $bulkDeadline -and $null -eq $tcpBulk -and -not $p
     if ($null -eq $tcpBulk) { Start-Sleep -Milliseconds 300 }
 }
 
+function Send-AerosPowerButton {
+    $client = [System.Net.Sockets.TcpClient]::new()
+    try {
+        $client.Connect("127.0.0.1", 17656)
+        $stream = $client.GetStream()
+        $command = [System.Text.Encoding]::ASCII.GetBytes("system_powerdown`r`n")
+        $stream.Write($command, 0, $command.Length)
+        $stream.Flush()
+        Start-Sleep -Milliseconds 300
+        return $true
+    } catch {
+        return $false
+    } finally {
+        $client.Close()
+    }
+}
+
 $deadline = [DateTime]::UtcNow.AddSeconds(240)
 $output = ""
+$powerButtonSent = $false
 
 while ([DateTime]::UtcNow -lt $deadline) {
     if (Test-Path -LiteralPath $serial) {
         $output = [string](Get-Content -Raw -LiteralPath $serial)
+        if (-not $powerButtonSent -and $output -match "AEROS_POWERBTN_WAIT") {
+            $powerButtonSent = Send-AerosPowerButton
+        }
         if ($output -match "AEROS_READY") {
             break
         }
@@ -351,6 +373,12 @@ if ($output -notmatch "acpi_valid=true") {
 }
 if ($output -notmatch "AEROS_ACPI .* madt_valid=true .* processors=[1-9].* ioapics=[1-9]") {
     throw "AerOS APIC topology validation failed`n$output"
+}
+if ($output -notmatch "AEROS_ACPI_EVENTS sci=[1-9][0-9]* acpi_mode=true routed=true power_button=true gpe_handlers=[0-9]+ gpes_enabled=[0-9]+") {
+    throw "AerOS ACPI event setup failed`n$output"
+}
+if ($output -notmatch "AEROS_POWERBTN pressed=true interrupts=[1-9][0-9]* line_shut_off=false") {
+    throw "AerOS did not see the power button press (SCI delivery)`n$output"
 }
 if ($output -notmatch "AEROS_ARCH gdt=true idt=true") {
     throw "AerOS descriptor-table validation failed`n$output"
@@ -988,7 +1016,7 @@ if ($output -notmatch "AEROS_AV signatures=[1-9][0-9]* self_test=true quarantine
 if ($output -notmatch "AEROS_AUDIT verified=true") {
     throw "AerOS audit log validation failed`n$output"
 }
-if ($output -notmatch "AEROS_COMMANDS count=85 shell=aersh elevation=ear unique=true parser=true privilege=true filesystem=true reauth=true redirection=true startup=true symlinks=true background_jobs=true firewall_command=true dmesg_command=true service_command=true text_tools=true priority_command=true crashes_command=true bench_command=true sigcheck_command=true pipelines=true strace_command=true fsck_command=true verified=true") {
+if ($output -notmatch "AEROS_COMMANDS count=87 shell=aersh elevation=ear unique=true parser=true privilege=true filesystem=true reauth=true redirection=true startup=true symlinks=true background_jobs=true firewall_command=true dmesg_command=true service_command=true text_tools=true priority_command=true crashes_command=true bench_command=true sigcheck_command=true pipelines=true strace_command=true fsck_command=true verified=true") {
     throw "AerOS command registry validation failed`n$output"
 }
 if ($output -notmatch "AEROS_UI_CORE geometry=true scaling=true interaction=true frost=true max_frost_pixels=1048576 verified=true") {

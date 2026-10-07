@@ -4,10 +4,12 @@
 //! resource queries, and the `acpi` shell command.
 
 use core::fmt::Write;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::acpi::{self, AcpiInfo};
 use crate::aml::{self, Aml, Hooks, NodeKind, Resource, Value};
 use crate::arch;
+use crate::ec;
 use crate::sync::TicketLock;
 
 const HOOKS: Hooks = Hooks {
@@ -17,6 +19,8 @@ const HOOKS: Hooks = Hooks {
     mem_write,
     pci_read,
     pci_write,
+    ec_read,
+    ec_write,
     now_ns,
 };
 
@@ -113,6 +117,100 @@ fn now_ns() -> u64 {
     crate::time::monotonic_nanoseconds()
 }
 
+static EC_DATA: AtomicU32 = AtomicU32::new(0);
+static EC_COMMAND: AtomicU32 = AtomicU32::new(0);
+static EC_LOCK: TicketLock<()> = TicketLock::new(());
+
+/// The embedded controller's ports, which AML reaches through its
+/// `EmbeddedControl` operation regions.
+pub fn set_embedded_controller(data: u16, command: u16) {
+    EC_DATA.store(data as u32, Ordering::Release);
+    EC_COMMAND.store(command as u32, Ordering::Release);
+}
+
+struct EcPorts {
+    data: u16,
+    command: u16,
+}
+
+impl ec::Bus for EcPorts {
+    fn status(&mut self) -> u8 {
+        // SAFETY: the controller's own ports, from its `_CRS`.
+        unsafe { arch::inb(self.command) }
+    }
+
+    fn read_data(&mut self) -> u8 {
+        // SAFETY: as above.
+        unsafe { arch::inb(self.data) }
+    }
+
+    fn write_command(&mut self, value: u8) {
+        // SAFETY: as above.
+        unsafe { arch::outb(self.command, value) }
+    }
+
+    fn write_data(&mut self, value: u8) {
+        // SAFETY: as above.
+        unsafe { arch::outb(self.data, value) }
+    }
+
+    fn now_ns(&mut self) -> u64 {
+        crate::time::monotonic_nanoseconds()
+    }
+}
+
+fn ec_ports() -> Option<EcPorts> {
+    let command = EC_COMMAND.load(Ordering::Acquire);
+    (command != 0).then(|| EcPorts {
+        data: EC_DATA.load(Ordering::Acquire) as u16,
+        command: command as u16,
+    })
+}
+
+fn ec_read(offset: u8) -> Option<u8> {
+    let mut ports = ec_ports()?;
+    let _serialized = EC_LOCK.lock();
+    ec::read(&mut ports, offset)
+}
+
+fn ec_write(offset: u8, value: u8) -> bool {
+    let Some(mut ports) = ec_ports() else {
+        return false;
+    };
+    let _serialized = EC_LOCK.lock();
+    ec::write(&mut ports, offset, value)
+}
+
+/// The next event the embedded controller is holding, if any.
+pub fn ec_query() -> Option<u8> {
+    let mut ports = ec_ports()?;
+    let _serialized = EC_LOCK.lock();
+    ec::query(&mut ports)
+}
+
+/// Runs `\_SB._INI` and the `_INI` method of every device the firmware says
+/// is present, in load order. Laptop tables use them to record which
+/// operating system they are talking to.
+fn run_initialisers(aml: &mut Aml) {
+    let system_bus = aml.find("\\_SB_");
+    for index in 0..aml.node_count() {
+        let node = index as u16;
+        if aml.node_kind(node) != NodeKind::Device && Some(node) != system_bus {
+            continue;
+        }
+        if let Some(status) = aml.child_node(node, b"_STA")
+            && let Ok(value) = aml.evaluate_node(status, &[])
+            && let Some(bits) = aml.integer(value)
+            && bits & 0b1001 == 0
+        {
+            continue;
+        }
+        if let Some(initialiser) = aml.child_node(node, b"_INI") {
+            let _ = aml.evaluate_node(initialiser, &[]);
+        }
+    }
+}
+
 /// Loads the DSDT and every SSDT and tells the firmware the system uses the
 /// APIC (`_PIC`).
 pub fn initialize(acpi: &AcpiInfo) -> Report {
@@ -137,6 +235,9 @@ pub fn initialize(acpi: &AcpiInfo) -> Report {
         });
     }
     let apic_mode = tables != 0 && aml.evaluate("\\_PIC", &[1]).is_ok();
+    if tables != 0 {
+        run_initialisers(&mut aml);
+    }
     let mut devices = 0;
     let mut methods = 0;
     for index in 0..aml.node_count() {

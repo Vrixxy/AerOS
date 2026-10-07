@@ -15,6 +15,7 @@ const MAX_LOOPS: u32 = 4_000_000;
 const MAX_SEGMENTS: usize = 8;
 const ROOT: u16 = 0;
 const NO_NODE: u16 = 0xffff;
+const NOTIFY_SLOTS: usize = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Error {
@@ -56,6 +57,9 @@ pub struct Hooks {
     pub mem_write: fn(address: u64, bytes: u8, value: u64) -> bool,
     pub pci_read: fn(bus: u8, slot: u8, function: u8, offset: u16, bytes: u8) -> u64,
     pub pci_write: fn(bus: u8, slot: u8, function: u8, offset: u16, bytes: u8, value: u64),
+    /// One byte of the embedded controller's address space.
+    pub ec_read: fn(offset: u8) -> Option<u8>,
+    pub ec_write: fn(offset: u8, value: u8) -> bool,
     pub now_ns: fn() -> u64,
 }
 
@@ -397,6 +401,8 @@ pub struct Aml {
     method_mark: usize,
     int_mask: u64,
     pub notifications: u64,
+    notify_queue: [(u16, u32); NOTIFY_SLOTS],
+    notify_length: usize,
     pub load_errors: u32,
 }
 
@@ -421,6 +427,8 @@ impl Aml {
             method_mark: 0,
             int_mask: u64::MAX,
             notifications: 0,
+            notify_queue: [(0, 0); NOTIFY_SLOTS],
+            notify_length: 0,
             load_errors: 0,
         };
         aml.nodes[0] = Node {
@@ -445,6 +453,7 @@ impl Aml {
         self.depth = 0;
         self.method_mark = 0;
         self.notifications = 0;
+        self.notify_length = 0;
         self.load_errors = 0;
         for scope in [b"_GPE", b"_PR_", b"_SB_", b"_SI_", b"_TZ_"] {
             let _ = self.add(ROOT, *scope, Kind::Scope);
@@ -614,6 +623,18 @@ impl Aml {
 
     pub fn child_node(&self, parent: u16, name: &[u8; 4]) -> Option<u16> {
         self.child(parent, *name)
+    }
+
+    /// The oldest `Notify(object, value)` the firmware's methods issued that
+    /// nobody has taken yet.
+    pub fn take_notification(&mut self) -> Option<(u16, u32)> {
+        if self.notify_length == 0 {
+            return None;
+        }
+        let first = self.notify_queue[0];
+        self.notify_queue.copy_within(1..self.notify_length, 0);
+        self.notify_length -= 1;
+        Some(first)
     }
 
     pub fn node_count(&self) -> usize {
@@ -953,6 +974,19 @@ impl Aml {
                     bytes,
                 ))
             }
+            3 => {
+                let mut value = 0u64;
+                for index in 0..bytes.min(8) as u64 {
+                    let address = base + offset + index;
+                    if address > 0xff {
+                        return fail(Error::Hardware);
+                    }
+                    let byte =
+                        (self.hooks.ec_read)(address as u8).ok_or(Flow::Fail(Error::Hardware))?;
+                    value |= (byte as u64) << (index * 8);
+                }
+                Ok(value)
+            }
             _ => fail(Error::Unsupported),
         }
     }
@@ -977,6 +1011,17 @@ impl Aml {
             2 => {
                 let (bus, slot, function) = self.pci_function(region)?;
                 (self.hooks.pci_write)(bus, slot, function, (base + offset) as u16, bytes, value);
+                Ok(())
+            }
+            3 => {
+                for index in 0..bytes.min(8) as u64 {
+                    let address = base + offset + index;
+                    if address > 0xff
+                        || !(self.hooks.ec_write)(address as u8, (value >> (index * 8)) as u8)
+                    {
+                        return fail(Error::Hardware);
+                    }
+                }
                 Ok(())
             }
             _ => fail(Error::Unsupported),
@@ -1969,9 +2014,15 @@ impl Aml {
                 self.finish(f, result)
             }
             0x86 => {
-                self.parse_target(f)?;
-                self.operand(f)?;
+                let target = self.parse_target(f)?;
+                let value = self.operand(f)?;
                 self.notifications += 1;
+                if let Target::Node(node) = target
+                    && self.notify_length < NOTIFY_SLOTS
+                {
+                    self.notify_queue[self.notify_length] = (node, value as u32);
+                    self.notify_length += 1;
+                }
                 Ok(Value::Integer(0))
             }
             0x87 => {

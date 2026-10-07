@@ -50,6 +50,16 @@ pub struct AcpiInfo {
     pub pm1a_control_block: u32,
     pub pm1b_control_block: u32,
     pub pm1_control_length: u8,
+    pub sci_interrupt: u16,
+    pub pm1a_event_block: u32,
+    pub pm1b_event_block: u32,
+    pub pm1_event_length: u8,
+    pub gpe0_block: u32,
+    pub gpe0_length: u8,
+    pub gpe1_block: u32,
+    pub gpe1_length: u8,
+    pub gpe1_base: u8,
+    pub fadt_flags: u32,
     pub fadt_valid: bool,
 }
 
@@ -84,6 +94,16 @@ impl AcpiInfo {
         pm1a_control_block: 0,
         pm1b_control_block: 0,
         pm1_control_length: 0,
+        sci_interrupt: 0,
+        pm1a_event_block: 0,
+        pm1b_event_block: 0,
+        pm1_event_length: 0,
+        gpe0_block: 0,
+        gpe0_length: 0,
+        gpe1_block: 0,
+        gpe1_length: 0,
+        gpe1_base: 0,
+        fadt_flags: 0,
         fadt_valid: false,
     };
 
@@ -262,6 +282,20 @@ unsafe fn parse_fadt(info: &mut AcpiInfo) {
     info.pm1a_control_block = pm1a_cnt;
     info.pm1b_control_block = pm1b_cnt;
     info.pm1_control_length = pm1_cnt_len;
+    info.sci_interrupt = unsafe { read_u16(base.add(46)) };
+    info.pm1a_event_block = unsafe { read_u32(base.add(56)) };
+    info.pm1b_event_block = unsafe { read_u32(base.add(60)) };
+    info.pm1_event_length = unsafe { core::ptr::read_volatile(base.add(88)) };
+    if length >= 96 {
+        info.gpe0_block = unsafe { read_u32(base.add(80)) };
+        info.gpe1_block = unsafe { read_u32(base.add(84)) };
+        info.gpe0_length = unsafe { core::ptr::read_volatile(base.add(92)) };
+        info.gpe1_length = unsafe { core::ptr::read_volatile(base.add(93)) };
+        info.gpe1_base = unsafe { core::ptr::read_volatile(base.add(94)) };
+    }
+    if length >= 116 {
+        info.fadt_flags = unsafe { read_u32(base.add(112)) };
+    }
     info.fadt_valid = dsdt != 0 && pm1a_cnt != 0 && pm1_cnt_len != 0;
 }
 

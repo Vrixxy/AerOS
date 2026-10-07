@@ -5,6 +5,8 @@
 
 mod ac97;
 mod acpi;
+mod acpi_devices;
+mod acpi_events;
 mod acpi_ns;
 mod aerfs;
 #[cfg(feature = "boot-test")]
@@ -30,6 +32,7 @@ mod datafs;
 mod deflate;
 mod desktop;
 mod e1000;
+mod ec;
 mod ed25519;
 mod elf;
 mod fat;
@@ -973,6 +976,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     let preempt_fpu_isolation = scheduler::preemption_fpu_isolation();
     let keyboard = keyboard::initialize(&acpi, apic.id);
     let mouse = mouse::initialize(&acpi, apic.id);
+    let events = acpi_events::initialize(&acpi, apic.id);
     let shell_info = shell::SystemInfo {
         version: VERSION,
         cpu: &cpu,
@@ -3288,6 +3292,16 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         mouse.present, mouse.routed, mouse.reporting, mouse.absolute, mouse.verified
     ));
     serial::format(format_args!(
+        "AEROS_ACPI_EVENTS sci={} acpi_mode={} routed={} power_button={} gpe_handlers={} gpes_enabled={} ec={}\n",
+        events.sci,
+        events.acpi_mode,
+        events.routed,
+        events.power_button,
+        events.handlers,
+        events.enabled_gpes,
+        events.embedded_controller
+    ));
+    serial::format(format_args!(
         "AEROS_PLATFORM framebuffer={}x{} stride={} rsdp={:#x} acpi_revision={} acpi_root={:#x} acpi_valid={}\n",
         boot.framebuffer.width,
         boot.framebuffer.height,
@@ -3719,6 +3733,8 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
             lines == 2_500
         ));
     }
+    #[cfg(feature = "boot-test")]
+    acpi_events::power_button_test();
     serial::line("AEROS_READY");
 
     #[cfg(feature = "boot-test")]

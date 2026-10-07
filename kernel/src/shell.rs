@@ -102,6 +102,8 @@ enum Handler {
     Aerfs,
     Install,
     Acpi,
+    Battery,
+    Thermal,
     Swap,
     Measure,
     Update,
@@ -174,7 +176,7 @@ const fn command(
     }
 }
 
-static COMMANDS: [CommandSpec; 85] = [
+static COMMANDS: [CommandSpec; 87] = [
     command(
         "notify",
         "notify <message...>",
@@ -442,6 +444,20 @@ static COMMANDS: [CommandSpec; 85] = [
         "inspect the ACPI namespace: summary, devices, evaluate an object, resources",
         false,
         Handler::Acpi,
+    ),
+    command(
+        "battery",
+        "battery",
+        "show batteries, the mains adapter and the lid as the firmware reports them",
+        false,
+        Handler::Battery,
+    ),
+    command(
+        "thermal",
+        "thermal",
+        "show thermal zone temperatures and trip points, and the ACPI event counters",
+        false,
+        Handler::Thermal,
     ),
     command(
         "install",
@@ -1452,6 +1468,8 @@ impl<'a> Shell<'a> {
             Handler::Fsck => self.command_fsck(arguments, offset, output),
             Handler::Install => self.command_install(arguments, offset, output),
             Handler::Acpi => self.command_acpi(arguments, offset, output),
+            Handler::Battery => self.command_battery(output),
+            Handler::Thermal => self.command_thermal(output),
             Handler::Measure => {
                 if arguments.get(offset) == Some("seal") {
                     let sealed = crate::measure::seal(crate::measure::REFERENCE_PATH);
@@ -2992,6 +3010,144 @@ impl Shell<'_> {
             }
             _ => self.usage_named(output, "acpi"),
         }
+    }
+
+    fn command_battery(&mut self, output: &mut Text<MAX_OUTPUT>) {
+        use crate::{acpi_devices, acpi_ns};
+        if !acpi_ns::report().loaded {
+            self.fail(output, "battery", "no ACPI namespace");
+            return;
+        }
+        crate::acpi_events::poll();
+        acpi_ns::with(|aml| {
+            let inventory = acpi_devices::scan(aml);
+            if inventory.battery_count + inventory.adapter_count == 0 && inventory.lid.is_none() {
+                let _ = writeln!(
+                    output,
+                    "no battery, adapter or lid device in the firmware tables"
+                );
+                return;
+            }
+            for node in &inventory.batteries[..inventory.battery_count] {
+                let battery = acpi_devices::read_battery(aml, *node);
+                let mut path = [0u8; 32];
+                let length = aml.node_path(*node, &mut path);
+                let name = core::str::from_utf8(&path[..length]).unwrap_or("?");
+                if !battery.present {
+                    let _ = writeln!(output, "{name}: no battery in the bay");
+                    continue;
+                }
+                let state = if battery.charging {
+                    "charging"
+                } else if battery.discharging {
+                    "discharging"
+                } else {
+                    "idle"
+                };
+                let (energy, power) = if battery.current_units {
+                    ("mAh", "mA")
+                } else {
+                    ("mWh", "mW")
+                };
+                let _ = write!(output, "{name}: {state}");
+                if let Some(percent) = battery.percent() {
+                    let _ = write!(output, ", {percent}%");
+                }
+                if let Some(minutes) = battery.minutes() {
+                    let _ = write!(output, ", {}h{:02}m", minutes / 60, minutes % 60);
+                }
+                if battery.critical {
+                    let _ = write!(output, ", CRITICAL");
+                }
+                let _ = writeln!(output);
+                let _ = writeln!(
+                    output,
+                    "  {} of {} {energy} (design {}), {} {power}, {} mV",
+                    battery.remaining,
+                    battery.full_capacity,
+                    battery.design_capacity,
+                    battery.rate,
+                    battery.voltage_mv
+                );
+                if battery.model_length != 0 {
+                    let _ = write!(
+                        output,
+                        "  model {}",
+                        core::str::from_utf8(battery.model_text()).unwrap_or("?")
+                    );
+                    if let Some(cycles) = battery.cycles {
+                        let _ = write!(output, ", {cycles} cycles");
+                    }
+                    let _ = writeln!(output);
+                }
+            }
+            if let Some(online) = acpi_devices::on_mains(aml, &inventory) {
+                let _ = writeln!(
+                    output,
+                    "mains adapter: {}",
+                    if online { "online" } else { "offline" }
+                );
+            }
+            if let Some(open) = acpi_devices::lid_open(aml, &inventory) {
+                let _ = writeln!(output, "lid: {}", if open { "open" } else { "closed" });
+            }
+        });
+    }
+
+    fn command_thermal(&mut self, output: &mut Text<MAX_OUTPUT>) {
+        use crate::{acpi_devices, acpi_events, acpi_ns};
+        if !acpi_ns::report().loaded {
+            self.fail(output, "thermal", "no ACPI namespace");
+            return;
+        }
+        acpi_events::poll();
+        acpi_ns::with(|aml| {
+            let inventory = acpi_devices::scan(aml);
+            let mut readable = 0;
+            for node in &inventory.zones[..inventory.zone_count] {
+                let Some(zone) = acpi_devices::read_zone(aml, *node) else {
+                    continue;
+                };
+                readable += 1;
+                let mut path = [0u8; 32];
+                let length = aml.node_path(*node, &mut path);
+                let _ = write!(
+                    output,
+                    "{}: {}.{} C",
+                    core::str::from_utf8(&path[..length]).unwrap_or("?"),
+                    zone.temperature / 10,
+                    (zone.temperature % 10).abs()
+                );
+                for (label, limit) in [
+                    ("passive", zone.passive),
+                    ("hot", zone.hot),
+                    ("critical", zone.critical),
+                ] {
+                    if let Some(limit) = limit {
+                        let _ = write!(output, ", {label} {}", limit / 10);
+                    }
+                }
+                let _ = writeln!(output);
+            }
+            if readable == 0 {
+                let _ = writeln!(output, "no thermal zone with a readable temperature");
+            }
+        });
+        let report = acpi_events::report();
+        let _ = writeln!(
+            output,
+            "SCI {} routed {}, {} interrupts, {} events run, {} device notifications{}",
+            report.sci,
+            report.routed,
+            acpi_events::interrupts(),
+            acpi_events::events_run(),
+            acpi_events::device_changes(),
+            if acpi_events::line_shut_off() {
+                ", LINE SHUT OFF (stuck)"
+            } else {
+                ""
+            }
+        );
     }
 
     fn command_install(
@@ -5554,7 +5710,7 @@ pub fn self_test(info: SystemInfo<'_>) -> ShellReport {
         pipelines,
         strace_command,
         fsck_command,
-        verified: COMMANDS.len() == 85
+        verified: COMMANDS.len() == 87
             && unique
             && parser
             && privilege

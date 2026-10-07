@@ -3653,6 +3653,14 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
     loop {
         let mut redraw = false;
         let splash_active = boot_splash(crate::time::monotonic_nanoseconds()).is_some();
+        crate::acpi_events::poll();
+        if crate::acpi_events::take_power_button()
+            && state.power_action == shellui::PowerAction::None
+        {
+            serial::line("AEROS_POWER_BUTTON action=shutdown");
+            state.start_power_action(shellui::PowerAction::Shutdown);
+            redraw = true;
+        }
         if let Some(action) = state.power_due(crate::time::monotonic_nanoseconds()) {
             match action {
                 shellui::PowerAction::Restart => {

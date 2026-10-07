@@ -335,6 +335,7 @@ vector_without_error!(vector_50, 50);
 vector_without_error!(vector_51, 51);
 vector_without_error!(vector_52, 52);
 vector_without_error!(vector_53, 53);
+vector_without_error!(vector_54, 54);
 vector_without_error!(vector_128, 128);
 vector_without_error!(vector_default, 255);
 
@@ -401,6 +402,7 @@ pub fn init() {
         set(entries, 51, vector_51, 0, 0);
         set(entries, 52, vector_52, 0, 0);
         set(entries, 53, vector_53, 0, 0);
+        set(entries, 54, vector_54, 0, 0);
         set(entries, 128, vector_128, 0, 3);
     }
     load();
@@ -480,6 +482,11 @@ extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
         }
         53 => {
             crate::mouse::handle_interrupt();
+            crate::arch::apic::end_interrupt();
+            0
+        }
+        54 => {
+            crate::acpi_events::handle_interrupt();
             crate::arch::apic::end_interrupt();
             0
         }

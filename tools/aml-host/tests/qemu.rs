@@ -7,9 +7,11 @@ fn mem_write(_address: u64, _bytes: u8, _value: u64) -> bool { true }
 fn pci_read(_b: u8, _s: u8, _f: u8, _o: u16, _n: u8) -> u64 { 0 }
 fn pci_write(_b: u8, _s: u8, _f: u8, _o: u16, _n: u8, _v: u64) {}
 fn now() -> u64 { 0 }
+fn ec_read(_offset: u8) -> Option<u8> { None }
+fn ec_write(_offset: u8, _value: u8) -> bool { false }
 
 fn hooks() -> Hooks {
-    Hooks { io_read, io_write, mem_read, mem_write, pci_read, pci_write, now_ns: now }
+    Hooks { io_read, io_write, mem_read, mem_write, pci_read, pci_write, ec_read, ec_write, now_ns: now }
 }
 
 fn with_aml(body: impl FnOnce(&mut Aml) + Send + 'static) {
