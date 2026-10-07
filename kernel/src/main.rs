@@ -103,6 +103,8 @@ mod tcp;
 mod tcpnet;
 mod time;
 mod timezone;
+mod tls;
+mod tlsnet;
 mod trace;
 mod truetype;
 mod udp;
@@ -541,6 +543,53 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         if !(http.connected && http.status == 200 && body_ok) {
             serial::line("AEROS_HTTP_CLIENT_INVARIANT_FAILURE");
             arch::halt_forever();
+        }
+        tcpnet::reset();
+        let tls_kat = tls::selftest::run();
+        serial::format(format_args!(
+            "AEROS_TLS_KAT hashes={} key_schedule={} x25519={} aead={} signatures={} rejects_bad={} verified={}\n",
+            tls_kat.hashes,
+            tls_kat.key_schedule,
+            tls_kat.x25519,
+            tls_kat.aead,
+            tls_kat.signatures,
+            tls_kat.rejects_bad_signatures,
+            tls_kat.verified()
+        ));
+        if !tls_kat.verified() {
+            serial::line("AEROS_TLS_KAT_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+        let tls_net = tlsnet::self_test();
+        serial::format(format_args!(
+            "AEROS_TLS_NET roots={} rsa_chacha={} ec_aes={} wrong_host_refused={} untrusted_refused={} verified={}\n",
+            tls_net.roots,
+            tls_net.rsa_chacha,
+            tls_net.ec_aes,
+            tls_net.wrong_host_refused,
+            tls_net.untrusted_refused,
+            tls_net.verified()
+        ));
+        if !tls_net.verified() {
+            serial::line("AEROS_TLS_NET_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+        for host in [
+            "example.com",
+            "www.google.com",
+            "github.com",
+            "www.wikipedia.org",
+            "aws.amazon.com",
+            "www.microsoft.com",
+        ] {
+            match tlsnet::internet_probe(host) {
+                Ok(status) => serial::format(format_args!(
+                    "AEROS_TLS_INTERNET host={host} status={status} certificate=verified\n"
+                )),
+                Err(reason) => serial::format(format_args!(
+                    "AEROS_TLS_INTERNET host={host} failed={reason}\n"
+                )),
+            }
         }
         tcpnet::reset();
     }

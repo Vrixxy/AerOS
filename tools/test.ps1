@@ -42,6 +42,33 @@ if (Test-Path -LiteralPath $quarantineArtifact) {
     Remove-Item -Force -Recurse -LiteralPath $quarantineArtifact
 }
 
+# TLS: a throwaway certificate authority per run (no private keys live in
+# the repository). The two roots go onto the virtio test disk for the guest to
+# read (not the boot volume: files there show up in /tmp and change unrelated
+# counts); two `openssl s_server` processes on the host answer on 18443 (RSA chain,
+# ChaCha20-Poly1305) and 18444 (ECDSA chain, AES-128-GCM).
+$tlsDir = Join-Path $root "build\tls"
+Get-CimInstance Win32_Process -Filter "Name='openssl.exe'" |
+    Where-Object { $_.CommandLine -match "s_server.* -accept 1844[34]\b" } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+& python (Join-Path $PSScriptRoot "make-tls-test-pki.py") $tlsDir | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not make the TLS test certificates (python and openssl must be on PATH)"
+}
+$tlsServers = @()
+foreach ($server in @(
+    @{ Prefix = "rsa"; Port = 18443; Suite = "TLS_CHACHA20_POLY1305_SHA256" },
+    @{ Prefix = "ec"; Port = 18444; Suite = "TLS_AES_128_GCM_SHA256" })) {
+    $tlsServers += Start-Process -FilePath "openssl" -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput (Join-Path $tlsDir "$($server.Prefix).out.log") `
+        -RedirectStandardError (Join-Path $tlsDir "$($server.Prefix).err.log") `
+        -ArgumentList @("s_server", "-accept", "$($server.Port)", "-tls1_3", "-www",
+            "-cert", (Join-Path $tlsDir "$($server.Prefix).leaf.pem"),
+            "-cert_chain", (Join-Path $tlsDir "$($server.Prefix).chain.pem"),
+            "-key", (Join-Path $tlsDir "$($server.Prefix).key.pem"),
+            "-ciphersuites", $server.Suite, "-groups", "X25519")
+}
+
 # A 4 MiB scratch NVMe namespace: sector 0 carries the signature the driver
 # checks, sector 2 is overwritten by its write/read-back probe.
 $nvmeImage = Join-Path $root "build\nvme-test.img"
@@ -78,6 +105,13 @@ $virtioSignature = [System.Text.Encoding]::ASCII.GetBytes("AEROS-VIRTIO-BLK")
 # A swap area from sector 4096: the first page carries the swap signature.
 $swapSignature = [System.Text.Encoding]::ASCII.GetBytes("SWAPSPACE2")
 [Array]::Copy($swapSignature, 0, $virtioBytes, 4096 * 512 + 4086, $swapSignature.Length)
+# The TLS test roots: a 32-bit length then the DER, four sectors each.
+foreach ($rootDisk in @(@{ File = "TLSRSA.DER"; Sector = 100 }, @{ File = "TLSEC.DER"; Sector = 108 })) {
+    $der = [System.IO.File]::ReadAllBytes((Join-Path $tlsDir $rootDisk.File))
+    $derLength = [BitConverter]::GetBytes([uint32]$der.Length)
+    [Array]::Copy($derLength, 0, $virtioBytes, $rootDisk.Sector * 512, 4)
+    [Array]::Copy($der, 0, $virtioBytes, $rootDisk.Sector * 512 + 4, $der.Length)
+}
 [System.IO.File]::WriteAllBytes($virtioImage, $virtioBytes)
 $hdaCapture = Join-Path $root "build\hda-test.wav"
 Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $hdaCapture
@@ -636,6 +670,15 @@ if ($tcpServerEcho -ne "AEROS-TCP-SERVER-TEST") {
 if ($output -notmatch "AEROS_HTTP_CLIENT connected=true status=200 bytes=[0-9]+ body_ok=true verified=true") {
     throw "AerOS HTTP client over the TCP engine failed`n$output"
 }
+foreach ($tlsServer in $tlsServers) {
+    if (-not $tlsServer.HasExited) { Stop-Process -Id $tlsServer.Id -Force }
+}
+if ($output -notmatch "AEROS_TLS_KAT hashes=true key_schedule=true x25519=true aead=true signatures=4 rejects_bad=true verified=true") {
+    throw "AerOS TLS known-answer self-test failed`n$output"
+}
+if ($output -notmatch "AEROS_TLS_NET roots=true rsa_chacha=true ec_aes=true wrong_host_refused=true untrusted_refused=true verified=true") {
+    throw "AerOS TLS 1.3 handshake against OpenSSL failed`n$output"
+}
 $httpRequestLine = if (Wait-Job $httpServer -Timeout 5) { Receive-Job $httpServer } else { "" }
 Remove-Job $httpServer -Force
 $httpRequestLine6 = if (Wait-Job $httpServer6 -Timeout 5) { Receive-Job $httpServer6 } else { "" }
@@ -914,7 +957,7 @@ if ($output -notmatch "AEROS_AV signatures=[1-9][0-9]* self_test=true quarantine
 if ($output -notmatch "AEROS_AUDIT verified=true") {
     throw "AerOS audit log validation failed`n$output"
 }
-if ($output -notmatch "AEROS_COMMANDS count=83 shell=aersh elevation=ear unique=true parser=true privilege=true filesystem=true reauth=true redirection=true startup=true symlinks=true background_jobs=true firewall_command=true dmesg_command=true service_command=true text_tools=true priority_command=true crashes_command=true bench_command=true sigcheck_command=true pipelines=true strace_command=true fsck_command=true verified=true") {
+if ($output -notmatch "AEROS_COMMANDS count=84 shell=aersh elevation=ear unique=true parser=true privilege=true filesystem=true reauth=true redirection=true startup=true symlinks=true background_jobs=true firewall_command=true dmesg_command=true service_command=true text_tools=true priority_command=true crashes_command=true bench_command=true sigcheck_command=true pipelines=true strace_command=true fsck_command=true verified=true") {
     throw "AerOS command registry validation failed`n$output"
 }
 if ($output -notmatch "AEROS_UI_CORE geometry=true scaling=true interaction=true frost=true max_frost_pixels=1048576 verified=true") {

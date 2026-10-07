@@ -1486,7 +1486,7 @@ pub fn tcp_server_self_test(port: u16, timeout_ns: u64) -> TcpServerReport {
     report
 }
 
-fn http_status(response: &[u8]) -> u16 {
+pub(crate) fn http_status(response: &[u8]) -> u16 {
     if response.len() < 12 || !response.starts_with(b"HTTP/1.") {
         return 0;
     }

@@ -6,3 +6,5 @@
 !/assets/wallpapers/aeros-mountains.png
 *.ppm
 /tools/aml-host/target/
+/tools/tls-host/target/
+/tools/tls-host/tests/chain_data.rs

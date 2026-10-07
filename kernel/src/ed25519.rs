@@ -3,7 +3,7 @@
 //! handling here. The field arithmetic follows the compact TweetNaCl design
 //! (16 limbs of 16 bits), which is slow but small and easy to audit.
 
-type Gf = [i64; 16];
+pub(crate) type Gf = [i64; 16];
 
 const GF0: Gf = [0; 16];
 const GF1: Gf = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -127,6 +127,17 @@ const SHA512_H0: [u64; 8] = [
     0x5be0cd19137e2179,
 ];
 
+const SHA384_H0: [u64; 8] = [
+    0xcbbb9d5dc1059ed8,
+    0x629a292a367cd507,
+    0x9159015a3070dd17,
+    0x152fecd8f70e5939,
+    0x67332667ffc00b31,
+    0x8eb44a8768581511,
+    0xdb0c2e0d64f98fa7,
+    0x47b5481dbefa4fa4,
+];
+
 pub struct Sha512 {
     state: [u64; 8],
     buffer: [u8; 128],
@@ -136,8 +147,12 @@ pub struct Sha512 {
 
 impl Sha512 {
     pub fn new() -> Self {
+        Self::with_state(SHA512_H0)
+    }
+
+    fn with_state(state: [u64; 8]) -> Self {
         Self {
-            state: SHA512_H0,
+            state,
             buffer: [0; 128],
             used: 0,
             total: 0,
@@ -179,6 +194,22 @@ impl Sha512 {
         }
         digest
     }
+}
+
+pub fn sha512(data: &[u8]) -> [u8; 64] {
+    let mut hasher = Sha512::new();
+    hasher.update(data);
+    hasher.finish()
+}
+
+/// SHA-384: SHA-512 with its own start value, cut to 48 bytes.
+pub fn sha384(data: &[u8]) -> [u8; 48] {
+    let mut hasher = Sha512::with_state(SHA384_H0);
+    hasher.update(data);
+    let full = hasher.finish();
+    let mut digest = [0u8; 48];
+    digest.copy_from_slice(&full[..48]);
+    digest
 }
 
 fn compress(state: &mut [u64; 8], block: &[u8; 128]) {
@@ -234,7 +265,7 @@ fn carry(o: &mut Gf) {
     }
 }
 
-fn select(p: &mut Gf, q: &mut Gf, bit: i64) {
+pub(crate) fn select(p: &mut Gf, q: &mut Gf, bit: i64) {
     let mask = !(bit - 1);
     for i in 0..16 {
         let t = mask & (p[i] ^ q[i]);
@@ -243,7 +274,7 @@ fn select(p: &mut Gf, q: &mut Gf, bit: i64) {
     }
 }
 
-fn pack25519(n: &Gf) -> [u8; 32] {
+pub(crate) fn pack25519(n: &Gf) -> [u8; 32] {
     let mut t = *n;
     carry(&mut t);
     carry(&mut t);
@@ -268,7 +299,7 @@ fn pack25519(n: &Gf) -> [u8; 32] {
     out
 }
 
-fn unpack25519(n: &[u8; 32]) -> Gf {
+pub(crate) fn unpack25519(n: &[u8; 32]) -> Gf {
     let mut o = [0i64; 16];
     for i in 0..16 {
         o[i] = n[2 * i] as i64 + ((n[2 * i + 1] as i64) << 8);
@@ -285,7 +316,7 @@ fn parity(a: &Gf) -> u8 {
     pack25519(a)[0] & 1
 }
 
-fn fadd(a: &Gf, b: &Gf) -> Gf {
+pub(crate) fn fadd(a: &Gf, b: &Gf) -> Gf {
     let mut o = [0i64; 16];
     for i in 0..16 {
         o[i] = a[i] + b[i];
@@ -293,7 +324,7 @@ fn fadd(a: &Gf, b: &Gf) -> Gf {
     o
 }
 
-fn sub(a: &Gf, b: &Gf) -> Gf {
+pub(crate) fn sub(a: &Gf, b: &Gf) -> Gf {
     let mut o = [0i64; 16];
     for i in 0..16 {
         o[i] = a[i] - b[i];
@@ -301,7 +332,7 @@ fn sub(a: &Gf, b: &Gf) -> Gf {
     o
 }
 
-fn mul(a: &Gf, b: &Gf) -> Gf {
+pub(crate) fn mul(a: &Gf, b: &Gf) -> Gf {
     let mut t = [0i64; 31];
     for i in 0..16 {
         for j in 0..16 {
@@ -318,11 +349,11 @@ fn mul(a: &Gf, b: &Gf) -> Gf {
     o
 }
 
-fn square(a: &Gf) -> Gf {
+pub(crate) fn square(a: &Gf) -> Gf {
     mul(a, a)
 }
 
-fn invert(i: &Gf) -> Gf {
+pub(crate) fn invert(i: &Gf) -> Gf {
     let mut c = *i;
     for a in (0..=253).rev() {
         c = square(&c);

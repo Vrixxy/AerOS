@@ -136,6 +136,7 @@ enum Handler {
     Ip,
     Ping,
     Dns,
+    Https,
     Route,
     Arp,
     Netstat,
@@ -172,7 +173,7 @@ const fn command(
     }
 }
 
-static COMMANDS: [CommandSpec; 83] = [
+static COMMANDS: [CommandSpec; 84] = [
     command(
         "notify",
         "notify <message...>",
@@ -667,6 +668,13 @@ static COMMANDS: [CommandSpec; 83] = [
         "resolve a DNS name",
         false,
         Handler::Dns,
+    ),
+    command(
+        "https",
+        "https <host> [path]",
+        "fetch a page over TLS 1.3, checking the server's certificate",
+        false,
+        Handler::Https,
     ),
     command(
         "route",
@@ -1552,6 +1560,7 @@ impl<'a> Shell<'a> {
             Handler::Ip => self.command_ip(output),
             Handler::Ping => self.command_ping(arguments, offset, output),
             Handler::Dns => self.command_dns(arguments, offset, output),
+            Handler::Https => self.command_https(arguments, offset, output),
             Handler::Route => self.command_route(output),
             Handler::Arp => self.command_arp(output),
             Handler::Netstat => self.command_netstat(output),
@@ -4224,6 +4233,52 @@ impl Shell<'_> {
         }
     }
 
+    fn command_https(
+        &mut self,
+        arguments: &Arguments,
+        offset: usize,
+        output: &mut Text<MAX_OUTPUT>,
+    ) {
+        let Some(name) = arguments.get(offset) else {
+            self.usage_named(output, "https");
+            return;
+        };
+        let path = arguments.get(offset + 1).unwrap_or("/");
+        let lookup = crate::net::resolve(name);
+        if !lookup.verified {
+            self.fail(output, "https", "lookup failed");
+            return;
+        }
+        let mut response = [0u8; 4096];
+        match crate::tlsnet::https_get(
+            crate::ip::v4(lookup.address),
+            443,
+            name,
+            path,
+            &mut response,
+            crate::tls::roots::ROOTS,
+        ) {
+            Ok(reply) => {
+                let _ = writeln!(
+                    output,
+                    "HTTP {} ({} bytes, TLS 1.3, certificate verified)",
+                    reply.status, reply.bytes
+                );
+                let text = &response[..reply.bytes.min(3000)];
+                for &byte in text {
+                    let shown = match byte {
+                        b'\n' | b'\t' | 0x20..=0x7e => byte,
+                        b'\r' => continue,
+                        _ => b'.',
+                    };
+                    let _ = output.write_char(char::from(shown));
+                }
+                let _ = writeln!(output);
+            }
+            Err(failure) => self.fail(output, "https", failure.describe()),
+        }
+    }
+
     fn command_route(&mut self, output: &mut Text<MAX_OUTPUT>) {
         let _ = writeln!(output, "Destination      Gateway          Interface");
         let _ = write!(output, "default          ");
@@ -5456,7 +5511,7 @@ pub fn self_test(info: SystemInfo<'_>) -> ShellReport {
         pipelines,
         strace_command,
         fsck_command,
-        verified: COMMANDS.len() == 83
+        verified: COMMANDS.len() == 84
             && unique
             && parser
             && privilege

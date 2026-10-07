@@ -24,7 +24,7 @@ You can expect an acknowledgement within 7 days. Fixes are developed privately, 
 
 - Denial of service from unbounded local resource use by an already-privileged user.
 - Issues that need physical access to a machine with no disk encryption (`/home` is not encrypted yet).
-- Missing features listed under "Known gaps" in `CHANGELOG.md`, such as TLS, kernel address-space randomisation or secure boot.
+- Missing features listed under "Known gaps" in `CHANGELOG.md`, such as kernel address-space randomisation or secure boot.
 
 ## Current self-audit
 
