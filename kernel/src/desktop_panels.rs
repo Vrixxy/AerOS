@@ -114,40 +114,6 @@ pub(super) fn icon_bluetooth(
     });
 }
 
-pub(super) fn icon_antenna(
-    painter: &mut Painter<'_>,
-    layout: Layout,
-    center: Point,
-    half: i32,
-    ink: Rgba,
-    slashed: bool,
-) {
-    paint_shape(painter, layout, center, half, ink, &|u, v| {
-        if u * u + v * v <= 130 * 130 {
-            return true;
-        }
-        if v.abs() <= u.abs() * 15 / 10 && (arc_hit(u, v, 400, 120) || arc_hit(u, v, 760, 120)) {
-            return true;
-        }
-        slashed && segment_d2(u, v, (-820, -820), (820, 820)) <= 62 * 62
-    });
-}
-
-pub(super) fn icon_battery_body(
-    painter: &mut Painter<'_>,
-    layout: Layout,
-    center: Point,
-    half: i32,
-    ink: Rgba,
-) {
-    paint_shape(painter, layout, center, half, ink, &|u, v| {
-        let outer = (-900..=700).contains(&u) && v.abs() <= 430;
-        let inner = (-780..=580).contains(&u) && v.abs() <= 310;
-        let nub = u > 700 && u <= 920 && v.abs() <= 170;
-        (outer && !inner) || nub
-    });
-}
-
 pub(super) fn icon_cross(
     painter: &mut Painter<'_>,
     layout: Layout,
@@ -221,22 +187,59 @@ pub(super) fn icon_speaker(
 
 // ------------------------------------------------------- control center
 
-pub(super) const QUICK_PANEL: Rect = Rect::new(356, 20, 284, 282);
-pub(super) const BRIGHTNESS_TRACK: Rect = Rect::new(372, 194, 252, 26);
-pub(super) const VOLUME_TRACK: Rect = Rect::new(372, 258, 252, 26);
+/// The control center as designed, at the top right: a Wi-Fi pill, a column of
+/// round buttons (Bluetooth, power, screenshot), two upright sliders (volume,
+/// brightness) and an airplane-mode pill. Focus numbers: 0 Wi-Fi, 1 Bluetooth,
+/// 2 power, 3 screenshot, 4 airplane mode, 5 volume, 6 brightness.
+pub(super) const QUICK_PANEL: Rect = Rect::new(584, 38, 164, 216);
+const QUICK_WIFI: Rect = Rect::new(589, 41, 145, 48);
+const QUICK_AIRPLANE: Rect = Rect::new(645, 202, 101, 46);
+const QUICK_SLIDERS: [Rect; 2] = [Rect::new(648, 100, 43, 98), Rect::new(694, 100, 43, 98)];
+const QUICK_COUNT: usize = 7;
 
-pub(super) fn quick_pill(index: usize) -> Rect {
-    Rect::new(
-        372 + (index as i32 % 2) * 134,
-        42 + (index as i32 / 2) * 68,
-        118,
-        54,
-    )
+fn quick_circle(index: usize) -> Rect {
+    Rect::new(594, 100 + (index as i32 - 1) * 51, 46, 46)
+}
+
+fn quick_bounds(index: usize) -> Rect {
+    match index {
+        0 => QUICK_WIFI,
+        1..=3 => quick_circle(index),
+        4 => QUICK_AIRPLANE,
+        _ => QUICK_SLIDERS[index - 5],
+    }
 }
 
 fn shown_toggle(state: &DesktopState, index: usize, on: bool, now: u64) -> i32 {
     let t = ease_out_milli(progress_of(now, state.quick_toggle_ns[index], 300_000_000)) as i32;
     if on { t } else { 1000 - t }
+}
+
+fn icon_power(painter: &mut Painter<'_>, layout: Layout, center: Point, half: i32, ink: Rgba) {
+    paint_shape(painter, layout, center, half, ink, &|u, v| {
+        let distance = isqrt(u as i64 * u as i64 + v as i64 * v as i64) as i32;
+        let ring = (distance - 600).abs() <= 95 && !(v < 0 && u.abs() <= 280);
+        let bar = u.abs() <= 95 && (-860..=-60).contains(&v);
+        ring || bar
+    });
+}
+
+fn icon_airplane(painter: &mut Painter<'_>, layout: Layout, center: Point, half: i32, ink: Rgba) {
+    paint_shape(painter, layout, center, half, ink, &|u, v| {
+        segment_d2(u, v, (-780, 0), (820, 0)) <= 105 * 105
+            || segment_d2(u, v, (160, 0), (-260, -680)) <= 92 * 92
+            || segment_d2(u, v, (160, 0), (-260, 680)) <= 92 * 92
+            || segment_d2(u, v, (-640, 0), (-900, -340)) <= 78 * 78
+            || segment_d2(u, v, (-640, 0), (-900, 340)) <= 78 * 78
+    });
+}
+
+fn icon_screenshot(painter: &mut Painter<'_>, layout: Layout, center: Point, half: i32, ink: Rgba) {
+    paint_shape(painter, layout, center, half, ink, &|u, v| {
+        let outer = u.abs() <= 820 && v.abs() <= 640;
+        let inner = u.abs() <= 640 && v.abs() <= 460;
+        (outer && !inner) || u * u + v * v <= 250 * 250
+    });
 }
 
 pub(super) fn draw_quick(
@@ -246,164 +249,197 @@ pub(super) fn draw_quick(
     state: &DesktopState,
     now: u64,
 ) -> bool {
-    let captured = frost_mode(
-        painter,
-        layout,
-        QUICK_PANEL,
-        CornerRadii::all(30),
-        dock_style(),
-        0xae91_0001,
-        false,
-    )
-    .captured;
-    let toggles = [
-        state.wifi,
-        state.bluetooth,
-        state.microphone,
-        state.battery_saver,
-    ];
-    for (index, on) in toggles.into_iter().enumerate() {
-        let t = shown_toggle(state, index, on, now);
-        let age = now.saturating_sub(state.quick_toggle_ns[index]);
-        let pop = if age < 320_000_000 {
-            wave_milli(age / 640_000 + 250).max(0) * 7 / 1000
-        } else {
-            0
-        };
-        let base = quick_pill(index);
-        let bounds = Rect::new(
-            base.x - pop,
-            base.y - pop / 2,
-            base.width + pop * 2,
-            base.height + pop,
-        );
-        let radii = CornerRadii::all(bounds.height / 2);
-        let fill = mix_color(Color::rgb(160, 178, 186), Color::rgb(238, 248, 252), t);
-        painter.fill_rounded_rect(
-            layout.rect(bounds),
-            layout.radii(radii),
-            Rgba::new(fill.red, fill.green, fill.blue, (78 + t * 90 / 1000) as u8),
-        );
-        painter.stroke_rounded_rect(
-            layout.rect(bounds),
-            layout.radii(radii),
-            1,
-            Rgba::new(255, 255, 255, (70 + t * 90 / 1000) as u8),
-        );
+    let dark = Color::rgb(14, 24, 30);
+    let blue = Color::rgb(36, 98, 232);
+    let glass = |painter: &mut Painter<'_>, bounds: Rect, alpha: u8| {
+        let radii = layout.radii(CornerRadii::all(bounds.height.min(bounds.width) / 2));
+        painter.fill_rounded_rect(layout.rect(bounds), radii, Rgba::new(40, 70, 80, alpha));
+        painter.stroke_rounded_rect(layout.rect(bounds), radii, 1, Rgba::new(255, 255, 255, 96));
+    };
+    let ring = |painter: &mut Painter<'_>, bounds: Rect, index: usize| {
         if state.focus_visible && state.quick_focus == index {
             painter.stroke_rounded_rect(
                 layout.rect(bounds.expand(3)),
-                layout.radii(CornerRadii::all(bounds.height / 2 + 3)),
+                layout.radii(CornerRadii::all(bounds.height.min(bounds.width) / 2 + 3)),
                 2,
                 Rgba::new(
                     255,
                     255,
                     255,
-                    (170 + wave_milli(now / 4_000_000) * 60 / 1000) as u8,
+                    (190 + wave_milli(now / 4_000_000) * 60 / 1000) as u8,
                 ),
             );
         }
-        let dark = Color::rgb(14, 20, 26);
-        let blue = Color::rgb(36, 98, 232);
-        let ink = if index == 3 {
-            dark
+    };
+    let pop_of = |index: usize| {
+        let age = now.saturating_sub(state.quick_toggle_ns[index]);
+        if age < 320_000_000 {
+            wave_milli(age / 640_000 + 250).max(0) * 6 / 1000
         } else {
-            mix_color(dark, blue, t)
+            0
+        }
+    };
+
+    // Wi-Fi: a glass capsule with a round button and the connection's state.
+    let wifi_on = state.wifi && !state.airplane;
+    let t = shown_toggle(state, 0, wifi_on, now);
+    let pop = pop_of(0);
+    let bounds = QUICK_WIFI;
+    glass(painter, bounds, 120);
+    let button = Rect::new(
+        bounds.x + 8 - pop / 2,
+        bounds.y + 6 - pop / 2,
+        bounds.height - 12 + pop,
+        bounds.height - 12 + pop,
+    );
+    painter.fill_rounded_rect(
+        layout.rect(button),
+        layout.radii(CornerRadii::all(button.height / 2)),
+        {
+            let fill = mix_color(Color::rgb(170, 186, 194), Color::rgb(250, 252, 253), t);
+            Rgba::new(fill.red, fill.green, fill.blue, 255)
+        },
+    );
+    let ink = mix_color(Color::rgb(80, 96, 104), blue, t);
+    icon_wifi(
+        painter,
+        layout,
+        Point::new(button.x + button.width / 2, button.y + button.height / 2),
+        14,
+        Rgba::new(ink.red, ink.green, ink.blue, 255),
+    );
+    text(
+        painter,
+        layout,
+        font,
+        Point::new(bounds.x + 56, bounds.y + 11),
+        "Wi-Fi",
+        13,
+        Color::rgb(236, 246, 249),
+    );
+    text(
+        painter,
+        layout,
+        font,
+        Point::new(bounds.x + 56, bounds.y + 28),
+        if wifi_on { "Connected" } else { "Off" },
+        10,
+        Color::rgb(200, 220, 226),
+    );
+    ring(painter, bounds, 0);
+
+    // The round buttons.
+    for index in 1..=3 {
+        let on = match index {
+            1 => state.bluetooth && !state.airplane,
+            _ => true,
         };
+        let t = if index == 1 {
+            shown_toggle(state, 1, on, now)
+        } else {
+            1000
+        };
+        let pop = pop_of(index);
+        let base = quick_circle(index);
+        let bounds = Rect::new(
+            base.x - pop / 2,
+            base.y - pop / 2,
+            base.width + pop,
+            base.height + pop,
+        );
+        let fill = mix_color(Color::rgb(170, 186, 194), Color::rgb(250, 252, 253), t);
+        painter.fill_rounded_rect(
+            layout.rect(bounds),
+            layout.radii(CornerRadii::all(bounds.height / 2)),
+            Rgba::new(fill.red, fill.green, fill.blue, 255),
+        );
+        let ink = mix_color(Color::rgb(80, 96, 104), blue, t);
         let ink = Rgba::new(ink.red, ink.green, ink.blue, 255);
-        let center = Point::new(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+        let middle = Point::new(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
         match index {
-            0 => icon_wifi(painter, layout, center, 15, ink),
-            1 => icon_bluetooth(painter, layout, center, 15, ink),
-            2 => icon_antenna(painter, layout, center, 16, ink, t < 500),
-            _ => {
-                icon_battery_body(painter, layout, center, 18, ink);
-                let leaf_w = 17;
-                let leaf = layout.rect(Rect::new(
-                    center.x - 13,
-                    center.y - crate::logo::height_for(leaf_w) / 2,
-                    leaf_w,
-                    crate::logo::height_for(leaf_w),
-                ));
-                painter.draw_rgba_scaled_alpha(
-                    leaf,
-                    crate::logo::green_rgba(),
-                    crate::logo::WIDTH,
-                    crate::logo::HEIGHT,
-                    (120 + t * 135 / 1000) as u8,
-                );
-            }
+            1 => icon_bluetooth(painter, layout, middle, 15, ink),
+            2 => icon_power(painter, layout, middle, 15, ink),
+            _ => icon_screenshot(painter, layout, middle, 15, ink),
         }
+        ring(painter, bounds, index);
     }
-    let tracks = [
-        (
-            "Brightness",
-            BRIGHTNESS_TRACK,
-            state.shown_brightness(now) as i32,
-            4usize,
-        ),
-        (
-            "Volume",
-            VOLUME_TRACK,
-            state.shown_volume(now) as i32,
-            5usize,
-        ),
+
+    // The two upright sliders: volume, then brightness.
+    let levels = [
+        state.shown_volume(now) as i32,
+        state.shown_brightness(now) as i32,
     ];
-    for (label, track, level, slot) in tracks {
-        text(
-            painter,
-            layout,
-            font,
-            Point::new(track.x + 2, track.y - 17),
-            label,
-            11,
-            Color::rgb(20, 36, 44),
-        );
-        let radii = CornerRadii::all(track.height / 2);
-        painter.fill_rounded_rect(
-            layout.rect(track),
-            layout.radii(radii),
-            Rgba::new(255, 255, 255, 70),
-        );
-        painter.stroke_rounded_rect(
-            layout.rect(track),
-            layout.radii(radii),
-            1,
-            Rgba::new(255, 255, 255, 110),
-        );
-        let thumb = track.height + 2;
-        let travel = track.width - thumb;
-        let x = track.x + travel * level.clamp(0, 100) / 100;
-        painter.fill_rounded_rect(
-            layout.rect(Rect::new(
-                track.x + 3,
-                track.y + 3,
-                (x - track.x) + thumb / 2,
-                track.height - 6,
-            )),
-            layout.radii(CornerRadii::all((track.height - 6) / 2)),
-            Rgba::new(255, 255, 255, 96),
-        );
-        painter.fill_rounded_rect(
-            layout.rect(Rect::new(x - 1, track.y + 3, thumb, thumb)),
-            layout.radii(CornerRadii::all(thumb / 2)),
-            Rgba::new(0, 0, 0, 40),
-        );
-        painter.fill_rounded_rect(
-            layout.rect(Rect::new(x, track.y - 1, thumb, thumb)),
-            layout.radii(CornerRadii::all(thumb / 2)),
-            Rgba::new(246, 249, 251, 250),
-        );
-        if state.focus_visible && state.quick_focus == slot {
-            painter.stroke_rounded_rect(
-                layout.rect(track.expand(3)),
-                layout.radii(CornerRadii::all(track.height / 2 + 3)),
-                2,
-                Rgba::new(255, 255, 255, 200),
-            );
+    for (slot, track) in QUICK_SLIDERS.into_iter().enumerate() {
+        glass(painter, track, 100);
+        let level = levels[slot].clamp(0, 100);
+        let fill_h = (track.height * level / 100).max(track.width.min(8));
+        let fill = Rect::new(track.x, track.bottom() - fill_h, track.width, fill_h);
+        let radii = layout.radii(CornerRadii::all(track.width / 2));
+        if painter.set_clip(layout.rect(fill)) {
+            painter.fill_rounded_rect(layout.rect(track), radii, Rgba::new(236, 244, 247, 188));
         }
+        painter.reset_clip();
+        let middle = Point::new(track.x + track.width / 2, track.bottom() - 22);
+        let ink = Rgba::new(120, 150, 160, 255);
+        if slot == 0 {
+            icon_speaker(painter, layout, middle, 13, ink, level, state.muted);
+        } else {
+            icon_sun(painter, layout, middle, 12, ink);
+        }
+        ring(painter, track, 5 + slot);
     }
-    captured
+
+    // Airplane mode.
+    let t = shown_toggle(state, 4, state.airplane, now);
+    let pop = pop_of(4);
+    let base = QUICK_AIRPLANE;
+    let bounds = Rect::new(
+        base.x - pop,
+        base.y - pop / 2,
+        base.width + pop * 2,
+        base.height + pop,
+    );
+    let fill = mix_color(Color::rgb(170, 186, 194), Color::rgb(250, 252, 253), t);
+    let radii = layout.radii(CornerRadii::all(bounds.height / 2));
+    painter.fill_rounded_rect(
+        layout.rect(bounds),
+        radii,
+        Rgba::new(
+            fill.red,
+            fill.green,
+            fill.blue,
+            (150 + t * 105 / 1000) as u8,
+        ),
+    );
+    painter.stroke_rounded_rect(layout.rect(bounds), radii, 1, Rgba::new(255, 255, 255, 110));
+    let ink = mix_color(Color::rgb(80, 96, 104), blue, t);
+    icon_airplane(
+        painter,
+        layout,
+        Point::new(bounds.x + 22, bounds.y + bounds.height / 2),
+        14,
+        Rgba::new(ink.red, ink.green, ink.blue, 255),
+    );
+    text(
+        painter,
+        layout,
+        font,
+        Point::new(bounds.x + 44, bounds.y + 11),
+        "Airplane",
+        11,
+        dark,
+    );
+    text(
+        painter,
+        layout,
+        font,
+        Point::new(bounds.x + 44, bounds.y + 25),
+        "mode",
+        11,
+        dark,
+    );
+    ring(painter, bounds, 4);
+    true
 }
 
 impl DesktopState {
@@ -431,7 +467,7 @@ impl DesktopState {
         self.motion_until_ns = self.motion_until_ns.max(self.brightness_hud_until_ns);
     }
 
-    fn set_volume_to(&mut self, value: u8) {
+    pub(super) fn set_volume_to(&mut self, value: u8) {
         let now = crate::time::monotonic_nanoseconds();
         self.volume_prev = self.shown_volume(now);
         self.muted = false;
@@ -442,16 +478,55 @@ impl DesktopState {
         self.motion_until_ns = self.motion_until_ns.max(self.volume_hud_until_ns);
     }
 
+    /// The buttons: 0 Wi-Fi, 1 Bluetooth, 2 power menu, 3 screenshot,
+    /// 4 airplane mode (which switches the radios off and back).
     fn quick_toggle(&mut self, index: usize) {
         let now = crate::time::monotonic_nanoseconds();
         match index {
-            0 => self.wifi = !self.wifi,
-            1 => self.bluetooth = !self.bluetooth,
-            2 => self.microphone = !self.microphone,
-            _ => self.battery_saver = !self.battery_saver,
+            0 => {
+                self.wifi = !self.wifi;
+                if self.wifi {
+                    self.airplane = false;
+                }
+            }
+            1 => {
+                self.bluetooth = !self.bluetooth;
+                if self.bluetooth {
+                    self.airplane = false;
+                }
+            }
+            2 => {
+                self.set_overlay(Overlay::None);
+                self.open_power_menu();
+            }
+            3 => {
+                self.set_overlay(Overlay::None);
+                self.screenshot_at_ns = now + 450_000_000;
+            }
+            _ => {
+                if self.airplane {
+                    self.airplane = false;
+                    (self.wifi, self.bluetooth) = self.airplane_stash;
+                } else {
+                    self.airplane_stash = (self.wifi, self.bluetooth);
+                    self.airplane = true;
+                    self.wifi = false;
+                    self.bluetooth = false;
+                }
+                self.quick_toggle_ns[0] = now;
+                self.quick_toggle_ns[1] = now;
+            }
         }
-        self.quick_toggle_ns[index] = now;
+        self.quick_toggle_ns[index.min(4)] = now;
         self.motion_until_ns = self.motion_until_ns.max(now + 420_000_000);
+    }
+
+    fn quick_slider_step(&mut self, slot: usize, delta: i32) {
+        if slot == 0 {
+            self.set_volume_to((self.volume as i32 + delta).clamp(0, 100) as u8);
+        } else {
+            self.brightness_step(delta);
+        }
     }
 
     pub(super) fn quick_key(&mut self, key: DesktopKey) -> Option<DesktopAction> {
@@ -460,43 +535,26 @@ impl DesktopState {
         }
         let focus = self.quick_focus;
         self.focus_visible = true;
+        let slider = focus >= 5;
         match key {
-            DesktopKey::Left => {
-                if focus == 4 {
-                    self.brightness_step(-6);
-                } else if focus == 5 {
-                    self.set_volume_to((self.volume as i32 - 6).max(0) as u8);
-                } else if focus % 2 == 1 {
-                    self.quick_focus -= 1;
-                }
-            }
+            DesktopKey::Up | DesktopKey::Right if slider => self.quick_slider_step(focus - 5, 6),
+            DesktopKey::Down | DesktopKey::Left if slider => self.quick_slider_step(focus - 5, -6),
             DesktopKey::Right => {
-                if focus == 4 {
-                    self.brightness_step(6);
-                } else if focus == 5 {
-                    self.set_volume_to((self.volume as i32 + 6).min(100) as u8);
-                } else if focus.is_multiple_of(2) {
-                    self.quick_focus += 1;
-                }
-            }
-            DesktopKey::Down | DesktopKey::Tab => {
-                self.quick_focus = match focus {
-                    0 | 1 => focus + 2,
-                    2 | 3 => 4,
-                    4 => 5,
-                    _ => 0,
+                self.quick_focus = if focus == 4 {
+                    6
+                } else if focus >= 1 {
+                    5
+                } else {
+                    4
                 };
             }
-            DesktopKey::Up => {
-                self.quick_focus = match focus {
-                    0 | 1 => 5,
-                    2 | 3 => focus - 2,
-                    4 => 2,
-                    _ => 4,
-                };
+            DesktopKey::Left => {
+                self.quick_focus = if focus == 4 { 0 } else { focus.min(3) };
             }
+            DesktopKey::Down | DesktopKey::Tab => self.quick_focus = (focus + 1) % QUICK_COUNT,
+            DesktopKey::Up => self.quick_focus = (focus + QUICK_COUNT - 1) % QUICK_COUNT,
             DesktopKey::Activate => {
-                if focus < 4 {
+                if focus < 5 {
                     self.quick_toggle(focus);
                 }
             }
@@ -505,26 +563,24 @@ impl DesktopState {
         Some(DesktopAction::Redraw)
     }
 
-    /// A click inside the control center panel.
+    /// A click inside the control center.
     pub(super) fn quick_click(&mut self, point: Point) -> DesktopAction {
         let now = crate::time::monotonic_nanoseconds();
-        for index in 0..4 {
-            if quick_pill(index).contains(point) {
+        for index in 0..5 {
+            if quick_bounds(index).contains(point) {
                 self.quick_focus = index;
                 self.quick_toggle(index);
                 return DesktopAction::Redraw;
             }
         }
-        for (track, slot) in [(BRIGHTNESS_TRACK, 4usize), (VOLUME_TRACK, 5usize)] {
-            if track.expand(6).contains(point) {
-                let thumb = track.height + 2;
-                let value =
-                    ((point.x - track.x - thumb / 2) * 100 / (track.width - thumb)).clamp(0, 100);
-                self.quick_focus = slot;
-                if slot == 4 {
-                    self.set_brightness(value.max(8) as u8, now);
-                } else {
+        for (slot, track) in QUICK_SLIDERS.into_iter().enumerate() {
+            if track.expand(5).contains(point) {
+                let value = ((track.bottom() - point.y) * 100 / track.height).clamp(0, 100);
+                self.quick_focus = 5 + slot;
+                if slot == 0 {
                     self.set_volume_to(value as u8);
+                } else {
+                    self.set_brightness(value.max(8) as u8, now);
                 }
                 return DesktopAction::Redraw;
             }
@@ -561,13 +617,13 @@ fn hud_bar(
         0
     };
     let slide = ((1000 - entering.min(1000)) + leaving).clamp(0, 1300);
-    let width = 54 + kick.abs() / 160;
+    let width = 58 + kick.abs() / 160;
     let x = if left {
-        22 - 96 * slide / 1000 - kick / 300
+        32 - 96 * slide / 1000 - kick / 300
     } else {
-        DESIGN_WIDTH - 22 - width + 96 * slide / 1000 + kick / 300
+        DESIGN_WIDTH - 32 - width + 96 * slide / 1000 + kick / 300
     };
-    let pill = Rect::new(x, 150, width, 150);
+    let pill = Rect::new(x, 112, width, 152);
     let radii = layout.radii(CornerRadii::all(width / 2));
     painter.fill_rounded_rect(
         layout.rect(Rect::new(
@@ -1032,8 +1088,8 @@ pub(super) fn draw_context(
         radii,
         Rgba::new(0, 0, 0, 40),
     );
-    painter.fill_rounded_rect(layout.rect(panel), radii, Rgba::new(218, 220, 222, 250));
-    painter.stroke_rounded_rect(layout.rect(panel), radii, 1, Rgba::new(28, 30, 32, 110));
+    painter.fill_rounded_rect(layout.rect(panel), radii, Rgba::new(150, 180, 188, 214));
+    painter.stroke_rounded_rect(layout.rect(panel), radii, 1, Rgba::new(20, 30, 34, 150));
     if pop < 800 {
         return;
     }
@@ -1052,9 +1108,9 @@ pub(super) fn draw_context(
             layout.rect(shown),
             layout.radii(CornerRadii::all(row.height / 2)),
             if focused {
-                Rgba::new(120, 122, 126, 255)
+                Rgba::new(208, 228, 252, 255)
             } else {
-                Rgba::new(154, 156, 159, 255)
+                Rgba::new(252, 252, 252, 255)
             },
         );
         if focused {
@@ -1062,7 +1118,7 @@ pub(super) fn draw_context(
                 layout.rect(shown.expand(2)),
                 layout.radii(CornerRadii::all(row.height / 2 + 2)),
                 2,
-                Rgba::new(255, 255, 255, 220),
+                Rgba::new(46, 120, 232, 220),
             );
         }
         centered_text(
@@ -1072,11 +1128,7 @@ pub(super) fn draw_context(
             shown,
             label,
             if index == 3 { 8 } else { 11 },
-            if focused {
-                Color::rgb(250, 250, 250)
-            } else {
-                Color::rgb(24, 26, 28)
-            },
+            Color::rgb(24, 26, 28),
         );
     }
 }
@@ -1102,8 +1154,8 @@ pub(super) fn draw_clipboard_panel(
         radii,
         Rgba::new(0, 0, 0, 40),
     );
-    painter.fill_rounded_rect(layout.rect(panel), radii, Rgba::new(218, 220, 222, 252));
-    painter.stroke_rounded_rect(layout.rect(panel), radii, 1, Rgba::new(28, 30, 32, 110));
+    painter.fill_rounded_rect(layout.rect(panel), radii, Rgba::new(150, 180, 188, 214));
+    painter.stroke_rounded_rect(layout.rect(panel), radii, 1, Rgba::new(20, 30, 34, 150));
     if pop < 750 {
         return;
     }
@@ -1114,7 +1166,7 @@ pub(super) fn draw_clipboard_panel(
         Point::new(full.x + 30, full.y + 18),
         "Clipboard",
         12,
-        Color::rgb(24, 26, 28),
+        Color::rgb(244, 248, 250),
     );
     let visible = 4usize;
     let first = if state.clip_selected >= visible {
@@ -1155,9 +1207,9 @@ pub(super) fn draw_clipboard_panel(
             layout.rect(row),
             layout.radii(CornerRadii::all(21)),
             if selected {
-                Rgba::new(118, 120, 124, 255)
+                Rgba::new(208, 228, 252, 255)
             } else {
-                Rgba::new(154, 156, 159, 255)
+                Rgba::new(252, 252, 252, 255)
             },
         );
         if selected {
@@ -1165,7 +1217,7 @@ pub(super) fn draw_clipboard_panel(
                 layout.rect(row.expand(2)),
                 layout.radii(CornerRadii::all(23)),
                 2,
-                Rgba::new(255, 255, 255, 230),
+                Rgba::new(46, 120, 232, 230),
             );
         }
         let mut label = ClockBuffer56::new();
@@ -1189,11 +1241,7 @@ pub(super) fn draw_clipboard_panel(
             row,
             label.as_str(),
             11,
-            if selected {
-                Color::rgb(252, 252, 252)
-            } else {
-                Color::rgb(24, 26, 28)
-            },
+            Color::rgb(24, 26, 28),
         );
     }
     if count > visible {
@@ -1201,7 +1249,7 @@ pub(super) fn draw_clipboard_panel(
         painter.fill_rounded_rect(
             layout.rect(track),
             layout.radii(CornerRadii::all(6)),
-            Rgba::new(190, 192, 194, 255),
+            Rgba::new(120, 150, 158, 200),
         );
         let thumb_h = (track.height * visible as i32 / count as i32).max(30);
         let travel = track.height - thumb_h;

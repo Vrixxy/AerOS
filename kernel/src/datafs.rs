@@ -958,9 +958,20 @@ pub fn device_name(disk: Disk) -> &'static str {
         Disk::Usb => "sdu",
         Disk::Sd => "mmcblk0",
         Disk::Virtio => "vda",
+        Disk::Volume(0) => "md0",
+        Disk::Volume(_) => "md1",
         #[cfg(feature = "boot-test")]
         Disk::Ram => "ram0",
     }
+}
+
+/// Whether a filesystem on `disk` is mounted.
+pub fn disk_mounted(disk: Disk) -> bool {
+    STATE
+        .lock()
+        .mounts
+        .iter()
+        .any(|mount| mount.used && mount.disk == disk)
 }
 
 /// Details of the `index`-th mount slot (0 = /home, then media), if used.
@@ -1041,6 +1052,8 @@ pub fn disk_by_name(name: &str) -> Option<Disk> {
         Disk::Usb,
         Disk::Sd,
         Disk::Virtio,
+        Disk::Volume(0),
+        Disk::Volume(1),
     ]
     .into_iter()
     .find(|disk| device_name(*disk) == name)

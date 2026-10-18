@@ -19,12 +19,14 @@ pub struct CpuInfo {
     pub smep: bool,
     pub smap: bool,
     pub invariant_tsc: bool,
+    pub rdtscp: bool,
     pub rdrand: bool,
     pub rdseed: bool,
     pub fxsave: bool,
     pub sse: bool,
     pub xsave: bool,
     pub avx: bool,
+    brand: [u8; 48],
 }
 
 impl CpuInfo {
@@ -57,8 +59,20 @@ impl CpuInfo {
             __cpuid(0)
         };
 
+        let mut brand = [0u8; 48];
+        if extended.eax >= 0x8000_0004 {
+            for (index, leaf) in (0x8000_0002u32..=0x8000_0004).enumerate() {
+                let regs = __cpuid(leaf);
+                for (slot, value) in [regs.eax, regs.ebx, regs.ecx, regs.edx].iter().enumerate() {
+                    let at = index * 16 + slot * 4;
+                    brand[at..at + 4].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+
         Self {
             vendor,
+            brand,
             max_basic_leaf: basic.eax,
             nx: leaf_ext1.edx & (1 << 20) != 0,
             syscall: leaf_ext1.edx & (1 << 11) != 0,
@@ -67,6 +81,7 @@ impl CpuInfo {
             smep: leaf7.ebx & (1 << 7) != 0,
             smap: leaf7.ebx & (1 << 20) != 0,
             invariant_tsc: leaf_ext7.edx & (1 << 8) != 0,
+            rdtscp: leaf_ext1.edx & (1 << 27) != 0,
             rdrand: leaf1.ecx & (1 << 30) != 0,
             rdseed: leaf7.ebx & (1 << 18) != 0,
             fxsave: leaf1.edx & (1 << 24) != 0,
@@ -74,6 +89,14 @@ impl CpuInfo {
             xsave: leaf1.ecx & (1 << 26) != 0,
             avx: leaf1.ecx & (1 << 28) != 0,
         }
+    }
+
+    /// The marketing name from CPUID (empty when the CPU has none).
+    pub fn brand(&self) -> &str {
+        let end = self.brand.iter().position(|b| *b == 0).unwrap_or(48);
+        core::str::from_utf8(&self.brand[..end])
+            .unwrap_or("")
+            .trim()
     }
 
     pub fn vendor(&self) -> &str {
@@ -95,8 +118,12 @@ pub fn enable_interrupts() {
 
 pub fn wait_for_interrupt() {
     let start = crate::time::monotonic_nanoseconds();
-    unsafe {
-        asm!("sti; hlt", options(nomem, nostack));
+    if crate::kernel_lock::active() && crate::kernel_lock::held_by_me() {
+        crate::scheduler::idle_wait();
+    } else {
+        unsafe {
+            asm!("sti; hlt", options(nomem, nostack));
+        }
     }
     crate::sysmon::add_idle(crate::time::monotonic_nanoseconds().saturating_sub(start));
 }

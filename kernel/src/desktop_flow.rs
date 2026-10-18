@@ -1,6 +1,17 @@
 use super::*;
 
-pub(super) const CARD: Rect = Rect::new(96, 12, 560, 434);
+pub(super) const CARD: Rect = Rect::new(126, 18, 500, 408);
+pub(super) const BACK: Rect = Rect::new(136, 40, 100, 38);
+pub(super) const NEXT: Rect = Rect::new(516, 40, 100, 38);
+/// The show/hide-password eye inside the password field.
+pub(super) const EYE: Rect = Rect::new(508, 202, 32, 30);
+/// "Forgot password?" under the sign-in pill, and its confirmation card.
+pub(super) const RESET_LINK: Rect = Rect::new(296, 388, 160, 22);
+const RESET_CARD: Rect = Rect::new(206, 112, 340, 230);
+pub(super) const RESET_CANCEL: Rect = Rect::new(226, 276, 140, 44);
+pub(super) const RESET_OK: Rect = Rect::new(386, 276, 140, 44);
+const INK: Color = Color::rgb(22, 26, 32);
+const INK_SOFT: Color = Color::rgb(86, 96, 108);
 pub(super) const WELCOME_NS: u64 = 3_600_000_000;
 const SLIDE_NS: u64 = 620_000_000;
 const KB_SCROLL_NS: u64 = 280_000_000;
@@ -21,41 +32,14 @@ pub(super) fn shift_layout_x(layout: Layout, logical_dx: i32) -> Layout {
     shifted
 }
 
-fn pill_style(dark: bool) -> FrostStyle {
-    let mut style = setup_field_style();
-    if dark {
-        style.tint = Rgba::new(0, 0, 0, 118);
-        style.inner_shadow = Rgba::new(0, 0, 0, 120);
-        style.border = Rgba::new(255, 255, 255, 215);
-    }
-    style
+fn light_pill(painter: &mut Painter<'_>, layout: Layout, bounds: Rect, tint: Rgba) {
+    let radii = layout.radii(CornerRadii::all(bounds.height / 2));
+    painter.fill_rounded_rect(layout.rect(bounds), radii, tint);
+    painter.stroke_rounded_rect(layout.rect(bounds), radii, 1, Rgba::new(26, 30, 36, 210));
 }
 
-fn glass_pill(
-    painter: &mut Painter<'_>,
-    layout: Layout,
-    bounds: Rect,
-    dark: bool,
-    seed: u32,
-) -> bool {
-    let captured = frost_mode(
-        painter,
-        layout,
-        bounds,
-        CornerRadii::all(bounds.height / 2),
-        pill_style(dark),
-        seed,
-        true,
-    )
-    .captured;
-    if !dark {
-        painter.fill_rounded_rect(
-            layout.rect(bounds),
-            layout.radii(CornerRadii::all(bounds.height / 2)),
-            Rgba::new(255, 255, 255, 44),
-        );
-    }
-    captured
+fn field_pill(painter: &mut Painter<'_>, layout: Layout, bounds: Rect) {
+    light_pill(painter, layout, bounds, Rgba::new(241, 243, 246, 255));
 }
 
 fn caret_on(now: u64) -> bool {
@@ -83,35 +67,42 @@ fn slide_in(state: &DesktopState, now: u64) -> i32 {
     (1000 - eased) * 110 / 1000
 }
 
-fn title(painter: &mut Painter<'_>, layout: Layout, font: RasterFont, subtitle: &str, tone: Color) {
+fn chrome(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    font: RasterFont,
+    heading: &str,
+    back: bool,
+    next: &str,
+) {
+    let button = |painter: &mut Painter<'_>, bounds: Rect, label: &str| {
+        field_pill(painter, layout, bounds);
+        centered_text(painter, layout, font, bounds, label, 14, INK);
+    };
+    if back {
+        button(painter, BACK, "Back");
+    }
+    if !next.is_empty() {
+        button(painter, NEXT, next);
+    }
     centered_text(
         painter,
         layout,
         font,
-        Rect::new(CARD.x, 36, CARD.width, 34),
-        "AerOS Setup",
-        27,
-        Color::rgb(244, 246, 248),
+        Rect::new(
+            BACK.right() + 6,
+            BACK.y,
+            NEXT.x - BACK.right() - 12,
+            BACK.height,
+        ),
+        heading,
+        17,
+        INK,
     );
-    if !subtitle.is_empty() {
-        centered_text(
-            painter,
-            layout,
-            font,
-            Rect::new(CARD.x, 70, CARD.width, 18),
-            subtitle,
-            13,
-            tone,
-        );
-    }
 }
 
 fn hint(painter: &mut Painter<'_>, layout: Layout, font: RasterFont, value: &str, alpha: i32) {
-    let tone = mix_color(
-        Color::rgb(110, 138, 152),
-        Color::rgb(222, 228, 234),
-        alpha.clamp(0, 1000),
-    );
+    let tone = mix_color(Color::rgb(168, 176, 184), INK_SOFT, alpha.clamp(0, 1000));
     centered_text(
         painter,
         layout,
@@ -135,47 +126,27 @@ pub(super) fn draw_language(
     now: u64,
 ) -> bool {
     let layout = shift_layout_x(layout, slide_in(state, now));
-    title(painter, layout, font, "Language", Color::rgb(232, 236, 240));
+    chrome(painter, layout, font, "Select your language", false, "Next");
     let glow = breathe(now);
-    let ok = glass_pill(painter, layout, LANGUAGE_ENGLISH, false, 0xae5e_0201);
+    field_pill(painter, layout, LANGUAGE_ENGLISH);
     painter.stroke_rounded_rect(
-        layout.rect(LANGUAGE_ENGLISH.expand(2)),
-        layout.radii(CornerRadii::all(LANGUAGE_ENGLISH.height / 2 + 2)),
+        layout.rect(LANGUAGE_ENGLISH.expand(3)),
+        layout.radii(CornerRadii::all(LANGUAGE_ENGLISH.height / 2 + 3)),
         2,
-        Rgba::new(255, 255, 255, (70 + glow * 90 / 1000) as u8),
+        Rgba::new(46, 120, 232, (90 + glow * 120 / 1000) as u8),
     );
+    centered_text(painter, layout, font, LANGUAGE_ENGLISH, "English", 17, INK);
     centered_text(
         painter,
         layout,
         font,
-        LANGUAGE_ENGLISH,
-        "English",
-        17,
-        Color::rgb(30, 42, 52),
-    );
-    let soon = Rect::new(244, 244, 264, 40);
-    painter.fill_rounded_rect(
-        layout.rect(soon),
-        layout.radii(CornerRadii::all(20)),
-        Rgba::new(255, 255, 255, 34),
-    );
-    painter.stroke_rounded_rect(
-        layout.rect(soon),
-        layout.radii(CornerRadii::all(20)),
-        1,
-        Rgba::new(255, 255, 255, 120),
-    );
-    centered_text(
-        painter,
-        layout,
-        font,
-        soon,
+        Rect::new(CARD.x, 232, CARD.width, 24),
         "More languages coming soon",
         13,
-        Color::rgb(36, 50, 62),
+        INK_SOFT,
     );
     hint(painter, layout, font, "Press Enter to continue", glow);
-    ok
+    true
 }
 
 pub(super) fn keyboard_matches(state: &DesktopState, out: &mut [usize; 16]) -> usize {
@@ -210,36 +181,21 @@ pub(super) fn draw_keyboard(
     now: u64,
 ) -> bool {
     let layout = shift_layout_x(layout, slide_in(state, now));
-    title(
+    chrome(
         painter,
         layout,
         font,
-        "Keyboard Language",
-        Color::rgb(232, 236, 240),
+        "Select your keyboard layout",
+        true,
+        "Next",
     );
     let search = Rect::new(216, 112, 320, 46);
-    let mut ok = glass_pill(painter, layout, search, false, 0xae5e_0211);
+    field_pill(painter, layout, search);
     let query = field_text(&state.kb_search[..state.kb_search_len], false, now);
     if state.kb_search_len == 0 {
-        centered_text(
-            painter,
-            layout,
-            font,
-            search,
-            "Search",
-            15,
-            Color::rgb(44, 58, 70),
-        );
+        centered_text(painter, layout, font, search, "Search", 15, INK_SOFT);
     } else {
-        centered_text(
-            painter,
-            layout,
-            font,
-            search,
-            query.as_str(),
-            15,
-            Color::rgb(24, 34, 44),
-        );
+        centered_text(painter, layout, font, search, query.as_str(), 15, INK);
     }
     let mut matches = [0usize; 16];
     let count = keyboard_matches(state, &mut matches);
@@ -258,18 +214,22 @@ pub(super) fn draw_keyboard(
             }
             let row = Rect::new(KB_LIST.x, y, KB_LIST.width, KB_ROW_HEIGHT);
             let selected = position == state.kb_cursor;
-            ok &= glass_pill(painter, layout, row, false, 0xae5e_0220 + position as u32);
+            light_pill(
+                painter,
+                layout,
+                row,
+                if selected {
+                    Rgba::new(208, 228, 252, 255)
+                } else {
+                    Rgba::new(241, 243, 246, 255)
+                },
+            );
             if selected {
-                painter.fill_rounded_rect(
-                    layout.rect(row),
-                    layout.radii(CornerRadii::all(KB_ROW_HEIGHT / 2)),
-                    Rgba::new(255, 255, 255, 58),
-                );
                 painter.stroke_rounded_rect(
                     layout.rect(row.expand(2)),
                     layout.radii(CornerRadii::all(KB_ROW_HEIGHT / 2 + 2)),
                     2,
-                    Rgba::new(255, 255, 255, (120 + breathe(now) * 110 / 1000) as u8),
+                    Rgba::new(46, 120, 232, (120 + breathe(now) * 110 / 1000) as u8),
                 );
             }
             if row.y < KB_LIST.y || row.bottom() > KB_LIST.bottom() {
@@ -282,17 +242,13 @@ pub(super) fn draw_keyboard(
                 row,
                 crate::keymap::layout_name(index),
                 14,
-                if selected {
-                    Color::rgb(16, 26, 36)
-                } else {
-                    Color::rgb(40, 54, 66)
-                },
+                INK,
             );
             if index == crate::keymap::layout_index() {
                 painter.fill_rounded_rect(
                     layout.rect(Rect::new(row.x + 16, row.y + KB_ROW_HEIGHT / 2 - 3, 6, 6)),
                     layout.radii(CornerRadii::all(3)),
-                    Rgba::new(255, 255, 255, 235),
+                    Rgba::new(46, 120, 232, 255),
                 );
             }
         }
@@ -304,7 +260,7 @@ pub(super) fn draw_keyboard(
                 KB_LIST,
                 "No matching layouts",
                 14,
-                Color::rgb(220, 226, 232),
+                INK_SOFT,
             );
         }
     }
@@ -314,7 +270,7 @@ pub(super) fn draw_keyboard(
         painter.fill_rounded_rect(
             layout.rect(track),
             layout.radii(CornerRadii::all(4)),
-            Rgba::new(255, 255, 255, 60),
+            Rgba::new(26, 30, 36, 28),
         );
         let total = count as i32 * KB_ROW_PITCH;
         let thumb_h = (track.height * KB_VISIBLE * KB_ROW_PITCH / total).max(24);
@@ -324,7 +280,7 @@ pub(super) fn draw_keyboard(
         painter.fill_rounded_rect(
             layout.rect(Rect::new(track.x, thumb_y, 8, thumb_h)),
             layout.radii(CornerRadii::all(4)),
-            Rgba::new(236, 240, 244, 240),
+            Rgba::new(70, 78, 90, 230),
         );
     }
     hint(
@@ -334,7 +290,7 @@ pub(super) fn draw_keyboard(
         "Type to search, arrows to choose, Enter to continue",
         breathe(now),
     );
-    ok
+    true
 }
 
 pub(super) fn draw_credentials(
@@ -345,41 +301,31 @@ pub(super) fn draw_credentials(
     now: u64,
 ) -> bool {
     let layout = shift_layout_x(layout, slide_in(state, now));
-    title(painter, layout, font, "", Color::rgb(232, 236, 240));
-    let heading = match state.screen {
-        Screen::Username => "Set a Username",
-        Screen::Password => "Set a Password",
-        _ => "Confirm Your Password",
+    let (heading, next) = match state.screen {
+        Screen::Username => ("What should we call you?", "Next"),
+        Screen::Password => ("Set a password", "Next"),
+        _ => ("Confirm your password", "Finish"),
     };
-    centered_text(
-        painter,
-        layout,
-        font,
-        Rect::new(CARD.x, 128, CARD.width, 30),
-        heading,
-        23,
-        Color::rgb(244, 246, 248),
-    );
+    chrome(painter, layout, font, heading, true, next);
     let field = Rect::new(196, 184, 360, 66);
-    let ok = glass_pill(painter, layout, field, true, 0xae5e_0231);
+    field_pill(painter, layout, field);
     let caret = match state.screen {
         Screen::Password => field_text(
             &state.setup_password_input[..state.setup_password_len],
-            true,
+            !state.reveal_password,
             now,
         ),
-        Screen::Confirm => field_text(&state.confirm_input[..state.confirm_len], true, now),
+        Screen::Confirm => field_text(
+            &state.confirm_input[..state.confirm_len],
+            !state.reveal_password,
+            now,
+        ),
         _ => field_text(&state.username_input[..state.username_len], false, now),
     };
-    centered_text(
-        painter,
-        layout,
-        font,
-        field,
-        caret.as_str(),
-        18,
-        Color::rgb(244, 247, 249),
-    );
+    centered_text(painter, layout, font, field, caret.as_str(), 18, INK);
+    if matches!(state.screen, Screen::Password | Screen::Confirm) {
+        draw_eye(painter, layout, EYE, state.reveal_password);
+    }
     let since_typed = now.saturating_sub(state.setup_typed_ns);
     if since_typed < 240_000_000 {
         let pulse = 240_000_000 - since_typed;
@@ -387,19 +333,20 @@ pub(super) fn draw_credentials(
             layout.rect(field.expand((pulse / 40_000_000) as i32 + 1)),
             layout.radii(CornerRadii::all(field.height / 2 + 4)),
             2,
-            Rgba::new(255, 255, 255, (pulse * 150 / 240_000_000) as u8),
+            Rgba::new(46, 120, 232, (pulse * 190 / 240_000_000) as u8),
         );
     }
     let (message, tone) = if !state.setup_error.is_empty() {
-        (state.setup_error, Color::rgb(255, 176, 166))
+        (state.setup_error, Color::rgb(206, 52, 40))
     } else {
         (
             match state.screen {
+                _ if state.caps_lock => "Caps Lock is on",
                 Screen::Password => "8+ characters, not a common password",
                 Screen::Confirm => "Type the same password again",
                 _ => "Letters and numbers only",
             },
-            Color::rgb(214, 222, 230),
+            INK_SOFT,
         )
     };
     let shake = if state.setup_error.is_empty() {
@@ -429,7 +376,77 @@ pub(super) fn draw_credentials(
         "Press Enter to continue",
         breathe(now),
     );
-    ok
+    true
+}
+
+/// The confirmation shown over the sign-in screen.
+pub(super) fn draw_reset(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    font: RasterFont,
+    state: &DesktopState,
+) {
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(-60, -60, DESIGN_WIDTH + 120, 458 + 120)),
+        CornerRadii::all(0),
+        Rgba::new(0, 0, 0, 90),
+    );
+    painter.fill_rounded_rect(
+        layout.rect(RESET_CARD),
+        layout.radii(CornerRadii::all(34)),
+        Rgba::new(250, 251, 252, 255),
+    );
+    centered_text(
+        painter,
+        layout,
+        font,
+        Rect::new(RESET_CARD.x, RESET_CARD.y + 22, RESET_CARD.width, 28),
+        "Reset this account?",
+        19,
+        INK,
+    );
+    for (index, line) in [
+        "Your files are kept. You will choose",
+        "a new user name and password.",
+    ]
+    .iter()
+    .enumerate()
+    {
+        centered_text(
+            painter,
+            layout,
+            font,
+            Rect::new(
+                RESET_CARD.x,
+                RESET_CARD.y + 66 + index as i32 * 24,
+                RESET_CARD.width,
+                22,
+            ),
+            line,
+            13,
+            INK_SOFT,
+        );
+    }
+    for (index, (bounds, label)) in [(RESET_CANCEL, "Cancel"), (RESET_OK, "Reset")]
+        .iter()
+        .enumerate()
+    {
+        let tint = if index == 1 {
+            Rgba::new(250, 222, 218, 255)
+        } else {
+            Rgba::new(241, 243, 246, 255)
+        };
+        light_pill(painter, layout, *bounds, tint);
+        if state.reset_focus as usize == index {
+            painter.stroke_rounded_rect(
+                layout.rect(bounds.expand(3)),
+                layout.radii(CornerRadii::all(bounds.height / 2 + 3)),
+                2,
+                Rgba::new(46, 120, 232, 255),
+            );
+        }
+        centered_text(painter, layout, font, *bounds, label, 15, INK);
+    }
 }
 
 pub(super) fn draw_welcome(
@@ -452,7 +469,7 @@ pub(super) fn draw_welcome(
         Rect::new(CARD.x, 52 + rise, CARD.width, 46),
         "Welcome to AerOS",
         36,
-        Color::rgb(12, 16, 22),
+        INK,
     );
     let bob = wave_milli(now / 3_200_000) * 5 / 1000;
     let base_w = 250 * pop.max(0) / 1000;
@@ -472,7 +489,14 @@ pub(super) fn draw_welcome(
         layout.rect(ring),
         layout.radii(CornerRadii::all(ring.height / 2)),
         2,
-        Rgba::new(255, 255, 255, halo_alpha),
+        Rgba::new(46, 120, 232, halo_alpha),
+    );
+    let tile_w = width * 13 / 10;
+    let tile = Rect::new(center.x - tile_w / 2, center.y - tile_w / 2, tile_w, tile_w);
+    painter.fill_rounded_rect(
+        layout.rect(tile),
+        layout.radii(CornerRadii::all(tile_w * 27 / 100)),
+        Rgba::new(22, 22, 24, (age * 255 / 500_000_000).min(255) as u8),
     );
     let target = layout.rect(Rect::new(
         center.x - width / 2,

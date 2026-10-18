@@ -437,6 +437,25 @@ pub fn stop() {
     }
 }
 
+/// Plays the first tune briefly and reports whether the controller consumed
+/// buffers (true when there is no controller).
+#[cfg_attr(not(feature = "boot-test"), allow(dead_code))]
+pub fn playback_probe() -> bool {
+    if !AC97.lock().ready {
+        return true;
+    }
+    play_song(0);
+    let start = crate::time::monotonic_nanoseconds();
+    let mut civ_max = 0u32;
+    while crate::time::monotonic_nanoseconds().saturating_sub(start) < 400_000_000 {
+        pump();
+        let nabm = AC97.lock().nabm;
+        civ_max = civ_max.max(unsafe { arch::inb(nabm + NABM_PO_CIV) } as u32);
+    }
+    stop();
+    civ_max >= 3
+}
+
 /// Resumes a stopped song where it left off.
 pub fn resume() {
     let mut state = AC97.lock();
@@ -451,6 +470,42 @@ pub fn resume() {
 /// 0..=100 software volume (applied when samples are rendered).
 pub fn set_volume(percent: u8) {
     AC97.lock().volume = percent.min(100) as i32;
+}
+
+/// Brings the controller and codec back after a sleep that cost them their
+/// state: a cold reset, the volumes, the buffer list written again.
+pub fn reinitialize() -> bool {
+    let mut state = AC97.lock();
+    if !state.ready {
+        return true;
+    }
+    let (nam, nabm) = (state.nam, state.nabm);
+    state.playing = false;
+    state.stream_on = false;
+    unsafe {
+        arch::outl(nabm + NABM_GLOBAL_CONTROL, 0x02);
+        let mut waited = 0;
+        while arch::inl(nabm + NABM_GLOBAL_STATUS) & (1 << 8) == 0 && waited < 5_000_000 {
+            waited += 1;
+        }
+        if arch::inl(nabm + NABM_GLOBAL_STATUS) & (1 << 8) == 0 {
+            return false;
+        }
+        arch::outw(nam + NAM_RESET, 1);
+        arch::outw(nam + NAM_MASTER_VOLUME, 0x0000);
+        arch::outw(nam + NAM_PCM_VOLUME, 0x0000);
+    }
+    for index in 0..BDL_ENTRIES {
+        let entry = (state.bdl as usize + index * 8) as *mut u32;
+        unsafe {
+            core::ptr::write_volatile(
+                entry,
+                (state.buffers + (index * BUFFER_BYTES) as u64) as u32,
+            );
+            core::ptr::write_volatile(entry.add(1), SAMPLES_PER_BUFFER as u32);
+        }
+    }
+    true
 }
 
 pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> Ac97Report {

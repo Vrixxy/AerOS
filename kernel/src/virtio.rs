@@ -143,6 +143,15 @@ impl Legacy {
     }
 }
 
+impl Legacy {
+    /// Points virtqueue `index` at the memory an earlier `queue` call set up
+    /// (after a device reset that forgot it).
+    pub fn restore_queue(&self, index: u16, queue: &Queue) {
+        self.write16(REG_QUEUE_SELECT, index);
+        self.write32(REG_QUEUE_ADDRESS, (queue.descriptors >> 12) as u32);
+    }
+}
+
 /// A split virtqueue.
 #[derive(Clone, Copy)]
 pub struct Queue {
@@ -158,6 +167,18 @@ pub struct Queue {
 }
 
 impl Queue {
+    /// Empties the rings and starts the indices over, for a device that has
+    /// just been reset.
+    pub fn reset(&mut self) {
+        let descriptors = 16 * self.size;
+        let available = 6 + 2 * self.size;
+        let used_offset = (descriptors + available).next_multiple_of(4096);
+        let total = used_offset + 6 + 8 * self.size;
+        unsafe { core::ptr::write_bytes(self.descriptors as usize as *mut u8, 0, total) };
+        self.next_available = 0;
+        self.last_used = 0;
+    }
+
     pub const EMPTY: Self = Self {
         size: 0,
         descriptors: 0,

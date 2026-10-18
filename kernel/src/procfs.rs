@@ -12,6 +12,12 @@ use crate::vfs;
 
 const BACKING: &str = "/tmp/.proc";
 const BACKING_SYS: &str = "/tmp/.sys";
+const BACKING_DEV: &str = "/tmp/.dev";
+/// Device files `/dev` lists; the descriptors that open them are made in
+/// the syscall layer (`null`, `zero`, `urandom`, `random`, `tty`, `console`).
+const DEV_FILES: [&str; 7] = [
+    "null", "zero", "urandom", "random", "tty", "console", "full",
+];
 const MAX_PATH: usize = 160;
 const TEXT_BYTES: usize = 4096;
 
@@ -57,9 +63,9 @@ fn current_pid() -> u64 {
     crate::scheduler::current_task_pid_for_linux().unwrap_or_else(crate::scheduler::current_task_id)
 }
 
-/// Paths served by this module: `/proc` and the small `/sys`.
+/// Paths served by this module: `/proc`, the small `/sys` and `/dev`.
 pub fn is_virtual_path(path: &str) -> bool {
-    ["/proc", "/sys"].iter().any(|root| {
+    ["/proc", "/sys", "/dev"].iter().any(|root| {
         path.strip_prefix(root)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
     })
@@ -68,6 +74,11 @@ pub fn is_virtual_path(path: &str) -> bool {
 /// The backing path for a `/proc` path, with the files it names refreshed.
 /// `None` for any path outside `/proc`.
 pub fn resolve(path: &str) -> Option<Mapped> {
+    if let Some(rest) = path.strip_prefix("/dev")
+        && (rest.is_empty() || rest.starts_with('/'))
+    {
+        return Some(resolve_dev(rest));
+    }
     let (rest, is_proc) = match (path.strip_prefix("/proc"), path.strip_prefix("/sys")) {
         (Some(""), _) => ("", true),
         (Some(rest), _) if rest.starts_with('/') => (rest, true),
@@ -120,6 +131,44 @@ pub fn resolve(path: &str) -> Option<Mapped> {
     Some(mapped)
 }
 
+fn resolve_dev(rest: &str) -> Mapped {
+    let mut mapped = Mapped {
+        bytes: [0; MAX_PATH],
+        length: 0,
+    };
+    if rest.split('/').any(|part| part == "." || part == "..") {
+        return mapped;
+    }
+    for text in [BACKING_DEV, rest] {
+        let count = text.len().min(MAX_PATH - mapped.length);
+        mapped.bytes[mapped.length..mapped.length + count]
+            .copy_from_slice(&text.as_bytes()[..count]);
+        mapped.length += count;
+    }
+    ensure_directory(BACKING_DEV);
+    for name in DEV_FILES {
+        let mut path = Text::new();
+        let _ = write!(path, "{BACKING_DEV}/{name}");
+        if vfs::metadata(path.as_ref()).is_err() {
+            let mut relative = Text::new();
+            let _ = write!(relative, "/{name}");
+            write_file(BACKING_DEV, relative.as_ref(), b"");
+        }
+    }
+    for (name, target) in [
+        ("stdin", "/proc/self/fd/0"),
+        ("stdout", "/proc/self/fd/1"),
+        ("stderr", "/proc/self/fd/2"),
+    ] {
+        let mut path = Text::new();
+        let _ = write!(path, "{BACKING_DEV}/{name}");
+        if vfs::symlink_metadata(path.as_ref()).is_err() {
+            let _ = vfs::symlink(path.as_ref(), target);
+        }
+    }
+    mapped
+}
+
 fn ensure_directory(path: &str) {
     let _ = vfs::create_directory(path, 0o755);
 }
@@ -137,7 +186,8 @@ fn write_file(backing: &str, relative: &str, content: &[u8]) {
     let _ = vfs::close(handle);
 }
 
-const FILES: [&str; 14] = [
+const FILES: [&str; 15] = [
+    "net/dev",
     "version",
     "uptime",
     "meminfo",
@@ -153,8 +203,8 @@ const FILES: [&str; 14] = [
     "iommu",
     "self",
 ];
-const SELF_FILES: [&str; 7] = [
-    "status", "stat", "statm", "comm", "cmdline", "environ", "maps",
+const SELF_FILES: [&str; 9] = [
+    "status", "stat", "statm", "comm", "cmdline", "environ", "maps", "limits", "cgroup",
 ];
 const SYS_FILES: [&str; 6] = [
     "sys/kernel/ostype",
@@ -173,12 +223,17 @@ fn refresh(relative: &str) {
                 refresh_one(name);
             }
             refresh("/sys");
+            refresh_processes();
         }
         "/self" => {
             for name in SELF_FILES {
                 refresh_one(join("self/", name));
             }
+            refresh_descriptors();
+            refresh_working_directory();
         }
+        "/self/fd" => refresh_descriptors(),
+        "/self/cwd" => refresh_working_directory(),
         "/sys" | "/sys/kernel" | "/sys/vm" => {
             let prefix = &relative[1..];
             for name in SYS_FILES {
@@ -187,7 +242,136 @@ fn refresh(relative: &str) {
                 }
             }
         }
-        other => refresh_one(other.trim_start_matches('/')),
+        other => {
+            let name = other.trim_start_matches('/');
+            if name.starts_with("self/fd/") {
+                refresh_descriptors();
+                return;
+            }
+            match name.split_once('/') {
+                None if name.parse::<u64>().is_ok() => refresh_process(name),
+                _ => refresh_one(name),
+            }
+        }
+    }
+}
+
+const PROCESS_FILES: [&str; 6] = ["stat", "status", "comm", "cmdline", "maps", "statm"];
+
+/// `/proc/self/cwd`: a link to the working directory.
+fn refresh_working_directory() {
+    let mut directory = Text::new();
+    let _ = write!(directory, "{BACKING}/self");
+    ensure_directory(directory.as_ref());
+    let mut path = Text::new();
+    let _ = write!(path, "{BACKING}/self/cwd");
+    let _ = vfs::remove(path.as_ref(), false);
+    let (bytes, length) = crate::syscall::proc_working_directory();
+    if let Ok(target) = core::str::from_utf8(&bytes[..length])
+        && !target.is_empty()
+    {
+        let _ = vfs::symlink(path.as_ref(), target);
+    }
+}
+
+/// `/proc/self/fd`: one symlink per open descriptor, rebuilt on every look.
+fn refresh_descriptors() {
+    let mut directory = Text::new();
+    let _ = write!(directory, "{BACKING}/self");
+    ensure_directory(directory.as_ref());
+    let mut directory = Text::new();
+    let _ = write!(directory, "{BACKING}/self/fd");
+    ensure_directory(directory.as_ref());
+    if let Ok(handle) = vfs::open_directory(directory.as_ref()) {
+        let mut stale = [0u8; 24];
+        let mut stale_count = 0;
+        while let Ok(Some(entry)) = vfs::next_directory_entry(handle) {
+            if let Ok(name) = core::str::from_utf8(&entry.name[..entry.name_len as usize])
+                && let Ok(number) = name.parse::<u8>()
+                && stale_count < stale.len()
+            {
+                stale[stale_count] = number;
+                stale_count += 1;
+            }
+        }
+        let _ = vfs::close(handle);
+        for number in &stale[..stale_count] {
+            let mut path = Text::new();
+            let _ = write!(path, "{BACKING}/self/fd/{number}");
+            let _ = vfs::remove(path.as_ref(), false);
+        }
+    }
+    crate::syscall::proc_open_descriptors(&mut |number, target| {
+        let mut path = Text::new();
+        let _ = write!(path, "{BACKING}/self/fd/{number}");
+        let _ = vfs::symlink(path.as_ref(), target);
+    });
+}
+
+fn task_summary(pid: u64) -> Option<crate::scheduler::TaskSummary> {
+    let mut found = None;
+    crate::scheduler::list_tasks(|task| {
+        if task.id == pid {
+            found = Some(task);
+        }
+    });
+    found
+}
+
+/// Writes the files of one other process, if it is still there.
+fn refresh_process(pid: &str) {
+    for file in PROCESS_FILES {
+        let mut name = Text::new();
+        let _ = write!(name, "{pid}/{file}");
+        refresh_one(name);
+    }
+}
+
+/// Directories for the live processes under the backing store; those of
+/// processes that have ended are removed.
+fn refresh_processes() {
+    let mut live = [0u64; 64];
+    let mut count = 0;
+    crate::scheduler::list_tasks(|task| {
+        if count < live.len() {
+            live[count] = task.id;
+            count += 1;
+        }
+    });
+    // Only the directories: a process's files are written when it is looked
+    // at, so a long `ls /proc` does not fill the file pool.
+    for pid in &live[..count] {
+        let mut path = Text::new();
+        let _ = write!(path, "{BACKING}/{pid}");
+        ensure_directory(path.as_ref());
+    }
+    let Ok(directory) = vfs::open_directory(BACKING) else {
+        return;
+    };
+    let mut stale = [0u64; 16];
+    let mut stale_count = 0;
+    while let Ok(Some(entry)) = vfs::next_directory_entry(directory) {
+        let Ok(name) = core::str::from_utf8(&entry.name[..entry.name_len as usize]) else {
+            continue;
+        };
+        if let Ok(pid) = name.parse::<u64>()
+            && !live[..count].contains(&pid)
+            && stale_count < stale.len()
+        {
+            stale[stale_count] = pid;
+            stale_count += 1;
+        }
+    }
+    let _ = vfs::close(directory);
+    for pid in &stale[..stale_count] {
+        for file in PROCESS_FILES {
+            let mut path = Text::new();
+            let _ = write!(path, "{BACKING}/{pid}/{file}");
+            let _ = vfs::remove(path.as_ref(), false);
+        }
+        let mut path = Text::new();
+        let _ = write!(path, "{BACKING}/{pid}");
+        let _ = vfs::remove(path.as_ref(), true);
     }
 }
 
@@ -477,8 +661,108 @@ fn render(name: &str, out: &mut Text) -> bool {
             });
             let _ = writeln!(out, "{pages} {resident} 0 0 0 0 0");
         }
+        "net/dev" => {
+            let _ = writeln!(
+                out,
+                "Inter-|   Receive                                                |  Transmit
+                 face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed"
+            );
+            let (rx_packets, rx_bytes, tx_packets, tx_bytes) = crate::nic::counters();
+            let _ = writeln!(
+                out,
+                "    lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0"
+            );
+            if crate::nic::present() {
+                let _ = writeln!(
+                    out,
+                    "  eth0: {rx_bytes:>7} {rx_packets:>7}    0    0    0     0          0         0 {tx_bytes:>8} {tx_packets:>7}    0    0    0     0       0          0"
+                );
+            }
+        }
         "self/status" => render_status(out),
         "self/stat" => render_stat(out),
+        "self/cgroup" => {
+            let _ = writeln!(out, "0::/");
+        }
+        "self/limits" => {
+            let files = crate::syscall::proc_descriptor_limit();
+            let _ = write!(
+                out,
+                "Limit                     Soft Limit           Hard Limit           Units     
+                 Max cpu time              unlimited            unlimited            seconds   
+                 Max file size             unlimited            unlimited            bytes     
+                 Max data size             unlimited            unlimited            bytes     
+                 Max stack size            278528               278528               bytes     
+                 Max core file size        0                    0                    bytes     
+                 Max processes             unlimited            unlimited            processes 
+                 Max open files            {files:<20} {files:<20} files     
+                 Max address space         unlimited            unlimited            bytes     
+"
+            );
+        }
+        other => return render_other(other, out),
+    }
+    true
+}
+
+/// `<pid>/stat`, `status`, `comm` and `cmdline` of a process other than the
+/// caller, from the task table.
+fn render_other(name: &str, out: &mut Text) -> bool {
+    let Some((pid, file)) = name.split_once('/') else {
+        return false;
+    };
+    let Some(task) = pid.parse::<u64>().ok().and_then(task_summary) else {
+        return false;
+    };
+    let details = Own {
+        pid: task.id,
+        parent: task.parent_id,
+        group: task.pgid,
+        session: task.sid,
+        resident_kib: task.resident_pages * 4,
+        nice: task.nice,
+    };
+    match file {
+        "stat" => write_stat(out, &details, task.cpu_ms * 1_000_000, 0),
+        "status" => {
+            let _ = write!(
+                out,
+                "Name:\taeros\nState:\t{state}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{parent}\n\
+                 Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\nVmRSS:\t{rss:>8} kB\n",
+                state = if task.running {
+                    "R (running)"
+                } else {
+                    "S (sleeping)"
+                },
+                pid = details.pid,
+                parent = details.parent,
+                rss = details.resident_kib,
+            );
+        }
+        "comm" => {
+            let _ = writeln!(out, "aeros");
+        }
+        "cmdline" => {}
+        "maps" => {
+            crate::scheduler::with_task_space(task.id, |space| {
+                space.regions(&mut |start, end, permissions, name| {
+                    let permissions = core::str::from_utf8(&permissions).unwrap_or("---p");
+                    let _ = writeln!(
+                        out,
+                        "{start:08x}-{end:08x} {permissions} 00000000 00:00 0 {name}"
+                    );
+                });
+            });
+        }
+        "statm" => {
+            let mut pages = 0u64;
+            let resident = crate::scheduler::with_task_space(task.id, |space| {
+                space.regions(&mut |start, end, _, _| pages += (end - start) / 4096);
+                space.resident_pages()
+            })
+            .unwrap_or(0);
+            let _ = writeln!(out, "{pages} {resident} 0 0 0 0 0");
+        }
         _ => return false,
     }
     true
@@ -533,9 +817,16 @@ fn render_status(out: &mut Text) {
 
 fn render_stat(out: &mut Text) {
     let own = own();
+    let (user_ns, system_ns) = crate::scheduler::current_cpu_time();
+    write_stat(out, &own, user_ns, system_ns);
+}
+
+fn write_stat(out: &mut Text, own: &Own, user_ns: u64, system_ns: u64) {
     let _ = write!(
         out,
-        "{pid} (aeros) R {parent} {group} {session} 0 -1 0 0 0 0 0 0 0 0 0 {priority} {nice} 1 0 0 {vsize} {rss}",
+        "{pid} (aeros) R {parent} {group} {session} 0 -1 0 0 0 0 0 {user} {system} 0 0 {priority} {nice} 1 0 0 {vsize} {rss}",
+        user = user_ns / 10_000_000,
+        system = system_ns / 10_000_000,
         pid = own.pid,
         parent = own.parent,
         group = own.group,
@@ -588,6 +879,24 @@ pub fn self_test() -> bool {
     let mut numeric = Text::new();
     let _ = write!(numeric, "/proc/{own_pid}/stat");
     let stat_ok = contains(&read_text(numeric.as_ref()), "(aeros) R ");
+    let mut other_pid = 0u64;
+    crate::scheduler::list_tasks(|task| {
+        if task.id != own_pid && other_pid == 0 {
+            other_pid = task.id;
+        }
+    });
+    let other_ok = other_pid == 0 || {
+        let mut path = Text::new();
+        let _ = write!(path, "/proc/{other_pid}/stat");
+        let mut status_path = Text::new();
+        let _ = write!(status_path, "/proc/{other_pid}/status");
+        let mut head = Text::new();
+        let _ = write!(head, "{other_pid} (aeros)");
+        let mut line = Text::new();
+        let _ = writeln!(line, "Pid:	{other_pid}");
+        contains(&read_text(path.as_ref()), head.as_ref())
+            && contains(&read_text(status_path.as_ref()), line.as_ref())
+    } && vfs::metadata("/proc/4242424/stat").is_err();
     let mounts_ok = contains(&read_text("/proc/mounts"), "tmpfs /tmp tmpfs");
     let cpu_online = read_text("/sys/devices/system/cpu/online");
     let sys_ok = contains(&read_text("/proc/sys/kernel/osrelease"), "6.8.0-aeros")
@@ -667,6 +976,10 @@ pub fn self_test() -> bool {
         && cpuinfo_ok
         && status_ok
         && stat_ok
+        && other_ok
+        && contains(&read_text("/proc/self/limits"), "Max open files")
+        && contains(&read_text("/proc/self/cgroup"), "0::/")
+        && contains(&read_text("/proc/net/dev"), "Inter-|")
         && mounts_ok
         && sys_ok
         && metadata_ok

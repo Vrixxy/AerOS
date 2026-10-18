@@ -365,6 +365,7 @@ impl Lockout {
 }
 
 /// Known-answer checks for the primitives plus the policy and lockout rules.
+#[cfg_attr(not(feature = "boot-test"), allow(dead_code))]
 pub fn self_test() -> bool {
     // FIPS 180-2: SHA-256("abc").
     let abc = sha256(b"abc");

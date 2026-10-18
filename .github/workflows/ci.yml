@@ -29,6 +29,8 @@ jobs:
         run: cargo clippy --manifest-path kernel/Cargo.toml --target x86_64-unknown-uefi --features boot-test -- -D warnings
       - name: Clippy (linux-headless)
         run: cargo clippy --manifest-path kernel/Cargo.toml --target x86_64-unknown-uefi --features linux-headless -- -D warnings
+      - name: Clippy (s3-early)
+        run: cargo clippy --manifest-path kernel/Cargo.toml --target x86_64-unknown-uefi --features s3-early -- -D warnings
       - name: Release build
         run: cargo build --release --manifest-path kernel/Cargo.toml --target x86_64-unknown-uefi
       - name: Boot-test build

@@ -231,7 +231,15 @@ fn stop(
         trace.resume = Resume::Wait;
         trace.signal = 0;
     });
+    scheduler::save_fpu_here();
     loop {
+        if scheduler::take_kill_pending() {
+            scheduler::trace_current(|trace| {
+                trace.resume = Resume::Kill;
+                trace.stopped = false;
+            });
+            break;
+        }
         let tracer = scheduler::trace_current(|trace| trace.stopped.then_some(trace.tracer));
         let Some(tracer) = tracer else {
             break;
@@ -255,6 +263,7 @@ fn stop(
             scheduler::yield_now();
         }
     }
+    scheduler::flush_tlb_here();
     let (resume, injected, dirty, regs) = scheduler::trace_current(|trace| {
         trace.stopped = false;
         (trace.resume, trace.signal, trace.dirty, trace.regs)
@@ -434,7 +443,7 @@ pub(super) fn candidates(group: u64, out: &mut [u64]) -> usize {
     count
 }
 
-fn read_memory(tid: u64, address: u64, out: &mut [u8]) -> bool {
+pub(super) fn read_memory(tid: u64, address: u64, out: &mut [u8]) -> bool {
     let mut done = 0;
     while done < out.len() {
         let at = address.wrapping_add(done as u64);
@@ -460,7 +469,7 @@ fn read_memory(tid: u64, address: u64, out: &mut [u8]) -> bool {
     true
 }
 
-fn write_memory(tid: u64, address: u64, data: &[u8]) -> bool {
+pub(super) fn write_memory(tid: u64, address: u64, data: &[u8]) -> bool {
     let mut done = 0;
     while done < data.len() {
         let at = address.wrapping_add(done as u64);

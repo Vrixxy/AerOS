@@ -288,8 +288,6 @@ pub(super) fn draw_search(
 
 // ------------------------------------------------------------ dock hover
 
-pub(super) const DOCK_ICON_Y: i32 = 380;
-
 pub(super) fn dock_app(index: usize) -> DesktopApp {
     match index {
         1 => DesktopApp::Terminal,
@@ -307,7 +305,14 @@ impl DesktopState {
         let mut over = usize::MAX;
         if self.screen == Screen::Desktop && self.overlay == Overlay::None {
             for index in 0..DOCK_BUTTONS.len() {
-                if Rect::new(44 + index as i32 * 64, DOCK_ICON_Y - 10, 50, 62).contains(point) {
+                if Rect::new(
+                    dock_icon_rect(index).x,
+                    DOCK_ICON_Y - 10,
+                    DOCK_ICON_SIZE,
+                    DOCK_ICON_SIZE + 12,
+                )
+                .contains(point)
+                {
                     over = index;
                 }
             }
@@ -395,9 +400,9 @@ pub(super) fn draw_dock_preview(
         return;
     };
     let window = layout.rect(window_base_rect(state.app));
-    let cache = unsafe { &mut *PANEL_CACHE.0.get() };
+    let cache = panel_buffer();
     let length = frame_pixels(window);
-    if length == 0 || length > PANEL_CACHE_PIXELS {
+    if length == 0 || length > screen_capacity() {
         return;
     }
     if !painter.read_region(window, &mut cache[..length]) {
@@ -406,7 +411,7 @@ pub(super) fn draw_dock_preview(
     PANEL_CACHE_KEY.store(0, Ordering::Release);
     let width = 168 * pop.max(0) / 1000;
     let height = width * window.height / window.width.max(1);
-    let center = 44 + index as i32 * 64 + 25;
+    let center = dock_icon_rect(index).x + DOCK_ICON_SIZE / 2;
     let outer = Rect::new(
         center - width / 2 - 6,
         344 - height - 12,

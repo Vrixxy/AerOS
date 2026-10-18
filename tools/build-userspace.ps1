@@ -7,7 +7,10 @@ $projects = @(
     @("threads", "aeros-threads"),
     @("ptrace", "aeros-ptrace"),
     @("swap", "aeros-swap"),
-    @("bench", "aeros-bench")
+    @("bench", "aeros-bench"),
+    @("parallel", "aeros-parallel"),
+    @("sysx", "aeros-sysx"),
+    @("apps", "aeros-apps")
 )
 $destinationRoot = Join-Path $root "assets\userspace"
 

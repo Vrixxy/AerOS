@@ -330,12 +330,12 @@ pub(super) fn draw_power_menu(
         return true;
     }
     let settled = progress >= 1000 && now >= state.motion_until_ns;
-    let cache = unsafe { &mut *PANEL_CACHE.0.get() };
+    let cache = panel_buffer();
     let cache_len = frame_pixels(screen);
     let key = dock_cache_key(layout, screen) ^ 0x70e1_0000 ^ ((state.app as u64 + 1) << 40);
     let mut cached = false;
     if settled
-        && cache_len <= PANEL_CACHE_PIXELS
+        && cache_len <= screen_capacity()
         && PANEL_CACHE_KEY.load(Ordering::Acquire) == key
         && painter.write_region(screen, &cache[..cache_len])
     {
@@ -354,7 +354,7 @@ pub(super) fn draw_power_menu(
             )
             .captured;
         if settled
-            && cache_len <= PANEL_CACHE_PIXELS
+            && cache_len <= screen_capacity()
             && painter.read_region(screen, &mut cache[..cache_len])
         {
             PANEL_CACHE_KEY.store(key, Ordering::Release);

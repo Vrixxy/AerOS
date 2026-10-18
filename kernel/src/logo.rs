@@ -90,8 +90,6 @@ struct Pixels(UnsafeCell<[u8; WIDTH * HEIGHT * 4]>);
 unsafe impl Sync for Pixels {}
 
 static PIXELS: Pixels = Pixels(UnsafeCell::new([0; WIDTH * HEIGHT * 4]));
-static GREEN: Pixels = Pixels(UnsafeCell::new([0; WIDTH * HEIGHT * 4]));
-static GREEN_READY: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
 
 fn inside_leaf(x: i32, y: i32) -> bool {
@@ -198,20 +196,4 @@ pub fn self_test() -> bool {
         opaque, clear, ok
     ));
     ok
-}
-
-/// The leaf tinted green (for the battery-saver icon).
-pub fn green_rgba() -> &'static [u8] {
-    let white = rgba();
-    if !GREEN_READY.load(Ordering::Acquire) {
-        let green = unsafe { &mut *GREEN.0.get() };
-        for (index, pixel) in white.chunks(4).enumerate() {
-            green[index * 4] = 92;
-            green[index * 4 + 1] = 170;
-            green[index * 4 + 2] = 74;
-            green[index * 4 + 3] = pixel[3];
-        }
-        GREEN_READY.store(true, Ordering::Release);
-    }
-    unsafe { &*GREEN.0.get() }
 }

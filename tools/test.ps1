@@ -164,6 +164,7 @@ $arguments = @(
     # unlike virtio-net/virtio-blk above - exercises virtio_modern.rs/
     # virtio_input.rs, the real touchscreen driver.
     "-device", "virtio-multitouch-pci,disable-modern=off,disable-legacy=on",
+    "-device", "virtio-rng-pci,disable-modern=off,disable-legacy=on",
     "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
     "-display", "none",
     "-serial", "file:$serial",
@@ -179,7 +180,9 @@ $start.FileName = $qemu
 $start.Arguments = $quoted -join " "
 $start.UseShellExecute = $false
 $start.CreateNoWindow = $true
+$start.RedirectStandardError = $true
 $process = [System.Diagnostics.Process]::Start($start)
+$qemuErrors = $process.StandardError.ReadToEndAsync()
 
 # Real end-to-end proof of the TCP server self-test (kernel/src/net.rs):
 # connect in from the host over the hostfwd rule above, send bytes, and
@@ -318,12 +321,13 @@ while ([DateTime]::UtcNow -lt $bulkDeadline -and $null -eq $tcpBulk -and -not $p
     if ($null -eq $tcpBulk) { Start-Sleep -Milliseconds 300 }
 }
 
-function Send-AerosPowerButton {
+function Send-AerosMonitor {
+    param([string]$Text)
     $client = [System.Net.Sockets.TcpClient]::new()
     try {
         $client.Connect("127.0.0.1", 17656)
         $stream = $client.GetStream()
-        $command = [System.Text.Encoding]::ASCII.GetBytes("system_powerdown`r`n")
+        $command = [System.Text.Encoding]::ASCII.GetBytes("$Text`r`n")
         $stream.Write($command, 0, $command.Length)
         $stream.Flush()
         Start-Sleep -Milliseconds 300
@@ -335,7 +339,9 @@ function Send-AerosPowerButton {
     }
 }
 
-$deadline = [DateTime]::UtcNow.AddSeconds(240)
+function Send-AerosPowerButton { return (Send-AerosMonitor "system_powerdown") }
+
+$deadline = [DateTime]::UtcNow.AddSeconds(480)
 $output = ""
 $powerButtonSent = $false
 
@@ -360,7 +366,7 @@ if (-not $process.HasExited) {
     $process.WaitForExit()
 }
 if ($output -notmatch "AEROS_READY") {
-    throw "AerOS did not reach the ready state (QEMU exited: $($process.HasExited), exit code: $(if ($process.HasExited) { $process.ExitCode } else { 'still running' }))`n$output"
+    throw "AerOS did not reach the ready state (QEMU exited: $($process.HasExited), exit code: $(if ($process.HasExited) { $process.ExitCode } else { 'still running' }))`nQEMU said: $(if ($process.HasExited) { $qemuErrors.Result } else { '' })`n$output"
 }
 if ($output -notmatch "allocator_test=true") {
     throw "AerOS allocator self-test failed`n$output"
@@ -379,6 +385,21 @@ if ($output -notmatch "AEROS_ACPI_EVENTS sci=[1-9][0-9]* acpi_mode=true routed=t
 }
 if ($output -notmatch "AEROS_POWERBTN pressed=true interrupts=[1-9][0-9]* line_shut_off=false") {
     throw "AerOS did not see the power button press (SCI delivery)`n$output"
+}
+if ($output -notmatch "AEROS_SMP_USER .* verified=true") {
+    throw "AerOS user programs did not run in parallel on two processors`n$output"
+}
+if ($output -notmatch "AEROS_SMP_THREADS enabled=true exit=78 timed_out=false clean=true verified=true") {
+    throw "AerOS threads of one process did not run in parallel and stay correct`n$output"
+}
+if ($output -notmatch "AEROS_SMP_PROGRAMS .* verified=true") {
+    throw "AerOS programs failed with user tasks on the application processors`n$output"
+}
+if ($output -notmatch "AEROS_MICROCODE virtualised=true loaded=false") {
+    throw "AerOS microcode loader touched a virtual processor`n$output"
+}
+if ($output -notmatch "AEROS_PROTOCOLS wpa=true bluetooth=true tpm=absent") {
+    throw "AerOS protocol layer self-tests failed$([char]96)n$output"
 }
 if ($output -notmatch "AEROS_ARCH gdt=true idt=true") {
     throw "AerOS descriptor-table validation failed`n$output"
@@ -443,7 +464,7 @@ if ($output -notmatch "AEROS_HEAP .* active=0 verified=true") {
 if ($output -notmatch "AEROS_USER .* exit=42 smep=true smap=true mapped=true verified=true") {
     throw "AerOS ring-3 transition failed`n$output"
 }
-if ($output -notmatch "AEROS_VFS nodes=[0-9]+ directories=11 files=[0-9]+ bytes=[0-9]+ handles=0 mutable_files=0 mutable_bytes=0 readonly_root=true verified=true") {
+if ($output -notmatch "AEROS_VFS nodes=[0-9]+ directories=14 files=[0-9]+ bytes=[0-9]+ handles=0 mutable_files=0 mutable_bytes=0 readonly_root=true verified=true") {
     throw "AerOS VFS validation failed`n$output"
 }
 if ($output -notmatch "AEROS_ELF type=pie machine=x86_64 segments=3 .* wx=false verified=true") {
@@ -470,10 +491,10 @@ if ($output -notmatch "AEROS_REAP mappings=5 released_pages=[1-9][0-9]* free_bef
 if ($output -notmatch "AEROS_PROCESSES spawned=4 reaped=4 highest_pid=4 ready=0 running=0 zombies=0 generations=true init_exit=73 compiled_exit=74 std_exit=75 fault_exit=132 verified=true") {
     throw "AerOS process table validation failed`n$output"
 }
-if ($output -notmatch "AEROS_TMPFS path=/tmp nodes=[0-9]+ directories=11 files=[0-9]+ mutable_files=1 mutable_bytes=6 handles=0 verified=true") {
+if ($output -notmatch "AEROS_TMPFS path=/tmp nodes=[0-9]+ directories=14 files=[0-9]+ mutable_files=1 mutable_bytes=6 handles=0 verified=true") {
     throw "AerOS writable tmpfs validation failed`n$output"
 }
-if ($output -notmatch "AEROS_SYSCALL .* calls=161 bootstrap=2 linux=159 exits=4 unknown=0 opens=13 reads=12 writes=10 closes=17 io_bytes=264 clocks=1 random_calls=1 random_bytes=32 compat_calls=73 memory_calls=15 mmaps=5 file_mmaps=1 mprotects=2 munmaps=4 metadata=9 seeks=2 paths=12 resources=1 rseq=1 futex=1 fd_calls=10 dup_calls=4 last_fd=3 signals=12 runtime=8 directories=1 sockets=4 datagrams=2 network_bytes=[3-9][0-9]+ vectored=2 positional=1 access=1 statx=1 wall_clock=2 sleeps=2 chdir=1 relative_paths=5 polls=1 creates=2 renames=2 removes=5 syncs=2 truncates=1 chmods=1 verified=true") {
+if ($output -notmatch "AEROS_SYSCALL .* calls=161 bootstrap=2 linux=159 exits=4 unknown=0 opens=13 reads=12 writes=10 closes=17 io_bytes=264 clocks=1 random_calls=1 random_bytes=32 compat_calls=73 memory_calls=16 mmaps=6 file_mmaps=1 mprotects=2 munmaps=4 metadata=9 seeks=2 paths=12 resources=1 rseq=1 futex=1 fd_calls=10 dup_calls=4 last_fd=3 signals=12 runtime=8 directories=1 sockets=4 datagrams=2 network_bytes=[3-9][0-9]+ vectored=2 positional=1 access=1 statx=1 wall_clock=2 sleeps=2 chdir=1 relative_paths=5 polls=1 creates=2 renames=2 removes=5 syncs=2 truncates=1 chmods=1 verified=true") {
     throw "AerOS syscall gate failed`n$output"
 }
 if ($output -notmatch "AEROS_PCI devices=[1-9].* verified=true") {
@@ -499,6 +520,30 @@ if ($output -notmatch "AEROS_VIRTIO_INPUT present=true queue_ready=true abs_x_sp
 }
 if ($output -notmatch "AEROS_VIRTIO_GPU present=true queue_ready=true display_width=[1-9][0-9]* display_height=[1-9][0-9]* resource_created=true backing_attached=true transfer_ok=true flush_ok=true verified=true") {
     throw "AerOS virtio-gpu driver validation failed`n$output"
+}
+if ($output -notmatch "AEROS_VIRTIO_RNG present=true queue_ready=true bytes=(1[6-9]|[2-9][0-9]) verified=true") {
+    throw "AerOS virtio-rng driver validation failed`n$output"
+}
+if ($output -notmatch "AEROS_DRIVER_RESUME_TEST sata=true nvme=true virtio_blk=true sd=true usb_storage=true usb_input=true ethernet=true audio=true verified=true") {
+    throw "AerOS driver resume validation failed`n$output"
+}
+if ($output -notmatch "AEROS_SHELL_COMPLETE verified=true") {
+    throw "AerOS shell completion validation failed`n$output"
+}
+if ($output -notmatch "AEROS_PCI_RESTORE verified=true") {
+    throw "AerOS PCI config restore validation failed`n$output"
+}
+if ($output -notmatch "AEROS_RAID linear=true stripe=true mirror=true degraded=true resync=true block_layer=true refused=true headers=true verified=true") {
+    throw "AerOS software RAID validation failed`n$output"
+}
+if ($output -notmatch "AEROS_SYSX exit=89 reaped=1 verified=true") {
+    throw "AerOS extra syscall validation failed`n$output"
+}
+if ($output -notmatch "AEROS_APPS done passed=(\d+) total=\1\b" -or $output -notmatch "AEROS_APPS exit=90 reaped=1 verified=true") {
+    throw "AerOS third-party program (BusyBox) validation failed`n$output"
+}
+if ($output -notmatch "AEROS_GPU_CURSOR installed=true") {
+    throw "AerOS virtio-gpu hardware cursor validation failed`n$output"
 }
 if ($output -notmatch "AEROS_RTL8139 present=true .* link=true tx=true arp_reply=true gateway=10\.10\.0\.2 verified=true") {
     throw "AerOS RTL8139 driver validation failed`n$output"
@@ -843,6 +888,10 @@ if ($output -notmatch "AEROS_AERFS_HOME adopted=true folders=true system_directo
 if ($output -notmatch "AEROS_FATFS_CRASH cases=[1-9][0-9]* structural=0 torn=0 leaks_repaired=[0-9]+ repair_failures=0 verified=true") {
     throw "AerOS /home filesystem power-loss consistency test failed`n$output"
 }
+if ($output -notmatch "AEROS_OVERLAY enabled=true created=true listed=true copy_up=true image_intact=true whiteout=true recreate=true rename=true persists=true reset=true verified=true") {
+    throw "AerOS union overlay root self-test failed`n$output"
+}
+
 if ($output -notmatch "AEROS_MOUNTS bound=[0-9]+ same_file=true listing=true rename=true protected=true refused=true unbind=true persists=true etc=true verified=true") {
     throw "AerOS mount table self-test failed`n$output"
 }
@@ -1019,7 +1068,7 @@ if ($output -notmatch "AEROS_AV signatures=[1-9][0-9]* self_test=true quarantine
 if ($output -notmatch "AEROS_AUDIT verified=true") {
     throw "AerOS audit log validation failed`n$output"
 }
-if ($output -notmatch "AEROS_COMMANDS count=87 shell=aersh elevation=ear unique=true parser=true privilege=true filesystem=true reauth=true redirection=true startup=true symlinks=true background_jobs=true firewall_command=true dmesg_command=true service_command=true text_tools=true priority_command=true crashes_command=true bench_command=true sigcheck_command=true pipelines=true strace_command=true fsck_command=true verified=true") {
+if ($output -notmatch "AEROS_COMMANDS count=94 shell=aersh elevation=ear unique=true parser=true privilege=true filesystem=true reauth=true redirection=true startup=true symlinks=true background_jobs=true firewall_command=true dmesg_command=true service_command=true text_tools=true priority_command=true crashes_command=true bench_command=true sigcheck_command=true pipelines=true strace_command=true fsck_command=true verified=true") {
     throw "AerOS command registry validation failed`n$output"
 }
 if ($output -notmatch "AEROS_UI_CORE geometry=true scaling=true interaction=true frost=true max_frost_pixels=1048576 verified=true") {
@@ -1074,5 +1123,13 @@ for ($index = 44; $index -lt $hdaBytes.Length; $index++) {
 if ($hdaLoud -lt 2000) {
     throw "AerOS HDA audio capture is silent ($hdaLoud non-zero bytes of $($hdaBytes.Length))"
 }
+# Suspend to RAM needs a firmware that can resume, which QEMU's WHPX
+# acceleration does not give (the firmware faults before the kernel runs), so
+# it is tried on the emulated CPU in a separate short boot.
+$sleepRun = (& (Join-Path $PSScriptRoot "s3-quick.ps1") -Accel tcg -CpuCount $CpuCount -WaitSeconds 300) | Out-String
+if ($sleepRun -notmatch "AEROS_S3 supported=true slept=true processors=([0-9]+)/\1 clock=true timer=true ioapic=true job=true verified=true") {
+    throw "AerOS suspend to RAM (S3) failed`n$sleepRun"
+}
 Write-Output $output
+Write-Output $sleepRun
 Write-Output "AerOS boot test passed"

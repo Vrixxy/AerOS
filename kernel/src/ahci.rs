@@ -81,6 +81,7 @@ struct AhciState {
     disks: [Disk; MAX_DISKS],
     count: usize,
     boot: usize,
+    abar: u64,
 }
 
 impl AhciState {
@@ -88,6 +89,7 @@ impl AhciState {
         disks: [Disk::EMPTY; MAX_DISKS],
         count: 0,
         boot: 0,
+        abar: 0,
     };
 }
 
@@ -163,6 +165,7 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> AhciReport
     };
 
     let mut state = AhciState::EMPTY;
+    state.abar = abar;
     for port in 0..32usize {
         if state.count >= MAX_DISKS || ports & (1 << port) == 0 {
             continue;
@@ -304,6 +307,51 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> AhciReport
         *CONTROLLER.lock() = state;
     }
     report
+}
+
+/// Brings the controller back after a sleep that cost it its state: a host
+/// bus adapter reset, then every disk's command list and receive area again
+/// (the same memory, emptied) and the link up.
+pub fn resume() -> bool {
+    let _io = IO_LOCK.lock();
+    let state = CONTROLLER.lock();
+    if state.count == 0 || state.abar == 0 {
+        return true;
+    }
+    let abar = state.abar;
+    unsafe {
+        let control = read_register(abar, 0x04);
+        write_register(abar, 0x04, control | 1);
+        if !wait_clear(abar, 0x04, 1) {
+            return false;
+        }
+        let control = read_register(abar, 0x04);
+        write_register(abar, 0x04, control | (1 << 31));
+    }
+    let mut all = true;
+    for disk in &state.disks[..state.count] {
+        unsafe {
+            core::ptr::write_bytes(
+                disk.command_list as usize as *mut u8,
+                0,
+                PAGE_SIZE as usize * 2,
+            );
+        }
+        if !configure_port(disk.port, disk.command_list, disk.command_list + PAGE_SIZE) {
+            all = false;
+            continue;
+        }
+        let mut linked = false;
+        for _ in 0..COMMAND_TIMEOUT {
+            if unsafe { read_register(disk.port, PORT_SSTS) } & 0x0f == 3 {
+                linked = true;
+                break;
+            }
+            spin_loop();
+        }
+        all &= linked && wait_clear(disk.port, PORT_TFD, 0x88);
+    }
+    all
 }
 
 fn write_probe(disk: &Disk) -> bool {

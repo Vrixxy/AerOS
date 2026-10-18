@@ -1,3 +1,4 @@
+use crate::sync::TicketLock;
 use crate::{arch, serial};
 
 const MAX_DEVICES: usize = 256;
@@ -296,6 +297,139 @@ pub fn bar_address(device: &PciDevice, bar: u8, offset: u32) -> Option<u64> {
         raw as u64 & !0xf
     };
     Some(base + offset as u64)
+}
+
+const SAVED_FUNCTIONS: usize = 128;
+
+#[derive(Clone, Copy)]
+struct SavedFunction {
+    bus: u8,
+    slot: u8,
+    function: u8,
+    /// The standard header: ID, command/status, class, BARs, bus numbers,
+    /// expansion ROM, interrupt line (16 dwords).
+    header: [u32; 16],
+}
+
+struct SavedConfig {
+    count: usize,
+    functions: [SavedFunction; SAVED_FUNCTIONS],
+}
+
+static SAVED: TicketLock<SavedConfig> = TicketLock::new(SavedConfig {
+    count: 0,
+    functions: [SavedFunction {
+        bus: 0,
+        slot: 0,
+        function: 0,
+        header: [0; 16],
+    }; SAVED_FUNCTIONS],
+});
+
+/// Copies the standard header of every function, ahead of a sleep. Returns
+/// how many functions were saved.
+pub fn save_config() -> usize {
+    let mut saved = SAVED.lock();
+    let mut count = 0;
+    for bus in 0u16..=255 {
+        for slot in 0u8..32 {
+            if read16(bus as u8, slot, 0, 0) == 0xffff {
+                continue;
+            }
+            let multi = read8(bus as u8, slot, 0, 0x0e) & 0x80 != 0;
+            for function in 0u8..if multi { 8 } else { 1 } {
+                if read16(bus as u8, slot, function, 0) == 0xffff || count == SAVED_FUNCTIONS {
+                    continue;
+                }
+                let mut header = [0u32; 16];
+                for (index, word) in header.iter_mut().enumerate() {
+                    *word = read32(bus as u8, slot, function, (index * 4) as u8);
+                }
+                saved.functions[count] = SavedFunction {
+                    bus: bus as u8,
+                    slot,
+                    function,
+                    header,
+                };
+                count += 1;
+            }
+        }
+    }
+    saved.count = count;
+    count
+}
+
+/// Writes back what `save_config` copied wherever a function no longer has
+/// it (BARs, bus numbers, expansion ROM, interrupt line, command), with
+/// decoding off while the address registers change. Returns the number of
+/// registers written. Capability state (MSI, power management) is left to the
+/// firmware and to the drivers.
+pub fn restore_config() -> usize {
+    let saved = SAVED.lock();
+    let mut written = 0;
+    for function in &saved.functions[..saved.count] {
+        let (bus, slot, number) = (function.bus, function.slot, function.function);
+        if read16(bus, slot, number, 0) != (function.header[0] & 0xffff) as u16 {
+            continue;
+        }
+        let differs =
+            |index: usize| read32(bus, slot, number, (index * 4) as u8) != function.header[index];
+        let address_changed = (4..16).any(|index| index != 15 && differs(index));
+        let command = (function.header[1] & 0xffff) as u16;
+        if address_changed {
+            write16(bus, slot, number, 0x04, command & !0x7);
+            for index in 4..16 {
+                if index == 15 || !differs(index) {
+                    continue;
+                }
+                config_write(
+                    bus,
+                    slot,
+                    number,
+                    (index * 4) as u16,
+                    4,
+                    function.header[index] as u64,
+                );
+                written += 1;
+            }
+        }
+        // Interrupt line only (the pin is read-only).
+        let line = (function.header[15] & 0xff) as u8;
+        if read8(bus, slot, number, 0x3c) != line {
+            config_write(bus, slot, number, 0x3c, 1, line as u64);
+            written += 1;
+        }
+        if read16(bus, slot, number, 0x04) != command {
+            write16(bus, slot, number, 0x04, command);
+            written += 1;
+        }
+    }
+    written
+}
+
+/// Boot test: damages one idle device's BAR, restores, and checks that it is
+/// back and that a second restore has nothing to do.
+#[cfg(feature = "boot-test")]
+pub fn restore_self_test() -> bool {
+    let saved = save_config();
+    if saved == 0 {
+        return false;
+    }
+    // The virtio-rng device is only touched once, at start-up.
+    let Some(slot) =
+        (0u8..32).find(|slot| read16(0, *slot, 0, 0) == 0x1af4 && read16(0, *slot, 0, 2) == 0x1044)
+    else {
+        return restore_config() == 0;
+    };
+    let low = read32(0, slot, 0, 0x20);
+    let high = read32(0, slot, 0, 0x24);
+    config_write(0, slot, 0, 0x20, 4, 0xffff_ffff);
+    config_write(0, slot, 0, 0x24, 4, 0xffff_ffff);
+    let damaged = read32(0, slot, 0, 0x20) != low;
+    let written = restore_config();
+    let fixed = read32(0, slot, 0, 0x20) == low && read32(0, slot, 0, 0x24) == high;
+    let idle = restore_config() == 0;
+    damaged && written >= 2 && fixed && idle
 }
 
 /// Reads 1, 2 or 4 bytes of a function's configuration space (the first 256

@@ -72,6 +72,13 @@ pub fn restore_task_context(context: &UserTaskContext) {
     SMAP_ACTIVE.store(context.smap_active, Ordering::Release);
 }
 
+/// Turns on SMEP and SMAP (where the processor has them) on the processor this
+/// runs on; each processor that runs user tasks needs it.
+pub fn enable_protections_here() {
+    let cpu = CpuInfo::detect();
+    enable_user_protections(&cpu);
+}
+
 pub fn run_scheduled_task(entry: u64, stack: u64, user_start: u64, user_end: u64) -> u64 {
     let cpu = CpuInfo::detect();
     let (_, smap_enabled) = enable_user_protections(&cpu);
@@ -80,7 +87,8 @@ pub fn run_scheduled_task(entry: u64, stack: u64, user_start: u64, user_end: u64
     ACTIVE_USER_END.store(user_end, Ordering::Release);
     SMAP_ACTIVE.store(smap_enabled as u64, Ordering::Release);
     USER_EXIT_CODE.store(u64::MAX, Ordering::Release);
-    let exit_code = unsafe { enter_user(entry, stack) };
+    let release = crate::scheduler::user_entry_lock();
+    let exit_code = unsafe { enter_user(entry, stack, release) };
     super::syscall_entry::reset_user_bases();
     ACTIVE_USER_START.store(0, Ordering::Release);
     ACTIVE_USER_END.store(0, Ordering::Release);
@@ -146,7 +154,8 @@ pub fn resume_forked_child(
     ACTIVE_USER_END.store(user_end, Ordering::Release);
     SMAP_ACTIVE.store(smap_enabled as u64, Ordering::Release);
     USER_EXIT_CODE.store(u64::MAX, Ordering::Release);
-    let exit_code = unsafe { enter_user_from_snapshot(snapshot) };
+    let release = crate::scheduler::user_entry_lock();
+    let exit_code = unsafe { enter_user_from_snapshot(snapshot, release) };
     super::syscall_entry::reset_user_bases();
     ACTIVE_USER_START.store(0, Ordering::Release);
     ACTIVE_USER_END.store(0, Ordering::Release);
@@ -194,7 +203,7 @@ fn run(
     ACTIVE_USER_END.store(user_end, Ordering::Release);
     SMAP_ACTIVE.store(smap_enabled as u64, Ordering::Release);
     USER_EXIT_CODE.store(u64::MAX, Ordering::Release);
-    let exit_code = unsafe { enter_user(entry, stack) };
+    let exit_code = unsafe { enter_user(entry, stack, core::ptr::null_mut()) };
     crate::syscall::finish_process();
     super::syscall_entry::reset_user_bases();
     ACTIVE_USER_START.store(0, Ordering::Release);
@@ -225,6 +234,13 @@ pub fn write_fs_base(address: u64) {
 /// Runs `body` with the user range of a task as the active one, so the
 /// kernel can touch that task's memory (after its program has returned and
 /// the range was cleared).
+/// Replaces the range of user addresses the running task may hand the
+/// kernel (after an exec that moved its window).
+pub fn set_active_range(start: u64, end: u64) {
+    ACTIVE_USER_START.store(start, Ordering::Release);
+    ACTIVE_USER_END.store(end, Ordering::Release);
+}
+
 pub fn with_user_range<R>(start: u64, end: u64, body: impl FnOnce() -> R) -> R {
     let saved = (
         ACTIVE_USER_START.load(Ordering::Acquire),
@@ -415,7 +431,7 @@ unsafe fn write_msr(register: u32, value: u64) {
 }
 
 #[unsafe(naked)]
-unsafe extern "C" fn enter_user(entry: u64, stack: u64) -> u64 {
+unsafe extern "C" fn enter_user(entry: u64, stack: u64, release: *mut u32) -> u64 {
     naked_asm!(
         "push rbp",
         "push rbx",
@@ -426,6 +442,11 @@ unsafe extern "C" fn enter_user(entry: u64, stack: u64) -> u64 {
         "push r14",
         "push r15",
         "mov qword ptr [rip + {return_rsp}], rsp",
+        "test r8, r8",
+        "jz 2f",
+        "mov dword ptr [r8 + 8], 0",
+        "inc dword ptr [r8]",
+        "2:",
         "mov ax, {user_data}",
         "mov ds, ax",
         "mov es, ax",
@@ -442,7 +463,10 @@ unsafe extern "C" fn enter_user(entry: u64, stack: u64) -> u64 {
 }
 
 #[unsafe(naked)]
-unsafe extern "C" fn enter_user_from_snapshot(snapshot: *const ForkSnapshot) -> u64 {
+unsafe extern "C" fn enter_user_from_snapshot(
+    snapshot: *const ForkSnapshot,
+    release: *mut u32,
+) -> u64 {
     naked_asm!(
         "push rbp",
         "push rbx",
@@ -453,6 +477,11 @@ unsafe extern "C" fn enter_user_from_snapshot(snapshot: *const ForkSnapshot) -> 
         "push r14",
         "push r15",
         "mov qword ptr [rip + {return_rsp}], rsp",
+        "test rdx, rdx",
+        "jz 2f",
+        "mov dword ptr [rdx + 8], 0",
+        "inc dword ptr [rdx]",
+        "2:",
         "mov ax, {user_data}",
         "mov ds, ax",
         "mov es, ax",

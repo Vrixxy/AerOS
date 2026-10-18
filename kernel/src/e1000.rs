@@ -204,35 +204,7 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> NetworkRep
         2 | 3 => 1000,
         _ => 0,
     };
-    unsafe {
-        write_register(mmio, IMC, u32::MAX);
-        let _ = read_register(mmio, ICR);
-        write_register(mmio, TDBAL, transmit_ring as u32);
-        write_register(mmio, TDBAH, (transmit_ring >> 32) as u32);
-        write_register(
-            mmio,
-            TDLEN,
-            (DESCRIPTORS * core::mem::size_of::<TransmitDescriptor>()) as u32,
-        );
-        write_register(mmio, TDH, 0);
-        write_register(mmio, TDT, 0);
-        write_register(mmio, TIPG, 10 | (8 << 10) | (6 << 20));
-        write_register(mmio, TCTL, (1 << 1) | (1 << 3) | (0x10 << 4) | (0x40 << 12));
-        write_register(mmio, RDBAL, receive_ring as u32);
-        write_register(mmio, RDBAH, (receive_ring >> 32) as u32);
-        write_register(
-            mmio,
-            RDLEN,
-            (DESCRIPTORS * core::mem::size_of::<ReceiveDescriptor>()) as u32,
-        );
-        write_register(mmio, RDH, 0);
-        write_register(mmio, RDT, (DESCRIPTORS - 1) as u32);
-        // Enable, multicast promiscuous (IPv6 neighbour and router discovery arrive
-        // as multicast), accept broadcast, strip the CRC.
-        write_register(mmio, RCTL, (1 << 1) | (1 << 4) | (1 << 15) | (1 << 26));
-        let control = read_register(mmio, CTRL);
-        write_register(mmio, CTRL, control | (1 << 6));
-    }
+    unsafe { program(mmio, transmit_ring, receive_ring) };
     let frame = unsafe { core::slice::from_raw_parts_mut(transmit_buffer as usize as *mut u8, 60) };
     frame[..6].fill(0xff);
     frame[6..12].copy_from_slice(&mac);
@@ -340,6 +312,89 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> NetworkRep
         arp_reply,
         verified,
     }
+}
+
+/// Masks interrupts and loads the ring registers, receiver and transmitter.
+unsafe fn program(mmio: u64, transmit_ring: u64, receive_ring: u64) {
+    unsafe {
+        write_register(mmio, IMC, u32::MAX);
+        let _ = read_register(mmio, ICR);
+        write_register(mmio, TDBAL, transmit_ring as u32);
+        write_register(mmio, TDBAH, (transmit_ring >> 32) as u32);
+        write_register(
+            mmio,
+            TDLEN,
+            (DESCRIPTORS * core::mem::size_of::<TransmitDescriptor>()) as u32,
+        );
+        write_register(mmio, TDH, 0);
+        write_register(mmio, TDT, 0);
+        write_register(mmio, TIPG, 10 | (8 << 10) | (6 << 20));
+        write_register(mmio, TCTL, (1 << 1) | (1 << 3) | (0x10 << 4) | (0x40 << 12));
+        write_register(mmio, RDBAL, receive_ring as u32);
+        write_register(mmio, RDBAH, (receive_ring >> 32) as u32);
+        write_register(
+            mmio,
+            RDLEN,
+            (DESCRIPTORS * core::mem::size_of::<ReceiveDescriptor>()) as u32,
+        );
+        write_register(mmio, RDH, 0);
+        write_register(mmio, RDT, (DESCRIPTORS - 1) as u32);
+        // Enable, multicast promiscuous (IPv6 neighbour and router discovery arrive
+        // as multicast), accept broadcast, strip the CRC.
+        write_register(mmio, RCTL, (1 << 1) | (1 << 4) | (1 << 15) | (1 << 26));
+        let control = read_register(mmio, CTRL);
+        write_register(mmio, CTRL, control | (1 << 6));
+    }
+}
+
+/// Brings the card back after a sleep that cost it its state: a reset, the
+/// station address, then the rings from the start with the same memory.
+pub fn resume() -> bool {
+    let mut network = NETWORK.lock();
+    if !network.ready {
+        return true;
+    }
+    let mmio = network.mmio;
+    unsafe {
+        let control = read_register(mmio, CTRL);
+        write_register(mmio, CTRL, control | (1 << 26));
+        for _ in 0..WAIT_LIMIT / 100 {
+            if read_register(mmio, CTRL) & (1 << 26) == 0 {
+                break;
+            }
+            spin_loop();
+        }
+        core::ptr::write_bytes(
+            network.transmit_ring as usize as *mut u8,
+            0,
+            DESCRIPTORS * core::mem::size_of::<TransmitDescriptor>(),
+        );
+        for index in 0..DESCRIPTORS {
+            let descriptor = ReceiveDescriptor {
+                address: network.receive_buffers + (index * BUFFER_SIZE) as u64,
+                length: 0,
+                checksum: 0,
+                status: 0,
+                errors: 0,
+                special: 0,
+            };
+            core::ptr::write_volatile(
+                (network.receive_ring as usize as *mut ReceiveDescriptor).add(index),
+                descriptor,
+            );
+        }
+        let mac = network.mac;
+        write_register(
+            mmio,
+            RAL,
+            u32::from_le_bytes([mac[0], mac[1], mac[2], mac[3]]),
+        );
+        write_register(mmio, RAH, u32::from_le_bytes([mac[4], mac[5], 0, 0x80]));
+        program(mmio, network.transmit_ring, network.receive_ring);
+    }
+    network.transmit_tail = 0;
+    network.receive_head = 0;
+    true
 }
 
 pub fn transmit(packet: &[u8]) -> bool {

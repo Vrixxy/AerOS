@@ -212,6 +212,54 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> NicReport 
     report
 }
 
+/// Brings the chip back after a sleep that cost it its state: a reset, the
+/// rings emptied and handed to the chip again, receiver and transmitter on.
+pub fn resume() -> bool {
+    let mut state = NIC.lock();
+    if !state.ready {
+        return true;
+    }
+    let mmio = state.mmio;
+    write8(mmio, CR, CR_RESET);
+    let mut waited = 0u32;
+    while read8(mmio, CR) & CR_RESET != 0 {
+        waited += 1;
+        if waited > 10_000_000 {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    unsafe {
+        core::ptr::write_bytes(
+            state.tx_ring as usize as *mut u8,
+            0,
+            RING * core::mem::size_of::<Descriptor>(),
+        )
+    };
+    for slot in 0..RING {
+        arm_receive(state.rx_ring, state.rx_buffers, slot);
+    }
+    write8(mmio, CFG9346, 0xc0);
+    write16(mmio, RMS, 0x1fff);
+    write8(mmio, MTPS, 0x3b);
+    let plus = read16(mmio, CPLUS);
+    write16(mmio, CPLUS, plus);
+    write32(mmio, TNPDS, state.tx_ring as u32);
+    write32(mmio, TNPDS + 4, (state.tx_ring >> 32) as u32);
+    write32(mmio, RDSAR, state.rx_ring as u32);
+    write32(mmio, RDSAR + 4, (state.rx_ring >> 32) as u32);
+    write8(mmio, CR, CR_RX_ENABLE | CR_TX_ENABLE);
+    write32(mmio, TCR, 3 << 24 | 7 << 8);
+    write32(mmio, RCR, 0x0e | 7 << 13 | 7 << 8);
+    for offset in 0..8 {
+        write8(mmio, MAR0 + offset, 0xff);
+    }
+    write8(mmio, CFG9346, 0x00);
+    state.tx_index = 0;
+    state.rx_index = 0;
+    true
+}
+
 pub fn transmit(packet: &[u8]) -> bool {
     if !(14..=1514).contains(&packet.len()) {
         return false;

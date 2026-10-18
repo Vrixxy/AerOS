@@ -1,8 +1,11 @@
 const ELF_HEADER_SIZE: usize = 64;
 const PROGRAM_HEADER_SIZE: usize = 56;
 const MAX_SEGMENTS: usize = 8;
-const USER_IMAGE_LIMIT: u64 = 509 * 4096;
+/// The most address space an image may span: the code window of a process
+/// (the paging layer checks the exact fit).
+const USER_IMAGE_LIMIT: u64 = 1600 * 4096;
 const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
 const PF_EXECUTE: u32 = 1;
 const PF_WRITE: u32 = 2;
 const PF_READ: u32 = 4;
@@ -56,6 +59,11 @@ pub struct ElfImage<'a> {
     segments: [LoadSegment; MAX_SEGMENTS],
     segment_count: usize,
     program_header_count: usize,
+    program_header_offset: u64,
+    /// An `ET_EXEC` image: it runs at the addresses it was linked for.
+    fixed: bool,
+    /// Offset and length (without the NUL) of the program interpreter path.
+    interpreter: Option<(usize, usize)>,
 }
 
 impl<'a> ElfImage<'a> {
@@ -78,7 +86,8 @@ impl<'a> ElfImage<'a> {
         if bytes[7] != 0 && bytes[7] != 3 {
             return Err(ElfError::UnsupportedAbi);
         }
-        if read_u16(bytes, 16)? != 3 {
+        let object_type = read_u16(bytes, 16)?;
+        if object_type != 3 && object_type != 2 {
             return Err(ElfError::UnsupportedType);
         }
         if read_u16(bytes, 18)? != 62 {
@@ -109,10 +118,29 @@ impl<'a> ElfImage<'a> {
             segments: [LoadSegment::EMPTY; MAX_SEGMENTS],
             segment_count: 0,
             program_header_count: header_count,
+            program_header_offset: table_offset as u64,
+            fixed: object_type == 2,
+            interpreter: None,
         };
         for header_index in 0..header_count {
             let offset = table_offset + header_index * PROGRAM_HEADER_SIZE;
-            if read_u32(bytes, offset)? != PT_LOAD {
+            let header_type = read_u32(bytes, offset)?;
+            if header_type == PT_INTERP {
+                let path_offset = usize::try_from(read_u64(bytes, offset + 8)?)
+                    .map_err(|_| ElfError::InvalidHeader)?;
+                let path_size = usize::try_from(read_u64(bytes, offset + 32)?)
+                    .map_err(|_| ElfError::InvalidHeader)?;
+                let path = path_offset
+                    .checked_add(path_size)
+                    .and_then(|end| bytes.get(path_offset..end))
+                    .ok_or(ElfError::InvalidHeader)?;
+                if path_size < 2 || path[path_size - 1] != 0 || path_size > 128 {
+                    return Err(ElfError::InvalidHeader);
+                }
+                image.interpreter = Some((path_offset, path_size - 1));
+                continue;
+            }
+            if header_type != PT_LOAD {
                 continue;
             }
             if image.segment_count == MAX_SEGMENTS {
@@ -204,6 +232,30 @@ impl<'a> ElfImage<'a> {
 
     pub fn program_header_count(&self) -> usize {
         self.program_header_count
+    }
+
+    pub fn is_fixed(&self) -> bool {
+        self.fixed
+    }
+
+    /// The path of the program interpreter (`ld.so`) of a dynamically linked
+    /// program.
+    pub fn interpreter(&self) -> Option<&'a str> {
+        let (offset, length) = self.interpreter?;
+        core::str::from_utf8(&self.bytes[offset..offset + length]).ok()
+    }
+
+    /// Where the program header table sits in memory once loaded (AT_PHDR),
+    /// relative to the load base: the segment that holds it at that file
+    /// offset, or None when none does.
+    pub fn program_headers_address(&self) -> Option<u64> {
+        let size = (self.program_header_count * PROGRAM_HEADER_SIZE) as u64;
+        self.segments().iter().find_map(|segment| {
+            let start = segment.file_offset as u64;
+            let end = start + segment.file_size as u64;
+            (self.program_header_offset >= start && self.program_header_offset + size <= end)
+                .then(|| segment.virtual_address + (self.program_header_offset - start))
+        })
     }
 
     pub fn range_loaded(&self, address: u64, length: usize) -> bool {

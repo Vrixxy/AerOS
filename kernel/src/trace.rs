@@ -74,6 +74,7 @@ pub fn for_each(visit: impl FnMut(&Entry)) {
     RING.lock().for_each(visit);
 }
 
+#[cfg_attr(not(feature = "boot-test"), allow(dead_code))]
 pub fn self_test() -> bool {
     let mut ring = Ring::new();
     for index in 0..(CAPACITY as u64 + 5) {

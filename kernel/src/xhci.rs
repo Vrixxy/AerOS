@@ -331,6 +331,8 @@ struct XhciState {
     device_memory: u64,
     devices: [Device; MAX_DEVICES],
     ports: u32,
+    max_slots: u32,
+    scratch_pages: u32,
     /// Hub status-change reports waiting for `poll` to act on: (hub slot, port bitmap).
     hub_changes: [(u8, u16); 4],
     ready: bool,
@@ -351,6 +353,8 @@ impl XhciState {
         device_memory: 0,
         devices: [Device::EMPTY; MAX_DEVICES],
         ports: 0,
+        max_slots: 0,
+        scratch_pages: 0,
         hub_changes: [(0, 0); 4],
         ready: false,
     };
@@ -878,6 +882,8 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> XhciReport
 
     // Bring up each connected root port.
     state.ports = report.ports;
+    state.max_slots = max_slots;
+    state.scratch_pages = scratch_pages;
     scan_root_ports(&mut state);
     report.devices = state.devices.iter().filter(|device| device.used).count() as u32;
     for device in state.devices.iter().filter(|device| device.used) {
@@ -920,6 +926,76 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> XhciReport
         && report.keyboards + report.mice + report.tablets + report.disks > 0
         && (report.disks == 0 || (report.disk_read && report.disk_write));
     report
+}
+
+/// Brings the controller back after a sleep that cost it its state: halted
+/// and reset, its memory cleared and laid out again, then every attached
+/// device enumerated afresh (slots and endpoints do not survive a reset).
+pub fn resume() -> bool {
+    let mut state = XHCI.lock();
+    if !state.ready {
+        return true;
+    }
+    let operational = state.operational;
+    unsafe {
+        write32(operational, 0, read32(operational, 0) & !1);
+    }
+    if !wait_for(|| unsafe { read32(operational, 4) } & 1 != 0) {
+        return false;
+    }
+    unsafe { write32(operational, 0, 2) };
+    if !wait_for(|| {
+        let command = unsafe { read32(operational, 0) };
+        let status = unsafe { read32(operational, 4) };
+        command & 2 == 0 && status & (1 << 11) == 0
+    }) {
+        return false;
+    }
+    let scratch_pages = state.scratch_pages as u64;
+    let total_pages = 6 + PAGES_PER_DEVICE * MAX_DEVICES as u64 + scratch_pages;
+    let memory = state.dcbaa;
+    zero(memory, (total_pages * PAGE_SIZE) as usize);
+    let scratch_list = memory + PAGE_SIZE;
+    let scratch_area = state.device_memory + PAGES_PER_DEVICE * MAX_DEVICES as u64 * PAGE_SIZE;
+    if scratch_pages != 0 {
+        for index in 0..scratch_pages {
+            unsafe {
+                core::ptr::write_volatile(
+                    (scratch_list as usize + index as usize * 8) as *mut u64,
+                    scratch_area + index * PAGE_SIZE,
+                );
+            }
+        }
+        unsafe { core::ptr::write_volatile(state.dcbaa as usize as *mut u64, scratch_list) };
+    }
+    let command_ring = memory + 2 * PAGE_SIZE;
+    let event_ring = state.event_base;
+    let erst = event_ring + EVENT_TRBS as u64 * 16;
+    state.command = Ring::at(command_ring);
+    state.event_dequeue = 0;
+    state.event_cycle = true;
+    state.hub_changes = [(0, 0); 4];
+    state.devices = [Device::EMPTY; MAX_DEVICES];
+    unsafe {
+        write32(
+            operational,
+            0x38,
+            state.max_slots.min(MAX_DEVICES as u32 + 6),
+        );
+        write64(operational, 0x30, state.dcbaa);
+        write64(operational, 0x18, command_ring | 1);
+        core::ptr::write_volatile(erst as usize as *mut u64, event_ring);
+        core::ptr::write_volatile((erst as usize + 8) as *mut u32, EVENT_TRBS as u32);
+        write32(state.runtime, 0x20 + 0x08, 1);
+        write64(state.runtime, 0x20 + 0x18, event_ring);
+        write64(state.runtime, 0x20 + 0x10, erst);
+        write32(operational, 0, 1);
+    }
+    if !wait_for(|| unsafe { read32(operational, 4) } & 1 == 0) {
+        return false;
+    }
+    scan_root_ports(&mut state);
+    true
 }
 
 /// PORTSC bits that are plain state, safe to write back (the RW1C change bits
@@ -1876,6 +1952,19 @@ fn setup_storage(state: &mut XhciState, device: usize) {
 
 /// Sectors on the first USB mass-storage disk (0 = none). Only 512-byte
 /// blocks are served.
+/// Keyboards, mice and tablets currently enumerated.
+#[cfg_attr(not(feature = "boot-test"), allow(dead_code))]
+pub fn input_devices() -> usize {
+    let state = XHCI.lock();
+    state
+        .devices
+        .iter()
+        .filter(|device| device.used)
+        .flat_map(|device| device.funcs.iter())
+        .filter(|func| matches!(func.kind, Kind::Keyboard | Kind::Mouse | Kind::Pointer))
+        .count()
+}
+
 pub fn storage_sectors() -> u64 {
     let state = XHCI.lock();
     state

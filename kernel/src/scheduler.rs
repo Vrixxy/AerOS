@@ -2,14 +2,18 @@ use core::alloc::Layout;
 use core::arch::{asm, naked_asm};
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use crate::acpi::MAX_PROCESSORS;
 use crate::{arch, heap, slab};
 
 const MAX_TASKS: usize = 32;
 const STACK_SIZE: usize = 64 * 1024;
 const STACK_ALIGNMENT: usize = 16;
-const INTERRUPT_STACK_SIZE: usize = 48 * 1024;
+/// Syscalls and interrupts run on this stack, where `fork`, `execve` and the
+/// process-creation paths build and copy `ProcessAddressSpace` values (about
+/// 33 KiB each, by value), so it is deliberately large.
+const INTERRUPT_STACK_SIZE: usize = 224 * 1024;
 const RSP0_CPU: usize = 0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -123,6 +127,27 @@ struct Task {
     /// The status set by `exit_group` (the leader's slot holds it), `u64::MAX` until then.
     group_code: u64,
     trace: Trace,
+    /// The processor that last ran the task in user mode (for the SMP test and `ps`).
+    last_cpu: u8,
+    /// A kill that reached the task while it was running on another processor;
+    /// it ends itself at its next entry into the kernel.
+    kill_pending: bool,
+    /// When the task first ran and when it ended (monotonic nanoseconds; SMP test).
+    started_ns: u64,
+    ended_ns: u64,
+    /// CPU time the timer ticks charged to the process (leader's slot holds
+    /// the sum of its threads), in nanoseconds.
+    cpu_user_ns: u64,
+    cpu_system_ns: u64,
+    /// CPU time of the children this process has waited for (and theirs).
+    children_user_ns: u64,
+    children_system_ns: u64,
+    /// The path the program was started or last exec'd from (`/proc/self/exe`).
+    exe: [u8; 64],
+    exe_length: u8,
+    /// The parent has collected this task's exit status (`wait4`); until
+    /// then an exited process stays a zombie while its parent lives.
+    waited: bool,
 }
 
 impl Task {
@@ -157,6 +182,17 @@ impl Task {
         robust_list: 0,
         group_code: u64::MAX,
         trace: Trace::NONE,
+        last_cpu: 0,
+        kill_pending: false,
+        started_ns: 0,
+        ended_ns: 0,
+        cpu_user_ns: 0,
+        cpu_system_ns: 0,
+        children_user_ns: 0,
+        children_system_ns: 0,
+        exe: [0; 64],
+        exe_length: 0,
+        waited: false,
     };
 }
 
@@ -218,6 +254,17 @@ impl Scheduler {
             robust_list: 0,
             group_code: u64::MAX,
             trace: Trace::NONE,
+            last_cpu: 0,
+            kill_pending: false,
+            started_ns: 0,
+            ended_ns: 0,
+            cpu_user_ns: 0,
+            cpu_system_ns: 0,
+            children_user_ns: 0,
+            children_system_ns: 0,
+            exe: [0; 64],
+            exe_length: 0,
+            waited: false,
         };
         self.current = 0;
         self.next_id = 1;
@@ -266,6 +313,36 @@ impl Scheduler {
         })
     }
 
+    /// Ends the other threads of `group` for the task in slot `current`: the
+    /// ones not running are finished at once, the ones running on another
+    /// processor are told to end themselves at their next entry into the
+    /// kernel. Returns whether any of the latter remain.
+    fn end_siblings(&mut self, current: usize, group: u64) -> bool {
+        let mut pending = false;
+        for index in 0..MAX_TASKS {
+            let member = &mut self.tasks[index];
+            if index == current
+                || (if member.tgid == 0 {
+                    member.id
+                } else {
+                    member.tgid
+                }) != group
+            {
+                continue;
+            }
+            match member.state {
+                TaskState::Ready => member.state = TaskState::Exited,
+                TaskState::Running if crate::kernel_lock::active() => {
+                    member.kill_pending = true;
+                    pending = true;
+                    kick_task(index);
+                }
+                _ => {}
+            }
+        }
+        pending
+    }
+
     /// Moves the Linux process state across a context switch. Tasks of one
     /// process share everything but the signal mask, pending signals and
     /// alternate stack, so inside a process only those change hands; between
@@ -305,11 +382,34 @@ impl Scheduler {
     }
 
     fn pick_ready(&mut self, skip_boot_task: bool) -> Option<usize> {
+        self.pick_with(skip_boot_task, None, None)
+    }
+
+    /// `pick_ready`, optionally for a given processor when user tasks run on
+    /// several: the boot task belongs to the bootstrap processor, and a task
+    /// whose process is already running on another processor must wait (an
+    /// address space is active on one processor at a time).
+    fn pick_with(
+        &mut self,
+        skip_boot_task: bool,
+        cpu: Option<usize>,
+        yielding: Option<usize>,
+    ) -> Option<usize> {
+        if cpu == Some(0) && !BSP_RUNS_TASKS.load(Ordering::Acquire) {
+            return None;
+        }
         let mut candidates = [(0usize, 0i8, 0u8); MAX_TASKS];
         let mut count = 0;
         for distance in 1..=MAX_TASKS {
             let index = (self.current + distance) % MAX_TASKS;
             if skip_boot_task && index == BOOT_TASK_SLOT {
+                continue;
+            }
+            if let Some(cpu) = cpu
+                && ((index == BOOT_TASK_SLOT && cpu != 0)
+                    || (!PARALLEL_THREADS.load(Ordering::Acquire)
+                        && self.process_running_elsewhere(index, yielding)))
+            {
                 continue;
             }
             let task = &self.tasks[index];
@@ -328,6 +428,32 @@ impl Scheduler {
             };
         }
         Some(chosen)
+    }
+
+    /// Whether another task of `candidate`'s process is running, apart from
+    /// the one that is giving up its processor right now.
+    fn process_running_elsewhere(&self, candidate: usize, yielding: Option<usize>) -> bool {
+        let group = self.group(candidate);
+        self.tasks.iter().enumerate().any(|(index, task)| {
+            index != candidate
+                && Some(index) != yielding
+                && task.state == TaskState::Running
+                && (if task.tgid == 0 { task.id } else { task.tgid }) == group
+        })
+    }
+
+    /// Makes `to` the task whose Linux process state is live in the statics:
+    /// what a context switch does for those, without switching stacks. Used
+    /// when a processor enters the kernel from the user task it was running.
+    fn rebind(&mut self, to: usize) {
+        let from = self.current;
+        if from == to {
+            return;
+        }
+        self.tasks[from].user_context = arch::user::save_task_context();
+        self.switch_state(from, to, false);
+        arch::user::restore_task_context(&self.tasks[to].user_context);
+        self.current = to;
     }
 }
 
@@ -372,6 +498,7 @@ pub fn nice_of(pid: u64) -> Option<i8> {
         .map(|task| task.nice)
 }
 
+#[cfg_attr(not(feature = "boot-test"), allow(dead_code))]
 pub fn priority_self_test() -> bool {
     let equal = pick_weighted(&[(3, 0, 0), (5, 0, 0), (1, 0, 0)]) == Some(3);
     let prefers_low_nice = pick_weighted(&[(3, 5, 0), (5, -3, 0), (1, 0, 0)]) == Some(5);
@@ -408,12 +535,46 @@ pub fn set_default_cr3(root_physical: u64) {
     ACTIVE_CR3.store(root_physical, Ordering::Release);
 }
 
+/// The task whose user code this processor is running (or last ran) in user
+/// mode, by slot; read when the processor enters the kernel again.
+static CPU_TASK: [AtomicUsize; MAX_PROCESSORS] =
+    [const { AtomicUsize::new(NO_TASK) }; MAX_PROCESSORS];
+/// Where each application processor's idle loop waits while a task runs.
+static IDLE_RSP: [AtomicU64; MAX_PROCESSORS] = [const { AtomicU64::new(0) }; MAX_PROCESSORS];
+/// The address space each processor has loaded (to reload it when another
+/// processor may have changed it since).
+static CPU_CR3: [AtomicU64; MAX_PROCESSORS] = [const { AtomicU64::new(0) }; MAX_PROCESSORS];
+static IDLE_MASK: AtomicU64 = AtomicU64::new(0);
+/// Threads of one process may run on several processors at once.
+static PARALLEL_THREADS: AtomicBool = AtomicBool::new(false);
+/// Whether a processor is executing user code right now (set as it leaves the
+/// kernel, cleared before it waits for the kernel lock on the way back in).
+static IN_USER: [AtomicBool; MAX_PROCESSORS] = [const { AtomicBool::new(false) }; MAX_PROCESSORS];
+/// A processor's cached translations of its address space went stale while it
+/// ran something else (or sat in the kernel); it reloads before user code.
+static FLUSH_PENDING: [AtomicBool; MAX_PROCESSORS] =
+    [const { AtomicBool::new(false) }; MAX_PROCESSORS];
+static BSP_RUNS_TASKS: AtomicBool = AtomicBool::new(false);
+static AP_TIMERS: AtomicU64 = AtomicU64::new(0);
+const AP_TICK_HZ: u32 = 250;
+static DISPATCHES: [AtomicU64; MAX_PROCESSORS] = [const { AtomicU64::new(0) }; MAX_PROCESSORS];
+const NO_TASK: usize = usize::MAX;
+
 fn switch_cr3(target: &Task) {
     let root = if target.cr3 != 0 {
         target.cr3
     } else {
         DEFAULT_CR3.load(Ordering::Acquire)
     };
+    if crate::kernel_lock::active() {
+        let cpu = crate::kernel_lock::this_cpu();
+        let stale = FLUSH_PENDING[cpu].swap(false, Ordering::AcqRel);
+        if stale || CPU_CR3[cpu].load(Ordering::Acquire) != root {
+            arch::paging::activate_root(root);
+            CPU_CR3[cpu].store(root, Ordering::Release);
+        }
+        return;
+    }
     if ACTIVE_CR3.load(Ordering::Acquire) != root {
         arch::paging::activate_root(root);
         ACTIVE_CR3.store(root, Ordering::Release);
@@ -644,7 +805,19 @@ pub fn spawn(entry: extern "C" fn() -> !) -> Option<u64> {
         robust_list: 0,
         group_code: u64::MAX,
         trace: Trace::NONE,
+        last_cpu: 0,
+        kill_pending: false,
+        started_ns: 0,
+        ended_ns: 0,
+        cpu_user_ns: 0,
+        cpu_system_ns: 0,
+        children_user_ns: 0,
+        children_system_ns: 0,
+        exe: [0; 64],
+        exe_length: 0,
+        waited: false,
     };
+    wake_idle_processors();
     Some(id)
 }
 
@@ -697,6 +870,7 @@ pub fn spawn_process_with(
             path,
             args,
             &[],
+            0,
         )
     {
         arch::paging::destroy_process(&space);
@@ -712,6 +886,7 @@ pub fn spawn_process_with(
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     scheduler.tasks[slot].cr3 = space.root_physical;
     scheduler.tasks[slot].process_space = Some(space);
+    set_exe(&mut scheduler.tasks[slot], path);
     Some((id, slot, space))
 }
 
@@ -730,6 +905,10 @@ pub fn fork_current_user_task(snapshot: &arch::user::ForkSnapshot) -> Option<u64
     let parent_pgid = scheduler.tasks[current].pgid;
     let parent_sid = scheduler.tasks[current].sid;
     let parent_nice = scheduler.tasks[current].nice;
+    let parent_exe = (
+        scheduler.tasks[owner].exe,
+        scheduler.tasks[owner].exe_length,
+    );
     // The parent is still "current", so its live Linux-ABI process state
     // (fd table, cwd, signal handlers) lives in syscall.rs's shared statics
     // right now, not in `scheduler.tasks[current].process_state` (that copy
@@ -759,6 +938,8 @@ pub fn fork_current_user_task(snapshot: &arch::user::ForkSnapshot) -> Option<u64
     scheduler.tasks[slot].pgid = parent_pgid;
     scheduler.tasks[slot].sid = parent_sid;
     scheduler.tasks[slot].nice = parent_nice;
+    scheduler.tasks[slot].exe = parent_exe.0;
+    scheduler.tasks[slot].exe_length = parent_exe.1;
     scheduler.tasks[slot].fs_base = arch::user::read_fs_base();
     scheduler.tasks[slot].process_state = parent_process_state;
     crate::syscall::clear_pending_signals(&mut scheduler.tasks[slot].process_state);
@@ -934,11 +1115,25 @@ pub fn signal_other_task(id: u64, signal: u64) -> Option<crate::syscall::RemoteS
         return None;
     }
     let traced = scheduler.tasks[slot].trace.tracer != 0;
-    Some(crate::syscall::signal_stored_state(
+    let delivered = crate::syscall::signal_stored_state(
         &mut scheduler.tasks[slot].process_state,
         signal,
         traced,
-    ))
+    );
+    if scheduler.tasks[slot].state == TaskState::Running {
+        kick_task(slot);
+    }
+    Some(delivered)
+}
+
+/// True once the process `id` has ended (or was never there): it is gone
+/// or exited and waiting to be reaped.
+pub fn task_ended(id: u64) -> bool {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    !scheduler.tasks.iter().any(|task| {
+        task.id == id && task.state != TaskState::Empty && task.state != TaskState::Exited
+    })
 }
 
 pub fn task_exists(id: u64) -> bool {
@@ -1064,6 +1259,8 @@ pub struct TaskSummary {
     pub sid: u64,
     pub running: bool,
     pub resident_pages: u64,
+    /// User plus kernel CPU time, in milliseconds.
+    pub cpu_ms: u64,
     pub nice: i8,
 }
 
@@ -1090,6 +1287,7 @@ pub fn list_tasks(mut visit: impl FnMut(TaskSummary)) {
                     .as_ref()
                     .map_or(0, |space| space.resident_pages()),
                 nice: task.nice,
+                cpu_ms: (task.cpu_user_ns + task.cpu_system_ns) / 1_000_000,
             });
         }
     }
@@ -1156,26 +1354,42 @@ pub fn kill_task(target_id: u64) -> Result<(), ()> {
         return Err(());
     };
     let group = scheduler.group(slot);
+    // With user tasks on several processors the target may be running right now
+    // on another one; it then ends itself at its next entry into the kernel.
+    let running_elsewhere =
+        crate::kernel_lock::active() && scheduler.tasks[slot].state == TaskState::Running;
     let alive = scheduler.tasks[slot].state == TaskState::Ready
+        || running_elsewhere
         || (scheduler.tasks[slot].state == TaskState::Exited && scheduler.group_live(group));
     if slot == scheduler.current || !alive || group != target_id {
         return Err(());
     }
     let current = scheduler.current;
+    let mut pending = false;
     for index in 0..MAX_TASKS {
         let member = &mut scheduler.tasks[index];
-        if index != current
-            && member.state == TaskState::Ready
-            && (if member.tgid == 0 {
+        if index == current
+            || (if member.tgid == 0 {
                 member.id
             } else {
                 member.tgid
-            }) == group
+            }) != group
         {
-            member.state = TaskState::Exited;
+            continue;
+        }
+        match member.state {
+            TaskState::Ready => member.state = TaskState::Exited,
+            TaskState::Running if crate::kernel_lock::active() => {
+                member.kill_pending = true;
+                pending = true;
+                kick_task(index);
+            }
+            _ => {}
         }
     }
-    USER_TASK_EXIT[slot].store(137, Ordering::Release);
+    if !pending {
+        USER_TASK_EXIT[slot].store(137, Ordering::Release);
+    }
     Ok(())
 }
 
@@ -1312,17 +1526,27 @@ pub fn kill_other_threads() {
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     let current = scheduler.current;
     let group = scheduler.group(current);
-    for index in 0..MAX_TASKS {
-        let member = &mut scheduler.tasks[index];
-        if index != current
-            && member.state == TaskState::Ready
-            && (if member.tgid == 0 {
-                member.id
-            } else {
-                member.tgid
-            }) == group
-        {
-            member.state = TaskState::Exited;
+    if !scheduler.end_siblings(current, group) {
+        return;
+    }
+    // Threads on other processors end when they next enter the kernel; the
+    // new program must not start until they have.
+    let start = crate::time::monotonic_nanoseconds();
+    loop {
+        relax_kernel();
+        arch::disable_interrupts();
+        let scheduler = unsafe { &*SCHEDULER.0.get() };
+        let running = scheduler.tasks.iter().enumerate().any(|(index, member)| {
+            index != scheduler.current
+                && member.state == TaskState::Running
+                && (if member.tgid == 0 {
+                    member.id
+                } else {
+                    member.tgid
+                }) == group
+        });
+        if !running || crate::time::monotonic_nanoseconds().wrapping_sub(start) > 2_000_000_000 {
+            return;
         }
     }
 }
@@ -1336,19 +1560,7 @@ pub fn exit_group(code: u64) {
     let leader = scheduler.leader_slot(current);
     let group = scheduler.group(current);
     scheduler.tasks[leader].group_code = code;
-    for index in 0..MAX_TASKS {
-        let member = &mut scheduler.tasks[index];
-        if index != current
-            && member.state == TaskState::Ready
-            && (if member.tgid == 0 {
-                member.id
-            } else {
-                member.tgid
-            }) == group
-        {
-            member.state = TaskState::Exited;
-        }
-    }
+    scheduler.end_siblings(current, group);
 }
 
 /// Called when a task's program is over (before it leaves the scheduler).
@@ -1366,29 +1578,46 @@ pub fn task_finished(code: u64) -> bool {
     let leader = scheduler.leader_slot(current);
     let group = scheduler.group(current);
     if scheduler.group_has_others(current) {
-        if !matches!(code, 132 | 134 | 135 | 136 | 137 | 139) {
+        // A thread ended because `exit_group` asked it to must not replace the
+        // status that call recorded.
+        if scheduler.tasks[leader].group_code != u64::MAX
+            || !matches!(code, 132 | 134 | 135 | 136 | 137 | 139)
+        {
             return false;
         }
         scheduler.tasks[leader].group_code = code;
-        for index in 0..MAX_TASKS {
-            let member = &mut scheduler.tasks[index];
-            if index != current
-                && member.state == TaskState::Ready
-                && (if member.tgid == 0 {
-                    member.id
-                } else {
-                    member.tgid
-                }) == group
-            {
-                member.state = TaskState::Exited;
-            }
-        }
+        scheduler.end_siblings(current, group);
     }
     let status = match scheduler.tasks[leader].group_code {
         u64::MAX => code,
         recorded => recorded,
     };
     USER_TASK_EXIT[leader].store(status, Ordering::Release);
+    let (child, parent) = (
+        scheduler.tasks[leader].id,
+        scheduler.tasks[leader].parent_id,
+    );
+    if parent != 0
+        && let Some(slot) = scheduler
+            .tasks
+            .iter()
+            .enumerate()
+            .position(|(index, task)| {
+                task.id == parent
+                    && task.state != TaskState::Empty
+                    && task.state != TaskState::Exited
+                    && index != scheduler.current
+            })
+    {
+        crate::syscall::notify_parent_of_exit(
+            &mut scheduler.tasks[slot].process_state,
+            child,
+            status,
+        );
+        if scheduler.tasks[slot].state == TaskState::Running {
+            kick_task(slot);
+        }
+    }
     true
 }
 
@@ -1478,8 +1707,44 @@ pub fn poll_child(child_id: u64) -> Option<Option<u64>> {
     if exit_code == u64::MAX {
         return Some(None);
     }
+    add_child_cpu_time(slot);
+    mark_waited(slot);
     reap();
     Some(Some(exit_code))
+}
+
+fn mark_waited(slot: usize) {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    scheduler.tasks[slot].waited = true;
+}
+
+/// Folds an exited child's CPU time (and its own waited-for children's) into
+/// the caller's children totals, the way `wait4` reports it.
+fn add_child_cpu_time(child_slot: usize) {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let (user, system) = {
+        let child = &scheduler.tasks[child_slot];
+        (
+            child.cpu_user_ns + child.children_user_ns,
+            child.cpu_system_ns + child.children_system_ns,
+        )
+    };
+    let leader = scheduler.leader_slot(scheduler.current);
+    let parent = &mut scheduler.tasks[leader];
+    parent.children_user_ns += user;
+    parent.children_system_ns += system;
+}
+
+/// User and kernel CPU time of the children the running process has waited
+/// for, in nanoseconds.
+pub fn current_children_cpu_time() -> (u64, u64) {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    let leader = scheduler.leader_slot(scheduler.current);
+    let task = &scheduler.tasks[leader];
+    (task.children_user_ns, task.children_system_ns)
 }
 
 pub fn wait_for_child(child_id: u64) -> Option<u64> {
@@ -1487,6 +1752,7 @@ pub fn wait_for_child(child_id: u64) -> Option<u64> {
     loop {
         let exit_code = USER_TASK_EXIT[slot].load(Ordering::Acquire);
         if exit_code != u64::MAX {
+            mark_waited(slot);
             reap();
             return Some(exit_code);
         }
@@ -1561,6 +1827,51 @@ pub fn linux_mmap_for_current_task(pages: usize, protection: u8) -> Option<Optio
     Some(arch::paging::process_mmap(space, pages, protection))
 }
 
+/// `MAP_FIXED`: the mapping goes at `address` (replacing what is there when
+/// `replace` is set).
+pub fn linux_mmap_fixed_for_current_task(
+    address: u64,
+    pages: usize,
+    protection: u8,
+    replace: bool,
+) -> Option<Option<u64>> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let current = scheduler.current;
+    let owner = scheduler.leader_slot(current);
+    let space = scheduler.tasks[owner].process_space.as_mut()?;
+    Some(arch::paging::process_mmap_fixed(
+        space, address, pages, protection, replace,
+    ))
+}
+
+/// A shared mapping (`MAP_SHARED`, System V `shmat`): `frames` are the
+/// pages to map, or fresh zeroed ones when `None`.
+pub fn linux_mmap_shared_for_current_task(
+    pages: usize,
+    protection: u8,
+    frames: Option<&[u64]>,
+) -> Option<Option<u64>> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let current = scheduler.current;
+    let owner = scheduler.leader_slot(current);
+    let space = scheduler.tasks[owner].process_space.as_mut()?;
+    Some(arch::paging::process_mmap_shared(
+        space, pages, protection, frames,
+    ))
+}
+
+/// The frame of the first page of the mapping at `address`.
+pub fn linux_mmap_frame_for_current_task(address: u64) -> Option<Option<u64>> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let current = scheduler.current;
+    let owner = scheduler.leader_slot(current);
+    let space = scheduler.tasks[owner].process_space.as_ref()?;
+    Some(arch::paging::process_mmap_frame(space, address))
+}
+
 /// The file-backed half of the same contract: writes into an mmap region
 /// this task already has mapped via `linux_mmap_for_current_task`.
 pub fn linux_mmap_write_for_current_task(
@@ -1616,7 +1927,12 @@ pub fn exec_current_user_task(program: &[u8]) -> Option<(u64, u64)> {
     if !arch::paging::exec_process(space, program) {
         return None;
     }
-    let (entry, stack_top) = (space.entry, space.stack_top);
+    let (entry, stack_top, user_slot) = (space.entry, space.stack_top, space.user_slot);
+    let user_start = arch::paging::process_virtual_base(user_slot);
+    let user_end = arch::paging::process_reserved_end(user_start);
+    scheduler.tasks[current].user_start = user_start;
+    scheduler.tasks[current].user_end = user_end;
+    arch::user::set_active_range(user_start, user_end);
     kill_other_threads();
     crate::syscall::exec_reset_process_state();
     Some((entry, stack_top))
@@ -1731,20 +2047,69 @@ pub fn exec_current_user_task_path_with(
     if crate::antivirus::blocks_exec(program) {
         return None;
     }
+    // A dynamically linked program is started through its interpreter,
+    // which is loaded into the same window.
+    let parsed = crate::elf::ElfImage::parse(program);
+    let interpreter = match &parsed {
+        Ok(image) => match image.interpreter() {
+            Some(interpreter_path) => Some(crate::vfs::file(interpreter_path).ok()?),
+            None => None,
+        },
+        Err(_) => None,
+    };
     arch::disable_interrupts();
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     let current = scheduler.current;
     let space = scheduler.tasks[current].process_space.as_mut()?;
-    if !arch::paging::exec_process(space, program) {
-        return None;
-    }
-    if let Ok(image) = crate::elf::ElfImage::parse(program)
-        && !crate::process::prepare_scheduled_process_stack_with(space, &image, path, args, env)
+    if !arch::paging::exec_process_with(space, program, interpreter.as_ref().map(|file| file.data))
     {
         return None;
     }
+    if let Ok(image) = parsed {
+        let interpreter_base = if interpreter.is_some() {
+            arch::paging::process_virtual_base(space.user_slot)
+                + arch::paging::interpreter_bias(&image)
+        } else {
+            0
+        };
+        if !crate::process::prepare_scheduled_process_stack_with(
+            space,
+            &image,
+            path,
+            args,
+            env,
+            interpreter_base,
+        ) {
+            return None;
+        }
+    }
+    let entry = (space.entry, space.stack_top);
+    // A fixed-address program moves the window: the bounds the kernel
+    // checks user pointers against follow it.
+    let user_start = arch::paging::process_virtual_base(space.user_slot);
+    let user_end = arch::paging::process_reserved_end(user_start);
+    scheduler.tasks[current].user_start = user_start;
+    scheduler.tasks[current].user_end = user_end;
+    arch::user::set_active_range(user_start, user_end);
+    let leader = scheduler.leader_slot(current);
+    set_exe(&mut scheduler.tasks[leader], path);
     crate::syscall::exec_reset_process_state();
-    Some((space.entry, space.stack_top))
+    Some(entry)
+}
+
+fn set_exe(task: &mut Task, path: &str) {
+    let count = path.len().min(task.exe.len());
+    task.exe[..count].copy_from_slice(&path.as_bytes()[..count]);
+    task.exe_length = count as u8;
+}
+
+/// The path of the running process's program, empty when unknown.
+pub fn current_exe_path() -> ([u8; 64], usize) {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    let leader = scheduler.leader_slot(scheduler.current);
+    let task = &scheduler.tasks[leader];
+    (task.exe, task.exe_length as usize)
 }
 
 extern "C" fn forked_task_trampoline() -> ! {
@@ -1795,6 +2160,9 @@ pub fn yield_to_work() -> bool {
 
 fn yield_with(work_first: bool) -> bool {
     arch::disable_interrupts();
+    if crate::kernel_lock::active() {
+        return yield_smp(work_first);
+    }
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     if !scheduler.initialized {
         return false;
@@ -1845,6 +2213,9 @@ fn yield_with(work_first: bool) -> bool {
 
 pub fn exit_current() -> ! {
     arch::disable_interrupts();
+    if crate::kernel_lock::active() {
+        exit_smp();
+    }
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     let current = scheduler.current;
     scheduler.tasks[current].state = TaskState::Exited;
@@ -1880,6 +2251,472 @@ pub fn exit_current() -> ! {
         switch_context(abandoned_rsp, new_rsp);
     }
     arch::halt_forever()
+}
+
+// ---------------------------------------------------------------------------
+// User tasks on several processors. See `kernel_lock.rs` for the scheme: kernel
+// mode runs under one lock, user mode runs wherever a task is dispatched, and
+// the task that holds the lock is `Scheduler::current`.
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Switch {
+    /// The running task gives its place to another.
+    Yield,
+    /// The running task is done and leaves its state behind.
+    Exit,
+    /// An idle processor starts a task; its registers belong to nobody.
+    FromIdle,
+}
+
+impl Scheduler {
+    /// Moves everything a switch carries besides the kernel stack itself and
+    /// returns the next task's saved stack pointer and floating-point area.
+    fn prepare_switch(
+        &mut self,
+        cpu: usize,
+        current: usize,
+        next: usize,
+        mode: Switch,
+    ) -> (u64, *const u8) {
+        self.tasks[next].state = TaskState::Running;
+        self.tasks[next].switches = self.tasks[next].switches.saturating_add(1);
+        self.tasks[next].last_cpu = cpu as u8;
+        if self.tasks[next].started_ns == 0 {
+            self.tasks[next].started_ns = crate::time::monotonic_nanoseconds().max(1);
+        }
+        self.current = next;
+        self.context_switches = self.context_switches.saturating_add(1);
+        self.fpu_switches = self.fpu_switches.saturating_add(1);
+        if mode != Switch::Exit {
+            self.tasks[current].user_context = arch::user::save_task_context();
+        }
+        if mode == Switch::Yield {
+            self.tasks[current].fs_base = arch::user::read_fs_base();
+        }
+        arch::user::restore_task_context(&self.tasks[next].user_context);
+        arch::user::write_fs_base(self.tasks[next].fs_base);
+        let discard = mode == Switch::Exit && !self.group_has_others(current);
+        self.switch_state(current, next, discard);
+        arch::gdt::set_ring0_stack(cpu, self.tasks[next].interrupt_stack_top);
+        let has_space = self.tasks[self.leader_slot(next)].process_space.is_some();
+        arch::syscall_entry::set_syscall_stack(
+            cpu,
+            has_space.then_some(self.tasks[next].interrupt_stack_top),
+        );
+        switch_cr3(&self.tasks[next]);
+        DISPATCHES[cpu].fetch_add(1, Ordering::Relaxed);
+        (
+            self.tasks[next].context.rsp,
+            self.tasks[next].fpu_base as *const u8,
+        )
+    }
+}
+
+/// Whether a kill reached the running task while it ran or waited on another
+/// processor; clears the mark.
+pub fn take_kill_pending() -> bool {
+    if !crate::kernel_lock::active() {
+        return false;
+    }
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let current = scheduler.current;
+    core::mem::take(&mut scheduler.tasks[current].kill_pending)
+}
+
+/// Saves the running task's floating-point registers where a debugger on
+/// another processor looks. A stopped tracee keeps its processor, so they
+/// would otherwise stay in the hardware.
+pub fn save_fpu_here() {
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    let fpu = scheduler.tasks[scheduler.current].fpu_base as *mut u8;
+    // SAFETY: the area belongs to the running task.
+    if fpu.is_null() || !unsafe { arch::fpu::save_context(fpu) } {
+        arch::halt_forever();
+    }
+}
+
+/// Drops this processor's cached translations of the running address space.
+/// A task that sat stopped here while a debugger changed its pages through
+/// the kernel's own mapping must call this before it runs user code again.
+pub fn flush_tlb_here() {
+    if !crate::kernel_lock::active() {
+        return;
+    }
+    let cpu = crate::kernel_lock::this_cpu();
+    let root = CPU_CR3[cpu].load(Ordering::Acquire);
+    if root != 0 {
+        arch::paging::activate_root(root);
+    }
+    // The debugger may also have edited the saved floating-point registers.
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    let fpu = scheduler.tasks[scheduler.current].fpu_base as *const u8;
+    // SAFETY: the area belongs to the running task and holds a saved state.
+    if fpu.is_null() || !unsafe { arch::fpu::restore_context(fpu) } {
+        arch::halt_forever();
+    }
+}
+
+/// Lets the other processors into the kernel for a moment, then takes the
+/// lock back and makes the caller's task the live one again.
+pub fn relax_kernel() {
+    if !crate::kernel_lock::active() || !crate::kernel_lock::held_by_me() {
+        return;
+    }
+    let me = unsafe { (*SCHEDULER.0.get()).current };
+    crate::kernel_lock::relax();
+    unsafe { (*SCHEDULER.0.get()).rebind(me) };
+}
+
+/// `sti; hlt` for the bootstrap processor's idle loop without keeping the
+/// kernel lock while it sleeps.
+pub fn idle_wait() {
+    let me = unsafe { (*SCHEDULER.0.get()).current };
+    crate::kernel_lock::unlock();
+    // SAFETY: interrupts wake the halt; nothing is held.
+    unsafe { asm!("sti; hlt", options(nomem, nostack)) };
+    crate::kernel_lock::lock();
+    unsafe { (*SCHEDULER.0.get()).rebind(me) };
+}
+
+fn yield_smp(work_first: bool) -> bool {
+    let cpu = crate::kernel_lock::this_cpu();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    if !scheduler.initialized {
+        return false;
+    }
+    // Tasks that switch among themselves on this processor must not keep it
+    // in the kernel for good: let a processor that is queued for the lock in.
+    if crate::kernel_lock::has_waiters() {
+        relax_kernel();
+    }
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let current = scheduler.current;
+    let next = if work_first {
+        scheduler
+            .pick_with(true, Some(cpu), Some(current))
+            .or_else(|| scheduler.pick_with(false, Some(cpu), Some(current)))
+    } else {
+        scheduler.pick_with(false, Some(cpu), Some(current))
+    };
+    let Some(next) = next else {
+        // Nothing for this processor to switch to. Others may still be running
+        // the tasks a waiter is waiting for, so let them into the kernel.
+        let others = scheduler.tasks.iter().enumerate().any(|(index, task)| {
+            index != current
+                && task.id != 0
+                && matches!(task.state, TaskState::Ready | TaskState::Running)
+        });
+        relax_kernel();
+
+        return others;
+    };
+    if scheduler.tasks[current].state == TaskState::Running {
+        scheduler.tasks[current].state = TaskState::Ready;
+    }
+    let old_rsp = &mut scheduler.tasks[current].context.rsp as *mut u64;
+    let old_fpu = scheduler.tasks[current].fpu_base as *mut u8;
+    let (new_rsp, new_fpu) = scheduler.prepare_switch(cpu, current, next, Switch::Yield);
+    unsafe {
+        if !arch::fpu::save_context(old_fpu) || !arch::fpu::restore_context(new_fpu) {
+            arch::halt_forever();
+        }
+        switch_context(old_rsp, new_rsp);
+    }
+    true
+}
+
+fn exit_smp() -> ! {
+    let cpu = crate::kernel_lock::this_cpu();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let current = scheduler.current;
+    scheduler.tasks[current].state = TaskState::Exited;
+    scheduler.tasks[current].ended_ns = crate::time::monotonic_nanoseconds().max(1);
+    CPU_TASK[cpu].store(NO_TASK, Ordering::Release);
+    let next = scheduler
+        .pick_with(true, Some(cpu), Some(current))
+        .or_else(|| scheduler.pick_with(false, Some(cpu), Some(current)));
+    let abandoned_rsp = &mut scheduler.tasks[current].context.rsp as *mut u64;
+    let abandoned_fpu = scheduler.tasks[current].fpu_base as *mut u8;
+    let (new_rsp, new_fpu) = match next {
+        Some(next) => scheduler.prepare_switch(cpu, current, next, Switch::Exit),
+        None => {
+            if cpu == 0 {
+                arch::halt_forever();
+            }
+            // Back to this processor's idle loop, with the live state handed to
+            // the boot task's slot so `current` never names a slot that is
+            // about to be freed.
+            let discard = !scheduler.group_has_others(current);
+            scheduler.switch_state(current, BOOT_TASK_SLOT, discard);
+            arch::user::restore_task_context(&scheduler.tasks[BOOT_TASK_SLOT].user_context);
+            scheduler.current = BOOT_TASK_SLOT;
+            arch::gdt::set_ring0_stack(cpu, arch::gdt::default_ring0_stack(cpu));
+            arch::syscall_entry::set_syscall_stack(cpu, None);
+            let default = DEFAULT_CR3.load(Ordering::Acquire);
+            arch::paging::activate_root(default);
+            CPU_CR3[cpu].store(default, Ordering::Release);
+            (IDLE_RSP[cpu].load(Ordering::Acquire), core::ptr::null())
+        }
+    };
+    unsafe {
+        let saved = if new_fpu.is_null() {
+            arch::fpu::save_context(abandoned_fpu)
+        } else {
+            arch::fpu::save_context(abandoned_fpu) && arch::fpu::restore_context(new_fpu)
+        };
+        if !saved {
+            arch::halt_forever();
+        }
+        switch_context(abandoned_rsp, new_rsp);
+    }
+    arch::halt_forever()
+}
+
+/// What an idle application processor found to do.
+pub enum IdleStep {
+    Ran,
+    /// Someone is in the kernel; try again without sleeping.
+    Busy,
+    Nothing,
+}
+
+/// Called from an application processor's idle loop with interrupts off.
+pub fn idle_step(cpu: usize) -> IdleStep {
+    if !crate::kernel_lock::active() {
+        return IdleStep::Nothing;
+    }
+    // The first time through, this processor starts its own tick: it
+    // preempts the tasks it runs and wakes it from idle now and then.
+    if AP_TIMERS.fetch_or(1 << cpu, Ordering::AcqRel) & (1 << cpu) == 0 {
+        arch::apic::start_timer(AP_TICK_HZ);
+        arch::disable_interrupts();
+    }
+    if !crate::kernel_lock::try_lock() {
+        return IdleStep::Busy;
+    }
+    let ran = dispatch_from_idle(cpu);
+    crate::kernel_lock::unlock();
+    if ran {
+        IdleStep::Ran
+    } else {
+        IdleStep::Nothing
+    }
+}
+
+/// Starts a ready task on this idle processor. Returns when that task (or a
+/// later one that took its place) hands the processor back, with the lock held.
+fn dispatch_from_idle(cpu: usize) -> bool {
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    if !scheduler.initialized {
+        return false;
+    }
+    let Some(next) = scheduler.pick_with(true, Some(cpu), None) else {
+        return false;
+    };
+    let current = scheduler.current;
+    let (new_rsp, new_fpu) = scheduler.prepare_switch(cpu, current, next, Switch::FromIdle);
+    unsafe {
+        if !arch::fpu::restore_context(new_fpu) {
+            arch::halt_forever();
+        }
+        switch_context(IDLE_RSP[cpu].as_ptr(), new_rsp);
+    }
+    true
+}
+
+/// Records that an application processor is (or is no longer) about to sleep,
+/// so a new task can wake it.
+pub fn mark_idle(cpu: usize, idle: bool) {
+    if idle {
+        IDLE_MASK.fetch_or(1 << cpu, Ordering::AcqRel);
+    } else {
+        IDLE_MASK.fetch_and(!(1 << cpu), Ordering::AcqRel);
+    }
+}
+
+/// A processor is being stopped for a sleep: it starts its own tick again
+/// when it comes back.
+pub fn cpu_parked(cpu: usize) {
+    AP_TIMERS.fetch_and(!(1 << cpu), Ordering::AcqRel);
+    IDLE_MASK.fetch_and(!(1 << cpu), Ordering::AcqRel);
+}
+
+/// True while an application processor is running a user task.
+pub fn cpus_busy() -> bool {
+    CPU_TASK
+        .iter()
+        .skip(1)
+        .any(|slot| slot.load(Ordering::Acquire) != NO_TASK)
+}
+
+/// Wakes the sleeping application processors: a task is ready.
+pub fn wake_idle_processors() {
+    if !crate::kernel_lock::active() {
+        return;
+    }
+    let mask = IDLE_MASK.load(Ordering::Acquire);
+    for cpu in 1..MAX_PROCESSORS {
+        if mask & (1 << cpu) != 0 {
+            crate::smp::wake(cpu);
+        }
+    }
+}
+
+/// Sends a processor into the kernel (the work interrupt) if it is running
+/// task `slot` in user mode, so a pending kill or signal is noticed.
+fn kick_task(slot: usize) {
+    for (cpu, running) in CPU_TASK.iter().enumerate() {
+        if running.load(Ordering::Acquire) == slot {
+            crate::smp::wake(cpu);
+        }
+    }
+}
+
+/// What entering the kernel from user mode found.
+pub struct Entry {
+    /// The task was killed while it ran elsewhere and must end now.
+    pub kill: bool,
+}
+
+/// Takes the kernel lock for a processor that trapped out of user mode and
+/// makes the task it was running the live one.
+pub fn enter_from_user() -> Entry {
+    if !crate::kernel_lock::active() {
+        return Entry { kill: false };
+    }
+    // Before waiting for the lock: a processor stopping the others for a
+    // page-table change must see this one is no longer running user code.
+    IN_USER[crate::kernel_lock::this_cpu()].store(false, Ordering::SeqCst);
+    crate::kernel_lock::lock();
+    let cpu = crate::kernel_lock::this_cpu();
+    crate::kernel_lock::note_entry(cpu);
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let task = CPU_TASK[cpu].load(Ordering::Acquire);
+    if task < MAX_TASKS {
+        scheduler.rebind(task);
+    }
+    let current = scheduler.current;
+    let kill = scheduler.tasks[current].kill_pending;
+    scheduler.tasks[current].kill_pending = false;
+    Entry { kill }
+}
+
+/// Gives the kernel lock up for the return to user mode.
+pub fn leave_to_user() {
+    let current = unsafe { (*SCHEDULER.0.get()).current };
+    let cpu = crate::kernel_lock::this_cpu();
+    CPU_TASK[cpu].store(current, Ordering::Release);
+    reload_if_stale(cpu);
+    IN_USER[cpu].store(true, Ordering::SeqCst);
+    crate::kernel_lock::unlock();
+}
+
+/// Reloads this processor's address space if another processor changed it
+/// while this one was in the kernel or running something else.
+fn reload_if_stale(cpu: usize) {
+    if FLUSH_PENDING[cpu].swap(false, Ordering::AcqRel) {
+        let root = CPU_CR3[cpu].load(Ordering::Acquire);
+        if root != 0 {
+            arch::paging::activate_root(root);
+        }
+    }
+}
+
+/// Before the running task's page tables lose or downgrade a mapping: stops
+/// every other processor that has the address space loaded. Those running
+/// user code are sent into the kernel and held there on the kernel lock (this
+/// one holds it), so none can use a stale translation or a freed frame; all of
+/// them reload the address space before they next leave the kernel. A no-op
+/// unless user tasks run on several processors.
+pub fn stop_siblings(root: u64) {
+    if !crate::kernel_lock::active() || !PARALLEL_THREADS.load(Ordering::Acquire) {
+        return;
+    }
+    let me = crate::kernel_lock::this_cpu();
+    let mut targets = 0u64;
+    for cpu in 0..MAX_PROCESSORS {
+        if cpu != me && CPU_CR3[cpu].load(Ordering::Acquire) == root {
+            FLUSH_PENDING[cpu].store(true, Ordering::SeqCst);
+            targets |= 1 << cpu;
+        }
+    }
+    let start = crate::time::monotonic_nanoseconds();
+    loop {
+        let mut running = false;
+        for (cpu, in_user) in IN_USER.iter().enumerate() {
+            if targets & (1 << cpu) != 0 && in_user.load(Ordering::SeqCst) {
+                running = true;
+                crate::smp::wake(cpu);
+            }
+        }
+        if !running {
+            return;
+        }
+        if crate::time::monotonic_nanoseconds().wrapping_sub(start) > 2_000_000_000 {
+            crate::serial::line("AEROS_STOP_SIBLINGS_TIMEOUT");
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// For the first entry into user mode of a task: the lock word the assembly
+/// releases right after it has stored its return point, or null when user
+/// tasks do not run on several processors.
+pub fn user_entry_lock() -> *mut u32 {
+    if !crate::kernel_lock::active() {
+        return core::ptr::null_mut();
+    }
+    let current = unsafe { (*SCHEDULER.0.get()).current };
+    let cpu = crate::kernel_lock::this_cpu();
+    CPU_TASK[cpu].store(current, Ordering::Release);
+    reload_if_stale(cpu);
+    IN_USER[cpu].store(true, Ordering::SeqCst);
+    crate::kernel_lock::release_address()
+}
+
+/// Lets user tasks run on every processor. The caller (the bootstrap
+/// processor) keeps the kernel lock from here on.
+pub fn enable_smp(bsp_runs_tasks: bool) -> bool {
+    arch::disable_interrupts();
+    if crate::smp::online_mask().count_ones() < 2 {
+        return false;
+    }
+    for slot in &CPU_TASK {
+        slot.store(NO_TASK, Ordering::Release);
+    }
+    for slot in CPU_CR3.iter().chain(&DISPATCHES) {
+        slot.store(0, Ordering::Release);
+    }
+    BSP_RUNS_TASKS.store(bsp_runs_tasks, Ordering::Release);
+    PREEMPTION_ENABLED.store(1, Ordering::Release);
+    for slot in IN_USER.iter().chain(&FLUSH_PENDING) {
+        slot.store(false, Ordering::Release);
+    }
+    PARALLEL_THREADS.store(true, Ordering::Release);
+    crate::kernel_lock::enable();
+    // The application processors are asleep; let them start looking for tasks.
+    for cpu in 1..MAX_PROCESSORS {
+        if crate::smp::online_mask() & (1 << cpu) != 0 {
+            crate::smp::wake(cpu);
+        }
+    }
+    true
+}
+
+/// Back to one processor running user tasks; the caller holds the lock.
+#[cfg(feature = "boot-test")]
+pub fn disable_smp() {
+    PARALLEL_THREADS.store(false, Ordering::Release);
+    crate::kernel_lock::disable();
+    PREEMPTION_ENABLED.store(0, Ordering::Release);
+    BSP_RUNS_TASKS.store(false, Ordering::Release);
+}
+
+pub fn dispatches(cpu: usize) -> u64 {
+    DISPATCHES
+        .get(cpu)
+        .map_or(0, |count| count.load(Ordering::Acquire))
 }
 
 /// Frees the slots of threads that have exited, which nothing waits for.
@@ -1922,6 +2759,22 @@ pub fn reap() -> usize {
             continue;
         }
         if (tgid == 0 || tgid == leader_id) && scheduler.group_live(leader_id) {
+            continue;
+        }
+        // A process whose parent is alive stays until the parent waits for it.
+        let (parent, waited) = (
+            scheduler.tasks[index].parent_id,
+            scheduler.tasks[index].waited,
+        );
+        if parent != 0
+            && !waited
+            && (tgid == 0 || tgid == leader_id)
+            && scheduler.tasks.iter().any(|other| {
+                other.id == parent
+                    && other.state != TaskState::Empty
+                    && other.state != TaskState::Exited
+            })
+        {
             continue;
         }
         let task = &mut scheduler.tasks[index];
@@ -2058,6 +2911,51 @@ pub fn preemption_self_test() -> bool {
         && before_reap.context_switches >= 8
         && reaped == 2
         && after_reap.tasks == 1
+}
+
+static LAST_TICK_NS: [AtomicU64; MAX_PROCESSORS] = [const { AtomicU64::new(0) }; MAX_PROCESSORS];
+
+/// Charges the time since this processor's previous tick to the process it
+/// is running, as user or kernel time by where the tick caught it. Sampled,
+/// like the classic accounting: a task that runs between two ticks is charged
+/// for the whole interval.
+pub fn account_tick(user: bool) {
+    let cpu = crate::kernel_lock::this_cpu();
+    let now = crate::time::monotonic_nanoseconds();
+    let last = LAST_TICK_NS[cpu].swap(now, Ordering::AcqRel);
+    if last == 0 || now <= last {
+        return;
+    }
+    let delta = (now - last).min(100_000_000);
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let slot = if crate::kernel_lock::active() {
+        let running = CPU_TASK[cpu].load(Ordering::Acquire);
+        if running == NO_TASK {
+            return;
+        }
+        running
+    } else {
+        scheduler.current
+    };
+    if slot >= scheduler.tasks.len() || scheduler.tasks[slot].state == TaskState::Empty {
+        return;
+    }
+    let leader = scheduler.leader_slot(slot);
+    let task = &mut scheduler.tasks[leader];
+    if user {
+        task.cpu_user_ns += delta;
+    } else {
+        task.cpu_system_ns += delta;
+    }
+}
+
+/// User and kernel CPU time of the running process, in nanoseconds.
+pub fn current_cpu_time() -> (u64, u64) {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    let leader = scheduler.leader_slot(scheduler.current);
+    let task = &scheduler.tasks[leader];
+    (task.cpu_user_ns, task.cpu_system_ns)
 }
 
 pub fn on_timer_tick() {
@@ -4982,6 +5880,350 @@ fn read_x87_control() -> u16 {
         asm!("fnstcw [{}]", in(reg) &mut value, options(nostack));
     }
     value
+}
+
+#[cfg(feature = "boot-test")]
+fn build_getpid_loop_probe(count: u32, exit_code: u32) -> [u8; 30] {
+    let mut code = [0u8; 30];
+    // mov r12d, count
+    code[0] = 0x41;
+    code[1] = 0xbc;
+    code[2..6].copy_from_slice(&count.to_le_bytes());
+    // loop: mov eax, 39 (getpid); syscall; dec r12d; jnz loop
+    code[6] = 0xb8;
+    code[7..11].copy_from_slice(&39u32.to_le_bytes());
+    code[11] = 0x0f;
+    code[12] = 0x05;
+    code[13] = 0x41;
+    code[14] = 0xff;
+    code[15] = 0xcc;
+    code[16] = 0x75;
+    code[17] = 0xf4;
+    // mov eax, 0; mov edi, exit_code; int 0x80 (the bootstrap exit)
+    code[18] = 0xb8;
+    code[23] = 0xbf;
+    code[24..28].copy_from_slice(&exit_code.to_le_bytes());
+    code[28] = 0xcd;
+    code[29] = 0x80;
+    code
+}
+
+#[cfg(feature = "boot-test")]
+#[derive(Clone, Copy, Default)]
+pub struct SmpUserResult {
+    pub enabled: bool,
+    pub timed_out: bool,
+    pub exit_a: u64,
+    pub exit_b: u64,
+    pub cpu_a: usize,
+    pub cpu_b: usize,
+    pub overlap_permille: u64,
+    pub syscall_exit_c: u64,
+    pub syscall_exit_d: u64,
+    pub syscalls: u64,
+    pub kernel_entries: u64,
+    pub contended: u64,
+    pub acquisitions: u64,
+    pub spins: u64,
+    pub relaxes: u64,
+    pub try_failed: u64,
+    pub dispatched: [u64; MAX_PROCESSORS],
+    pub clean: bool,
+    pub verified: bool,
+}
+
+/// Two processes that compute for a while and two that make a stream of system
+/// calls run on different processors at once and finish with the right status.
+#[cfg(feature = "boot-test")]
+pub fn smp_user_self_test(state: &crate::arch::paging::PagingState) -> SmpUserResult {
+    let mut result = SmpUserResult::default();
+    initialize();
+    for slot in USER_TASK_EXIT.iter() {
+        slot.store(u64::MAX, Ordering::Release);
+    }
+    if !enable_smp(true) {
+        // One processor: there is nothing to test.
+        result.verified = crate::smp::online_mask().count_ones() < 2;
+        return result;
+    }
+    result.enabled = true;
+    let wait_for = |first: usize, second: usize| -> bool {
+        let deadline = crate::time::monotonic_nanoseconds() + 120_000_000_000;
+        while USER_TASK_EXIT[first].load(Ordering::Acquire) == u64::MAX
+            || USER_TASK_EXIT[second].load(Ordering::Acquire) == u64::MAX
+        {
+            if crate::time::monotonic_nanoseconds() > deadline {
+                return false;
+            }
+            yield_now();
+        }
+        true
+    };
+    let program_a = build_spin_probe(60_000_000, 71);
+    let program_b = build_spin_probe(60_000_000, 72);
+    let (Some((id_a, slot_a, _)), Some((id_b, slot_b, _))) = (
+        spawn_process(state, &program_a),
+        spawn_process(state, &program_b),
+    ) else {
+        disable_smp();
+        return result;
+    };
+    if !wait_for(slot_a, slot_b) {
+        result.timed_out = true;
+        disable_smp();
+        return result;
+    }
+    result.exit_a = USER_TASK_EXIT[slot_a].load(Ordering::Acquire);
+    result.exit_b = USER_TASK_EXIT[slot_b].load(Ordering::Acquire);
+    {
+        let scheduler = unsafe { &*SCHEDULER.0.get() };
+        let (a, b) = (&scheduler.tasks[slot_a], &scheduler.tasks[slot_b]);
+        result.cpu_a = a.last_cpu as usize;
+        result.cpu_b = b.last_cpu as usize;
+        let overlap = a
+            .ended_ns
+            .min(b.ended_ns)
+            .saturating_sub(a.started_ns.max(b.started_ns));
+        let shorter = a
+            .ended_ns
+            .saturating_sub(a.started_ns)
+            .min(b.ended_ns.saturating_sub(b.started_ns))
+            .max(1);
+        result.overlap_permille = overlap * 1000 / shorter;
+        let _ = (id_a, id_b);
+    }
+    reap();
+
+    let calls_before = crate::syscall::stats().calls;
+    let entries_before = crate::kernel_lock::stats().entries.iter().sum::<u64>();
+    let program_c = build_getpid_loop_probe(25_000, 73);
+    let program_d = build_getpid_loop_probe(25_000, 74);
+    let (Some((_, slot_c, _)), Some((_, slot_d, _))) = (
+        spawn_process(state, &program_c),
+        spawn_process(state, &program_d),
+    ) else {
+        disable_smp();
+        return result;
+    };
+    if !wait_for(slot_c, slot_d) {
+        result.timed_out = true;
+        disable_smp();
+        return result;
+    }
+    result.syscall_exit_c = USER_TASK_EXIT[slot_c].load(Ordering::Acquire);
+    result.syscall_exit_d = USER_TASK_EXIT[slot_d].load(Ordering::Acquire);
+    result.syscalls = crate::syscall::stats().calls.saturating_sub(calls_before);
+    let lock_stats = crate::kernel_lock::stats();
+    result.kernel_entries = lock_stats.entries.iter().sum::<u64>() - entries_before;
+    result.contended = lock_stats.contended;
+    result.acquisitions = lock_stats.acquisitions;
+    result.spins = lock_stats.spins;
+    result.relaxes = lock_stats.relaxes;
+    result.try_failed = lock_stats.try_failed;
+    for (cpu, count) in result.dispatched.iter_mut().enumerate() {
+        *count = dispatches(cpu);
+    }
+    reap();
+    let after = stats();
+    result.clean = after.tasks == 1 && after.running == 1;
+    disable_smp();
+    result.verified = result.exit_a == 71
+        && result.exit_b == 72
+        && result.cpu_a != result.cpu_b
+        && result.overlap_permille >= 400
+        && result.syscall_exit_c == 73
+        && result.syscall_exit_d == 74
+        && result.kernel_entries >= 50_000
+        && result.clean;
+    result
+}
+
+#[cfg(feature = "boot-test")]
+#[derive(Clone, Copy, Default)]
+pub struct SmpProgramsResult {
+    pub enabled: bool,
+    pub run: usize,
+    pub passed: usize,
+    pub first_failure: usize,
+    pub first_failure_exit: u64,
+    pub dispatched: [u64; MAX_PROCESSORS],
+    pub verified: bool,
+}
+
+/// Real programs (threads, a tracer, std programs, forks) run the way the
+/// shell runs them with user tasks on the application processors only, and
+/// must end with the status they have on one processor.
+#[cfg(feature = "boot-test")]
+pub fn smp_programs_self_test(
+    state: &crate::arch::paging::PagingState,
+    programs: &[(&[u8], u64)],
+) -> SmpProgramsResult {
+    let mut result = SmpProgramsResult {
+        first_failure: usize::MAX,
+        ..SmpProgramsResult::default()
+    };
+    initialize();
+    if !enable_smp(false) {
+        result.verified = crate::smp::online_mask().count_ones() < 2;
+        return result;
+    }
+    result.enabled = true;
+    // Wait the way the desktop does: asleep between ticks, without the kernel
+    // lock, so the application processors get the kernel to themselves.
+    let ticking = arch::apic::start_timer(100);
+    for (index, (code, expected)) in programs.iter().enumerate() {
+        for slot in USER_TASK_EXIT.iter() {
+            slot.store(u64::MAX, Ordering::Release);
+        }
+        result.run += 1;
+        let Some((_, slot, space)) = spawn_process(state, code) else {
+            if result.first_failure == usize::MAX {
+                result.first_failure = index;
+            }
+            continue;
+        };
+        let deadline = crate::time::monotonic_nanoseconds() + 120_000_000_000;
+        let mut dumps = 0;
+        let mut next_dump = crate::time::monotonic_nanoseconds() + 40_000_000_000;
+        let exit = loop {
+            let value = USER_TASK_EXIT[slot].load(Ordering::Acquire);
+            if value != u64::MAX {
+                break value;
+            }
+            if !space.verified || crate::time::monotonic_nanoseconds() > deadline {
+                break u64::MAX;
+            }
+            if dumps < 6 && crate::time::monotonic_nanoseconds() > next_dump {
+                dumps += 1;
+                next_dump += 20_000_000_000;
+                crate::serial::format(format_args!(
+                    "AEROS_WAIT exit={:#x} ticking={ticking} lapic_ticks={}
+",
+                    USER_TASK_EXIT[slot].load(Ordering::Acquire),
+                    arch::interrupts::local_timer_ticks()
+                ));
+                debug_dump();
+            }
+            if ticking {
+                arch::wait_for_interrupt();
+            } else {
+                yield_now();
+            }
+        };
+        reap();
+        if exit == *expected {
+            result.passed += 1;
+        } else if result.first_failure == usize::MAX {
+            result.first_failure = index;
+            result.first_failure_exit = exit;
+        }
+        if exit == u64::MAX {
+            // A program that never ends: stop here rather than pile up.
+            break;
+        }
+    }
+    for (cpu, count) in result.dispatched.iter_mut().enumerate() {
+        *count = dispatches(cpu);
+    }
+    if ticking {
+        arch::apic::stop_timer();
+    }
+    disable_smp();
+    result.verified = result.passed == programs.len();
+    result
+}
+
+/// Prints what every processor and task is doing, for a test that has stopped
+/// making progress.
+#[cfg(feature = "boot-test")]
+fn debug_dump() {
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    crate::serial::format(format_args!(
+        "AEROS_DUMP current={} idle_mask={:#x} lock_held_by_me={} lock={:?}
+",
+        scheduler.current,
+        IDLE_MASK.load(Ordering::Acquire),
+        crate::kernel_lock::held_by_me(),
+        crate::kernel_lock::snapshot()
+    ));
+    for cpu in 0..MAX_PROCESSORS.min(4) {
+        crate::serial::format(format_args!(
+            "AEROS_DUMP cpu={} in_user={} flush={} task={:#x} cr3={:#x}
+",
+            cpu,
+            IN_USER[cpu].load(Ordering::Acquire),
+            FLUSH_PENDING[cpu].load(Ordering::Acquire),
+            CPU_TASK[cpu].load(Ordering::Acquire),
+            CPU_CR3[cpu].load(Ordering::Acquire)
+        ));
+    }
+    for (index, task) in scheduler.tasks.iter().enumerate() {
+        if task.state != TaskState::Empty {
+            crate::serial::format(format_args!(
+                "AEROS_DUMP slot={} id={} tgid={} state={} kill={} cpu={}
+",
+                index, task.id, task.tgid, task.state as u8, task.kill_pending, task.last_cpu
+            ));
+        }
+    }
+}
+
+#[cfg(feature = "boot-test")]
+#[derive(Clone, Copy, Default)]
+pub struct SmpThreadsResult {
+    pub enabled: bool,
+    pub exit: u64,
+    pub timed_out: bool,
+    pub clean: bool,
+    pub verified: bool,
+    pub elapsed_ms: u64,
+}
+
+/// A program whose threads run on several processors at once (the boot
+/// processor takes tasks too, so two processors suffice) must end with
+/// status 78: its page-table races held and its threads were seen together on
+/// different processors.
+#[cfg(feature = "boot-test")]
+pub fn smp_threads_self_test(
+    state: &crate::arch::paging::PagingState,
+    code: &[u8],
+) -> SmpThreadsResult {
+    let mut result = SmpThreadsResult::default();
+    initialize();
+    for slot in USER_TASK_EXIT.iter() {
+        slot.store(u64::MAX, Ordering::Release);
+    }
+    if !enable_smp(true) {
+        result.verified = crate::smp::online_mask().count_ones() < 2;
+        return result;
+    }
+    result.enabled = true;
+    let Some((_, slot, _)) = spawn_process(state, code) else {
+        disable_smp();
+        return result;
+    };
+    let began = crate::time::monotonic_nanoseconds();
+    let deadline = began + 60_000_000_000;
+    let mut dumped = false;
+    while USER_TASK_EXIT[slot].load(Ordering::Acquire) == u64::MAX {
+        if crate::time::monotonic_nanoseconds() > deadline {
+            result.timed_out = true;
+            break;
+        }
+        if !dumped && crate::time::monotonic_nanoseconds() + 40_000_000_000 > deadline {
+            dumped = true;
+            debug_dump();
+        }
+        yield_now();
+    }
+    result.exit = USER_TASK_EXIT[slot].load(Ordering::Acquire);
+    result.elapsed_ms = (crate::time::monotonic_nanoseconds() - began) / 1_000_000;
+    reap();
+    let after = stats();
+    result.clean = after.tasks == 1 && after.running == 1;
+    disable_smp();
+    result.verified = !result.timed_out && result.exit == 78 && result.clean;
+    result
 }
 
 #[unsafe(naked)]

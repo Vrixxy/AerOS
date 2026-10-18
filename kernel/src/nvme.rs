@@ -248,6 +248,64 @@ pub fn sector_bytes() -> u32 {
     NVME.lock().sector_bytes
 }
 
+/// Brings the controller back after a sleep that cost it its state: disabled,
+/// the admin queues and the I/O queue pair created again over the same memory.
+pub fn resume() -> bool {
+    let mut state = NVME.lock();
+    if !state.ready {
+        return true;
+    }
+    let base = state.base;
+    unsafe { write32(base, REG_CC, read32(base, REG_CC) & !1) };
+    if !wait_for(|| unsafe { read32(base, REG_CSTS) } & 1 == 0, READY_TIMEOUT) {
+        return false;
+    }
+    let (admin_sq, admin_cq) = (state.queues[0].submission, state.queues[0].completion);
+    let (io_sq, io_cq) = (state.queues[1].submission, state.queues[1].completion);
+    unsafe {
+        core::ptr::write_bytes(admin_sq as usize as *mut u8, 0, PAGE_SIZE as usize);
+        core::ptr::write_bytes(admin_cq as usize as *mut u8, 0, PAGE_SIZE as usize);
+        core::ptr::write_bytes(io_sq as usize as *mut u8, 0, PAGE_SIZE as usize);
+        core::ptr::write_bytes(io_cq as usize as *mut u8, 0, PAGE_SIZE as usize);
+    }
+    state.queues[0] = Queue {
+        submission: admin_sq,
+        completion: admin_cq,
+        ..Queue::EMPTY
+    };
+    state.queues[1] = Queue {
+        submission: io_sq,
+        completion: io_cq,
+        ..Queue::EMPTY
+    };
+    unsafe {
+        let entries = QUEUE_ENTRIES as u32 - 1;
+        write32(base, REG_AQA, entries << 16 | entries);
+        write64(base, REG_ASQ, admin_sq);
+        write64(base, REG_ACQ, admin_cq);
+        write32(base, REG_CC, 1 | 6 << 16 | 4 << 20);
+    }
+    if !wait_for(|| unsafe { read32(base, REG_CSTS) } & 1 == 1, READY_TIMEOUT) {
+        return false;
+    }
+    let mut command = [0u32; 16];
+    command[0] = ADMIN_CREATE_IO_CQ;
+    command[6] = io_cq as u32;
+    command[7] = (io_cq >> 32) as u32;
+    command[10] = (QUEUE_ENTRIES as u32 - 1) << 16 | 1;
+    command[11] = 1;
+    if state.submit(0, command) != Some(0) {
+        return false;
+    }
+    let mut command = [0u32; 16];
+    command[0] = ADMIN_CREATE_IO_SQ;
+    command[6] = io_sq as u32;
+    command[7] = (io_sq >> 32) as u32;
+    command[10] = (QUEUE_ENTRIES as u32 - 1) << 16 | 1;
+    command[11] = 1 << 16 | 1;
+    state.submit(0, command) == Some(0)
+}
+
 pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> NvmeReport {
     let Some(device) = pci.find_class(0x01, 0x08, 0x02) else {
         return NvmeReport::EMPTY;

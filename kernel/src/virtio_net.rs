@@ -107,6 +107,26 @@ pub fn receive(out: &mut [u8]) -> Option<usize> {
     copied
 }
 
+/// Starts the device again after a sleep: reset, the same queue memory, the
+/// receive buffers handed over again.
+pub fn resume() -> bool {
+    let mut state = NET.lock();
+    let Some(device) = state.device else {
+        return true;
+    };
+    device.begin(FEATURE_MAC);
+    state.receive.reset();
+    state.transmit.reset();
+    device.restore_queue(0, &state.receive);
+    device.restore_queue(1, &state.transmit);
+    device.driver_ok();
+    for index in 0..RX_BUFFERS {
+        state.post_receive(index);
+    }
+    device.notify(0);
+    true
+}
+
 pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> VirtioNetReport {
     let Some((_, device)) = Legacy::find(pci, DEVICE_ID) else {
         return VirtioNetReport::EMPTY;

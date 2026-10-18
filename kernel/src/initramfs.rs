@@ -11,9 +11,21 @@ pub static THREADS: &[u8] = include_bytes!("../../assets/userspace/aeros-threads
 pub static PTRACE: &[u8] = include_bytes!("../../assets/userspace/aeros-ptrace");
 pub static SWAP: &[u8] = include_bytes!("../../assets/userspace/aeros-swap");
 pub static BENCH: &[u8] = include_bytes!("../../assets/userspace/aeros-bench");
+pub static PARALLEL: &[u8] = include_bytes!("../../assets/userspace/aeros-parallel");
+pub static SYSX: &[u8] = include_bytes!("../../assets/userspace/aeros-sysx");
+pub static APPS: &[u8] = include_bytes!("../../assets/userspace/aeros-apps");
+/// BusyBox 1.37 from Debian: a static, non-PIE program that is not ours.
+pub static BUSYBOX: &[u8] = include_bytes!("../../assets/userspace/busybox");
+/// Debian's ldconfig: a static-PIE glibc program that is not ours.
+pub static LDCONFIG: &[u8] = include_bytes!("../../assets/userspace/ldconfig");
+/// A dynamically linked glibc program (built here, loaded through `ld.so`).
+pub static DYNHELLO: &[u8] = include_bytes!("../../assets/userspace/dynhello");
+/// Debian's glibc and its dynamic loader, the libraries such programs need.
+pub static LD_SO: &[u8] = include_bytes!("../../assets/userspace/lib/ld-linux-x86-64.so.2");
+pub static LIBC: &[u8] = include_bytes!("../../assets/userspace/lib/libc.so.6");
 pub static RELEASE: &[u8] = b"AerOS 0.1.0 x86_64\n";
 
-pub fn entries() -> [InitramfsEntry; 10] {
+pub fn entries() -> [InitramfsEntry; 18] {
     [
         InitramfsEntry {
             path: "/bin/init",
@@ -63,6 +75,46 @@ pub fn entries() -> [InitramfsEntry; 10] {
         InitramfsEntry {
             path: "/bin/aeros-bench",
             data: BENCH,
+            mode: 0o555,
+        },
+        InitramfsEntry {
+            path: "/bin/aeros-parallel",
+            data: PARALLEL,
+            mode: 0o555,
+        },
+        InitramfsEntry {
+            path: "/bin/aeros-sysx",
+            data: SYSX,
+            mode: 0o555,
+        },
+        InitramfsEntry {
+            path: "/bin/aeros-apps",
+            data: APPS,
+            mode: 0o555,
+        },
+        InitramfsEntry {
+            path: "/bin/busybox",
+            data: BUSYBOX,
+            mode: 0o555,
+        },
+        InitramfsEntry {
+            path: "/bin/ldconfig",
+            data: LDCONFIG,
+            mode: 0o555,
+        },
+        InitramfsEntry {
+            path: "/bin/dynhello",
+            data: DYNHELLO,
+            mode: 0o555,
+        },
+        InitramfsEntry {
+            path: "/lib64/ld-linux-x86-64.so.2",
+            data: LD_SO,
+            mode: 0o555,
+        },
+        InitramfsEntry {
+            path: "/lib/x86_64-linux-gnu/libc.so.6",
+            data: LIBC,
             mode: 0o555,
         },
     ]

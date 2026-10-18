@@ -337,6 +337,88 @@ pub fn initialize(pci: &PciInventory) -> SdReport {
     report
 }
 
+/// Brings the controller and the card up again after a sleep that cost them
+/// their state (the same sequence `initialize` runs): returns the card's
+/// capacity class and size, which must match what was there before.
+pub fn resume() -> bool {
+    let (mmio, was_high, was_sectors) = {
+        let state = SD.lock();
+        if !state.ready {
+            return true;
+        }
+        (state.mmio, state.high_capacity, state.sectors)
+    };
+    let _guard = SD.lock();
+    write8(mmio, RESET, 1);
+    if !wait(|| read8(mmio, RESET) & 1 == 0) {
+        return false;
+    }
+    write16(mmio, INT_ENABLE, !(1u16 << 6 | 1 << 7 | 1 << 8));
+    write16(mmio, ERROR_ENABLE, 0xffff);
+    write16(mmio, 0x38, 0);
+    let capabilities = read32(mmio, CAPABILITIES);
+    let power = if capabilities & (1 << 24) != 0 {
+        0x0e
+    } else if capabilities & (1 << 25) != 0 {
+        0x0c
+    } else {
+        0x0a
+    };
+    write8(mmio, POWER, power | 1);
+    write8(mmio, TIMEOUT_CONTROL, 0x0e);
+    if !set_clock(mmio, 400) {
+        return false;
+    }
+    delay_ms(10);
+    if command(mmio, 0, 0, RESPONSE_NONE, false).is_none() {
+        return false;
+    }
+    delay_ms(2);
+    let v2 = command(mmio, 8, 0x1aa, RESPONSE_48 | CRC_CHECK | INDEX_CHECK, false)
+        .is_some_and(|response| response[0] & 0xfff == 0x1aa);
+    let mut ocr = 0u32;
+    let mut ready = false;
+    for _ in 0..200 {
+        let argument = 0x00ff_8000 | if v2 { 1 << 30 } else { 0 };
+        let Some(response) = app_command(mmio, 0, 41, argument, RESPONSE_48) else {
+            return false;
+        };
+        ocr = response[0];
+        if ocr & (1 << 31) != 0 {
+            ready = true;
+            break;
+        }
+        delay_ms(5);
+    }
+    if !ready || (ocr & (1 << 30) != 0) != was_high {
+        return false;
+    }
+    if command(mmio, 2, 0, RESPONSE_136 | CRC_CHECK, false).is_none() {
+        return false;
+    }
+    let Some(rca_response) = command(mmio, 3, 0, RESPONSE_48 | CRC_CHECK | INDEX_CHECK, false)
+    else {
+        return false;
+    };
+    let rca = rca_response[0] >> 16;
+    if command(
+        mmio,
+        7,
+        rca << 16,
+        RESPONSE_48_BUSY | CRC_CHECK | INDEX_CHECK,
+        false,
+    )
+    .is_none()
+    {
+        return false;
+    }
+    if !was_high && command(mmio, 16, 512, RESPONSE_48 | CRC_CHECK | INDEX_CHECK, false).is_none() {
+        return false;
+    }
+    let _ = was_sectors;
+    set_clock(mmio, 25_000)
+}
+
 fn transfer_one(
     mmio: u64,
     high_capacity: bool,

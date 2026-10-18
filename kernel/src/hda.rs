@@ -47,6 +47,9 @@ impl HdaReport {
 struct HdaState {
     base: u64,
     codec: u32,
+    pin_node: u32,
+    dac_node: u32,
+    middle_node: u32,
     stream: usize,
     bdl: u64,
     buffers: u64,
@@ -63,6 +66,9 @@ impl HdaState {
     const EMPTY: Self = Self {
         base: 0,
         codec: 0,
+        pin_node: 0,
+        dac_node: 0,
+        middle_node: 0,
         stream: 0,
         bdl: 0,
         buffers: 0,
@@ -77,6 +83,45 @@ impl HdaState {
 }
 
 static HDA: TicketLock<HdaState> = TicketLock::new(HdaState::EMPTY);
+
+impl HdaState {
+    /// Powers up and unmutes the output path and routes the stream to the
+    /// converter (the codec forgets all of it when it is reset).
+    fn route(&mut self) {
+        let (pin_node, dac_node) = (self.pin_node, self.dac_node);
+        let middle = (self.middle_node != 0).then_some(self.middle_node);
+        // Power up and unmute the path, route the stream to the converter.
+        for node in [Some(pin_node), middle, Some(dac_node)]
+            .into_iter()
+            .flatten()
+        {
+            let _ = self.verb(node, 0x705, 0);
+            // Output amp, both channels, unmuted, gain 0x2f.
+            let _ = self.verb16(node, 0x3, 0xb02f);
+            // Input amp too (mixers/selectors), index 0 and 1.
+            let _ = self.verb16(node, 0x3, 0x7020);
+            let _ = self.verb16(node, 0x3, 0x7121);
+        }
+        if let Some(mid) = middle {
+            // Select the converter as the mixer's input when it is a selector.
+            let mut list = [0u32; 8];
+            let count = self.connections(mid, &mut list);
+            if let Some(index) = list[..count].iter().position(|node| *node == dac_node) {
+                let _ = self.verb(mid, 0x701, index as u32);
+            }
+        }
+        let mut list = [0u32; 8];
+        let count = self.connections(pin_node, &mut list);
+        let source = middle.unwrap_or(dac_node);
+        if let Some(index) = list[..count].iter().position(|node| *node == source) {
+            let _ = self.verb(pin_node, 0x701, index as u32);
+        }
+        let _ = self.verb(pin_node, 0x707, 0x40); // pin output enable
+        let _ = self.verb(pin_node, 0x70c, 2); // EAPD on
+        let _ = self.verb(dac_node, 0x706, 1 << 4); // stream tag 1, channel 0
+        let _ = self.verb16(dac_node, 0x2, 0x0011); // 48 kHz, 16-bit, stereo
+    }
+}
 
 unsafe fn r8(base: u64, offset: usize) -> u8 {
     unsafe { core::ptr::read_volatile((base as usize + offset) as *const u8) }
@@ -305,6 +350,69 @@ pub fn set_volume(percent: u8) {
     HDA.lock().volume = percent.min(100) as i32;
 }
 
+/// Brings the controller and codec back after a sleep that cost them their
+/// state: reset, the buffer list again, the output path routed again.
+pub fn reinitialize() -> bool {
+    let mut state = HDA.lock();
+    if !state.ready {
+        return true;
+    }
+    let base = state.base;
+    state.playing = false;
+    state.stream_on = false;
+    unsafe {
+        w32(base, GCTL, 0);
+        wait_for(|| r32(base, GCTL) & 1 == 0);
+        w32(base, GCTL, 1);
+    }
+    if !wait_for(|| unsafe { r32(base, GCTL) } & 1 == 1) {
+        return false;
+    }
+    let start = crate::time::monotonic_nanoseconds();
+    while crate::time::monotonic_nanoseconds().saturating_sub(start) < 100_000_000 {
+        core::hint::spin_loop();
+    }
+    if unsafe { r16(base, STATESTS) } & (1 << state.codec) == 0 {
+        return false;
+    }
+    let buffer_pages = (BDL_ENTRIES * BUFFER_BYTES) as u64 / PAGE_SIZE;
+    unsafe {
+        core::ptr::write_bytes(
+            state.bdl as usize as *mut u8,
+            0,
+            ((1 + buffer_pages) * PAGE_SIZE) as usize,
+        )
+    };
+    for index in 0..BDL_ENTRIES {
+        let entry = (state.bdl as usize + index * 16) as *mut u64;
+        unsafe {
+            core::ptr::write_volatile(entry, state.buffers + (index * BUFFER_BYTES) as u64);
+            core::ptr::write_volatile(entry.add(1), BUFFER_BYTES as u64);
+        }
+    }
+    state.route();
+    true
+}
+
+/// Plays the first tune briefly and reports whether the stream ran (true when
+/// there is no controller).
+#[cfg_attr(not(feature = "boot-test"), allow(dead_code))]
+pub fn playback_probe() -> bool {
+    if !ready() {
+        return true;
+    }
+    play_song(0);
+    let start = crate::time::monotonic_nanoseconds();
+    let mut position_max = 0u32;
+    while crate::time::monotonic_nanoseconds().saturating_sub(start) < 400_000_000 {
+        pump();
+        let state = HDA.lock();
+        position_max = position_max.max(unsafe { r32(state.base, state.stream_register() + 0x04) });
+    }
+    stop();
+    position_max > BUFFER_BYTES as u32
+}
+
 pub fn ready() -> bool {
     HDA.lock().ready
 }
@@ -428,36 +536,10 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> HdaReport 
     report.pin = pin_node;
     report.path_found = true;
 
-    // Power up and unmute the path, route the stream to the converter.
-    for node in [Some(pin_node), middle, Some(dac_node)]
-        .into_iter()
-        .flatten()
-    {
-        let _ = state.verb(node, 0x705, 0);
-        // Output amp, both channels, unmuted, gain 0x2f.
-        let _ = state.verb16(node, 0x3, 0xb02f);
-        // Input amp too (mixers/selectors), index 0 and 1.
-        let _ = state.verb16(node, 0x3, 0x7020);
-        let _ = state.verb16(node, 0x3, 0x7121);
-    }
-    if let Some(mid) = middle {
-        // Select the converter as the mixer's input when it is a selector.
-        let mut list = [0u32; 8];
-        let count = state.connections(mid, &mut list);
-        if let Some(index) = list[..count].iter().position(|node| *node == dac_node) {
-            let _ = state.verb(mid, 0x701, index as u32);
-        }
-    }
-    let mut list = [0u32; 8];
-    let count = state.connections(pin_node, &mut list);
-    let source = middle.unwrap_or(dac_node);
-    if let Some(index) = list[..count].iter().position(|node| *node == source) {
-        let _ = state.verb(pin_node, 0x701, index as u32);
-    }
-    let _ = state.verb(pin_node, 0x707, 0x40); // pin output enable
-    let _ = state.verb(pin_node, 0x70c, 2); // EAPD on
-    let _ = state.verb(dac_node, 0x706, 1 << 4); // stream tag 1, channel 0
-    let _ = state.verb16(dac_node, 0x2, 0x0011); // 48 kHz, 16-bit, stereo
+    state.pin_node = pin_node;
+    state.dac_node = dac_node;
+    state.middle_node = middle.unwrap_or(0);
+    state.route();
 
     // First output stream descriptor follows the input ones.
     let capabilities = unsafe { r16(base, GCAP) } as usize;

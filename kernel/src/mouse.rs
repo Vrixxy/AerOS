@@ -82,6 +82,33 @@ pub fn initialize(acpi: &AcpiInfo, destination: u32) -> MouseReport {
     }
 }
 
+/// Starts the pointing device again after a sleep (the routing is restored
+/// with the I/O APIC).
+pub fn resume() -> bool {
+    let flags: u64;
+    unsafe { core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags)) };
+    // The interrupt handler must not take the acknowledge bytes, and bytes
+    // already waiting (packets from a device that never lost its state) must
+    // not be mistaken for one.
+    arch::disable_interrupts();
+    PACKET_INDEX.store(0, Ordering::Release);
+    for _ in 0..64 {
+        if unsafe { arch::inb(STATUS) } & 1 == 0 {
+            break;
+        }
+        let _ = unsafe { arch::inb(DATA) };
+    }
+    let present = configure_controller();
+    let reporting = present && enable_reporting();
+    let absolute = reporting && enable_vmmouse();
+    ABSOLUTE.store(absolute, Ordering::Release);
+    READY.store(present && reporting, Ordering::Release);
+    if flags & (1 << 9) != 0 {
+        arch::enable_interrupts();
+    }
+    present && reporting
+}
+
 pub fn set_bounds(width: usize, height: usize) {
     if width == 0 || height == 0 {
         return;

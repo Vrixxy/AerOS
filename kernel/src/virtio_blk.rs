@@ -120,6 +120,19 @@ pub fn sectors() -> u64 {
     BLK.lock().sectors
 }
 
+/// Starts the device again after a sleep: reset, the same queue memory, ready.
+pub fn resume() -> bool {
+    let mut state = BLK.lock();
+    let Some(device) = state.device else {
+        return true;
+    };
+    device.begin(0);
+    state.queue.reset();
+    device.restore_queue(0, &state.queue);
+    device.driver_ok();
+    true
+}
+
 pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> VirtioBlkReport {
     let Some((_, device)) = Legacy::find(pci, DEVICE_ID) else {
         return VirtioBlkReport::EMPTY;

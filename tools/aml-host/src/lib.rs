@@ -10,3 +10,6 @@ pub mod acpi_devices;
 
 #[path = "../../../kernel/src/ec.rs"]
 pub mod ec;
+
+#[path = "../../../kernel/src/cpufreq.rs"]
+pub mod cpufreq;

@@ -188,6 +188,12 @@ impl Modern {
         self.device_status() & STATUS_FEATURES_OK != 0
     }
 
+    /// The low 32 feature bits the device offers.
+    pub fn offered_low(&self) -> u32 {
+        self.write32(0x00, 0);
+        self.read32(0x04)
+    }
+
     pub fn driver_ok(&self) {
         self.write8(
             0x14,
@@ -234,6 +240,16 @@ impl Modern {
             },
             notify_off,
         ))
+    }
+
+    /// Points virtqueue `index` at the memory an earlier `queue` call set up
+    /// (after a device reset that forgot it) and enables it.
+    pub fn restore_queue(&self, index: u16, queue: &Queue) {
+        self.write16(0x16, index);
+        self.write64(0x20, queue.descriptors);
+        self.write64(0x28, queue.available);
+        self.write64(0x30, queue.used);
+        self.write16(0x1c, 1);
     }
 
     /// Rings the doorbell for a queue, given the `queue_notify_off` its

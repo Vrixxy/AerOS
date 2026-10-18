@@ -1,5 +1,5 @@
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::acpi::{AcpiInfo, MAX_PROCESSORS};
 use crate::arch;
@@ -29,6 +29,12 @@ static WORK: [CpuCounter; MAX_PROCESSORS] =
 static OBSERVED_IDS: [AtomicU32; MAX_PROCESSORS] =
     [const { AtomicU32::new(u32::MAX) }; MAX_PROCESSORS];
 static TRAMPOLINE: AtomicU64 = AtomicU64::new(0);
+static PARK: AtomicBool = AtomicBool::new(false);
+static PARKED: AtomicU64 = AtomicU64::new(0);
+static ROOT: AtomicU64 = AtomicU64::new(0);
+static NX: AtomicBool = AtomicBool::new(false);
+static LISTED: AtomicU32 = AtomicU32::new(0);
+static LISTED_IDS: [AtomicU32; MAX_PROCESSORS] = [const { AtomicU32::new(0) }; MAX_PROCESSORS];
 static QUEUE_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static QUEUE_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static QUEUE_RESULTS: [AtomicU64; MAX_PROCESSORS] = [const { AtomicU64::new(0) }; MAX_PROCESSORS];
@@ -100,45 +106,21 @@ pub fn initialize(acpi: &AcpiInfo, paging: &PagingState, trampoline: u64) -> Smp
     {
         return failed_report(discovered, bsp_id, trampoline);
     }
-    let mut applications_started = 0u8;
-    let mut logical = 1usize;
-    for apic_id in &acpi.enabled_apic_ids[..discovered as usize] {
-        if *apic_id == bsp_id {
-            continue;
-        }
-        if logical >= MAX_PROCESSORS {
-            break;
-        }
-        let stack = unsafe { (*AP_STACKS.0.get())[logical].as_ptr().add(STACK_SIZE) as u64 & !15 };
-        if !build_trampoline(
-            trampoline,
-            paging.root_physical,
-            stack,
-            logical as u32,
-            *apic_id,
-            paging.nx_enabled,
-        ) {
-            FAILED.fetch_or(1 << logical, Ordering::AcqRel);
-            break;
-        }
-        core::sync::atomic::fence(Ordering::SeqCst);
-        if !arch::apic::start_processor(*apic_id, trampoline) {
-            FAILED.fetch_or(1 << logical, Ordering::AcqRel);
-            break;
-        }
-        applications_started += 1;
-        if !wait_for(
-            || ONLINE.load(Ordering::Acquire) & (1 << logical) != 0,
-            500_000_000,
-        ) {
-            FAILED.fetch_or(1 << logical, Ordering::AcqRel);
-            break;
-        }
-        logical += 1;
+    ROOT.store(paging.root_physical, Ordering::Release);
+    NX.store(paging.nx_enabled, Ordering::Release);
+    LISTED.store(discovered as u32, Ordering::Release);
+    for (slot, id) in LISTED_IDS
+        .iter()
+        .zip(&acpi.enabled_apic_ids[..discovered as usize])
+    {
+        slot.store(*id, Ordering::Release);
     }
-    let _ = wait_for(
-        || IDLE.load(Ordering::Acquire).count_ones() as usize == logical.saturating_sub(1),
-        2_000_000_000,
+    let (applications_started, logical) = start_applications(
+        trampoline,
+        paging.root_physical,
+        paging.nx_enabled,
+        bsp_id,
+        &acpi.enabled_apic_ids[..discovered as usize],
     );
     for apic_id in &acpi.enabled_apic_ids[..discovered as usize] {
         if *apic_id != bsp_id && !arch::apic::send_fixed(*apic_id, 49) {
@@ -192,6 +174,128 @@ pub fn initialize(acpi: &AcpiInfo, paging: &PagingState, trampoline: u64) -> Smp
         work_queue,
         verified,
     }
+}
+
+/// Starts every listed application processor through the trampoline and
+/// waits for them to reach their idle loop. Returns how many were started
+/// and the number of logical processors now counted (the boot one included).
+fn start_applications(
+    trampoline: u64,
+    root: u64,
+    nx: bool,
+    bsp_id: u32,
+    ids: &[u32],
+) -> (u8, usize) {
+    let mut applications_started = 0u8;
+    let mut logical = 1usize;
+    for apic_id in ids {
+        if *apic_id == bsp_id {
+            continue;
+        }
+        if logical >= MAX_PROCESSORS {
+            break;
+        }
+        let stack = unsafe { (*AP_STACKS.0.get())[logical].as_ptr().add(STACK_SIZE) as u64 & !15 };
+        if !build_trampoline(
+            trampoline,
+            root,
+            stack,
+            logical as u32,
+            *apic_id,
+            nx,
+            aeros_ap_entry as *const () as usize as u64,
+        ) {
+            FAILED.fetch_or(1 << logical, Ordering::AcqRel);
+            break;
+        }
+        core::sync::atomic::fence(Ordering::SeqCst);
+        if !arch::apic::start_processor(*apic_id, trampoline) {
+            FAILED.fetch_or(1 << logical, Ordering::AcqRel);
+            break;
+        }
+        applications_started += 1;
+        if !wait_for(
+            || ONLINE.load(Ordering::Acquire) & (1 << logical) != 0,
+            500_000_000,
+        ) {
+            FAILED.fetch_or(1 << logical, Ordering::AcqRel);
+            break;
+        }
+        logical += 1;
+    }
+    let _ = wait_for(
+        || IDLE.load(Ordering::Acquire).count_ones() as usize == logical.saturating_sub(1),
+        2_000_000_000,
+    );
+    (applications_started, logical)
+}
+
+/// The page the application processors (and a resuming boot processor) start
+/// from, below 1 MiB.
+pub fn trampoline_page() -> u64 {
+    TRAMPOLINE.load(Ordering::Acquire)
+}
+
+/// Writes a real-mode start page that ends in `entry` on `stack` (the boot
+/// processor's wake from a sleep uses the same page the others start from).
+pub fn build_trampoline_for(physical: u64, root: u64, stack: u64, nx: bool, entry: u64) -> bool {
+    build_trampoline(physical, root, stack, 0, 0, nx, entry)
+}
+
+/// Stops every application processor in a halt that only a start-up IPI ends,
+/// ahead of a sleep. False when one does not stop in time.
+pub fn park_all() -> bool {
+    let wanted = ONLINE.load(Ordering::Acquire) & !1;
+    PARK.store(true, Ordering::Release);
+    let _ = wait_for(
+        || {
+            for cpu in 1..MAX_PROCESSORS {
+                if wanted & (1 << cpu) != 0 && PARKED.load(Ordering::Acquire) & (1 << cpu) == 0 {
+                    wake(cpu);
+                }
+            }
+            PARKED.load(Ordering::Acquire) & wanted == wanted
+        },
+        1_000_000_000,
+    );
+    let parked = PARKED.load(Ordering::Acquire) & wanted == wanted;
+    if !parked {
+        PARK.store(false, Ordering::Release);
+    }
+    parked
+}
+
+/// Starts the processors `park_all` stopped. Returns how many came back.
+pub fn restart_all() -> usize {
+    let wanted = PARKED.swap(0, Ordering::AcqRel);
+    PARK.store(false, Ordering::Release);
+    ONLINE.store(1, Ordering::Release);
+    IDLE.store(0, Ordering::Release);
+    FAILED.store(0, Ordering::Release);
+    for job in &JOBS {
+        job.function.store(0, Ordering::Release);
+        job.argument.store(0, Ordering::Release);
+        job.state.store(0, Ordering::Release);
+    }
+    for slot in OBSERVED_IDS.iter().skip(1) {
+        slot.store(u32::MAX, Ordering::Release);
+    }
+    let count = LISTED.load(Ordering::Acquire) as usize;
+    let mut ids = [0u32; MAX_PROCESSORS];
+    for (id, slot) in ids.iter_mut().zip(&LISTED_IDS).take(count) {
+        *id = slot.load(Ordering::Acquire);
+    }
+    let trampoline = TRAMPOLINE.load(Ordering::Acquire);
+    let bsp_id = OBSERVED_IDS[0].load(Ordering::Acquire);
+    let (started, _) = start_applications(
+        trampoline,
+        ROOT.load(Ordering::Acquire),
+        NX.load(Ordering::Acquire),
+        bsp_id,
+        &ids[..count.min(MAX_PROCESSORS)],
+    );
+    let _ = started;
+    (ONLINE.load(Ordering::Acquire) & wanted).count_ones() as usize
 }
 
 pub fn online_mask() -> u64 {
@@ -374,6 +478,7 @@ fn build_trampoline(
     logical: u32,
     apic_id: u32,
     nx: bool,
+    entry: u64,
 ) -> bool {
     let Ok(protected) = u32::try_from(physical + PROTECTED_OFFSET as u64) else {
         return false;
@@ -442,7 +547,9 @@ fn build_trampoline(
         &mut page,
         &mut cursor,
         &[
-            0x66, 0xb8, 0x20, 0x00, 0x8e, 0xd8, 0x8e, 0xc0, 0x8e, 0xd0, 0x48, 0xbc,
+            0x66, 0xb8, 0x20, 0x00, 0x8e, 0xd8, 0x8e, 0xc0, 0x8e, 0xd0, 0x0f, 0x20, 0xe0, 0x48,
+            0x0d, 0x00, 0x06, 0x00, 0x00, 0x0f, 0x22, 0xe0, 0x0f, 0x20, 0xc0, 0x48, 0x83, 0xe0,
+            0xfb, 0x48, 0x83, 0xc8, 0x02, 0x0f, 0x22, 0xc0, 0x48, 0xbc,
         ],
     ) || !emit_u64(&mut page, &mut cursor, stack)
         || !emit(&mut page, &mut cursor, &[0x31, 0xed, 0xbf])
@@ -450,11 +557,7 @@ fn build_trampoline(
         || !emit(&mut page, &mut cursor, &[0xbe])
         || !emit_u32(&mut page, &mut cursor, apic_id)
         || !emit(&mut page, &mut cursor, &[0x48, 0xb8])
-        || !emit_u64(
-            &mut page,
-            &mut cursor,
-            aeros_ap_entry as *const () as usize as u64,
-        )
+        || !emit_u64(&mut page, &mut cursor, entry)
         || !emit(&mut page, &mut cursor, &[0xff, 0xd0, 0x0f, 0x0b])
     {
         return false;
@@ -526,8 +629,11 @@ extern "sysv64" fn aeros_ap_entry(logical: u32, expected_apic_id: u32) -> ! {
     arch::interrupts::load();
     let apic_id = arch::apic::initialize_secondary();
     let cpu = arch::CpuInfo::detect();
+    crate::sleep::prepare_application_processor();
+    crate::kernel_lock::init_cpu_id(logical, cpu.rdtscp);
     let fpu = arch::fpu::initialize(&cpu);
     let syscall = arch::syscall_entry::init_for_cpu(logical, &cpu);
+    arch::user::enable_protections_here();
     OBSERVED_IDS[logical].store(apic_id, Ordering::Release);
     if !descriptors.loaded || !fpu.verified || !syscall.verified || apic_id != expected_apic_id {
         FAILED.fetch_or(1 << logical, Ordering::AcqRel);
@@ -543,11 +649,43 @@ extern "sysv64" fn aeros_ap_entry(logical: u32, expected_apic_id: u32) -> ! {
     IDLE.fetch_or(1 << (logical - 1), Ordering::AcqRel);
     loop {
         arch::disable_interrupts();
+        if PARK.load(Ordering::Acquire) {
+            park_here(logical);
+        }
         if crate::smpsched::run_next(logical) {
             continue;
         }
+        // Flag the processor as sleepy before looking for tasks, so a task that
+        // appears after the look still sends the wake-up.
+        crate::scheduler::mark_idle(logical, true);
+        match crate::scheduler::idle_step(logical) {
+            crate::scheduler::IdleStep::Ran => {
+                crate::scheduler::mark_idle(logical, false);
+                continue;
+            }
+            crate::scheduler::IdleStep::Busy => {
+                crate::scheduler::mark_idle(logical, false);
+                core::hint::spin_loop();
+                continue;
+            }
+            crate::scheduler::IdleStep::Nothing => {}
+        }
         unsafe {
             core::arch::asm!("sti; hlt", options(nomem, nostack));
+        }
+        crate::scheduler::mark_idle(logical, false);
+    }
+}
+
+/// Takes this processor out of service until a start-up IPI restarts it.
+fn park_here(logical: usize) -> ! {
+    arch::disable_interrupts();
+    crate::scheduler::cpu_parked(logical);
+    ONLINE.fetch_and(!(1 << logical), Ordering::AcqRel);
+    PARKED.fetch_or(1 << logical, Ordering::AcqRel);
+    loop {
+        unsafe {
+            core::arch::asm!("hlt", options(nomem, nostack));
         }
     }
 }

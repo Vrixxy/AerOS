@@ -1563,6 +1563,7 @@ pub fn tick(now_ns: u64) {
 
 // --- self test -----------------------------------------------------------
 
+#[cfg_attr(not(feature = "boot-test"), allow(dead_code))]
 pub fn self_test() -> bool {
     let test = eicar();
     let detects_eicar = scan_bytes(&test)
@@ -1650,6 +1651,7 @@ pub fn self_test() -> bool {
 /// marker sitting in the file in plain sight to anyone who can read the
 /// raw bytes regardless of the mode bits), then restores it and confirms
 /// the recovered content is byte-for-byte identical to the original.
+#[cfg_attr(not(feature = "boot-test"), allow(dead_code))]
 pub(crate) fn quarantine_encryption_self_test() -> bool {
     let path = "/tmp/AV_CRYPTO_TEST";
     let plaintext = b"AEROS-QUARANTINE-ENCRYPTION-MARKER-0123456789";
@@ -1707,6 +1709,7 @@ pub(crate) fn quarantine_encryption_self_test() -> bool {
 /// generic PE heuristic looks for, followed by every byte value repeated
 /// enough times to trip the high-entropy check but not so much that the
 /// buffer is expensive to build at boot.
+#[cfg_attr(not(feature = "boot-test"), allow(dead_code))]
 fn alloc_packed_stub() -> [u8; 8192] {
     let mut data = [0u8; 8192];
     let header = b"MZ\x90\0This program cannot be run in DOS mode.";
@@ -1721,6 +1724,7 @@ fn alloc_packed_stub() -> [u8; 8192] {
 /// touching the VFS: a custom hash, a custom multi-part pattern, a
 /// malformed line that must be skipped rather than aborting the load, and
 /// confirmation that an unrelated file still scans clean.
+#[cfg_attr(not(feature = "boot-test"), allow(dead_code))]
 fn dynamic_self_test() -> bool {
     let sample = b"the quick brown fox jumps over a lazy dog";
     let digest = {

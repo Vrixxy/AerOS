@@ -35,6 +35,7 @@ pub struct SystemInfo<'a> {
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "boot-test"), allow(dead_code))]
 pub struct ShellReport {
     pub commands: usize,
     pub unique: bool,
@@ -91,6 +92,7 @@ enum Handler {
     Uptime,
     Sleep,
     Ps,
+    Top,
     Kill,
     Jobs,
     Wait,
@@ -99,11 +101,17 @@ enum Handler {
     Svc,
     Pkg,
     Fsck,
+    Raid,
     Aerfs,
     Install,
     Acpi,
     Battery,
     Thermal,
+    Cpufreq,
+    Overlay,
+    Ucode,
+    Suspend,
+    Tpm,
     Swap,
     Measure,
     Update,
@@ -176,7 +184,7 @@ const fn command(
     }
 }
 
-static COMMANDS: [CommandSpec; 87] = [
+static COMMANDS: [CommandSpec; 94] = [
     command(
         "notify",
         "notify <message...>",
@@ -376,6 +384,13 @@ static COMMANDS: [CommandSpec; 87] = [
     ),
     command("ps", "ps", "show process-table state", false, Handler::Ps),
     command(
+        "top",
+        "top",
+        "show the processes using the most CPU time",
+        false,
+        Handler::Top,
+    ),
+    command(
         "kill",
         "kill <pid>",
         "request process termination",
@@ -460,6 +475,41 @@ static COMMANDS: [CommandSpec; 87] = [
         Handler::Thermal,
     ),
     command(
+        "cpufreq",
+        "cpufreq [set <n> | max | min]",
+        "list the processor performance states the firmware offers, or switch to one",
+        true,
+        Handler::Cpufreq,
+    ),
+    command(
+        "overlay",
+        "overlay [reset]",
+        "show the writable layer over the boot image, or throw it away",
+        true,
+        Handler::Overlay,
+    ),
+    command(
+        "ucode",
+        "ucode [load <file>]",
+        "show the processor's microcode revision, or load an update from a file",
+        true,
+        Handler::Ucode,
+    ),
+    command(
+        "suspend",
+        "suspend --yes",
+        "sleep to RAM (ACPI S3); the drivers are restarted when the machine wakes",
+        true,
+        Handler::Suspend,
+    ),
+    command(
+        "tpm",
+        "tpm",
+        "show the TPM 2.0 the firmware lists: identity, random bytes and PCR 0-7",
+        false,
+        Handler::Tpm,
+    ),
+    command(
         "install",
         "install [<disk> --yes]",
         "list the disks the system can be installed on, or install onto one",
@@ -479,6 +529,13 @@ static COMMANDS: [CommandSpec; 87] = [
         "check a /home or /media filesystem, optionally repairing it",
         true,
         Handler::Fsck,
+    ),
+    command(
+        "raid",
+        "raid [create linear|stripe|mirror <disk>... --yes | stop <md> | fail <md> <slot> | replace <md> <slot> <disk>]",
+        "join disks into one volume (linear, stripe, mirror); the result is md0 or md1",
+        true,
+        Handler::Raid,
     ),
     command(
         "strace",
@@ -1458,6 +1515,7 @@ impl<'a> Shell<'a> {
             Handler::Uptime => self.command_uptime(output),
             Handler::Sleep => self.command_sleep(arguments, offset, output),
             Handler::Ps => self.command_ps(output),
+            Handler::Top => self.command_top(output),
             Handler::Kill => self.command_kill(arguments, offset, output),
             Handler::Jobs => self.command_jobs(output),
             Handler::Wait => self.command_wait(arguments, offset, output),
@@ -1466,10 +1524,16 @@ impl<'a> Shell<'a> {
             Handler::Svc => self.command_svc(arguments, offset, output),
             Handler::Pkg => self.command_pkg(arguments, offset, output),
             Handler::Fsck => self.command_fsck(arguments, offset, output),
+            Handler::Raid => self.command_raid(arguments, offset, output),
             Handler::Install => self.command_install(arguments, offset, output),
             Handler::Acpi => self.command_acpi(arguments, offset, output),
             Handler::Battery => self.command_battery(output),
             Handler::Thermal => self.command_thermal(output),
+            Handler::Cpufreq => self.command_cpufreq(arguments, offset, output),
+            Handler::Tpm => self.command_tpm(output),
+            Handler::Overlay => self.command_overlay(arguments, offset, output),
+            Handler::Ucode => self.command_ucode(arguments, offset, output),
+            Handler::Suspend => self.command_suspend(arguments, offset, output),
             Handler::Measure => {
                 if arguments.get(offset) == Some("seal") {
                     let sealed = crate::measure::seal(crate::measure::REFERENCE_PATH);
@@ -1623,6 +1687,101 @@ impl<'a> Shell<'a> {
         } else {
             "aero"
         }
+    }
+
+    /// Tab completion for the word at the end of `line`: command names for
+    /// the first word, directory entries (relative to the working directory)
+    /// for the rest. Returns the line with that word extended as far as
+    /// every candidate agrees (and a space after a single file or command),
+    /// and the number of candidates; with several, `names` lists them.
+    pub fn complete(&self, line: &str, names: &mut Text<512>) -> (Text<160>, usize) {
+        const MAX_CANDIDATES: usize = 24;
+        let mut result: Text<160> = Text::new();
+        names.clear();
+        let word_start = line.rfind(' ').map_or(0, |index| index + 1);
+        let (head, word) = line.split_at(word_start);
+        let first_word = head.bytes().all(|byte| byte == b' ');
+        let (directory_part, prefix) = if first_word {
+            ("", word)
+        } else {
+            match word.rfind('/') {
+                Some(index) => (&word[..=index], &word[index + 1..]),
+                None => ("", word),
+            }
+        };
+        let mut candidates: [Text<64>; MAX_CANDIDATES] = [Text::new(); MAX_CANDIDATES];
+        let mut count = 0usize;
+        let mut add = |name: &str, directory: bool, candidates: &mut [Text<64>; MAX_CANDIDATES]| {
+            if count < MAX_CANDIDATES && name.starts_with(prefix) {
+                let mut entry: Text<64> = Text::new();
+                let _ = entry.push_str_checked(name);
+                if directory {
+                    let _ = entry.push_str_checked("/");
+                }
+                candidates[count] = entry;
+                count += 1;
+            }
+        };
+        if first_word {
+            for specification in COMMANDS.iter() {
+                add(specification.name, false, &mut candidates);
+            }
+        } else {
+            let mut path: Text<MAX_PATH> = Text::new();
+            let target = if directory_part.is_empty() {
+                "."
+            } else {
+                directory_part
+            };
+            if normalize_path(self.cwd.as_str(), target, &mut path).is_err() {
+                return (Text::new(), 0);
+            }
+            if let Ok(descriptor) = vfs::open_directory(path.as_str()) {
+                while let Ok(Some(entry)) = vfs::next_directory_entry(descriptor) {
+                    let name =
+                        core::str::from_utf8(&entry.name[..entry.name_len as usize]).unwrap_or("");
+                    if name.is_empty() || name == "." || name == ".." {
+                        continue;
+                    }
+                    if name.starts_with('.') && !prefix.starts_with('.') {
+                        continue;
+                    }
+                    add(name, entry.kind == 4, &mut candidates);
+                }
+                let _ = vfs::close(descriptor);
+            }
+        }
+        if count == 0 {
+            return (Text::new(), 0);
+        }
+        // Longest prefix every candidate shares.
+        let first = candidates[0].as_str();
+        let mut common = first.len();
+        for candidate in &candidates[1..count] {
+            let other = candidate.as_str();
+            let mut same = 0;
+            for (left, right) in first.chars().zip(other.chars()) {
+                if left != right {
+                    break;
+                }
+                same += left.len_utf8();
+            }
+            common = common.min(same);
+        }
+        let _ = result.push_str_checked(head);
+        let _ = result.push_str_checked(directory_part);
+        let _ = result.push_str_checked(&first[..common]);
+        if count == 1 {
+            if !first.ends_with('/') {
+                let _ = result.push_str_checked(" ");
+            }
+        } else {
+            for candidate in &candidates[..count] {
+                let _ = names.push_str_checked(candidate.as_str());
+                let _ = names.push_str_checked("  ");
+            }
+        }
+        (result, count)
     }
 
     fn make_path(&self, input: &str, output: &mut Text<MAX_PATH>) -> Result<(), &'static str> {
@@ -2114,7 +2273,7 @@ impl Shell<'_> {
         }
         // `/home` and `/media` files have no zero-copy `'static` view, so they
         // are read into a scratch buffer and spawned from inside the closure.
-        let outcome = if crate::datafs::route(path.as_str()).is_some() {
+        let outcome = if vfs::needs_buffer(path.as_str()) {
             vfs::with_home_file(path.as_str(), |data, _mode| {
                 run_scanned(data, &state, path.as_str(), &argv[..argc])
             })
@@ -2687,19 +2846,20 @@ impl Shell<'_> {
     }
 
     fn command_ps(&mut self, output: &mut Text<MAX_OUTPUT>) {
-        let _ = writeln!(output, "PID  PPID PGID SID  STATE   NI  PAGES");
-        let _ = writeln!(output, "0    0    0    0    running 0   0");
+        let _ = writeln!(output, "PID  PPID PGID SID  STATE   NI  PAGES   CPU ms");
+        let _ = writeln!(output, "0    0    0    0    running 0   0       0");
         scheduler::list_tasks(|task| {
             let _ = writeln!(
                 output,
-                "{:<4} {:<4} {:<4} {:<4} {:<7} {:<3} {}",
+                "{:<4} {:<4} {:<4} {:<4} {:<7} {:<3} {:<7} {}",
                 task.id,
                 task.parent_id,
                 task.pgid,
                 task.sid,
                 if task.running { "running" } else { "ready" },
                 task.nice,
-                task.resident_pages
+                task.resident_pages,
+                task.cpu_ms
             );
         });
         let stats = process::stats();
@@ -2708,6 +2868,43 @@ impl Shell<'_> {
             "spawned={} reaped={} ready={} running={} zombies={}",
             stats.spawned, stats.reaped, stats.ready, stats.running, stats.zombies
         );
+    }
+
+    fn command_top(&mut self, output: &mut Text<MAX_OUTPUT>) {
+        let mut rows = [None; 32];
+        let mut count = 0;
+        let mut total_ms = 0u64;
+        scheduler::list_tasks(|task| {
+            total_ms += task.cpu_ms;
+            if count < rows.len() {
+                rows[count] = Some(task);
+                count += 1;
+            }
+        });
+        rows[..count].sort_unstable_by_key(|row| core::cmp::Reverse(row.map_or(0, |t| t.cpu_ms)));
+        let uptime_ms = time::monotonic_nanoseconds() / 1_000_000;
+        let _ = writeln!(
+            output,
+            "up {} s, {} processes, CPU time used {} ms",
+            uptime_ms / 1000,
+            count,
+            total_ms
+        );
+        let _ = writeln!(output, "PID  CPU ms   SHARE PAGES   NI  STATE");
+        for task in rows.iter().take(12).flatten() {
+            let share = (task.cpu_ms * 1000).checked_div(total_ms).unwrap_or(0);
+            let _ = writeln!(
+                output,
+                "{:<4} {:<8} {:>2}.{}% {:<7} {:<3} {}",
+                task.id,
+                task.cpu_ms,
+                share / 10,
+                share % 10,
+                task.resident_pages,
+                task.nice,
+                if task.running { "running" } else { "ready" }
+            );
+        }
     }
 
     fn command_kill(
@@ -3094,6 +3291,122 @@ impl Shell<'_> {
         });
     }
 
+    fn command_tpm(&mut self, output: &mut Text<MAX_OUTPUT>) {
+        use crate::{tpm, tpm_device};
+        let Some(id) = tpm_device::present() else {
+            let _ = writeln!(output, "no TPM listed by the firmware");
+            return;
+        };
+        let _ = writeln!(
+            output,
+            "TPM 2.0 at {:#x}, vendor/device {id:#010x}",
+            tpm::TIS_BASE
+        );
+        let mut response = [0u8; tpm::MAX_RESPONSE];
+        // The firmware has normally started it already; a second start is refused.
+        let _ = tpm_device::run(&tpm::startup(), &mut response);
+        match tpm_device::run(&tpm::get_random(8), &mut response)
+            .and_then(|length| tpm::random_bytes(&response[..length]).map(|bytes| bytes.len()))
+        {
+            Ok(count) => {
+                let _ = write!(output, "random:");
+                for byte in &response[12..12 + count] {
+                    let _ = write!(output, " {byte:02x}");
+                }
+                let _ = writeln!(output);
+            }
+            Err(error) => {
+                let _ = writeln!(output, "random: {error:?}");
+            }
+        }
+        for index in 0..8u8 {
+            let value = tpm_device::run(&tpm::pcr_read(index), &mut response)
+                .and_then(|length| tpm::pcr_value(&response[..length]));
+            match value {
+                Ok(digest) => {
+                    let _ = write!(output, "PCR{index}: ");
+                    for byte in &digest[..8] {
+                        let _ = write!(output, "{byte:02x}");
+                    }
+                    let _ = writeln!(output, "...");
+                }
+                Err(error) => {
+                    let _ = writeln!(output, "PCR{index}: {error:?}");
+                }
+            }
+        }
+    }
+
+    fn command_cpufreq(
+        &mut self,
+        arguments: &Arguments,
+        offset: usize,
+        output: &mut Text<MAX_OUTPUT>,
+    ) {
+        use crate::pstate::Error;
+        use crate::{acpi_ns, cpufreq, pstate};
+        if !acpi_ns::report().loaded {
+            self.fail(output, "cpufreq", "no ACPI namespace");
+            return;
+        }
+        let listed = acpi_ns::with(|aml| cpufreq::find(aml).map(|(_, table)| table));
+        let Some(table) = listed else {
+            let _ = writeln!(output, "the firmware lists no performance states");
+            return;
+        };
+        if let Some(action) = arguments.get(offset) {
+            let last = table.count - 1;
+            let target = match action {
+                "max" => Some(table.first_allowed),
+                "min" => Some(last),
+                "set" => arguments
+                    .get(offset + 1)
+                    .and_then(|value| value.parse::<usize>().ok()),
+                _ => None,
+            };
+            let Some(target) = target else {
+                self.usage_named(output, "cpufreq");
+                return;
+            };
+            match pstate::set(target) {
+                Ok(index) => {
+                    let _ = writeln!(output, "moved all processors to P{index}");
+                }
+                Err(error) => {
+                    let reason = match error {
+                        Error::Virtualised => "under a hypervisor the host sets the clock",
+                        Error::NoNamespace => "no ACPI namespace",
+                        Error::NoStates => "the firmware lists no performance states",
+                        Error::NoRegister => "the firmware names no control register (_PCT)",
+                        Error::BadState => "no such state, or the firmware does not allow it now",
+                        Error::Stuck => "a processor did not respond",
+                    };
+                    self.fail(output, "cpufreq", reason);
+                }
+            }
+            return;
+        }
+        for (index, state) in table.states().iter().enumerate() {
+            let _ = writeln!(
+                output,
+                "P{index}: {} MHz, {} mW, {} us{}{}",
+                state.mhz,
+                state.milliwatts,
+                state.latency,
+                if index < table.first_allowed {
+                    " (not allowed now)"
+                } else {
+                    ""
+                },
+                if pstate::current() == Some(index) {
+                    " (current)"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+
     fn command_thermal(&mut self, output: &mut Text<MAX_OUTPUT>) {
         use crate::{acpi_devices, acpi_events, acpi_ns};
         if !acpi_ns::report().loaded {
@@ -3276,6 +3589,280 @@ impl Shell<'_> {
                 }
             }
             Err(failure) => self.fail_vfs(output, "aerfs", failure),
+        }
+    }
+
+    fn command_suspend(
+        &mut self,
+        arguments: &Arguments,
+        offset: usize,
+        output: &mut Text<MAX_OUTPUT>,
+    ) {
+        use crate::sleep::Error;
+        if arguments.get(offset) != Some("--yes") {
+            let _ = writeln!(
+                output,
+                "this sleeps the machine and restarts the drivers when it wakes. Run `suspend --yes`."
+            );
+            return;
+        }
+        match crate::sleep::suspend() {
+            Ok(done) => {
+                let _ = writeln!(
+                    output,
+                    "resumed, {} of {} processors back",
+                    done.processors, done.expected
+                );
+            }
+            Err(error) => {
+                let reason = match error {
+                    Error::Unsupported => "the firmware offers no S3",
+                    Error::Busy => "programs are running on other processors",
+                    Error::CpuStuck => "a processor did not stop",
+                    Error::NotEntered => "the machine did not go to sleep",
+                };
+                self.fail(output, "suspend", reason);
+            }
+        }
+    }
+
+    fn command_ucode(
+        &mut self,
+        arguments: &Arguments,
+        offset: usize,
+        output: &mut Text<MAX_OUTPUT>,
+    ) {
+        use crate::ucode::Error;
+        if crate::microcode::virtualised() {
+            let _ = writeln!(
+                output,
+                "running under a hypervisor: the host owns the microcode"
+            );
+            return;
+        }
+        let Some(cpu) = crate::microcode::identify() else {
+            let _ = writeln!(output, "unknown processor vendor");
+            return;
+        };
+        let _ = writeln!(
+            output,
+            "{:?} signature {:#010x} platform {:#x} revision {:#x}",
+            cpu.vendor, cpu.signature, cpu.platform, cpu.revision
+        );
+        if arguments.get(offset) != Some("load") {
+            return;
+        }
+        let Some(name) = arguments.get(offset + 1) else {
+            self.usage_named(output, "ucode");
+            return;
+        };
+        let mut path: Text<MAX_PATH> = Text::new();
+        if self.make_path(name, &mut path).is_err() {
+            self.fail(output, "ucode", "invalid path");
+            return;
+        }
+        match crate::ucode::load(path.as_str()) {
+            Ok(done) => {
+                let _ = writeln!(
+                    output,
+                    "revision {:#x} -> {:#x} on {} processors, {} failed",
+                    done.before, done.after, done.processors, done.failed
+                );
+                if done.failed != 0 {
+                    self.last_status = 1;
+                }
+            }
+            Err(Error::NoUpdate { current }) => {
+                let _ = writeln!(
+                    output,
+                    "no newer update for this processor (revision {current:#x})"
+                );
+            }
+            Err(Error::NoFile) => self.fail(output, "ucode", "cannot read the file"),
+            Err(Error::Unavailable) => self.fail(output, "ucode", "not available here"),
+        }
+    }
+
+    fn command_overlay(
+        &mut self,
+        arguments: &Arguments,
+        offset: usize,
+        output: &mut Text<MAX_OUTPUT>,
+    ) {
+        if !crate::overlay::is_enabled() {
+            let _ = writeln!(output, "the boot image is read-only (no home volume)");
+            return;
+        }
+        if arguments.get(offset) == Some("reset") {
+            let removed = crate::overlay::reset();
+            let _ = writeln!(output, "upper layer cleared, {removed} files removed");
+            return;
+        }
+        let _ = writeln!(
+            output,
+            "union root over the boot image, {} whiteout marks",
+            crate::overlay::mark_count()
+        );
+    }
+
+    fn command_raid(
+        &mut self,
+        arguments: &Arguments,
+        offset: usize,
+        output: &mut Text<MAX_OUTPUT>,
+    ) {
+        use crate::raid::{self, Error, Level, Member};
+        let volume_of = |name: &str| match name {
+            "md0" => Some(0usize),
+            "md1" => Some(1usize),
+            _ => None,
+        };
+        let describe = |error: Error| match error {
+            Error::Members => "wrong number of disks for that level",
+            Error::Disk => "a disk is missing, empty or too small",
+            Error::Busy => "a disk is already in a volume, mounted or the boot disk",
+            Error::Slot => "no free volume or no such volume",
+        };
+        match arguments.get(offset) {
+            None => {
+                let mut any = false;
+                for index in 0..raid::MAX_VOLUMES {
+                    let Some(info) = raid::info(index) else {
+                        continue;
+                    };
+                    any = true;
+                    let _ = write!(
+                        output,
+                        "md{index} {} {} sectors, {} disks",
+                        info.level.name(),
+                        info.sectors,
+                        info.members
+                    );
+                    if info.level == Level::Stripe {
+                        let _ = write!(output, ", {}-sector chunks", info.chunk);
+                    }
+                    if info.failed != 0 {
+                        let _ = write!(output, ", DEGRADED ({} failed)", info.failed);
+                    }
+                    for slot in 0..info.members {
+                        let name =
+                            raid::member_disk(index, slot).map_or("?", crate::datafs::device_name);
+                        let state = if raid::member_failed(index, slot) {
+                            " (failed)"
+                        } else {
+                            ""
+                        };
+                        let _ = write!(output, " {name}{state}");
+                    }
+                    let _ = writeln!(output);
+                }
+                if !any {
+                    let _ = writeln!(output, "no volumes (raid create <level> <disk>...)");
+                }
+            }
+            Some("create") => {
+                let Some(level) = arguments.get(offset + 1).and_then(Level::parse) else {
+                    self.usage_named(output, "raid");
+                    return;
+                };
+                let mut members = [Member::Disk(crate::block::Disk::Nvme); raid::MAX_MEMBERS];
+                let mut count = 0;
+                let mut position = offset + 2;
+                let mut confirmed = false;
+                while let Some(name) = arguments.get(position) {
+                    if name == "--yes" {
+                        confirmed = true;
+                        position += 1;
+                        continue;
+                    }
+                    let Some(disk) = crate::datafs::disk_by_name(name) else {
+                        self.fail(output, "raid", "no such disk (see lsblk)");
+                        return;
+                    };
+                    if count == raid::MAX_MEMBERS {
+                        self.fail(output, "raid", "too many disks");
+                        return;
+                    }
+                    members[count] = Member::Disk(disk);
+                    count += 1;
+                    position += 1;
+                }
+                if !confirmed {
+                    let _ = writeln!(
+                        output,
+                        "this writes a header to the last sector of each disk (a GPT backup there is lost); add --yes to go on"
+                    );
+                    self.last_status = 1;
+                    return;
+                }
+                match raid::create(level, 128, &members[..count]) {
+                    Ok(index) => {
+                        let _ = writeln!(
+                            output,
+                            "md{index} is a {} volume of {} sectors",
+                            level.name(),
+                            raid::sectors(index as usize)
+                        );
+                    }
+                    Err(error) => self.fail(output, "raid", describe(error)),
+                }
+            }
+            Some("stop") => {
+                let Some(index) = arguments.get(offset + 1).and_then(volume_of) else {
+                    self.usage_named(output, "raid");
+                    return;
+                };
+                if crate::datafs::disk_mounted(crate::block::Disk::Volume(index as u8)) {
+                    self.fail(output, "raid", "the volume is mounted");
+                } else if raid::stop(index) {
+                    let _ = writeln!(output, "md{index} stopped");
+                } else {
+                    self.fail(output, "raid", "no such volume");
+                }
+            }
+            Some("fail") => {
+                let (Some(index), Some(slot)) = (
+                    arguments.get(offset + 1).and_then(volume_of),
+                    arguments
+                        .get(offset + 2)
+                        .and_then(|text| text.parse::<usize>().ok()),
+                ) else {
+                    self.usage_named(output, "raid");
+                    return;
+                };
+                if raid::fail(index, slot) {
+                    let _ = writeln!(output, "md{index} slot {slot} marked failed");
+                } else {
+                    self.fail(
+                        output,
+                        "raid",
+                        "only a mirror with another working disk can lose one",
+                    );
+                }
+            }
+            Some("replace") => {
+                let (Some(index), Some(slot), Some(name)) = (
+                    arguments.get(offset + 1).and_then(volume_of),
+                    arguments
+                        .get(offset + 2)
+                        .and_then(|text| text.parse::<usize>().ok()),
+                    arguments.get(offset + 3),
+                ) else {
+                    self.usage_named(output, "raid");
+                    return;
+                };
+                let Some(disk) = crate::datafs::disk_by_name(name) else {
+                    self.fail(output, "raid", "no such disk (see lsblk)");
+                    return;
+                };
+                match raid::replace(index, slot, Member::Disk(disk)) {
+                    Ok(()) => {
+                        let _ = writeln!(output, "md{index} slot {slot} is {name}, resynchronised");
+                    }
+                    Err(error) => self.fail(output, "raid", describe(error)),
+                }
+            }
+            Some(_) => self.usage_named(output, "raid"),
         }
     }
 
@@ -4015,6 +4602,31 @@ impl Shell<'_> {
             cpu.xsave,
             cpu.avx
         );
+        if crate::kernel_lock::active() {
+            let lock = crate::kernel_lock::stats();
+            let _ = writeln!(
+                output,
+                "Scheduler: user programs run on the application processors, kernel under one lock"
+            );
+            let _ = writeln!(
+                output,
+                "Kernel lock: {} taken, {} contended ({} spins), {} yielded, {} failed tries",
+                lock.acquisitions, lock.contended, lock.spins, lock.relaxes, lock.try_failed
+            );
+            for index in 0..self.info.cpu_count.min(crate::acpi::MAX_PROCESSORS) {
+                let _ = writeln!(
+                    output,
+                    "CPU{index}: {} task switches, {} kernel entries from user mode",
+                    crate::scheduler::dispatches(index),
+                    lock.entries[index]
+                );
+            }
+        } else {
+            let _ = writeln!(
+                output,
+                "Scheduler: user programs run on the bootstrap processor"
+            );
+        }
     }
 
     fn command_lspci(&mut self, output: &mut Text<MAX_OUTPUT>) {
@@ -4036,7 +4648,7 @@ impl Shell<'_> {
 
     fn command_lsblk(&mut self, output: &mut Text<MAX_OUTPUT>) {
         use crate::fatfs::Disk;
-        let mut disks = [None; 8];
+        let mut disks = [None; 10];
         let mut count = 0;
         for index in 0..crate::ahci::disk_count().min(3) {
             disks[count] = Some(Disk::Ahci(index));
@@ -4046,7 +4658,13 @@ impl Shell<'_> {
             disks[count] = Some(disk);
             count += 1;
         }
-        let _ = writeln!(output, "NAME      SIZE MiB  TYPE  MOUNTPOINT");
+        for volume in 0..crate::raid::MAX_VOLUMES {
+            if crate::raid::info(volume).is_some() {
+                disks[count] = Some(Disk::Volume(volume as u8));
+                count += 1;
+            }
+        }
+        let _ = writeln!(output, "NAME      SIZE MiB  TYPE   MOUNTPOINT");
         let mut listed = false;
         for disk in disks.into_iter().flatten() {
             let sectors = disk.sectors();
@@ -4065,11 +4683,22 @@ impl Shell<'_> {
                 }
                 index += 1;
             }
+            let kind = match disk {
+                Disk::Volume(volume) => {
+                    crate::raid::info(volume as usize).map_or("raid", |info| match info.level {
+                        crate::raid::Level::Linear => "linear",
+                        crate::raid::Level::Stripe => "raid0",
+                        crate::raid::Level::Mirror => "raid1",
+                    })
+                }
+                _ => "disk",
+            };
             let _ = writeln!(
                 output,
-                "{:<9} {:>8}  disk  {}",
+                "{:<9} {:>8}  {:<6} {}",
                 name,
                 sectors * 512 / 1024 / 1024,
+                kind,
                 mount_path.as_str()
             );
         }
@@ -4649,11 +5278,11 @@ pub(crate) fn fuzz_line(line: &str) -> usize {
 /// the number of lines executed.
 #[cfg(feature = "boot-test")]
 pub(crate) fn fuzz_commands(info: SystemInfo<'_>, rounds: u32) -> u32 {
-    const READERS: [&str; 41] = [
+    const READERS: [&str; 42] = [
         "echo", "pwd", "ls", "cat", "head", "tail", "wc", "stat", "readlink", "uname", "whoami",
         "id", "date", "uptime", "ps", "jobs", "grep", "find", "du", "uniq", "sort", "basename",
         "dirname", "seq", "true", "false", "free", "lscpu", "lspci", "lsblk", "mount", "df",
-        "which", "env", "history", "ip", "route", "arp", "netstat", "help", "man",
+        "which", "env", "history", "ip", "route", "arp", "netstat", "help", "man", "top",
     ];
     const WRITERS: [&str; 8] = ["touch", "mkdir", "rm", "ln", "cp", "mv", "tee", "chmod"];
     const PRIVILEGED_READERS: [&str; 3] = ["dmesg", "strace", "crashes"];
@@ -4782,6 +5411,7 @@ fn write_ipv6(output: &mut Text<MAX_OUTPUT>, address: [u8; 16]) {
     crate::ip::format(&address, output);
 }
 
+#[cfg_attr(not(feature = "boot-test"), allow(dead_code))]
 fn ipv6_text_valid() -> bool {
     let render = |address: [u8; 16]| {
         let mut text: Text<MAX_OUTPUT> = Text::new();
@@ -5143,6 +5773,7 @@ pub(crate) fn vfs_error(failure: vfs::VfsError) -> &'static str {
     }
 }
 
+#[cfg_attr(not(feature = "boot-test"), allow(dead_code))]
 pub fn self_test(info: SystemInfo<'_>) -> ShellReport {
     let unique = COMMANDS.iter().enumerate().all(|(left, command)| {
         !command.name.is_empty()
@@ -5711,7 +6342,7 @@ pub fn self_test(info: SystemInfo<'_>) -> ShellReport {
         pipelines,
         strace_command,
         fsck_command,
-        verified: COMMANDS.len() == 87
+        verified: COMMANDS.len() == 94
             && unique
             && parser
             && privilege
@@ -5831,4 +6462,31 @@ fn scancode_character_us(code: u8, shift: bool, caps: bool) -> Option<u8> {
 
 fn find_command(name: &str) -> Option<&'static CommandSpec> {
     COMMANDS.iter().find(|command| command.name == name)
+}
+
+/// Boot test: command and path completion.
+#[cfg(feature = "boot-test")]
+pub fn completion_self_test(info: SystemInfo<'_>) -> bool {
+    let shell = Shell::new(info, false);
+    let mut names: Text<512> = Text::new();
+    let (unique, unique_count) = shell.complete("whi", &mut names);
+    let (path, path_count) = shell.complete("cat /etc/ho", &mut names);
+    let listed = names.as_str().contains("hostname/") || names.as_str().contains("hostname");
+    let (directory, directory_count) = shell.complete("ls /et", &mut names);
+    let (nothing, nothing_count) = shell.complete("zzzz", &mut names);
+    let (several, several_count) = shell.complete("s", &mut names);
+    let (second, second_count) = shell.complete("echo hi /e", &mut names);
+    unique.as_str() == "which "
+        && unique_count == 1
+        && path.as_str() == "cat /etc/host"
+        && path_count == 2
+        && listed
+        && directory.as_str() == "ls /etc/"
+        && directory_count == 1
+        && nothing.as_str().is_empty()
+        && nothing_count == 0
+        && several.as_str() == "s"
+        && several_count > 5
+        && second.as_str() == "echo hi /etc/"
+        && second_count == 1
 }

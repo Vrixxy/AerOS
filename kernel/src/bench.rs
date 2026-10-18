@@ -12,6 +12,7 @@ use crate::time::monotonic_nanoseconds;
 
 const SLICE_NS: u64 = 60_000_000;
 
+#[cfg_attr(not(feature = "boot-test"), allow(dead_code))]
 pub const LABELS: [&str; 6] = ["memcpy", "sha256", "random", "lookup", "tmpfs-io", "yield"];
 
 /// Calls `step` until the time slice is used up and returns `(units, ns)`,

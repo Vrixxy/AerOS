@@ -6,7 +6,13 @@ publish = false
 
 [features]
 boot-test = []
+# Sleeps right after the processors start (tools/s3-quick.ps1) instead of running the whole boot test.
+s3-early = ["boot-test"]
 linux-guest = []
+# Prefixes every serial line with the milliseconds since boot (boot profiling).
+serial-stamps = []
+# Panics once the boot has finished, to look at the panic screen.
+panic-demo = []
 # With linux-guest: run the VM to completion at boot and log to serial
 # (tools/boot-linux.ps1) instead of waiting for the desktop's Linux window.
 linux-headless = ["linux-guest"]

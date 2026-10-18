@@ -159,6 +159,42 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> NicReport 
     report
 }
 
+/// Brings the chip back after a sleep that cost it its state: a reset, then
+/// the receive ring (same memory, emptied) and the receiver and transmitter.
+pub fn resume() -> bool {
+    let mut state = NIC.lock();
+    if !state.ready {
+        return true;
+    }
+    let mmio = state.mmio;
+    write8(mmio, CONFIG1, 0);
+    write8(mmio, CR, CR_RESET);
+    let mut waited = 0u32;
+    while read8(mmio, CR) & CR_RESET != 0 {
+        waited += 1;
+        if waited > 10_000_000 {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    unsafe {
+        core::ptr::write_bytes(
+            state.rx as usize as *mut u8,
+            0,
+            ((RX_BUFFER_PAGES + 2) * 4096) as usize,
+        )
+    };
+    write32(mmio, RBSTART, state.rx as u32);
+    write16(mmio, IMR, 0);
+    write16(mmio, ISR, 0xffff);
+    write32(mmio, RCR, 0x0e | 1 << 7 | 7 << 8);
+    write32(mmio, TCR, 3 << 24 | 7 << 8);
+    write8(mmio, CR, CR_RX_ENABLE | CR_TX_ENABLE);
+    state.rx_offset = 0;
+    state.tx_index = 0;
+    true
+}
+
 pub fn transmit(packet: &[u8]) -> bool {
     if !(14..=1514).contains(&packet.len()) {
         return false;

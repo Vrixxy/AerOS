@@ -4,6 +4,8 @@ use crate::sync::TicketLock;
 
 pub const MAX_FROST_PIXELS: usize = 1_048_576;
 const MAX_BLUR_RADIUS: u8 = 32;
+/// Below this many pixels the CPU blur is cheaper than a GPU round trip.
+const GPU_FROST_MIN_PIXELS: usize = 3_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Point {
@@ -563,6 +565,33 @@ impl FrostPixel {
     }
 }
 
+/// Nanoseconds spent per frost stage since the last `frost_profile_take`:
+/// shadow, capture, horizontal blur, vertical blur + colour + write, edges.
+static FROST_PROFILE: [core::sync::atomic::AtomicU64; 5] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+fn frost_prof(slot: usize, since: u64) -> u64 {
+    let now = crate::time::monotonic_nanoseconds();
+    FROST_PROFILE[slot].fetch_add(
+        now.saturating_sub(since),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    now
+}
+
+pub fn frost_profile_take() -> [u64; 5] {
+    let mut out = [0u64; 5];
+    for (slot, value) in FROST_PROFILE.iter().enumerate() {
+        out[slot] = value.swap(0, core::sync::atomic::Ordering::Relaxed) / 1000;
+    }
+    out
+}
+
 struct FrostScratch {
     source: [FrostPixel; MAX_FROST_PIXELS],
     horizontal: [FrostPixel; MAX_FROST_PIXELS],
@@ -831,6 +860,9 @@ impl<'a> Painter<'a> {
         // per-pixel corner test (most of a large panel).
         let band_top = bounds.y + radii.top_left.max(radii.top_right);
         let band_bottom = bounds.bottom() - radii.bottom_left.max(radii.bottom_right);
+        // Columns that no corner square reaches are plain fill on every row.
+        let plain_left = bounds.x + radii.top_left.max(radii.bottom_left);
+        let plain_right = bounds.right() - radii.top_right.max(radii.bottom_right);
         for y in area.y..area.bottom() {
             if y >= band_top && y < band_bottom {
                 for x in area.x..area.right() {
@@ -839,6 +871,10 @@ impl<'a> Painter<'a> {
                 continue;
             }
             for x in area.x..area.right() {
+                if x >= plain_left && x < plain_right {
+                    self.frame.blend(x, y, color.color(), color.alpha);
+                    continue;
+                }
                 let coverage = rounded_coverage(bounds, radii, Point::new(x, y));
                 if coverage != 0 {
                     self.frame
@@ -867,6 +903,8 @@ impl<'a> Painter<'a> {
         let band_top = bounds.y + radii.top_left.max(radii.top_right);
         let band_bottom = bounds.bottom() - radii.bottom_left.max(radii.bottom_right);
         let edge = width as i32;
+        let plain_left = bounds.x + radii.top_left.max(radii.bottom_left);
+        let plain_right = bounds.right() - radii.top_right.max(radii.bottom_right);
         for y in area.y..area.bottom() {
             if y >= band_top && y < band_bottom {
                 // Straight sides: only the two edge strips are inked.
@@ -879,6 +917,14 @@ impl<'a> Painter<'a> {
                 continue;
             }
             for x in area.x..area.right() {
+                if x >= plain_left && x < plain_right {
+                    // Between the corner squares only the top and bottom
+                    // edge strips are inked.
+                    if y < bounds.y + edge || y >= bounds.bottom() - edge {
+                        self.frame.blend(x, y, color.color(), color.alpha);
+                    }
+                    continue;
+                }
                 let point = Point::new(x, y);
                 let outer_coverage = rounded_coverage(bounds, radii, point);
                 let inner_coverage = inner
@@ -959,11 +1005,26 @@ impl<'a> Painter<'a> {
         // The drop shadow is up to 16 full-size blended layers - by far the
         // costliest part for a big panel - so a moving panel (step > 1) goes
         // without it and gets it back when it settles.
+        let t0 = crate::time::monotonic_nanoseconds();
         if step == 1 {
             self.paint_shadow(bounds, fitted, style);
         }
+        let t1 = frost_prof(0, t0);
+        if pixels >= GPU_FROST_MIN_PIXELS
+            && crate::virtio_gpu::frost_available()
+            && self.frost_on_gpu(area, bounds, fitted, style)
+        {
+            self.frost_edges(bounds, fitted, style);
+            return FrostReport {
+                pixels,
+                blur_radius: style.blur_radius,
+                captured: true,
+                clipped: area != bounds,
+            };
+        }
         let mut scratch = FROST_SCRATCH.lock();
         capture(self.frame, area, &mut scratch.source[..pixels]);
+        let t2 = frost_prof(1, t1);
         {
             let FrostScratch { source, horizontal } = &mut *scratch;
             horizontal_blur(
@@ -974,6 +1035,7 @@ impl<'a> Painter<'a> {
                 style.blur_radius as usize,
             );
         }
+        let t3 = frost_prof(2, t2);
         let width = area.width as usize;
         let height = area.height as usize;
         let radius = style.blur_radius as usize;
@@ -1053,7 +1115,21 @@ impl<'a> Painter<'a> {
                 end = next_end;
             }
         }
+
         drop(scratch);
+        let t4 = frost_prof(3, t3);
+        self.frost_edges(bounds, fitted, style);
+        frost_prof(4, t4);
+        FrostReport {
+            pixels,
+            blur_radius: style.blur_radius,
+            captured: true,
+            clipped: area != bounds,
+        }
+    }
+
+    /// The inner shadow, border and highlight painted over a frosted shape.
+    fn frost_edges(&mut self, bounds: Rect, fitted: CornerRadii, style: FrostStyle) {
         self.paint_inner_shadow(bounds, fitted, style);
         self.stroke_rounded_rect(bounds, fitted, style.border_width, style.border);
         if style.inner_highlight.alpha != 0 {
@@ -1066,40 +1142,154 @@ impl<'a> Painter<'a> {
                 style.inner_highlight,
             );
         }
-        FrostReport {
-            pixels,
-            blur_radius: style.blur_radius,
-            captured: true,
-            clipped: area != bounds,
-        }
     }
 
+    /// The whole frosted fill (blur, grade, shape edge) on the GPU, written
+    /// straight from the GPU's rows. False, with the frame untouched, when
+    /// the GPU cannot do it.
+    fn frost_on_gpu(
+        &mut self,
+        area: Rect,
+        bounds: Rect,
+        fitted: CornerRadii,
+        style: FrostStyle,
+    ) -> bool {
+        let width = area.width as usize;
+        let height = area.height as usize;
+        let grade = crate::virtio_gpu::Grade {
+            saturation: style.saturation_percent as f32 / 100.0,
+            brightness: style.brightness_percent as f32 / 100.0,
+            tint: [
+                style.tint.red as f32 / 255.0,
+                style.tint.green as f32 / 255.0,
+                style.tint.blue as f32 / 255.0,
+                style.tint.alpha as f32 / 255.0,
+            ],
+        };
+        let corner = fitted
+            .top_left
+            .max(fitted.top_right)
+            .max(fitted.bottom_right)
+            .max(fitted.bottom_left);
+        if area.x < 0
+            || area.y < 0
+            || area.right() > self.frame.width() as i32
+            || area.bottom() > self.frame.height() as i32
+        {
+            return false;
+        }
+        let frame_pointer: *mut FrameBuffer = &mut *self.frame;
+        let (x0, y0) = (area.x as usize, area.y as usize);
+        crate::virtio_gpu::frost_pass(
+            width as u32,
+            height as u32,
+            style.blur_radius as u32,
+            grade,
+            &mut |bytes, stride| {
+                // SAFETY: the pointer is to the frame this painter holds;
+                // the two closures run one after the other.
+                let frame = unsafe { &*frame_pointer };
+                frame.read_bgra_region(x0, y0, width, height, bytes, stride);
+            },
+            &mut |bytes, stride| {
+                let frame = unsafe { &mut *frame_pointer };
+                let straight_left = (bounds.x + corner).max(area.x);
+                let straight_right = (bounds.right() - corner).min(area.right());
+                for local_y in 0..height {
+                    let y = area.y + local_y as i32;
+                    let row = &bytes[local_y * stride..local_y * stride + width * 4];
+                    let in_band = y >= bounds.y + corner && y < bounds.bottom() - corner;
+                    if in_band {
+                        frame.write_bgra_row(x0, y as usize, row);
+                        continue;
+                    }
+                    let mid_start = (straight_left - area.x).clamp(0, width as i32) as usize;
+                    let mid_end = (straight_right - area.x).clamp(0, width as i32) as usize;
+                    let (mid_start, mid_end) = if mid_end > mid_start {
+                        (mid_start, mid_end)
+                    } else {
+                        (width, width)
+                    };
+                    for local_x in (0..mid_start).chain(mid_end..width) {
+                        let x = area.x + local_x as i32;
+                        let coverage = rounded_coverage(bounds, fitted, Point::new(x, y));
+                        if coverage == 0 {
+                            continue;
+                        }
+                        let at = local_x * 4;
+                        let color = Color::rgb(row[at + 2], row[at + 1], row[at]);
+                        if coverage == 255 {
+                            frame.pixel(x, y, color);
+                        } else {
+                            frame.blend(x, y, color, coverage);
+                        }
+                    }
+                    if mid_end > mid_start {
+                        frame.write_bgra_row(
+                            x0 + mid_start,
+                            y as usize,
+                            &row[mid_start * 4..mid_end * 4],
+                        );
+                    }
+                }
+            },
+        )
+    }
+
+    /// The drop shadow: what stacking `shadow_softness` growing copies of the
+    /// panel would give, worked out once per pixel from its distance to the
+    /// (offset) panel instead of by filling the whole stack.
     fn paint_shadow(&mut self, bounds: Rect, radii: CornerRadii, style: FrostStyle) {
         if style.shadow.alpha == 0 {
             return;
         }
-        let layers = style.shadow_softness.clamp(1, 16);
-        for layer in (0..layers).rev() {
-            let expansion = style.shadow_spread as i32 + layer as i32;
-            let shifted = Rect::new(
-                bounds.x + style.shadow_offset.x,
-                bounds.y + style.shadow_offset.y,
-                bounds.width,
-                bounds.height,
-            )
-            .expand(expansion);
-            let mut shadow = style.shadow;
-            shadow.alpha = (style.shadow.alpha as u16 / layers as u16).max(1) as u8;
-            self.fill_rounded_rect(
-                shifted,
-                CornerRadii::new(
-                    radii.top_left + expansion,
-                    radii.top_right + expansion,
-                    radii.bottom_right + expansion,
-                    radii.bottom_left + expansion,
-                ),
-                shadow,
-            );
+        let layers = style.shadow_softness.clamp(1, 16) as i32;
+        let layer_alpha = (style.shadow.alpha as u32 / layers as u32).max(1);
+        let spread = style.shadow_spread as i32;
+        // table[n]: the alpha of n translucent layers laid over each other.
+        let mut table = [0u8; 17];
+        let mut keep = 255u32;
+        for entry in table.iter_mut().take(layers as usize + 1).skip(1) {
+            keep = keep * (255 - layer_alpha) / 255;
+            *entry = (255 - keep) as u8;
+        }
+        let shape = Rect::new(
+            bounds.x + style.shadow_offset.x,
+            bounds.y + style.shadow_offset.y,
+            bounds.width,
+            bounds.height,
+        );
+        let reach = spread + layers;
+        let Some(area) = shape.expand(reach).intersect(self.clip) else {
+            return;
+        };
+        let corner = radii
+            .top_left
+            .max(radii.top_right)
+            .max(radii.bottom_right)
+            .max(radii.bottom_left);
+        let color = style.shadow.color();
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                let count = if x >= shape.x + corner
+                    && x < shape.right() - corner
+                    && y >= shape.y
+                    && y < shape.bottom()
+                    || y >= shape.y + corner
+                        && y < shape.bottom() - corner
+                        && x >= shape.x
+                        && x < shape.right()
+                {
+                    layers
+                } else {
+                    let distance = outside_distance(shape, radii, Point::new(x, y));
+                    (layers - (distance - spread).max(0)).clamp(0, layers)
+                };
+                let alpha = table[count as usize];
+                if alpha != 0 {
+                    self.frame.blend(x, y, color, alpha);
+                }
+            }
         }
     }
 
@@ -1119,11 +1309,12 @@ impl<'a> Painter<'a> {
         // the interior rectangle is not even visited.
         // (Kept clear of the rounded corners too, where the distance to the
         // arc can be smaller than the distance to the straight edges.)
-        let inset = softness
-            .max(radii.top_left)
+        let corner = radii
+            .top_left
             .max(radii.top_right)
             .max(radii.bottom_right)
             .max(radii.bottom_left);
+        let inset = softness.max(corner);
         let interior_x0 = bounds.x + inset + style.inner_shadow_offset.x;
         let interior_x1 = bounds.right() - inset + style.inner_shadow_offset.x;
         let interior_y0 = bounds.y + inset + style.inner_shadow_offset.y;
@@ -1139,15 +1330,32 @@ impl<'a> Painter<'a> {
                 x += 1;
                 let x = px;
                 let point = Point::new(x, y);
-                let coverage = rounded_coverage(bounds, radii, point);
-                if coverage == 0 {
-                    continue;
-                }
                 let shifted = Point::new(
                     x.saturating_sub(style.inner_shadow_offset.x),
                     y.saturating_sub(style.inner_shadow_offset.y),
                 );
-                let distance = rounded_edge_distance(bounds, radii, shifted).min(softness);
+                let straight = |p: Point| {
+                    bounds.contains(p)
+                        && ((p.x >= bounds.x + corner && p.x < bounds.right() - corner)
+                            || (p.y >= bounds.y + corner && p.y < bounds.bottom() - corner))
+                };
+                let (coverage, distance) = if straight(point) && straight(shifted) {
+                    let edge = (shifted.x - bounds.x)
+                        .min(bounds.right() - 1 - shifted.x)
+                        .min(shifted.y - bounds.y)
+                        .min(bounds.bottom() - 1 - shifted.y)
+                        .max(0);
+                    (255u8, edge.min(softness))
+                } else {
+                    let coverage = rounded_coverage(bounds, radii, point);
+                    if coverage == 0 {
+                        continue;
+                    }
+                    (
+                        coverage,
+                        rounded_edge_distance(bounds, radii, shifted).min(softness),
+                    )
+                };
                 let remaining = softness - distance;
                 if remaining == 0 {
                     continue;
@@ -1283,6 +1491,53 @@ fn rounded_edge_distance(bounds: Rect, radii: CornerRadii, point: Point) -> i32 
         }
     }
     distance
+}
+
+/// Pixels between `point` and the rounded rectangle (0 inside or on it).
+fn outside_distance(bounds: Rect, radii: CornerRadii, point: Point) -> i32 {
+    let dx = (bounds.x - point.x)
+        .max(point.x - (bounds.right() - 1))
+        .max(0);
+    let dy = (bounds.y - point.y)
+        .max(point.y - (bounds.bottom() - 1))
+        .max(0);
+    let corners = [
+        (
+            radii.top_left,
+            bounds.x + radii.top_left,
+            bounds.y + radii.top_left,
+            point.x < bounds.x + radii.top_left && point.y < bounds.y + radii.top_left,
+        ),
+        (
+            radii.top_right,
+            bounds.right() - radii.top_right,
+            bounds.y + radii.top_right,
+            point.x >= bounds.right() - radii.top_right && point.y < bounds.y + radii.top_right,
+        ),
+        (
+            radii.bottom_right,
+            bounds.right() - radii.bottom_right,
+            bounds.bottom() - radii.bottom_right,
+            point.x >= bounds.right() - radii.bottom_right
+                && point.y >= bounds.bottom() - radii.bottom_right,
+        ),
+        (
+            radii.bottom_left,
+            bounds.x + radii.bottom_left,
+            bounds.bottom() - radii.bottom_left,
+            point.x < bounds.x + radii.bottom_left
+                && point.y >= bounds.bottom() - radii.bottom_left,
+        ),
+    ];
+    for (radius, center_x, center_y, active) in corners {
+        if active && radius > 0 {
+            let ox = (point.x - center_x) as i64;
+            let oy = (point.y - center_y) as i64;
+            let radial = integer_sqrt((ox * ox + oy * oy) as u64) as i32;
+            return (radial - radius).max(0);
+        }
+    }
+    dx.max(dy)
 }
 
 fn integer_sqrt(value: u64) -> u64 {

@@ -10,6 +10,8 @@ const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
 const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
+const AT_CLKTCK: u64 = 17;
+const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
 const AT_UID: u64 = 11;
 const AT_EUID: u64 = 12;
@@ -379,8 +381,9 @@ pub fn prepare_scheduled_process_stack_with(
     executable: &str,
     args: &[&[u8]],
     env: &[&[u8]],
+    interpreter_base: u64,
 ) -> bool {
-    if executable.is_empty() || executable.len() >= 256 || args.len() > 16 || env.len() > 16 {
+    if executable.is_empty() || executable.len() >= 256 || args.len() > 24 || env.len() > 24 {
         return false;
     }
     let stack_physical = space.stack_physical;
@@ -410,7 +413,7 @@ pub fn prepare_scheduled_process_stack_with(
         return false;
     };
     random.fill(0);
-    let mut arg_addresses = [0u64; 16];
+    let mut arg_addresses = [0u64; 24];
     for (slot, arg) in args.iter().enumerate() {
         let Some(address) = push_bytes(stack_physical, stack_virtual, &mut cursor, arg, true)
         else {
@@ -418,7 +421,7 @@ pub fn prepare_scheduled_process_stack_with(
         };
         arg_addresses[slot] = address;
     }
-    let mut env_addresses = [0u64; 16];
+    let mut env_addresses = [0u64; 24];
     for (slot, value) in env.iter().enumerate() {
         let Some(address) = push_bytes(stack_physical, stack_virtual, &mut cursor, value, true)
         else {
@@ -439,7 +442,13 @@ pub fn prepare_scheduled_process_stack_with(
     }
     push_word(&mut words, &mut count, 0);
     let virtual_base = crate::arch::paging::process_virtual_base(space.user_slot);
-    push_pair(&mut words, &mut count, AT_PHDR, virtual_base + 64);
+    let program_headers = image.program_headers_address().unwrap_or(64);
+    push_pair(
+        &mut words,
+        &mut count,
+        AT_PHDR,
+        virtual_base + program_headers,
+    );
     push_pair(&mut words, &mut count, AT_PHENT, 56);
     push_pair(
         &mut words,
@@ -448,7 +457,17 @@ pub fn prepare_scheduled_process_stack_with(
         image.program_header_count() as u64,
     );
     push_pair(&mut words, &mut count, AT_PAGESZ, PAGE_SIZE);
-    push_pair(&mut words, &mut count, AT_ENTRY, space.entry);
+    // The program's own entry point, also when its interpreter runs first.
+    push_pair(
+        &mut words,
+        &mut count,
+        AT_ENTRY,
+        virtual_base + image.entry(),
+    );
+    if interpreter_base != 0 {
+        push_pair(&mut words, &mut count, AT_BASE, interpreter_base);
+    }
+    push_pair(&mut words, &mut count, AT_CLKTCK, 100);
     push_pair(&mut words, &mut count, AT_UID, 0);
     push_pair(&mut words, &mut count, AT_EUID, 0);
     push_pair(&mut words, &mut count, AT_GID, 0);

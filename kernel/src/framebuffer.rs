@@ -28,6 +28,19 @@ impl Color {
     }
 }
 
+/// What `FrameBuffer::copy_bgrx8888_changed` found.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Dirty {
+    Unavailable,
+    Clean,
+    Region {
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    },
+}
+
 pub struct FrameBuffer {
     address: *mut u32,
     pixels: usize,
@@ -124,6 +137,91 @@ impl FrameBuffer {
             }
         }
         true
+    }
+
+    /// Like `copy_bgrx8888`, but only rewrites bytes that differ and reports
+    /// the bounding box of what changed, so a GPU transfer can be limited to
+    /// it.
+    pub fn copy_bgrx8888_changed(&self, destination: &mut [u8]) -> Dirty {
+        let Some(bytes) = self
+            .width
+            .checked_mul(self.height)
+            .and_then(|p| p.checked_mul(4))
+        else {
+            return Dirty::Unavailable;
+        };
+        if destination.len() < bytes {
+            return Dirty::Unavailable;
+        }
+        let (mut left, mut top, mut right, mut bottom) = (usize::MAX, usize::MAX, 0, 0);
+        for row in 0..self.height {
+            let row_base = row * self.stride;
+            let destination_base = row * self.width * 4;
+            for col in 0..self.width {
+                let value = unsafe { core::ptr::read_volatile(self.address.add(row_base + col)) };
+                let color = self.unpack(value);
+                let offset = destination_base + col * 4;
+                let pixel = [color.blue, color.green, color.red, 0xff];
+                if destination[offset..offset + 4] != pixel {
+                    destination[offset..offset + 4].copy_from_slice(&pixel);
+                    left = left.min(col);
+                    right = right.max(col);
+                    top = top.min(row);
+                    bottom = bottom.max(row);
+                }
+            }
+        }
+        if left == usize::MAX {
+            return Dirty::Clean;
+        }
+        Dirty::Region {
+            x: left,
+            y: top,
+            width: right - left + 1,
+            height: bottom - top + 1,
+        }
+    }
+
+    /// Reads `width` x `height` pixels at (`x`, `y`) as B,G,R,0xff bytes into
+    /// `out`, rows `stride` bytes apart. The region must be on screen.
+    pub fn read_bgra_region(
+        &self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        out: &mut [u8],
+        stride: usize,
+    ) {
+        for row in 0..height {
+            let base = (y + row) * self.stride + x;
+            let line = &mut out[row * stride..row * stride + width * 4];
+            for (col, pixel) in line.chunks_exact_mut(4).enumerate() {
+                let value = unsafe { core::ptr::read_volatile(self.address.add(base + col)) };
+                match self.format {
+                    PixelFormat::Bgr => {
+                        pixel.copy_from_slice(&(value | 0xff00_0000).to_le_bytes());
+                    }
+                    _ => {
+                        let color = self.unpack(value);
+                        pixel.copy_from_slice(&[color.blue, color.green, color.red, 0xff]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Writes B,G,R,_ pixels (`source.len() / 4` of them) at (`x`, `y`);
+    /// the run must be on screen.
+    pub fn write_bgra_row(&mut self, x: usize, y: usize, source: &[u8]) {
+        let base = y * self.stride + x;
+        for (col, pixel) in source.chunks_exact(4).enumerate() {
+            let value = match self.format {
+                PixelFormat::Bgr => u32::from_le_bytes([pixel[0], pixel[1], pixel[2], 0]),
+                _ => self.pack(Color::rgb(pixel[2], pixel[1], pixel[0])),
+            };
+            unsafe { core::ptr::write_volatile(self.address.add(base + col), value) };
+        }
     }
 
     pub fn blit_packed(&mut self, packed: &[u32]) -> bool {

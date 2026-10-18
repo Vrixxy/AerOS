@@ -498,3 +498,106 @@ fn embedded_controller_region_is_read_and_written_through_the_hooks() {
         assert!(!acpi_devices::run_ec_query(aml, &ec, 0x18));
     });
 }
+
+fn pstate(mhz: u64, power: u64, latency: u64, control: u64) -> Vec<u8> {
+    package(&[int(mhz), int(power), int(latency), int(10), int(control), int(control)])
+}
+
+#[test]
+fn performance_states_are_listed_and_limited() {
+    let states = package(&[
+        pstate(2400, 35000, 10, 0x1800),
+        pstate(1800, 22000, 10, 0x1200),
+        pstate(1200, 12000, 10, 0x0c00),
+    ]);
+    let mut cpu = Vec::new();
+    cpu.extend(method("_PSS", &returning(&states)));
+    cpu.extend(method("_PPC", &returning(&int(1))));
+    let body = device("CPU0", &cpu);
+    with_table(scope(SB, &body), |aml| {
+        let (_, table) = aml_host::cpufreq::find(aml).unwrap();
+        assert_eq!(table.states().len(), 3);
+        assert_eq!(table.states()[0].mhz, 2400);
+        assert_eq!(table.states()[2].milliwatts, 12000);
+        assert_eq!(table.states()[1].control, 0x1200);
+        assert_eq!(table.first_allowed, 1);
+    });
+}
+
+fn generic_register(space: u8, width: u8, address: u64) -> Vec<u8> {
+    let mut bytes = vec![0x82, 0x0c, 0x00, space, width, 0, 0];
+    bytes.extend_from_slice(&address.to_le_bytes());
+    bytes.extend_from_slice(&[0x79, 0x00]);
+    bytes
+}
+
+fn processor_with_control(space: u8, width: u8, address: u64) -> Vec<u8> {
+    let states = package(&[pstate(2400, 35000, 10, 0x1d18), pstate(1200, 12000, 10, 0x0c04)]);
+    let pair = package(&[
+        buffer(&generic_register(space, width, address)),
+        buffer(&generic_register(space, width, address + 2)),
+    ]);
+    let mut cpu = Vec::new();
+    cpu.extend(method("_PSS", &returning(&states)));
+    cpu.extend(method("_PCT", &returning(&pair)));
+    device("CPU0", &cpu)
+}
+
+#[test]
+fn the_control_register_and_the_write_for_a_state() {
+    use aml_host::cpufreq::{Register, Switch};
+    let cases = [
+        (1u8, 8u8, 0xb2u64, Register::Io { port: 0xb2, width: 8 }),
+        (0, 32, 0xfed4_0000, Register::Memory { address: 0xfed4_0000, width: 32 }),
+        (0x7f, 64, 0, Register::FixedHardware),
+    ];
+    for (space, width, address, expected) in cases {
+        let body = processor_with_control(space, width, address);
+        with_table(scope(SB, &body), move |aml| {
+            let (node, table) = aml_host::cpufreq::find(aml).unwrap();
+            let register = aml_host::cpufreq::control_register(aml, node).unwrap();
+            assert_eq!(register, expected);
+            let state = table.states()[1];
+            let switch = aml_host::cpufreq::plan(register, &state, true);
+            match expected {
+                Register::Io { port, width } => {
+                    assert_eq!(switch, Switch::Io { port, width, value: 0x0c04 })
+                }
+                Register::Memory { address, width } => {
+                    assert_eq!(switch, Switch::Memory { address, width, value: 0x0c04 })
+                }
+                Register::FixedHardware => {
+                    assert_eq!(switch, Switch::Msr { register: 0x199, value: 0x0c04 });
+                    let amd = aml_host::cpufreq::plan(register, &state, false);
+                    assert_eq!(amd, Switch::Msr { register: 0xc001_0062, value: 0x4 });
+                }
+            }
+        });
+    }
+}
+
+#[test]
+fn a_missing_or_odd_control_register_is_refused() {
+    let states = package(&[pstate(2400, 35000, 10, 0x1d18)]);
+    let mut cpu = Vec::new();
+    cpu.extend(method("_PSS", &returning(&states)));
+    with_table(scope(SB, &device("CPU0", &cpu)), |aml| {
+        let (node, _) = aml_host::cpufreq::find(aml).unwrap();
+        assert!(aml_host::cpufreq::control_register(aml, node).is_none());
+    });
+    let body = processor_with_control(3, 8, 0x10);
+    with_table(scope(SB, &body), |aml| {
+        let (node, _) = aml_host::cpufreq::find(aml).unwrap();
+        assert!(aml_host::cpufreq::control_register(aml, node).is_none());
+    });
+}
+
+#[test]
+fn a_processor_without_states_lists_none() {
+    let body = device("CPU0", &named("_UID", &int(0)));
+    with_table(scope(SB, &body), |aml| {
+        assert!(aml_host::cpufreq::find(aml).is_none());
+    });
+}
+
+const SB: &str = "\\_SB_";

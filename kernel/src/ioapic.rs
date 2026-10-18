@@ -132,6 +132,78 @@ pub fn route_legacy_irq(acpi: &AcpiInfo, irq: u8, destination: u32, vector: u8) 
         && observed_high >> 24 == destination
 }
 
+/// Masks the entry a legacy interrupt line is routed to.
+#[cfg(feature = "s3-early")]
+pub fn mask_legacy_irq(acpi: &AcpiInfo, irq: u8) {
+    let address = acpi.io_apic_address;
+    if address == 0 || address & 0xfff != 0 {
+        return;
+    }
+    let _access = ACCESS.lock();
+    let route = acpi.legacy_route(irq);
+    if route.gsi < acpi.io_apic_gsi_base {
+        return;
+    }
+    let register = REDIRECTION_BASE + (route.gsi - acpi.io_apic_gsi_base) * 2;
+    write(address, register, read(address, register) | (1 << 16));
+}
+
+pub const SAVED_ENTRIES: usize = 64;
+
+/// The redirection table, kept across a sleep that resets the controller.
+#[derive(Clone, Copy)]
+pub struct Table {
+    entries: [(u32, u32); SAVED_ENTRIES],
+    count: usize,
+}
+
+impl Table {
+    pub const EMPTY: Table = Table {
+        entries: [(0, 0); SAVED_ENTRIES],
+        count: 0,
+    };
+}
+
+pub fn save(acpi: &AcpiInfo) -> Table {
+    let mut table = Table::EMPTY;
+    let address = acpi.io_apic_address;
+    if address == 0 || address & 0xfff != 0 {
+        return table;
+    }
+    let _access = ACCESS.lock();
+    let count = (((read(address, 1) >> 16) & 0xff) as usize + 1).min(SAVED_ENTRIES);
+    for entry in 0..count {
+        let register = REDIRECTION_BASE + entry as u32 * 2;
+        table.entries[entry] = (read(address, register), read(address, register + 1));
+    }
+    table.count = count;
+    table
+}
+
+/// Writes the table back, every entry masked first so nothing fires half set.
+pub fn restore(acpi: &AcpiInfo, table: &Table) -> bool {
+    let address = acpi.io_apic_address;
+    if address == 0 || address & 0xfff != 0 || table.count == 0 {
+        return false;
+    }
+    let _access = ACCESS.lock();
+    for (entry, (low, high)) in table.entries[..table.count].iter().enumerate() {
+        let register = REDIRECTION_BASE + entry as u32 * 2;
+        write(address, register, low | (1 << 16));
+        write(address, register + 1, *high);
+        write(address, register, *low);
+    }
+    table.entries[..table.count]
+        .iter()
+        .enumerate()
+        .all(|(entry, (low, high))| {
+            let register = REDIRECTION_BASE + entry as u32 * 2;
+            // The delivery-status and remote-IRR bits are the hardware's.
+            read(address, register) & 0xffff_afff == low & 0xffff_afff
+                && read(address, register + 1) == *high
+        })
+}
+
 fn empty(address: u64) -> IoApicReport {
     IoApicReport {
         present: false,

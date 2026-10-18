@@ -16,7 +16,7 @@ const PAGE_SECTORS: u64 = MAX_RUN as u64;
 const SETS: usize = 64;
 const WAYS: usize = 4;
 pub const CACHE_PAGES: usize = SETS * WAYS;
-const DISKS: usize = 9;
+const DISKS: usize = 11;
 pub const BATCH_MAX: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -26,6 +26,8 @@ pub enum Disk {
     Usb,
     Sd,
     Virtio,
+    /// A software volume (`raid.rs`): linear, stripe or mirror of other disks.
+    Volume(u8),
     /// The block layer's RAM disk, used by the power-loss test.
     #[cfg(feature = "boot-test")]
     Ram,
@@ -45,6 +47,7 @@ impl Disk {
             Disk::Usb => xhci::storage_sectors(),
             Disk::Sd => sdhci::sectors(),
             Disk::Virtio => virtio_blk::sectors(),
+            Disk::Volume(index) => crate::raid::sectors(index as usize),
             #[cfg(feature = "boot-test")]
             Disk::Ram => crate::blockdev::RAM_DISK_SECTORS,
         }
@@ -59,12 +62,13 @@ impl Disk {
             Disk::Virtio => 7,
             #[cfg(feature = "boot-test")]
             Disk::Ram => 8,
+            Disk::Volume(index) => 9 + (index as usize).min(1),
         }
     }
 
     pub fn name(index: usize) -> &'static str {
         [
-            "sda", "sdb", "sdc", "sdd", "nvme0n1", "usb0", "mmcblk0", "vda", "ram0",
+            "sda", "sdb", "sdc", "sdd", "nvme0n1", "usb0", "mmcblk0", "vda", "ram0", "md0", "md1",
         ]
         .get(index)
         .copied()
@@ -80,6 +84,7 @@ impl Disk {
             Disk::Usb => xhci::storage_read(lba, count, buffer),
             Disk::Sd => sdhci::read(lba, count, buffer),
             Disk::Virtio => virtio_blk::read(lba, count, buffer),
+            Disk::Volume(index) => crate::raid::read(index as usize, lba, count, buffer),
             #[cfg(feature = "boot-test")]
             Disk::Ram => crate::blockdev::ram_read(lba, &mut buffer[..count * SECTOR]),
         }
@@ -94,6 +99,7 @@ impl Disk {
             Disk::Usb => xhci::storage_write(lba, count, buffer),
             Disk::Sd => sdhci::write(lba, count, buffer),
             Disk::Virtio => virtio_blk::write(lba, count, buffer),
+            Disk::Volume(index) => crate::raid::write(index as usize, lba, count, buffer),
             #[cfg(feature = "boot-test")]
             Disk::Ram => crate::blockdev::ram_write(lba, &buffer[..count * SECTOR]),
         };

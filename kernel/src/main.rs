@@ -23,10 +23,12 @@ mod auth;
 mod bench;
 mod block;
 mod blockdev;
+mod bthci;
 pub mod button;
 mod capability;
 mod clipboard;
 mod compat;
+mod cpufreq;
 mod crash;
 mod datafs;
 mod deflate;
@@ -51,18 +53,21 @@ mod heap;
 mod image;
 mod inflate;
 mod initramfs;
+mod initramfs_gnu;
 mod installer;
 mod ioapic;
 mod iommu;
 mod ip;
 mod ipv6;
 mod jpeg;
+mod kernel_lock;
 mod keyboard;
 mod keymap;
 mod loading;
 mod logo;
 mod measure;
 mod memory;
+mod microcode;
 mod mounts;
 mod mouse;
 mod net;
@@ -71,6 +76,7 @@ mod notify;
 mod ntp;
 mod nvme;
 mod oom;
+mod overlay;
 mod partition;
 mod pci;
 #[cfg(feature = "boot-test")]
@@ -82,6 +88,8 @@ mod png;
 mod power;
 mod process;
 mod procfs;
+mod pstate;
+mod raid;
 mod random;
 mod rtc;
 mod rtl8139;
@@ -96,6 +104,7 @@ mod settings;
 mod sfx;
 mod shell;
 mod slab;
+mod sleep;
 mod smp;
 mod smpsched;
 mod sockopt;
@@ -114,8 +123,11 @@ mod time;
 mod timezone;
 mod tls;
 mod tlsnet;
+mod tpm;
+mod tpm_device;
 mod trace;
 mod truetype;
+mod ucode;
 mod udp;
 mod uefi;
 mod ui;
@@ -127,12 +139,14 @@ mod virtio_gpu;
 mod virtio_input;
 mod virtio_modern;
 mod virtio_net;
+mod virtio_rng;
 #[cfg(feature = "boot-test")]
 mod vmx;
 #[cfg(feature = "boot-test")]
 mod vmx_logic;
 mod volume;
 mod web;
+mod wpa;
 mod xhci;
 
 use core::panic::PanicInfo;
@@ -146,9 +160,109 @@ use uefi::{Handle, Status, SystemTable};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 static BOOT_PHASE: TicketLock<u8> = TicketLock::new(0);
 
+/// Boot progress marker with the time since the kernel started.
+fn stage(label: &str) {
+    serial::format(format_args!(
+        "AEROS_STAGE {} ms={}\n",
+        label,
+        time::monotonic_nanoseconds() / 1_000_000
+    ));
+}
+
+/// The framebuffer, recorded at boot so a panic can say what happened on
+/// the screen (a machine without a serial port shows nothing otherwise).
+struct PanicScreen(core::cell::UnsafeCell<Option<framebuffer::FrameBufferInfo>>);
+
+// SAFETY: written once during single-threaded boot, read only by the panic
+// handler.
+unsafe impl Sync for PanicScreen {}
+
+static PANIC_SCREEN: PanicScreen = PanicScreen(core::cell::UnsafeCell::new(None));
+
+struct PanicText {
+    bytes: [u8; 1024],
+    len: usize,
+}
+
+impl core::fmt::Write for PanicText {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let take = text.len().min(self.bytes.len() - self.len);
+        self.bytes[self.len..self.len + take].copy_from_slice(&text.as_bytes()[..take]);
+        self.len += take;
+        Ok(())
+    }
+}
+
+/// Paints the panic message on the framebuffer: the location and text in
+/// wrapped lines under a title. Runs inside the panic handler, so it takes
+/// no lock it cannot give up and needs no allocation.
+fn show_panic_screen(info: &PanicInfo<'_>) {
+    use core::fmt::Write;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static ENTERED: AtomicBool = AtomicBool::new(false);
+    if ENTERED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // SAFETY: see `PanicScreen`.
+    let Some(screen) = (unsafe { *PANIC_SCREEN.0.get() }) else {
+        return;
+    };
+    let mut frame = unsafe { FrameBuffer::new(screen) };
+    frame.clear(framebuffer::Color::rgb(120, 22, 30));
+    let fonts = font::FontCatalog::load();
+    if let Some(font) = fonts.mono() {
+        let mut text = PanicText {
+            bytes: [0; 1024],
+            len: 0,
+        };
+        let _ = write!(text, "{info}");
+        let message = match core::str::from_utf8(&text.bytes[..text.len]) {
+            Ok(message) => message,
+            Err(error) => core::str::from_utf8(&text.bytes[..error.valid_up_to()]).unwrap_or(""),
+        };
+        let margin = (frame.width() as i32 / 16).clamp(16, 96);
+        let size = if frame.width() >= 1600 { 22 } else { 16 };
+        let character = font.text_width("M", size).max(1);
+        let columns = ((frame.width() as i32 - margin * 2) / character).max(16) as usize;
+        let white = framebuffer::Color::rgb(255, 245, 245);
+        font.draw(&mut frame, margin, margin, "AerOS stopped", size * 2, white);
+        let mut y = margin + size * 4;
+        let line_height = size + size / 3;
+        let mut rest = message;
+        while !rest.is_empty() && y < frame.height() as i32 - margin * 2 {
+            let mut take = rest.len().min(columns);
+            while !rest.is_char_boundary(take) {
+                take -= 1;
+            }
+            if let Some(newline) = rest[..take].find('\n') {
+                take = newline;
+            } else if take < rest.len()
+                && let Some(space) = rest[..take].rfind(' ')
+                && space > 0
+            {
+                take = space;
+            }
+            font.draw(&mut frame, margin, y, rest[..take].trim_end(), size, white);
+            y += line_height;
+            rest = rest[take..].trim_start_matches([' ', '\n']);
+        }
+        let footer = frame.height() as i32 - margin - size;
+        font.draw(
+            &mut frame,
+            margin,
+            footer,
+            "Hold the power button to turn the machine off.",
+            size,
+            framebuffer::Color::rgb(240, 190, 190),
+        );
+    }
+    virtio_gpu::publish_panic(&frame);
+}
+
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
     serial::format(format_args!("AEROS_PANIC {info}\n"));
+    show_panic_screen(info);
     arch::halt_forever()
 }
 
@@ -294,6 +408,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         arch::halt_forever();
     }
     let cpu = CpuInfo::detect();
+    kernel_lock::init_cpu_id(0, cpu.rdtscp);
     let fpu = arch::fpu::initialize(&cpu);
     if !fpu.verified {
         serial::line("AEROS_FPU_FAILURE");
@@ -305,6 +420,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         arch::halt_forever();
     }
     let acpi = unsafe { acpi::inspect(boot.rsdp) };
+    sleep::configure(&acpi);
     let time = time::initialize(acpi.hpet_address);
     if !acpi.hpet_valid || !time.verified {
         serial::format(format_args!(
@@ -424,6 +540,24 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         serial::line("AEROS_SMP_FAILURE");
         arch::halt_forever();
     }
+    #[cfg(feature = "s3-early")]
+    {
+        let sleep = sleep::self_test();
+        serial::format(format_args!(
+            "AEROS_S3 supported={} slept={} processors={}/{} clock={} timer={} ioapic={} job={} verified={}
+",
+            sleep.supported,
+            sleep.slept,
+            sleep.processors,
+            sleep.expected,
+            sleep.clock,
+            sleep.timer,
+            sleep.ioapic,
+            sleep.job,
+            sleep.verified
+        ));
+        unsafe { arch::debug_exit(0x10) };
+    }
     // 4096 pages = 16 MiB - up from the original 1 MiB, now that `map_heap`
     // builds a real multi-page-table region instead of squeezing into the
     // handful of spare slots in the paging probe's single leaf table (see
@@ -463,6 +597,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     let virtio_nic = virtio_net::initialize(&pci, &mut frames);
     let virtio_touch = virtio_input::initialize(&pci, &mut frames);
     let virtio_gpu = virtio_gpu::initialize(&pci, &mut frames);
+    let virtio_rng = virtio_rng::initialize(&pci, &mut frames);
     let partitions = partition::inspect(if ahci.sectors != 0 {
         ahci.sectors
     } else {
@@ -665,8 +800,14 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         arch::halt_forever();
     }
     let initramfs_entries = initramfs::entries();
-    let vfs_stats = vfs::initialize(&initramfs_entries);
+    let vfs_stats = vfs::initialize(&initramfs_entries, &initramfs_gnu::GNU);
     let home = datafs::initialize();
+    let assembled_volumes = raid::assemble();
+    if assembled_volumes != 0 {
+        serial::format(format_args!(
+            "AEROS_RAID_ASSEMBLED volumes={assembled_volumes}\n"
+        ));
+    }
     #[cfg(not(feature = "boot-test"))]
     settings::load();
     #[cfg(feature = "boot-test")]
@@ -715,6 +856,25 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
                 serial::line("AEROS_MOUNTS_INVARIANT_FAILURE");
                 arch::halt_forever();
             }
+            let union = overlay::self_test();
+            serial::format(format_args!(
+                "AEROS_OVERLAY enabled={} created={} listed={} copy_up={} image_intact={} whiteout={} recreate={} rename={} persists={} reset={} verified={}\n",
+                union.enabled,
+                union.created,
+                union.listed,
+                union.copy_up,
+                union.image_intact,
+                union.whiteout,
+                union.recreate,
+                union.rename,
+                union.persists,
+                union.reset,
+                union.verified
+            ));
+            if !union.verified {
+                serial::line("AEROS_OVERLAY_INVARIANT_FAILURE");
+                arch::halt_forever();
+            }
         }
     }
     #[cfg(not(feature = "boot-test"))]
@@ -739,7 +899,9 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         serial::line("AEROS_COMPATIBILITY_FAILURE");
         arch::halt_forever();
     }
+    stage("pre-svm");
     let svm = svm::self_test(&mut frames);
+    stage("svm");
     serial::format(format_args!(
         "AEROS_SVM svm_supported={} npt_supported={} svm_enabled={} locked_off={} guest_ram_bytes={} exits={} io_writes={} cpuid_exits={} msr_exits={} last_exit_code={:#x} halted={} console_len={} console_ok={} high_marker={:#x} guest_marker={:#x} verified={}\n",
         svm.svm_supported,
@@ -817,6 +979,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         }
     };
     let init_process = arch::user::run_image(&init_mapping, &cpu, 73);
+    stage("run-init");
     let init_exited = process::mark_exit(&init_token, init_process.exit_code);
     let init_reap = arch::paging::destroy_user_image(&paging, &mut frames, &init_mapping);
     let init_lifecycle = init_exited && process::reap(&init_token);
@@ -856,6 +1019,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         }
     };
     let compiled_process = arch::user::run_image(&compiled_mapping, &cpu, 74);
+    stage("run-compiled");
     let compiled_exited = process::mark_exit(&compiled_token, compiled_process.exit_code);
     let compiled_reap = arch::paging::destroy_user_image(&paging, &mut frames, &compiled_mapping);
     let compiled_lifecycle = compiled_exited && process::reap(&compiled_token);
@@ -894,6 +1058,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         }
     };
     let std_process = arch::user::run_image(&std_mapping, &cpu, 75);
+    stage("run-std");
     let std_exited = process::mark_exit(&std_token, std_process.exit_code);
     let std_reap = arch::paging::destroy_user_image(&paging, &mut frames, &std_mapping);
     let std_lifecycle = std_exited && process::reap(&std_token);
@@ -926,6 +1091,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         }
     };
     let fault_process = arch::user::run_image(&fault_mapping, &cpu, 132);
+    stage("run-fault");
     let fault_exited = process::mark_exit(&fault_token, fault_process.exit_code);
     let fault_reap = arch::paging::destroy_user_image(&paging, &mut frames, &fault_mapping);
     let fault_lifecycle = fault_exited && process::reap(&fault_token);
@@ -934,8 +1100,8 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     let runtime_vfs = vfs::stats();
     let tmpfs_valid = runtime_vfs.verified
         && runtime_vfs.nodes == runtime_vfs.directories + runtime_vfs.files
-        && runtime_vfs.directories == 11
-        && runtime_vfs.files == initramfs::entries().len() + 1
+        && runtime_vfs.directories == 14
+        && runtime_vfs.files == initramfs::entries().len() + initramfs_gnu::GNU.len() + 1
         && runtime_vfs.mutable_files == 1
         && runtime_vfs.mutable_bytes == 6
         && runtime_vfs.open_handles == 0;
@@ -969,15 +1135,23 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         && process_table.spawned == 4
         && process_table.reaped == 4;
     let scheduler_valid = scheduler::self_test();
+    stage("sched");
     let preemption_valid = scheduler_valid && scheduler::preemption_self_test();
+    stage("preempt");
     let pipe_blocking_valid = scheduler_valid && syscall::pipe_blocking_self_test();
+    stage("pipe");
     let scheduler_stats = scheduler::stats();
     let preemption_ticks = scheduler::preemption_ticks();
     let (preempt_work_a, preempt_work_b) = scheduler::preemption_work();
     let preempt_fpu_isolation = scheduler::preemption_fpu_isolation();
     let keyboard = keyboard::initialize(&acpi, apic.id);
+    stage("kbd");
     let mouse = mouse::initialize(&acpi, apic.id);
+    stage("mouse");
     let events = acpi_events::initialize(&acpi, apic.id);
+    stage("acpi-events");
+    let tpm_present = tpm_device::initialize(&acpi);
+    stage("tpm");
     let shell_info = shell::SystemInfo {
         version: VERSION,
         cpu: &cpu,
@@ -990,8 +1164,11 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         internet,
         cpu_count: smp.online as usize,
     };
+    #[cfg(feature = "boot-test")]
     let commands = shell::self_test(shell_info);
+    stage("shell");
     let ui_core = aerui::self_test();
+    stage("aerui");
 
     serial::format(format_args!(
         "AEROS_CPU vendor={} max_leaf={:#x} nx={} syscall={} page1g={} smep={} smap={} x2apic={} invariant_tsc={} rdrand={} rdseed={}\n",
@@ -1142,10 +1319,64 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         arch::halt_forever();
     }
     if !process_aslr_verified {
+        serial::format(format_args!(
+            "AEROS_ENTROPY_PROCESS_ASLR_REASON {}
+",
+            arch::paging::ASLR_TEST_FAILURE.load(core::sync::atomic::Ordering::Relaxed)
+        ));
         serial::line("AEROS_ENTROPY_PROCESS_ASLR_FAILURE");
         #[cfg(feature = "boot-test")]
         arch::halt_forever();
     }
+    // Whether a fixed-address program's window (virtual 0..8 MiB) may shadow
+    // the identity map there: nothing outside plain memory below 8 MiB (the
+    // legacy area under 1 MiB is not used once the kernel runs), and not the
+    // kernel image.
+    let low_end = arch::paging::LOW_WINDOW_END;
+    let low_clean = boot.memory.regions().iter().all(|region| {
+        let start = region.start.max(0x10_0000);
+        let end = region
+            .start
+            .saturating_add(region.pages.saturating_mul(4096))
+            .min(low_end);
+        start >= end
+            || matches!(
+                region.kind,
+                memory::MemoryKind::Usable | memory::MemoryKind::BootReclaimable
+            )
+    }) && arch::paging::kernel_image_range()
+        .is_none_or(|(base, size)| base >= low_end || base.saturating_add(size) <= 0x10_0000);
+    arch::paging::set_low_window_clean(low_clean);
+    if !low_clean {
+        for region in boot.memory.regions().iter().filter(|region| {
+            let start = region.start.max(0x10_0000);
+            let end = region
+                .start
+                .saturating_add(region.pages.saturating_mul(4096))
+                .min(low_end);
+            start < end
+                && !matches!(
+                    region.kind,
+                    memory::MemoryKind::Usable | memory::MemoryKind::BootReclaimable
+                )
+        }) {
+            serial::format(format_args!(
+                "AEROS_LOW_WINDOW_BLOCKER start={:#x} pages={} kind={}
+",
+                region.start, region.pages, region.kind as u8
+            ));
+        }
+        if let Some((base, size)) = arch::paging::kernel_image_range() {
+            serial::format(format_args!(
+                "AEROS_LOW_WINDOW_IMAGE base={base:#x} size={size:#x}
+"
+            ));
+        }
+    }
+    serial::format(format_args!(
+        "AEROS_LOW_WINDOW clean={low_clean}
+"
+    ));
     serial::format(format_args!(
         "AEROS_MEMORY regions={} usable_pages={} reclaimable_pages={} dropped={} free_pages={} allocator_test={}\n",
         boot.memory.region_count(),
@@ -1401,8 +1632,8 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
             && syscall_stats.random_calls == 1
             && syscall_stats.random_bytes == 32
             && syscall_stats.compat_calls == 73
-            && syscall_stats.memory_calls == 15
-            && syscall_stats.mmaps == 5
+            && syscall_stats.memory_calls == 16
+            && syscall_stats.mmaps == 6
             && syscall_stats.file_mmaps == 1
             && syscall_stats.mprotects == 2
             && syscall_stats.munmaps == 4
@@ -1466,8 +1697,8 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         || syscall_stats.random_calls != 1
         || syscall_stats.random_bytes != 32
         || syscall_stats.compat_calls != 73
-        || syscall_stats.memory_calls != 15
-        || syscall_stats.mmaps != 5
+        || syscall_stats.memory_calls != 16
+        || syscall_stats.mmaps != 6
         || syscall_stats.file_mmaps != 1
         || syscall_stats.mprotects != 2
         || syscall_stats.munmaps != 4
@@ -1770,11 +2001,17 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         virtio_gpu.flush_ok,
         virtio_gpu.verified
     ));
+    serial::format(format_args!(
+        "AEROS_VIRTIO_RNG present={} queue_ready={} bytes={} verified={}
+",
+        virtio_rng.present, virtio_rng.queue_ready, virtio_rng.bytes, virtio_rng.verified
+    ));
     #[cfg(feature = "boot-test")]
     if (virtio_disk.present && !virtio_disk.verified)
         || (virtio_nic.present && !virtio_nic.verified)
         || !virtio_touch.verified
         || !virtio_gpu.verified
+        || !virtio_rng.verified
     {
         serial::line("AEROS_VIRTIO_INVARIANT_FAILURE");
         arch::halt_forever();
@@ -2848,6 +3085,35 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         #[cfg(feature = "boot-test")]
         arch::halt_forever();
     }
+    let sysx_result = match vfs::file("/bin/aeros-sysx") {
+        Ok(file) => scheduler::threaded_elf_self_test(&paging, file.data, 89),
+        Err(_) => scheduler::threaded_elf_self_test(&paging, &[], 89),
+    };
+    serial::format(format_args!(
+        "AEROS_SYSX exit={} reaped={} verified={}\n",
+        sysx_result.exit_code, sysx_result.reaped, sysx_result.verified
+    ));
+    if !sysx_result.verified {
+        serial::line("AEROS_SYSX_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
+    // Real third-party programs (BusyBox, a static non-PIE Debian build) run
+    // as processes; the lines say which applets ran and how each ended.
+    let apps_result = match vfs::file("/bin/aeros-apps") {
+        Ok(file) => scheduler::threaded_elf_self_test(&paging, file.data, 90),
+        Err(_) => scheduler::threaded_elf_self_test(&paging, &[], 90),
+    };
+    serial::format(format_args!(
+        "AEROS_APPS exit={} reaped={} verified={}
+",
+        apps_result.exit_code, apps_result.reaped, apps_result.verified
+    ));
+    if !apps_result.verified {
+        serial::line("AEROS_APPS_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
+        arch::halt_forever();
+    }
     #[cfg(feature = "boot-test")]
     {
         let before = swap::stats();
@@ -3252,35 +3518,38 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         #[cfg(feature = "boot-test")]
         arch::halt_forever();
     }
-    serial::format(format_args!(
-        "AEROS_COMMANDS count={} shell=aersh elevation=ear unique={} parser={} privilege={} filesystem={} reauth={} redirection={} startup={} symlinks={} background_jobs={} firewall_command={} dmesg_command={} service_command={} text_tools={} priority_command={} crashes_command={} bench_command={} sigcheck_command={} pipelines={} strace_command={} fsck_command={} verified={}\n",
-        commands.commands,
-        commands.unique,
-        commands.parser,
-        commands.privilege,
-        commands.filesystem,
-        commands.reauth,
-        commands.redirection,
-        commands.startup,
-        commands.symlinks,
-        commands.background_jobs,
-        commands.firewall_command,
-        commands.dmesg_command,
-        commands.service_command,
-        commands.text_tools,
-        commands.priority_command,
-        commands.crashes_command,
-        commands.bench_command,
-        commands.sigcheck_command,
-        commands.pipelines,
-        commands.strace_command,
-        commands.fsck_command,
-        commands.verified
-    ));
-    if !commands.verified {
-        serial::line("AEROS_COMMAND_INVARIANT_FAILURE");
-        #[cfg(feature = "boot-test")]
-        arch::halt_forever();
+    #[cfg(feature = "boot-test")]
+    {
+        serial::format(format_args!(
+            "AEROS_COMMANDS count={} shell=aersh elevation=ear unique={} parser={} privilege={} filesystem={} reauth={} redirection={} startup={} symlinks={} background_jobs={} firewall_command={} dmesg_command={} service_command={} text_tools={} priority_command={} crashes_command={} bench_command={} sigcheck_command={} pipelines={} strace_command={} fsck_command={} verified={}\n",
+            commands.commands,
+            commands.unique,
+            commands.parser,
+            commands.privilege,
+            commands.filesystem,
+            commands.reauth,
+            commands.redirection,
+            commands.startup,
+            commands.symlinks,
+            commands.background_jobs,
+            commands.firewall_command,
+            commands.dmesg_command,
+            commands.service_command,
+            commands.text_tools,
+            commands.priority_command,
+            commands.crashes_command,
+            commands.bench_command,
+            commands.sigcheck_command,
+            commands.pipelines,
+            commands.strace_command,
+            commands.fsck_command,
+            commands.verified
+        ));
+        if !commands.verified {
+            serial::line("AEROS_COMMAND_INVARIANT_FAILURE");
+            #[cfg(feature = "boot-test")]
+            arch::halt_forever();
+        }
     }
     serial::format(format_args!(
         "AEROS_UI_CORE geometry={} scaling={} interaction={} frost={} max_frost_pixels={} verified={}\n",
@@ -3317,6 +3586,21 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         events.handlers,
         events.enabled_gpes,
         events.embedded_controller
+    ));
+    let microcode_loaded = match ucode::load(ucode::BOOT_BLOB) {
+        Ok(done) => done.failed == 0,
+        Err(_) => false,
+    };
+    serial::format(format_args!(
+        "AEROS_MICROCODE virtualised={} loaded={}\n",
+        microcode::virtualised(),
+        microcode_loaded
+    ));
+    serial::format(format_args!(
+        "AEROS_PROTOCOLS wpa={} bluetooth={} tpm={}\n",
+        wpa::self_test(),
+        bthci::self_test(),
+        if tpm_present { "present" } else { "absent" }
     ));
     serial::format(format_args!(
         "AEROS_PLATFORM framebuffer={}x{} stride={} rsdp={:#x} acpi_revision={} acpi_root={:#x} acpi_valid={}\n",
@@ -3477,216 +3761,240 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
             antivirus::DEFAULT_SIGNATURE_PATH
         ));
     }
-    let av_self = antivirus::self_test();
-    // The manual flow below needs the realtime hooks out of the way.
-    antivirus::set_realtime(false);
-    let av_flow = {
-        let test = antivirus::eicar();
-        let created = vfs::open_file("/tmp/AVTEST", true, true, false, 0o644, true).ok();
-        let wrote = created.is_some_and(|descriptor| {
-            let ok = vfs::write(descriptor, &test, false) == Ok(test.len());
-            let _ = vfs::close(descriptor);
-            ok
-        });
-        let mut report = antivirus::Report::new();
-        antivirus::scan_path("/tmp/AVTEST", true, &mut report);
-        let found = report.threats == 1;
-        let moved = report.findings[0].is_some_and(|finding| finding.quarantined.is_some())
-            && vfs::metadata("/tmp/AVTEST").is_err();
-        let id = report.findings[0].and_then(|finding| finding.quarantined);
-        let restored = id.is_some_and(|id| antivirus::restore(id).is_ok())
-            && vfs::metadata("/tmp/AVTEST").is_ok();
-        let _ = vfs::remove("/tmp/AVTEST", false);
-        wrote && found && moved && restored
-    };
-    antivirus::set_realtime(true);
-    // Realtime: writing a known-bad file and closing it gets it quarantined
-    // on the spot, with no scan asked for.
-    let av_realtime = {
-        let created = vfs::open_file("/tmp/RT_TEST", true, true, false, 0o644, true).ok();
-        let events_before = antivirus::event_seq();
-        let wrote = created.is_some_and(|descriptor| {
-            let ok = vfs::write(descriptor, &antivirus::eicar(), false) == Ok(68);
-            let _ = vfs::close(descriptor);
-            ok
-        });
-        let gone = vfs::metadata("/tmp/RT_TEST").is_err();
-        let logged = antivirus::event_seq() > events_before;
-        let mut found_id = None;
-        antivirus::quarantine_list(|entry| {
-            if entry.original.as_str() == "/tmp/RT_TEST" {
-                found_id = Some(entry.id);
-            }
-        });
-        let leftover = found_id.is_some();
-        if let Some(id) = found_id {
-            let _ = antivirus::delete(id);
-        }
-        wrote && gone && logged && leftover
-    };
-    // The same realtime check, but through a real mounted /home volume
-    // (datafs), which used to bypass every antivirus hook entirely - a
-    // descriptor whose top bit is set (see `vfs::is_mounted_descriptor`)
-    // returned early out of `vfs::open_file`/`write_at`/`close` before any
-    // of the scanning code was reached. Skipped when no home volume is
-    // mounted (e.g. real hardware with no second disk).
-    let av_home_realtime = if datafs::route("/home").is_some() {
-        let created = vfs::open_file("/home/RT_HOME_TEST", true, true, false, 0o644, true).ok();
-        let events_before = antivirus::event_seq();
-        let wrote = created.is_some_and(|descriptor| {
-            let ok = vfs::write(descriptor, &antivirus::eicar(), false) == Ok(68);
-            let _ = vfs::close(descriptor);
-            ok
-        });
-        let gone = vfs::metadata("/home/RT_HOME_TEST").is_err();
-        let logged = antivirus::event_seq() > events_before;
-        let mut found_id = None;
-        antivirus::quarantine_list(|entry| {
-            if entry.original.as_str() == "/home/RT_HOME_TEST" {
-                found_id = Some(entry.id);
-            }
-        });
-        let leftover = found_id.is_some();
-        if let Some(id) = found_id {
-            let _ = antivirus::delete(id);
-        }
-        wrote && gone && logged && leftover
-    } else {
-        true
-    };
-    // `av delete` is supposed to make a quarantined file's bytes actually
-    // gone, not just unlink the directory entry while the content sits
-    // recoverable in its old disk sectors - checks that directly by
-    // shredding a known non-zero payload and reading it back.
-    let av_shred = {
-        let path = "/tmp/AV_SHRED_TEST";
-        // tmpfs (where /tmp lives) caps a single file at MUTABLE_FILE_BYTES
-        // (4096) - this is the largest payload that fits, and it exactly
-        // fills `shred`'s own 4096-byte zero buffer, so the write-in-place
-        // path is exercised right up to that boundary.
-        let payload = [0xa5u8; 4096];
-        let created = vfs::open_file(path, true, true, false, 0o644, true).ok();
-        let wrote = created.is_some_and(|descriptor| {
-            let ok = vfs::write(descriptor, &payload, false) == Ok(payload.len());
-            let _ = vfs::close(descriptor);
-            ok
-        });
-        antivirus::shred(path);
-        let zeroed = vfs::open_file_raw(path).is_ok_and(|descriptor| {
-            let mut buffer = [0xffu8; 4096];
-            let mut total = 0usize;
-            while total < buffer.len() {
-                match vfs::read(descriptor, &mut buffer[total..]) {
-                    Ok(0) => break,
-                    Ok(count) => total += count,
-                    Err(_) => break,
+    #[cfg(feature = "boot-test")]
+    {
+        stage("pre-av");
+        let av_self = antivirus::self_test();
+        // The manual flow below needs the realtime hooks out of the way.
+        antivirus::set_realtime(false);
+        let av_flow = {
+            let test = antivirus::eicar();
+            let created = vfs::open_file("/tmp/AVTEST", true, true, false, 0o644, true).ok();
+            let wrote = created.is_some_and(|descriptor| {
+                let ok = vfs::write(descriptor, &test, false) == Ok(test.len());
+                let _ = vfs::close(descriptor);
+                ok
+            });
+            let mut report = antivirus::Report::new();
+            antivirus::scan_path("/tmp/AVTEST", true, &mut report);
+            let found = report.threats == 1;
+            let moved = report.findings[0].is_some_and(|finding| finding.quarantined.is_some())
+                && vfs::metadata("/tmp/AVTEST").is_err();
+            let id = report.findings[0].and_then(|finding| finding.quarantined);
+            let restored = id.is_some_and(|id| antivirus::restore(id).is_ok())
+                && vfs::metadata("/tmp/AVTEST").is_ok();
+            let _ = vfs::remove("/tmp/AVTEST", false);
+            wrote && found && moved && restored
+        };
+        antivirus::set_realtime(true);
+        // Realtime: writing a known-bad file and closing it gets it quarantined
+        // on the spot, with no scan asked for.
+        let av_realtime = {
+            let created = vfs::open_file("/tmp/RT_TEST", true, true, false, 0o644, true).ok();
+            let events_before = antivirus::event_seq();
+            let wrote = created.is_some_and(|descriptor| {
+                let ok = vfs::write(descriptor, &antivirus::eicar(), false) == Ok(68);
+                let _ = vfs::close(descriptor);
+                ok
+            });
+            let gone = vfs::metadata("/tmp/RT_TEST").is_err();
+            let logged = antivirus::event_seq() > events_before;
+            let mut found_id = None;
+            antivirus::quarantine_list(|entry| {
+                if entry.original.as_str() == "/tmp/RT_TEST" {
+                    found_id = Some(entry.id);
                 }
+            });
+            let leftover = found_id.is_some();
+            if let Some(id) = found_id {
+                let _ = antivirus::delete(id);
             }
-            let _ = vfs::close(descriptor);
-            total == buffer.len() && buffer.iter().all(|&byte| byte == 0)
-        });
-        let _ = vfs::remove(path, false);
-        wrote && zeroed
-    };
-    let av_quarantine_encrypted = antivirus::quarantine_encryption_self_test();
-    let mut av_report = antivirus::Report::new();
-    antivirus::scan_path("/", false, &mut av_report);
-    serial::format(format_args!(
-        "AEROS_AV signatures={} self_test={} quarantine_flow={} quarantine_encrypted={} realtime={} home_realtime={} shred={} scanned_files={} threats={} unreadable={} verified={}\n",
-        antivirus::signature_count(),
-        av_self,
-        av_flow,
-        av_quarantine_encrypted,
-        av_realtime,
-        av_home_realtime,
-        av_shred,
-        av_report.files,
-        av_report.threats,
-        av_report.errors,
-        av_self
+            wrote && gone && logged && leftover
+        };
+        // The same realtime check, but through a real mounted /home volume
+        // (datafs), which used to bypass every antivirus hook entirely - a
+        // descriptor whose top bit is set (see `vfs::is_mounted_descriptor`)
+        // returned early out of `vfs::open_file`/`write_at`/`close` before any
+        // of the scanning code was reached. Skipped when no home volume is
+        // mounted (e.g. real hardware with no second disk).
+        let av_home_realtime = if datafs::route("/home").is_some() {
+            let created = vfs::open_file("/home/RT_HOME_TEST", true, true, false, 0o644, true).ok();
+            let events_before = antivirus::event_seq();
+            let wrote = created.is_some_and(|descriptor| {
+                let ok = vfs::write(descriptor, &antivirus::eicar(), false) == Ok(68);
+                let _ = vfs::close(descriptor);
+                ok
+            });
+            let gone = vfs::metadata("/home/RT_HOME_TEST").is_err();
+            let logged = antivirus::event_seq() > events_before;
+            let mut found_id = None;
+            antivirus::quarantine_list(|entry| {
+                if entry.original.as_str() == "/home/RT_HOME_TEST" {
+                    found_id = Some(entry.id);
+                }
+            });
+            let leftover = found_id.is_some();
+            if let Some(id) = found_id {
+                let _ = antivirus::delete(id);
+            }
+            wrote && gone && logged && leftover
+        } else {
+            true
+        };
+        // `av delete` is supposed to make a quarantined file's bytes actually
+        // gone, not just unlink the directory entry while the content sits
+        // recoverable in its old disk sectors - checks that directly by
+        // shredding a known non-zero payload and reading it back.
+        let av_shred = {
+            let path = "/tmp/AV_SHRED_TEST";
+            // tmpfs (where /tmp lives) caps a single file at MUTABLE_FILE_BYTES
+            // (4096) - this is the largest payload that fits, and it exactly
+            // fills `shred`'s own 4096-byte zero buffer, so the write-in-place
+            // path is exercised right up to that boundary.
+            let payload = [0xa5u8; 4096];
+            let created = vfs::open_file(path, true, true, false, 0o644, true).ok();
+            let wrote = created.is_some_and(|descriptor| {
+                let ok = vfs::write(descriptor, &payload, false) == Ok(payload.len());
+                let _ = vfs::close(descriptor);
+                ok
+            });
+            antivirus::shred(path);
+            let zeroed = vfs::open_file_raw(path).is_ok_and(|descriptor| {
+                let mut buffer = [0xffu8; 4096];
+                let mut total = 0usize;
+                while total < buffer.len() {
+                    match vfs::read(descriptor, &mut buffer[total..]) {
+                        Ok(0) => break,
+                        Ok(count) => total += count,
+                        Err(_) => break,
+                    }
+                }
+                let _ = vfs::close(descriptor);
+                total == buffer.len() && buffer.iter().all(|&byte| byte == 0)
+            });
+            let _ = vfs::remove(path, false);
+            wrote && zeroed
+        };
+        let av_quarantine_encrypted = antivirus::quarantine_encryption_self_test();
+        let mut av_report = antivirus::Report::new();
+        antivirus::scan_path("/", false, &mut av_report);
+        serial::format(format_args!(
+            "AEROS_AV signatures={} self_test={} quarantine_flow={} quarantine_encrypted={} realtime={} home_realtime={} shred={} scanned_files={} threats={} unreadable={} verified={}\n",
+            antivirus::signature_count(),
+            av_self,
+            av_flow,
+            av_quarantine_encrypted,
+            av_realtime,
+            av_home_realtime,
+            av_shred,
+            av_report.files,
+            av_report.threats,
+            av_report.errors,
+            av_self
+                && av_flow
+                && av_quarantine_encrypted
+                && av_realtime
+                && av_home_realtime
+                && av_shred
+                && av_report.threats == 0
+        ));
+        for finding in av_report.findings.iter().flatten() {
+            serial::format(format_args!(
+                "AEROS_AV_FINDING class={} name={} path={}\n",
+                finding.detection.class.label(),
+                finding.detection.name,
+                finding.path.as_str()
+            ));
+        }
+        if !(av_self
             && av_flow
             && av_quarantine_encrypted
             && av_realtime
             && av_home_realtime
-            && av_shred
-            && av_report.threats == 0
-    ));
-    for finding in av_report.findings.iter().flatten() {
-        serial::format(format_args!(
-            "AEROS_AV_FINDING class={} name={} path={}\n",
-            finding.detection.class.label(),
-            finding.detection.name,
-            finding.path.as_str()
-        ));
+            && av_shred)
+        {
+            serial::line("AEROS_AV_FAILURE");
+            #[cfg(feature = "boot-test")]
+            arch::halt_forever();
+        }
     }
-    if !(av_self
-        && av_flow
-        && av_quarantine_encrypted
-        && av_realtime
-        && av_home_realtime
-        && av_shred)
-    {
-        serial::line("AEROS_AV_FAILURE");
-        #[cfg(feature = "boot-test")]
-        arch::halt_forever();
-    }
+    #[cfg(not(feature = "boot-test"))]
+    antivirus::set_realtime(true);
 
-    let audit_verified = audit::self_test();
-    serial::format(format_args!("AEROS_AUDIT verified={}\n", audit_verified));
-    if !audit_verified {
-        serial::line("AEROS_AUDIT_INVARIANT_FAILURE");
-        #[cfg(feature = "boot-test")]
-        arch::halt_forever();
+    #[cfg(feature = "boot-test")]
+    {
+        let audit_verified = audit::self_test();
+        serial::format(format_args!("AEROS_AUDIT verified={}\n", audit_verified));
+        if !audit_verified {
+            serial::line("AEROS_AUDIT_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
     }
 
     let mut framebuffer = unsafe { FrameBuffer::new(boot.framebuffer) };
-    let ui_render = aerui::render_self_test(&mut framebuffer);
-    serial::format(format_args!(
-        "AEROS_UI_RENDER pixels={} captured={} changed={} corner_clipped={} verified={}\n",
-        ui_render.pixels,
-        ui_render.captured,
-        ui_render.changed,
-        ui_render.corner_clipped,
-        ui_render.verified
-    ));
-    if !ui_render.verified {
-        serial::line("AEROS_UI_RENDER_FAILURE");
-        #[cfg(feature = "boot-test")]
-        arch::halt_forever();
+    // SAFETY: single-threaded boot; the panic handler only reads it.
+    unsafe { *PANIC_SCREEN.0.get() = Some(framebuffer.info()) };
+    {
+        let info = framebuffer.info();
+        let allocated =
+            desktop::allocate_screen_buffers(&mut frames, info.stride.saturating_mul(info.height));
+        serial::format(format_args!(
+            "AEROS_SCREEN_BUFFERS pixels={} allocated={}
+",
+            info.stride.saturating_mul(info.height),
+            allocated
+        ));
     }
-    let desktop_render = desktop::render_self_test(&mut framebuffer, &fonts);
-    serial::format(format_args!(
-        "AEROS_DESKTOP wallpaper={} dock={} app_switcher={} quick_settings={} window={} button={} input={} verified={}\n",
-        desktop_render.wallpaper,
-        desktop_render.dock,
-        desktop_render.app_switcher,
-        desktop_render.quick_settings,
-        desktop_render.window,
-        desktop_render.button,
-        desktop_render.input,
-        desktop_render.verified
-    ));
-    if !desktop_render.verified {
-        serial::line("AEROS_DESKTOP_FAILURE");
-        arch::halt_forever();
-    }
-    let window_animation = desktop::window_animation_self_test();
-    serial::format(format_args!(
-        "AEROS_WINDOW_ANIMATION mirror=true monotonic=true centered=true verified={}\n",
-        window_animation
-    ));
-    if !window_animation {
-        serial::line("AEROS_WINDOW_ANIMATION_FAILURE");
-        arch::halt_forever();
-    }
-    let text_processing_valid = desktop::text_processing_self_test();
-    serial::format(format_args!(
-        "AEROS_TEXT_WRAP verified={}\n",
-        text_processing_valid
-    ));
-    if !text_processing_valid {
-        serial::line("AEROS_TEXT_WRAP_FAILURE");
-        arch::halt_forever();
+    #[cfg(feature = "boot-test")]
+    {
+        let ui_render = aerui::render_self_test(&mut framebuffer);
+        serial::format(format_args!(
+            "AEROS_UI_RENDER pixels={} captured={} changed={} corner_clipped={} verified={}\n",
+            ui_render.pixels,
+            ui_render.captured,
+            ui_render.changed,
+            ui_render.corner_clipped,
+            ui_render.verified
+        ));
+        if !ui_render.verified {
+            serial::line("AEROS_UI_RENDER_FAILURE");
+            #[cfg(feature = "boot-test")]
+            arch::halt_forever();
+        }
+        let desktop_render = desktop::render_self_test(&mut framebuffer, &fonts);
+        serial::format(format_args!(
+            "AEROS_DESKTOP wallpaper={} dock={} app_switcher={} quick_settings={} window={} button={} input={} verified={}\n",
+            desktop_render.wallpaper,
+            desktop_render.dock,
+            desktop_render.app_switcher,
+            desktop_render.quick_settings,
+            desktop_render.window,
+            desktop_render.button,
+            desktop_render.input,
+            desktop_render.verified
+        ));
+        if !desktop_render.verified {
+            serial::line("AEROS_DESKTOP_FAILURE");
+            arch::halt_forever();
+        }
+        let window_animation = desktop::window_animation_self_test();
+        serial::format(format_args!(
+            "AEROS_WINDOW_ANIMATION mirror=true monotonic=true centered=true verified={}\n",
+            window_animation
+        ));
+        if !window_animation {
+            serial::line("AEROS_WINDOW_ANIMATION_FAILURE");
+            arch::halt_forever();
+        }
+        let text_processing_valid = desktop::text_processing_self_test();
+        serial::format(format_args!(
+            "AEROS_TEXT_WRAP verified={}\n",
+            text_processing_valid
+        ));
+        if !text_processing_valid {
+            serial::line("AEROS_TEXT_WRAP_FAILURE");
+            arch::halt_forever();
+        }
     }
     let health = ui::BootHealth {
         cpu: &cpu,
@@ -3727,6 +4035,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     // avoids needing a `#[cfg]` split just to dodge a dead-code warning on
     // the `bind`/`SET_SCANOUT` path in that build.
     virtio_gpu::bind(&framebuffer, &mut frames);
+    desktop::install_hardware_cursor(&mut frames);
 
     memory::install_primary(frames);
     #[cfg(feature = "boot-test")]
@@ -3751,12 +4060,137 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         ));
     }
     #[cfg(feature = "boot-test")]
+    {
+        let smp_user = scheduler::smp_user_self_test(&paging);
+        serial::format(format_args!(
+            "AEROS_SMP_USER enabled={} timed_out={} exit_a={} exit_b={} cpu_a={} cpu_b={} overlap_permille={} syscall_exit_c={} syscall_exit_d={} syscalls={} kernel_entries={} contended={} acquisitions={} spins={} relaxes={} try_failed={} dispatched={:?} clean={} verified={}\n",
+            smp_user.enabled,
+            smp_user.timed_out,
+            smp_user.exit_a,
+            smp_user.exit_b,
+            smp_user.cpu_a,
+            smp_user.cpu_b,
+            smp_user.overlap_permille,
+            smp_user.syscall_exit_c,
+            smp_user.syscall_exit_d,
+            smp_user.syscalls,
+            smp_user.kernel_entries,
+            smp_user.contended,
+            smp_user.acquisitions,
+            smp_user.spins,
+            smp_user.relaxes,
+            smp_user.try_failed,
+            smp_user.dispatched,
+            smp_user.clean,
+            smp_user.verified
+        ));
+        if !smp_user.verified {
+            serial::line("AEROS_SMP_USER_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+        let program = |path: &str| vfs::file(path).map_or(&[][..], |file| file.data);
+        let parallel = scheduler::smp_threads_self_test(&paging, program("/bin/aeros-parallel"));
+        serial::format(format_args!(
+            "AEROS_SMP_THREADS enabled={} exit={} timed_out={} clean={} verified={} elapsed_ms={}
+",
+            parallel.enabled,
+            parallel.exit,
+            parallel.timed_out,
+            parallel.clean,
+            parallel.verified,
+            parallel.elapsed_ms
+        ));
+        if !parallel.verified {
+            serial::line("AEROS_SMP_THREADS_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+        let programs: [(&[u8], u64); 6] = [
+            (program("/bin/aeros-init"), 74),
+            (program("/bin/aeros-std-smoke"), 75),
+            (program("/bin/aeros-threads"), 76),
+            (program("/bin/aeros-ptrace"), 77),
+            (&scheduler::LINUX_PIPE_FORK_PROBE, 11),
+            (program("/bin/aeros-bench"), 0),
+        ];
+        let smp_programs = scheduler::smp_programs_self_test(&paging, &programs);
+        serial::format(format_args!(
+            "AEROS_SMP_PROGRAMS enabled={} run={} passed={} first_failure={} first_failure_exit={} dispatched={:?} verified={}\n",
+            smp_programs.enabled,
+            smp_programs.run,
+            smp_programs.passed,
+            smp_programs.first_failure as isize,
+            smp_programs.first_failure_exit,
+            smp_programs.dispatched,
+            smp_programs.verified
+        ));
+        if !smp_programs.verified {
+            serial::line("AEROS_SMP_PROGRAMS_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
+    }
+    #[cfg(feature = "boot-test")]
     acpi_events::power_button_test();
+    #[cfg(feature = "boot-test")]
+    {
+        let completion = shell::completion_self_test(shell_info);
+        serial::format(format_args!("AEROS_SHELL_COMPLETE verified={completion}\n"));
+        if !completion {
+            serial::line("AEROS_SHELL_COMPLETE_FAILURE");
+            arch::halt_forever();
+        }
+    }
+    #[cfg(feature = "boot-test")]
+    {
+        let restored = pci::restore_self_test();
+        serial::format(format_args!("AEROS_PCI_RESTORE verified={restored}\n"));
+        if !restored {
+            serial::line("AEROS_PCI_RESTORE_FAILURE");
+            arch::halt_forever();
+        }
+    }
+    #[cfg(feature = "boot-test")]
+    {
+        let raid = raid::self_test();
+        serial::format(format_args!(
+            "AEROS_RAID linear={} stripe={} mirror={} degraded={} resync={} block_layer={} refused={} headers={} verified={}\n",
+            raid.linear,
+            raid.stripe,
+            raid.mirror,
+            raid.degraded,
+            raid.resync,
+            raid.block_layer,
+            raid.refused,
+            raid.headers,
+            raid.verified
+        ));
+        if !raid.verified {
+            serial::line("AEROS_RAID_FAILURE");
+            arch::halt_forever();
+        }
+    }
+    #[cfg(feature = "boot-test")]
+    if !sleep::driver_self_test() {
+        serial::line("AEROS_DRIVER_RESUME_FAILURE");
+        arch::halt_forever();
+    }
+    stage("ready");
+    if cfg!(feature = "panic-demo") {
+        panic!("demonstration panic: the screen shows this text, the location and a title");
+    }
     serial::line("AEROS_READY");
 
     #[cfg(feature = "boot-test")]
     unsafe {
         arch::debug_exit(0x10);
+    }
+
+    #[cfg(not(feature = "boot-test"))]
+    {
+        // With another processor online, user programs run on it while the
+        // bootstrap processor keeps the desktop going.
+        scheduler::initialize();
+        let enabled = scheduler::enable_smp(cfg!(feature = "linux-guest"));
+        serial::format(format_args!("AEROS_SMP_TASKS enabled={enabled}\n"));
     }
 
     desktop::run(&mut framebuffer, &fonts, shell_info)

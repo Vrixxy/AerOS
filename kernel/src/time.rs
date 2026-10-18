@@ -4,6 +4,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 static HPET_BASE: AtomicU64 = AtomicU64::new(0);
 static PERIOD_FS: AtomicU64 = AtomicU64::new(0);
 static COUNTER_64: AtomicBool = AtomicBool::new(false);
+/// Added to the HPET reading once a sleep has restarted the counter at zero.
+static HPET_BIAS: AtomicU64 = AtomicU64::new(0);
 
 // The fast clock. Reading the HPET is a memory-mapped access to a device;
 // under a hypervisor each read costs tens of microseconds, and the kernel
@@ -215,11 +217,34 @@ pub fn initialize(base: u64) -> TimeReport {
     }
 }
 
+/// After a sleep that reset the clock hardware: starts the HPET counter
+/// again and carries the clock on from `resume_ns` (the time the sleep
+/// began), so it neither jumps nor goes backwards.
+pub fn resume(resume_ns: u64) {
+    let base = HPET_BASE.load(Ordering::Acquire);
+    if base != 0 {
+        unsafe {
+            let configuration = read64(base, 0x10);
+            write64(base, 0x10, configuration & !3);
+            write64(base, 0xf0, 0);
+            write64(base, 0x10, configuration & !2 | 1);
+        }
+    }
+    HPET_BIAS.store(resume_ns, Ordering::Release);
+    if TSC_ENABLED.load(Ordering::Acquire) {
+        let tsc = read_tsc();
+        let mult = TSC_MULT.load(Ordering::Acquire);
+        TSC_ORIGIN.store(tsc, Ordering::Relaxed);
+        NS_ORIGIN.store(ticks_to_nanoseconds(counter()), Ordering::Relaxed);
+        publish(tsc, resume_ns, mult);
+    }
+}
+
 pub fn monotonic_nanoseconds() -> u64 {
     if TSC_ENABLED.load(Ordering::Relaxed) {
         return tsc_nanoseconds();
     }
-    ticks_to_nanoseconds(counter())
+    ticks_to_nanoseconds(counter()).wrapping_add(HPET_BIAS.load(Ordering::Acquire))
 }
 
 fn counter() -> u64 {

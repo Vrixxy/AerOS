@@ -120,6 +120,22 @@ pub fn initialize(cpu: &CpuInfo) -> RandomReport {
     }
 }
 
+/// Stirs more entropy (a hardware RNG's output, say) into the generator's
+/// key; the keystream restarts from the new key.
+pub fn add_entropy(bytes: &[u8]) {
+    if !READY.load(Ordering::Acquire) {
+        return;
+    }
+    let mut generator = GENERATOR.lock();
+    for (index, chunk) in bytes.chunks(4).enumerate() {
+        let mut word = [0u8; 4];
+        word[..chunk.len()].copy_from_slice(chunk);
+        generator.key[index % 8] ^= u32::from_le_bytes(word);
+    }
+    generator.counter = generator.counter.wrapping_add(1);
+    generator.available = 0;
+}
+
 pub fn fill(destination: &mut [u8]) -> bool {
     if !READY.load(Ordering::Acquire) {
         return false;

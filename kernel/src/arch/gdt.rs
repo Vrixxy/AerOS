@@ -151,6 +151,13 @@ pub fn set_ring0_stack(cpu: usize, top: u64) {
     }
 }
 
+pub fn ring0_stack(cpu: usize) -> u64 {
+    if cpu >= MAX_CPUS {
+        return 0;
+    }
+    unsafe { core::ptr::read_unaligned(TSSES[cpu].0.get().cast::<u8>().add(4).cast::<u64>()) }
+}
+
 pub fn default_ring0_stack(cpu: usize) -> u64 {
     if cpu >= MAX_CPUS {
         return 0;

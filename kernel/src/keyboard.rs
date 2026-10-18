@@ -33,6 +33,22 @@ pub fn initialize(acpi: &AcpiInfo, destination: u32) -> KeyboardReport {
     report(controller, routed)
 }
 
+/// Programs the controller again after a sleep (its routing is restored with
+/// the I/O APIC); queued scancodes are dropped.
+pub fn resume() -> bool {
+    let flags: u64;
+    unsafe { core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags)) };
+    arch::disable_interrupts();
+    READ.store(0, Ordering::Release);
+    WRITE.store(0, Ordering::Release);
+    let controller = configure_controller();
+    READY.store(controller, Ordering::Release);
+    if flags & (1 << 9) != 0 {
+        arch::enable_interrupts();
+    }
+    controller
+}
+
 pub fn handle_interrupt() {
     for _ in 0..QUEUE_SIZE {
         let status = unsafe { arch::inb(STATUS) };

@@ -103,14 +103,40 @@ pub fn select_primary(e1000_ready: bool, rtl8139: &NicReport, rtl8168: &NicRepor
     PRIMARY.store(choice, Ordering::Release);
 }
 
+/// Frames and bytes through the primary interface, for `/proc/net/dev`.
+static TX_PACKETS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TX_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RX_PACKETS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RX_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// (received packets, received bytes, sent packets, sent bytes).
+pub fn counters() -> (u64, u64, u64, u64) {
+    (
+        RX_PACKETS.load(Ordering::Relaxed),
+        RX_BYTES.load(Ordering::Relaxed),
+        TX_PACKETS.load(Ordering::Relaxed),
+        TX_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+/// Whether a primary interface was found.
+pub fn present() -> bool {
+    PRIMARY.load(Ordering::Acquire) != NONE
+}
+
 pub fn transmit(packet: &[u8]) -> bool {
-    match PRIMARY.load(Ordering::Acquire) {
+    let sent = match PRIMARY.load(Ordering::Acquire) {
         E1000 => e1000::transmit(packet),
         RTL8139 => rtl8139::transmit(packet),
         RTL8168 => rtl8168::transmit(packet),
         VIRTIO => virtio_net::send(packet),
         _ => false,
+    };
+    if sent {
+        TX_PACKETS.fetch_add(1, Ordering::Relaxed);
+        TX_BYTES.fetch_add(packet.len() as u64, Ordering::Relaxed);
     }
+    sent
 }
 
 /// Non-blocking receive. A frame matching an active `firewall` DENY rule is
@@ -128,6 +154,8 @@ pub fn try_receive(destination: &mut [u8]) -> Option<usize> {
     if crate::firewall::blocks(&destination[..length]) {
         return None;
     }
+    RX_PACKETS.fetch_add(1, Ordering::Relaxed);
+    RX_BYTES.fetch_add(length as u64, Ordering::Relaxed);
     Some(length)
 }
 
@@ -138,6 +166,8 @@ pub fn receive(destination: &mut [u8]) -> Option<usize> {
         return if crate::firewall::blocks(&destination[..length]) {
             None
         } else {
+            RX_PACKETS.fetch_add(1, Ordering::Relaxed);
+            RX_BYTES.fetch_add(length as u64, Ordering::Relaxed);
             Some(length)
         };
     }

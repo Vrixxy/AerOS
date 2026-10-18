@@ -2,7 +2,7 @@ use crate::datafs;
 use crate::fat;
 use crate::sync::TicketLock;
 
-const MAX_NODES: usize = 96;
+const MAX_NODES: usize = 384;
 const MAX_HANDLES: usize = 24;
 pub const MAX_NAME: usize = 255;
 const MAX_DEPTH: usize = 16;
@@ -12,8 +12,9 @@ const READ_BITS: u16 = 0o444;
 // one permanent consumer of this pool (previously only ever /tmp scratch
 // files and quarantine entries, all transient), and self-tests that
 // exercise encryption need their own scratch file on top of that. /proc and /sys keep
-// about twenty-five generated files here, hence 56.
-const MAX_MUTABLE_FILES: usize = 56;
+// about sixty generated files and links here (the fd links and the per-process
+// files come and go), hence 112.
+const MAX_MUTABLE_FILES: usize = 176;
 const MUTABLE_FILE_BYTES: usize = 4096;
 const STATIC_STORAGE: u8 = u8::MAX;
 /// How many symlink hops `resolve_following` will chase before giving up -
@@ -364,8 +365,12 @@ impl Vfs {
         *self = Self::new();
     }
 
-    fn mount(&mut self, entries: &[InitramfsEntry]) -> Result<(), VfsError> {
-        for entry in entries {
+    fn mount(
+        &mut self,
+        entries: &[InitramfsEntry],
+        more: &[InitramfsEntry],
+    ) -> Result<(), VfsError> {
+        for entry in entries.iter().chain(more) {
             self.mount_file(entry.path, entry.data, entry.mode)?;
         }
         self.mount_directory("/tmp", 0o777)?;
@@ -537,11 +542,11 @@ impl Vfs {
             return Err(VfsError::Exists);
         }
         let (parent, name) = self.resolve_parent(&parsed)?;
-        if !self.mutable_subtree(parent) || self.nodes[parent as usize].mode & 0o222 == 0 {
-            return Err(VfsError::PermissionDenied);
-        }
         if self.find_child(parent, name).is_some() {
             return Err(VfsError::Exists);
+        }
+        if !self.mutable_subtree(parent) || self.nodes[parent as usize].mode & 0o222 == 0 {
+            return Err(VfsError::PermissionDenied);
         }
         let persist = self.find_child(ROOT_NODE, "data") == Some(parent);
         if persist {
@@ -814,7 +819,7 @@ impl Vfs {
     }
 
     fn file(&self, path: &str) -> Result<FileView, VfsError> {
-        let node = self.nodes[self.resolve(path)? as usize];
+        let node = self.nodes[self.resolve_following(path)? as usize];
         if node.kind != NodeKind::File {
             return Err(VfsError::IsDirectory);
         }
@@ -1399,7 +1404,7 @@ impl Vfs {
         handle.cursor = 0;
         // Bit 15 stays clear so a descriptor never has its top bit set (that
         // marks the persistent mount's descriptors).
-        handle.generation = (handle.generation.wrapping_add(1) & 0x7fff).max(1);
+        handle.generation = (handle.generation.wrapping_add(1) & 0x3fff).max(1);
         Ok(())
     }
 
@@ -1511,11 +1516,11 @@ static FILESYSTEM: TicketLock<Vfs> = TicketLock::new(Vfs::new());
 static MUTABLE_FILES: TicketLock<[MutableFile; MAX_MUTABLE_FILES]> =
     TicketLock::new([MutableFile::EMPTY; MAX_MUTABLE_FILES]);
 
-pub fn initialize(entries: &[InitramfsEntry]) -> VfsStats {
+pub fn initialize(entries: &[InitramfsEntry], more: &[InitramfsEntry]) -> VfsStats {
     *MUTABLE_FILES.lock() = [MutableFile::EMPTY; MAX_MUTABLE_FILES];
     let mut filesystem = FILESYSTEM.lock();
     filesystem.reset();
-    let mounted = filesystem.mount(entries).is_ok();
+    let mounted = filesystem.mount(entries, more).is_ok();
     let verified = mounted && filesystem.self_test();
     filesystem.stats(verified)
 }
@@ -1531,11 +1536,17 @@ fn is_mounted_descriptor(descriptor: u32) -> bool {
 }
 
 pub fn file(path: &str) -> Result<FileView, VfsError> {
-    if home(path).is_some() {
+    if home(path).is_some() || crate::overlay::replaced(path) {
         // Views of persistent files would have to be 'static; use open+read.
         return Err(VfsError::NotFound);
     }
     FILESYSTEM.lock().file(path)
+}
+
+/// True when a program at `path` has to be read through `with_home_file`
+/// rather than viewed in place: it lives on a volume or in the upper layer.
+pub fn needs_buffer(path: &str) -> bool {
+    crate::datafs::route(path).is_some() || crate::overlay::replaced(path)
 }
 
 pub fn metadata(path: &str) -> Result<Metadata, VfsError> {
@@ -1548,6 +1559,13 @@ pub fn metadata(path: &str) -> Result<Metadata, VfsError> {
     if let Some((mount, rest)) = home(path) {
         return datafs::metadata(mount, rest);
     }
+    if let Some(result) = crate::overlay::metadata(path) {
+        return result;
+    }
+    FILESYSTEM.lock().metadata(path)
+}
+
+pub(crate) fn lower_metadata(path: &str) -> Result<Metadata, VfsError> {
     FILESYSTEM.lock().metadata(path)
 }
 
@@ -1562,10 +1580,16 @@ pub fn symlink_metadata(path: &str) -> Result<Metadata, VfsError> {
     if let Some((mount, rest)) = home(path) {
         return datafs::metadata(mount, rest);
     }
+    if let Some(result) = crate::overlay::metadata(path) {
+        return result;
+    }
     FILESYSTEM.lock().symlink_metadata(path)
 }
 
 pub fn descriptor_metadata(descriptor: u32) -> Result<Metadata, VfsError> {
+    if crate::overlay::owns(descriptor) {
+        return crate::overlay::descriptor_metadata(descriptor);
+    }
     if is_mounted_descriptor(descriptor) {
         return datafs::descriptor_metadata(descriptor);
     }
@@ -1574,6 +1598,9 @@ pub fn descriptor_metadata(descriptor: u32) -> Result<Metadata, VfsError> {
 
 /// The path an open descriptor was opened with, for `fstatfs`.
 pub fn descriptor_path(descriptor: u32) -> Option<([u8; 128], usize)> {
+    if crate::overlay::owns(descriptor) {
+        return crate::overlay::descriptor_path(descriptor);
+    }
     if is_mounted_descriptor(descriptor) {
         return datafs::descriptor_path(descriptor);
     }
@@ -1610,6 +1637,21 @@ pub fn open_file(
         }
         return Ok(descriptor);
     }
+    if let Some(result) = crate::overlay::open_file(path, create, exclusive, truncate, mode, write)
+    {
+        return result;
+    }
+    lower_open_file(path, create, exclusive, truncate, mode, write)
+}
+
+pub(crate) fn lower_open_file(
+    path: &str,
+    create: bool,
+    exclusive: bool,
+    truncate: bool,
+    mode: u16,
+    write: bool,
+) -> Result<u32, VfsError> {
     let descriptor = FILESYSTEM
         .lock()
         .open_file(path, create, exclusive, truncate, mode, write)?;
@@ -1659,7 +1701,10 @@ pub fn with_home_file<R>(path: &str, action: impl FnOnce(&[u8], u16) -> R) -> Re
         return with_home_file(mapped.as_str(), action);
     }
     if home(path).is_none() {
-        return Err(VfsError::NotFound);
+        return match crate::overlay::upper_file(path) {
+            Some(upper) => with_home_file(upper.as_str(), action),
+            None => Err(VfsError::NotFound),
+        };
     }
     let _guard = HOME_FILE_LOCK.lock();
     let descriptor = open_file(path, false, false, false, 0, false)?;
@@ -1697,6 +1742,13 @@ pub fn open_file_raw(path: &str) -> Result<u32, VfsError> {
     if let Some((mount, rest)) = home(path) {
         return datafs::open_file(mount, rest, false, false, false, false, path);
     }
+    if let Some(result) = crate::overlay::open_raw(path) {
+        return result;
+    }
+    lower_open_raw(path)
+}
+
+pub(crate) fn lower_open_raw(path: &str) -> Result<u32, VfsError> {
     FILESYSTEM
         .lock()
         .open_file(path, false, false, false, 0, false)
@@ -1712,10 +1764,20 @@ pub fn open_directory(path: &str) -> Result<u32, VfsError> {
     if let Some((mount, rest)) = home(path) {
         return datafs::open_directory(mount, rest);
     }
+    if let Some(result) = crate::overlay::open_directory(path) {
+        return result;
+    }
+    lower_open_directory(path)
+}
+
+pub(crate) fn lower_open_directory(path: &str) -> Result<u32, VfsError> {
     FILESYSTEM.lock().open_directory(path)
 }
 
 pub fn next_directory_entry(descriptor: u32) -> Result<Option<DirectoryEntry>, VfsError> {
+    if crate::overlay::owns(descriptor) {
+        return crate::overlay::next_entry(descriptor);
+    }
     if is_mounted_descriptor(descriptor) {
         return datafs::next_directory_entry(descriptor);
     }
@@ -1723,6 +1785,9 @@ pub fn next_directory_entry(descriptor: u32) -> Result<Option<DirectoryEntry>, V
 }
 
 pub fn read(descriptor: u32, destination: &mut [u8]) -> Result<usize, VfsError> {
+    if crate::overlay::owns(descriptor) {
+        return Err(VfsError::IsDirectory);
+    }
     if is_mounted_descriptor(descriptor) {
         return datafs::read(descriptor, destination);
     }
@@ -1730,6 +1795,9 @@ pub fn read(descriptor: u32, destination: &mut [u8]) -> Result<usize, VfsError> 
 }
 
 pub fn read_at(descriptor: u32, offset: usize, destination: &mut [u8]) -> Result<usize, VfsError> {
+    if crate::overlay::owns(descriptor) {
+        return Err(VfsError::IsDirectory);
+    }
     if is_mounted_descriptor(descriptor) {
         return datafs::read_at(descriptor, offset, destination);
     }
@@ -1737,6 +1805,9 @@ pub fn read_at(descriptor: u32, offset: usize, destination: &mut [u8]) -> Result
 }
 
 pub fn write_at(descriptor: u32, offset: usize, source: &[u8]) -> Result<usize, VfsError> {
+    if crate::overlay::owns(descriptor) {
+        return Err(VfsError::IsDirectory);
+    }
     if is_mounted_descriptor(descriptor) {
         return datafs::write_at(descriptor, offset, source);
     }
@@ -1748,6 +1819,9 @@ pub fn write_at(descriptor: u32, offset: usize, source: &[u8]) -> Result<usize, 
 }
 
 pub fn write(descriptor: u32, source: &[u8], append: bool) -> Result<usize, VfsError> {
+    if crate::overlay::owns(descriptor) {
+        return Err(VfsError::IsDirectory);
+    }
     if is_mounted_descriptor(descriptor) {
         return datafs::write(descriptor, source, append);
     }
@@ -1759,6 +1833,9 @@ pub fn write(descriptor: u32, source: &[u8], append: bool) -> Result<usize, VfsE
 }
 
 pub fn seek(descriptor: u32, offset: i64, whence: u64) -> Result<usize, VfsError> {
+    if crate::overlay::owns(descriptor) {
+        return Err(VfsError::IsDirectory);
+    }
     if is_mounted_descriptor(descriptor) {
         return datafs::seek(descriptor, offset, whence);
     }
@@ -1766,6 +1843,9 @@ pub fn seek(descriptor: u32, offset: i64, whence: u64) -> Result<usize, VfsError
 }
 
 pub fn close(descriptor: u32) -> Result<(), VfsError> {
+    if crate::overlay::owns(descriptor) {
+        return crate::overlay::close(descriptor);
+    }
     if is_mounted_descriptor(descriptor) {
         return datafs::close(descriptor);
     }
@@ -1790,6 +1870,9 @@ pub fn create_directory(path: &str, mode: u16) -> Result<(), VfsError> {
     if let Some((mount, rest)) = home(path) {
         return datafs::create_directory(mount, rest);
     }
+    if let Some(result) = crate::overlay::create_directory(path) {
+        return result;
+    }
     FILESYSTEM.lock().create_directory(path, mode)
 }
 
@@ -1807,6 +1890,9 @@ pub fn symlink(path: &str, target: &str) -> Result<(), VfsError> {
 /// The literal target string a symlink at `path` was created with - `path`
 /// itself must name the symlink, since this never follows it.
 pub fn readlink(path: &str, buffer: &mut [u8]) -> Result<usize, VfsError> {
+    if let Some(mapped) = crate::procfs::resolve(path) {
+        return readlink(mapped.as_str(), buffer);
+    }
     if home(path).is_some() || crate::mounts::resolve(path).is_some() {
         return Err(VfsError::NotFound);
     }
@@ -1823,12 +1909,15 @@ pub fn remove(path: &str, directory: bool) -> Result<(), VfsError> {
     if let Some((mount, rest)) = home(path) {
         return datafs::remove(mount, rest, directory);
     }
+    if let Some(result) = crate::overlay::remove(path, directory) {
+        return result;
+    }
     FILESYSTEM.lock().remove(path, directory)
 }
 
 /// Copies a file between the in-memory tree and a mount, then deletes the
 /// source (a rename that crosses mounts).
-fn move_across(source: &str, destination: &str, replace: bool) -> Result<(), VfsError> {
+pub(crate) fn move_across(source: &str, destination: &str, replace: bool) -> Result<(), VfsError> {
     let metadata = metadata(source)?;
     if metadata.mode & 0o170000 == 0o040000 {
         return Err(VfsError::Busy);
@@ -1894,6 +1983,9 @@ pub fn rename(source: &str, destination: &str) -> Result<(), VfsError> {
     if let Some((from, to)) = bound_rename_paths(source, destination)? {
         return rename(from.as_str(), to.as_str());
     }
+    if let Some(result) = crate::overlay::rename(source, destination, false) {
+        return result;
+    }
     match (home(source), home(destination)) {
         (Some((from_mount, from)), Some((to_mount, to))) if from_mount == to_mount => {
             datafs::rename(from_mount, from, to, true)
@@ -1906,6 +1998,9 @@ pub fn rename(source: &str, destination: &str) -> Result<(), VfsError> {
 pub fn rename_noreplace(source: &str, destination: &str) -> Result<(), VfsError> {
     if let Some((from, to)) = bound_rename_paths(source, destination)? {
         return rename_noreplace(from.as_str(), to.as_str());
+    }
+    if let Some(result) = crate::overlay::rename(source, destination, true) {
+        return result;
     }
     match (home(source), home(destination)) {
         (Some((from_mount, from)), Some((to_mount, to))) if from_mount == to_mount => {
@@ -1923,10 +2018,16 @@ pub fn chmod(path: &str, mode: u16) -> Result<(), VfsError> {
     if let Some((mount, rest)) = home(path) {
         return datafs::chmod(mount, rest, mode);
     }
+    if let Some(result) = crate::overlay::chmod(path, mode) {
+        return result;
+    }
     FILESYSTEM.lock().chmod(path, mode)
 }
 
 pub fn fchmod(descriptor: u32, mode: u16) -> Result<(), VfsError> {
+    if crate::overlay::owns(descriptor) {
+        return Err(VfsError::IsDirectory);
+    }
     if is_mounted_descriptor(descriptor) {
         return datafs::fchmod(descriptor, mode);
     }
@@ -1934,6 +2035,9 @@ pub fn fchmod(descriptor: u32, mode: u16) -> Result<(), VfsError> {
 }
 
 pub fn truncate(descriptor: u32, length: usize) -> Result<(), VfsError> {
+    if crate::overlay::owns(descriptor) {
+        return Err(VfsError::IsDirectory);
+    }
     if is_mounted_descriptor(descriptor) {
         let result = datafs::truncate(descriptor, length);
         if result.is_ok() {

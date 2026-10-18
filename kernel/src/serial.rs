@@ -108,8 +108,45 @@ pub fn byte(value: u8) {
     }
 }
 
+/// Marks the start of every serial line with the milliseconds since boot, to
+/// find slow stages (`--features serial-stamps`).
+#[cfg(feature = "serial-stamps")]
+fn stamp(value: u8) {
+    static AT_LINE_START: AtomicBool = AtomicBool::new(true);
+    if value == b'\r' {
+        return;
+    }
+    if value == b'\n' {
+        AT_LINE_START.store(true, Ordering::Relaxed);
+        return;
+    }
+    if AT_LINE_START.swap(false, Ordering::Relaxed) {
+        let ms = crate::time::monotonic_nanoseconds() / 1_000_000;
+        let mut digits = [0u8; 20];
+        let mut count = 0;
+        let mut rest = ms;
+        loop {
+            digits[count] = b'0' + (rest % 10) as u8;
+            count += 1;
+            rest /= 10;
+            if rest == 0 {
+                break;
+            }
+        }
+        byte(b'[');
+        while count > 0 {
+            count -= 1;
+            byte(digits[count]);
+        }
+        byte(b']');
+        byte(b' ');
+    }
+}
+
 pub fn text(value: &str) {
     for byte_value in value.bytes() {
+        #[cfg(feature = "serial-stamps")]
+        stamp(byte_value);
         if byte_value == b'\n' {
             byte(b'\r');
         }

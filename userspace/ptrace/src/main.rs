@@ -252,8 +252,17 @@ fn fault_stop() {
         leave(60);
     }
     step("fault-stop", stopped(child, 11), 61);
+    // The injected signal reaches the runtime's own SIGSEGV handler first (it
+    // gives up and puts the default action back); the instruction faults
+    // again and the tracer sees one more stop before the process dies.
     ptrace(CONT, child, 0, 11);
-    let (result, status) = wait(child);
+    let (mut result, mut status) = wait(child);
+    let mut stops = 0;
+    while status == (11 << 8) | 0x7f && stops < 3 {
+        stops += 1;
+        ptrace(CONT, child, 0, 11);
+        (result, status) = wait(child);
+    }
     step("fault-ends", result == child as isize && status == 11, 62);
 }
 

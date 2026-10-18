@@ -1,7 +1,11 @@
 use crate::sync::TicketLock;
 
 const PAGE_SIZE: u64 = 4096;
-const LOW_MEMORY_LIMIT: u64 = 0x10_0000;
+/// Memory below this is never handed out. Besides the legacy area, it is the
+/// part of the identity map a fixed-address (`ET_EXEC`) program's window
+/// replaces in its own page tables (see `paging::LOW_WINDOW_END`), so nothing
+/// the kernel allocates may live there.
+const LOW_MEMORY_LIMIT: u64 = 0x80_0000;
 const MAX_MEMORY_REGIONS: usize = 256;
 const MAX_FREE_RANGES: usize = 512;
 

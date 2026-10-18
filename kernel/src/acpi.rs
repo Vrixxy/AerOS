@@ -44,6 +44,7 @@ pub struct AcpiInfo {
     pub madt_valid: bool,
     pub hpet_valid: bool,
     pub facp_address: u64,
+    pub facs_address: u64,
     pub dsdt_address: u64,
     pub smi_command_port: u32,
     pub acpi_enable_value: u8,
@@ -64,7 +65,7 @@ pub struct AcpiInfo {
 }
 
 impl AcpiInfo {
-    const MISSING: Self = Self {
+    pub const MISSING: Self = Self {
         revision: 0,
         root_table: 0,
         valid: false,
@@ -88,6 +89,7 @@ impl AcpiInfo {
         madt_valid: false,
         hpet_valid: false,
         facp_address: 0,
+        facs_address: 0,
         dsdt_address: 0,
         smi_command_port: 0,
         acpi_enable_value: 0,
@@ -271,6 +273,13 @@ unsafe fn parse_fadt(info: &mut AcpiInfo) {
         return;
     }
     let dsdt = (unsafe { read_u32(base.add(40)) }) as u64;
+    let facs = (unsafe { read_u32(base.add(36)) }) as u64;
+    let x_facs = if length >= 148 {
+        unsafe { read_u64(base.add(132)) }
+    } else {
+        0
+    };
+    info.facs_address = if x_facs != 0 { x_facs } else { facs };
     let smi_cmd = unsafe { read_u32(base.add(48)) };
     let acpi_enable = unsafe { core::ptr::read_volatile(base.add(52)) };
     let pm1a_cnt = unsafe { read_u32(base.add(64)) };

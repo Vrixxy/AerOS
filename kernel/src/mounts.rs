@@ -77,6 +77,15 @@ impl Mapped {
     pub fn as_str(&self) -> &str {
         core::str::from_utf8(&self.bytes[..self.length]).unwrap_or("/")
     }
+
+    pub fn join(first: &str, second: &str) -> Self {
+        let mut mapped = Mapped::of(first);
+        let count = second.len().min(MAPPED - mapped.length);
+        mapped.bytes[mapped.length..mapped.length + count]
+            .copy_from_slice(&second.as_bytes()[..count]);
+        mapped.length += count;
+        mapped
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -100,18 +109,7 @@ pub fn resolve(path: &str) -> Option<Mapped> {
     let binds = BINDS.lock();
     for bind in binds.iter().filter(|bind| bind.used) {
         if let Some(at) = below(path, bind.target()) {
-            let rest = &path[at..];
-            let mut mapped = Mapped {
-                bytes: [0; MAPPED],
-                length: 0,
-            };
-            for part in [bind.source(), rest] {
-                let count = part.len().min(MAPPED - mapped.length);
-                mapped.bytes[mapped.length..mapped.length + count]
-                    .copy_from_slice(&part.as_bytes()[..count]);
-                mapped.length += count;
-            }
-            return Some(mapped);
+            return Some(Mapped::join(bind.source(), &path[at..]));
         }
     }
     None
@@ -234,6 +232,7 @@ pub fn persistent_root() -> usize {
         }
     }
     seed_etc();
+    crate::overlay::enable();
     let mut active = 0;
     each_bind(|_, _| active += 1);
     active
@@ -262,7 +261,12 @@ fn seed_etc() {
 }
 
 pub fn procfs_text(out: &mut impl Write) {
-    let _ = write!(out, "rootfs / rootfs ro 0 0\ntmpfs /tmp tmpfs rw 0 0\n");
+    if crate::overlay::is_enabled() {
+        let _ = writeln!(out, "overlay / overlay rw,upperdir=/home/.root/upper 0 0");
+    } else {
+        let _ = writeln!(out, "rootfs / rootfs ro 0 0");
+    }
+    let _ = writeln!(out, "tmpfs /tmp tmpfs rw 0 0");
     let _ = write!(out, "proc /proc proc ro 0 0\nsysfs /sys sysfs ro 0 0\n");
     for index in 0..4 {
         if let Some(mount) = datafs::mount_info(index) {

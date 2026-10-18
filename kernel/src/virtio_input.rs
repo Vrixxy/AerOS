@@ -209,6 +209,36 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> TouchRepor
     }
 }
 
+/// Starts the device again after a sleep: reset, the same queue memory, the
+/// event buffers handed over again.
+pub fn resume() -> bool {
+    let mut guard = TOUCH.lock();
+    let Some(touch) = guard.as_mut() else {
+        return true;
+    };
+    if !touch.modern.begin(0) {
+        return false;
+    }
+    touch.queue.reset();
+    touch.modern.restore_queue(EVENT_QUEUE, &touch.queue);
+    unsafe { core::ptr::write_bytes(touch.buffers as usize as *mut u8, 0, 4096) };
+    for slot in 0..EVENT_SLOTS.min(touch.queue.size) {
+        touch.queue.descriptor(
+            slot,
+            touch.buffers + slot as u64 * EVENT_BYTES,
+            EVENT_BYTES as u32,
+            DESC_WRITE,
+            0,
+        );
+        touch.queue.submit(slot as u16);
+    }
+    touch.modern.notify(touch.notify_off);
+    touch.modern.driver_ok();
+    touch.active = false;
+    touch.have_position = false;
+    true
+}
+
 /// Drains every event the device has produced since the last call, feeding
 /// completed contact-down/move/up frames into `mouse::inject_absolute` -
 /// call this from the desktop loop the same way it already polls the

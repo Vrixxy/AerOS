@@ -73,6 +73,45 @@ const LINUX_MSYNC: u64 = 26;
 const LINUX_MADVISE: u64 = 28;
 const LINUX_SCHED_YIELD: u64 = 24;
 const LINUX_PAUSE: u64 = 34;
+const LINUX_MREMAP: u64 = 25;
+const LINUX_SPLICE: u64 = 275;
+const LINUX_TEE: u64 = 276;
+const LINUX_VMSPLICE: u64 = 278;
+const LINUX_SIGNALFD: u64 = 282;
+const LINUX_SIGNALFD4: u64 = 289;
+const LINUX_GETDENTS: u64 = 78;
+const LINUX_LINK: u64 = 86;
+const LINUX_SYSLOG: u64 = 103;
+const LINUX_SETREUID: u64 = 113;
+const LINUX_SETREGID: u64 = 114;
+const LINUX_SETRESUID: u64 = 117;
+const LINUX_SETRESGID: u64 = 119;
+const LINUX_SETFSUID: u64 = 122;
+const LINUX_SETFSGID: u64 = 123;
+const LINUX_RT_SIGPENDING: u64 = 127;
+const LINUX_RT_SIGTIMEDWAIT: u64 = 128;
+const LINUX_RT_SIGQUEUEINFO: u64 = 129;
+const LINUX_RT_SIGSUSPEND: u64 = 130;
+const LINUX_UTIME: u64 = 132;
+const LINUX_MKNOD: u64 = 133;
+const LINUX_SCHED_SETPARAM: u64 = 142;
+const LINUX_SCHED_RR_GET_INTERVAL: u64 = 148;
+const LINUX_SETRLIMIT: u64 = 160;
+const LINUX_READAHEAD: u64 = 187;
+const LINUX_SETXATTR_FIRST: u64 = 188;
+const LINUX_SETXATTR_LAST: u64 = 199;
+const LINUX_RESTART_SYSCALL: u64 = 219;
+const LINUX_UTIMES: u64 = 235;
+const LINUX_INOTIFY_INIT: u64 = 253;
+const LINUX_INOTIFY_ADD_WATCH: u64 = 254;
+const LINUX_INOTIFY_RM_WATCH: u64 = 255;
+const LINUX_MKNODAT: u64 = 259;
+const LINUX_LINKAT: u64 = 265;
+const LINUX_SYNC_FILE_RANGE: u64 = 277;
+const LINUX_INOTIFY_INIT1: u64 = 294;
+const LINUX_RECVMMSG: u64 = 299;
+const LINUX_SENDMMSG: u64 = 307;
+const LINUX_OPENAT2: u64 = 437;
 const LINUX_NANOSLEEP: u64 = 35;
 const LINUX_GETITIMER: u64 = 36;
 const LINUX_ALARM: u64 = 37;
@@ -173,6 +212,38 @@ const LINUX_EPOLL_CREATE: u64 = 213;
 const LINUX_EPOLL_PWAIT: u64 = 281;
 const LINUX_UTIMENSAT: u64 = 280;
 const LINUX_FADVISE64: u64 = 221;
+const LINUX_SHMGET: u64 = 29;
+const LINUX_SHMAT: u64 = 30;
+const LINUX_SHMCTL: u64 = 31;
+const LINUX_SHMDT: u64 = 67;
+const LINUX_SEMGET: u64 = 64;
+const LINUX_SEMOP: u64 = 65;
+const LINUX_SEMCTL: u64 = 66;
+const LINUX_MSGGET: u64 = 68;
+const LINUX_MSGSND: u64 = 69;
+const LINUX_MSGRCV: u64 = 70;
+const LINUX_MSGCTL: u64 = 71;
+const LINUX_SEMTIMEDOP: u64 = 220;
+const LINUX_FUTIMESAT: u64 = 261;
+const LINUX_PROCESS_VM_READV: u64 = 310;
+const LINUX_PROCESS_VM_WRITEV: u64 = 311;
+const LINUX_PIDFD_SEND_SIGNAL: u64 = 424;
+const LINUX_PIDFD_OPEN: u64 = 434;
+const LINUX_EXECVEAT: u64 = 322;
+const LINUX_UNSHARE: u64 = 272;
+const LINUX_RT_TGSIGQUEUEINFO: u64 = 297;
+const LINUX_SETNS: u64 = 308;
+const LINUX_SCHED_SETATTR: u64 = 314;
+const LINUX_SCHED_GETATTR: u64 = 315;
+const LINUX_MLOCK2: u64 = 325;
+const LINUX_PREADV2: u64 = 327;
+const LINUX_PWRITEV2: u64 = 328;
+const LINUX_EPOLL_PWAIT2: u64 = 441;
+const LINUX_TIMER_CREATE: u64 = 222;
+const LINUX_TIMER_SETTIME: u64 = 223;
+const LINUX_TIMER_GETTIME: u64 = 224;
+const LINUX_TIMER_GETOVERRUN: u64 = 225;
+const LINUX_TIMER_DELETE: u64 = 226;
 const LINUX_MLOCK: u64 = 149;
 const LINUX_MUNLOCK: u64 = 150;
 const LINUX_MLOCKALL: u64 = 151;
@@ -214,6 +285,8 @@ const PR_GET_NO_NEW_PRIVS: u64 = 39;
 const CLOCK_TICKS_PER_SECOND: u64 = 100;
 const AT_FDCWD: i64 = -100;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+const AT_NO_AUTOMOUNT: u64 = 0x800;
+const AT_STATX_SYNC_MASK: u64 = 0x6000;
 const AT_EMPTY_PATH: u64 = 0x1000;
 const AT_REMOVEDIR: u64 = 0x200;
 const RENAME_NOREPLACE: u64 = 1;
@@ -224,12 +297,23 @@ const O_EXCL: u64 = 0x80;
 const O_TRUNC: u64 = 0x200;
 const O_APPEND: u64 = 0x400;
 const O_LARGEFILE: u64 = 0x8000;
+/// Open flags that change nothing here: O_NOCTTY, O_NONBLOCK, O_DSYNC,
+/// O_NOFOLLOW, O_NOATIME and O_SYNC.
+const O_OPEN_HINTS: u64 = 0x100 | 0x800 | 0x1000 | 0x20000 | 0x40000 | 0x100000 | 0x200000;
+const MAP_SHARED: u64 = 0x01;
 const MAP_PRIVATE: u64 = 0x02;
+const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
+const MAP_DENYWRITE: u64 = 0x800;
+const MAP_NORESERVE: u64 = 0x4000;
+const MAP_POPULATE: u64 = 0x8000;
 const MAP_STACK: u64 = 0x20000;
+const MAP_FIXED_NOREPLACE: u64 = 0x100000;
 const MAX_PATH: usize = 256;
 mod futex;
+mod inotify;
 mod ptrace;
+mod sysv;
 
 pub use ptrace::Trap;
 mod tcpsock;
@@ -277,7 +361,13 @@ pub(crate) struct ProcessFd {
     nonblocking: bool,
     /// An `AF_INET6` socket (dual stack); selects the sockaddr layout.
     inet6: bool,
+    /// The path a directory descriptor was opened with, which later
+    /// `openat`/`fstatat` calls relative to it start from.
+    dir_path: [u8; DIR_PATH_MAX],
+    dir_length: u8,
 }
+
+const DIR_PATH_MAX: usize = 96;
 
 impl ProcessFd {
     const EMPTY: Self = Self {
@@ -298,6 +388,8 @@ impl ProcessFd {
         tcp: false,
         nonblocking: false,
         inet6: false,
+        dir_path: [0; DIR_PATH_MAX],
+        dir_length: 0,
     };
 
     const fn standard(kind: u8, readable: bool, writable: bool) -> Self {
@@ -319,6 +411,8 @@ impl ProcessFd {
             tcp: false,
             nonblocking: false,
             inet6: false,
+            dir_path: [0; DIR_PATH_MAX],
+            dir_length: 0,
         }
     }
 }
@@ -409,6 +503,13 @@ struct Pipe {
     timer: bool,
     timer_next: u64,
     timer_interval: u64,
+    /// A `signalfd`: `counter` holds the signal mask it reports.
+    signal: bool,
+    /// An inotify instance: the kernel appends `inotify_event` records to
+    /// the byte buffer, and the one descriptor only reads them.
+    inotify: bool,
+    /// A pidfd: `counter` holds the process id.
+    pidfd: bool,
 }
 
 impl Pipe {
@@ -423,6 +524,9 @@ impl Pipe {
         semaphore: false,
         counter: 0,
         timer: false,
+        signal: false,
+        inotify: false,
+        pidfd: false,
         timer_next: 0,
         timer_interval: 0,
     };
@@ -577,8 +681,8 @@ const PIPE_WAIT_ITERATIONS: u32 = 64;
 /// other tasks must see the ring-3 GS layout (and not clobber the saved user
 /// rsp) while this one is switched out. Kernel-only tasks just yield.
 fn interrupted() -> bool {
-    check_itimer().is_some()
-        || SIGNAL_PENDING.load(Ordering::Acquire) & !SIGNAL_MASK.load(Ordering::Acquire) != 0
+    check_itimer();
+    SIGNAL_PENDING.load(Ordering::Acquire) & !SIGNAL_MASK.load(Ordering::Acquire) != 0
 }
 
 fn yield_in_syscall() {
@@ -901,8 +1005,14 @@ fn pipe_read(slot: usize, destination: &mut [u8]) -> Result<usize, u64> {
     if is_eventfd(slot) {
         return eventfd_read(slot, destination);
     }
+    if is_signalfd(slot) {
+        return signalfd_read(slot, destination);
+    }
     if is_timerfd(slot) {
         return timerfd_read(slot, destination);
+    }
+    if PIPES.lock().get(slot).is_some_and(|pipe| pipe.pidfd) {
+        return Err(22);
     }
     for attempt in 0..PIPE_WAIT_ITERATIONS {
         {
@@ -933,11 +1043,62 @@ fn pipe_read(slot: usize, destination: &mut [u8]) -> Result<usize, u64> {
     Err(11)
 }
 
+/// `pipe_read` for a descriptor: a blocking one keeps waiting for data (or
+/// the end of the stream) and gives up with EINTR when a signal arrives; a
+/// non-blocking one reports EAGAIN after the short wait `pipe_read` does.
+fn pipe_read_waiting(slot: usize, destination: &mut [u8], nonblocking: bool) -> Result<usize, u64> {
+    // Kernel-side callers (self-tests, the fuzzers) are not processes and
+    // must never wait for a writer that does not exist.
+    let nonblocking = nonblocking || crate::scheduler::current_task_pid_for_linux().is_none();
+    loop {
+        match pipe_read(slot, destination) {
+            Err(11) if !nonblocking => {
+                if interrupted() {
+                    return Err(4);
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
+fn pipe_write_waiting(slot: usize, source: &[u8], nonblocking: bool) -> Result<usize, u64> {
+    let in_process = crate::scheduler::current_task_pid_for_linux().is_some();
+    let nonblocking = nonblocking || !in_process;
+    loop {
+        match pipe_write(slot, source) {
+            Err(11) if !nonblocking => {
+                if interrupted() {
+                    return Err(4);
+                }
+            }
+            // A write to a pipe nobody reads raises SIGPIPE besides failing.
+            Err(32) if in_process => {
+                if SIGNAL_ACTIONS.lock()[13 - 1].handler != 1 {
+                    queue_pending(13);
+                }
+                return Err(32);
+            }
+            other => return other,
+        }
+    }
+}
+
 fn pipe_write(slot: usize, source: &[u8]) -> Result<usize, u64> {
     if is_eventfd(slot) {
         return eventfd_write(slot, source);
     }
+    if is_signalfd(slot) {
+        return Err(22);
+    }
     if is_timerfd(slot) {
+        return Err(22);
+    }
+    if PIPES
+        .lock()
+        .get(slot)
+        .is_some_and(|pipe| pipe.inotify || pipe.pidfd)
+    {
         return Err(22);
     }
     if source.is_empty() {
@@ -1102,6 +1263,51 @@ impl AlternateStack {
 }
 
 static SIGNAL_ACTIONS: TicketLock<[SignalAction; 64]> = TicketLock::new([SignalAction::EMPTY; 64]);
+
+const SI_USER: i32 = 0;
+const SI_TIMER: i32 = -2;
+const SI_KERNEL: i32 = 0x80;
+
+/// What the `siginfo` of a pending signal carries besides its number: how it
+/// was raised, by whom, and the value `sigqueue` or a timer attached.
+#[derive(Clone, Copy)]
+pub struct SignalInfo {
+    code: i32,
+    pid: u32,
+    value: u64,
+    tid: u32,
+    overrun: u32,
+    /// A fault: `address` is the faulting address (`si_addr`).
+    fault: bool,
+    address: u64,
+}
+
+impl SignalInfo {
+    const USER: Self = Self {
+        code: SI_USER,
+        pid: 0,
+        value: 0,
+        tid: 0,
+        overrun: 0,
+        fault: false,
+        address: 0,
+    };
+}
+
+static SIGNAL_INFO: TicketLock<[SignalInfo; 64]> = TicketLock::new([SignalInfo::USER; 64]);
+/// The information the signal being sent right now carries (set by `kill` and
+/// `rt_sigqueueinfo` around the delivery, which the receiving side reads).
+static NEXT_SIGNAL_INFO: TicketLock<Option<SignalInfo>> = TicketLock::new(None);
+
+fn next_signal_info() -> SignalInfo {
+    NEXT_SIGNAL_INFO.lock().unwrap_or(SignalInfo::USER)
+}
+
+/// Marks `signal` pending for the running process, with its information.
+fn queue_pending(signal: u64) {
+    SIGNAL_INFO.lock()[signal as usize - 1] = next_signal_info();
+    SIGNAL_PENDING.fetch_or(1 << (signal - 1), Ordering::AcqRel);
+}
 static SIGNAL_MASK: AtomicU64 = AtomicU64::new(0);
 /// Signals raised at this process that are waiting for their handler to run
 /// (delivered when the next syscall returns, once unblocked).
@@ -1110,6 +1316,72 @@ static SIGNAL_PENDING: AtomicU64 = AtomicU64::new(0);
 /// reload interval. Expiry raises SIGALRM (see `check_itimer`).
 static ITIMER_DEADLINE: AtomicU64 = AtomicU64::new(0);
 static ITIMER_INTERVAL: AtomicU64 = AtomicU64::new(0);
+
+/// ITIMER_VIRTUAL (user CPU time, SIGVTALRM) and ITIMER_PROF (user plus
+/// kernel CPU time, SIGPROF): the CPU-time reading at which each fires
+/// (0 = disarmed) and its reload interval.
+#[derive(Clone, Copy)]
+struct CpuTimer {
+    deadline: u64,
+    interval: u64,
+}
+
+impl CpuTimer {
+    const EMPTY: Self = Self {
+        deadline: 0,
+        interval: 0,
+    };
+}
+
+static CPU_TIMERS: TicketLock<[CpuTimer; 2]> = TicketLock::new([CpuTimer::EMPTY; 2]);
+static CPU_TIMERS_ARMED: AtomicBool = AtomicBool::new(false);
+
+fn cpu_timer_reading(index: usize) -> u64 {
+    let (user, system) = crate::scheduler::current_cpu_time();
+    if index == 0 { user } else { user + system }
+}
+
+const POSIX_TIMER_COUNT: usize = 8;
+
+/// A POSIX timer (`timer_create`); `signal` 0 is SIGEV_NONE. The
+/// `sigev_value` is not passed on: signals here carry no payload.
+#[derive(Clone, Copy)]
+struct PosixTimer {
+    used: bool,
+    clock: u8,
+    signal: u8,
+    deadline: u64,
+    interval: u64,
+    overrun: u32,
+    value: u64,
+}
+
+impl PosixTimer {
+    const EMPTY: Self = Self {
+        used: false,
+        clock: 0,
+        signal: 0,
+        deadline: 0,
+        interval: 0,
+        overrun: 0,
+        value: 0,
+    };
+}
+
+static POSIX_TIMERS: TicketLock<[PosixTimer; POSIX_TIMER_COUNT]> =
+    TicketLock::new([PosixTimer::EMPTY; POSIX_TIMER_COUNT]);
+/// Earliest deadline among the armed POSIX timers (0 = none), so the check
+/// on every syscall return costs one load.
+static POSIX_NEXT: AtomicU64 = AtomicU64::new(0);
+
+fn posix_next_deadline(timers: &[PosixTimer; POSIX_TIMER_COUNT]) -> u64 {
+    timers
+        .iter()
+        .filter(|timer| timer.used && timer.deadline != 0)
+        .map(|timer| timer.deadline)
+        .min()
+        .unwrap_or(0)
+}
 static ALTERNATE_STACK: TicketLock<AlternateStack> = TicketLock::new(AlternateStack::EMPTY);
 const DEFAULT_UMASK: u64 = 0o022;
 static UMASK: AtomicU64 = AtomicU64::new(DEFAULT_UMASK);
@@ -1146,8 +1418,11 @@ pub struct ProcessState {
     signal_actions: [SignalAction; 64],
     signal_mask: u64,
     signal_pending: u64,
+    signal_info: [SignalInfo; 64],
     itimer_deadline: u64,
     itimer_interval: u64,
+    posix_timers: [PosixTimer; POSIX_TIMER_COUNT],
+    cpu_timers: [CpuTimer; 2],
     alternate_stack: AlternateStack,
     umask: u64,
     seccomp_strict: bool,
@@ -1162,16 +1437,22 @@ impl ProcessState {
     pub fn copy_thread_from(&mut self, other: &ProcessState) {
         self.signal_mask = other.signal_mask;
         self.signal_pending = other.signal_pending;
+        self.signal_info = other.signal_info;
         self.alternate_stack = other.alternate_stack;
     }
 
     /// Everything the threads of a process have in common.
     pub fn copy_shared_from(&mut self, other: &ProcessState) {
-        let (mask, pending, alternate) =
-            (self.signal_mask, self.signal_pending, self.alternate_stack);
+        let (mask, pending, info, alternate) = (
+            self.signal_mask,
+            self.signal_pending,
+            self.signal_info,
+            self.alternate_stack,
+        );
         *self = *other;
         self.signal_mask = mask;
         self.signal_pending = pending;
+        self.signal_info = info;
         self.alternate_stack = alternate;
     }
 
@@ -1181,8 +1462,11 @@ impl ProcessState {
         signal_actions: [SignalAction::EMPTY; 64],
         signal_mask: 0,
         signal_pending: 0,
+        signal_info: [SignalInfo::USER; 64],
         itimer_deadline: 0,
         itimer_interval: 0,
+        posix_timers: [PosixTimer::EMPTY; POSIX_TIMER_COUNT],
+        cpu_timers: [CpuTimer::EMPTY; 2],
         alternate_stack: AlternateStack::EMPTY,
         umask: DEFAULT_UMASK,
         seccomp_strict: false,
@@ -1215,8 +1499,11 @@ pub fn save_process_state() -> ProcessState {
         signal_actions: *SIGNAL_ACTIONS.lock(),
         signal_mask: SIGNAL_MASK.load(Ordering::Acquire),
         signal_pending: SIGNAL_PENDING.load(Ordering::Acquire),
+        signal_info: *SIGNAL_INFO.lock(),
         itimer_deadline: ITIMER_DEADLINE.load(Ordering::Acquire),
         itimer_interval: ITIMER_INTERVAL.load(Ordering::Acquire),
+        posix_timers: *POSIX_TIMERS.lock(),
+        cpu_timers: *CPU_TIMERS.lock(),
         alternate_stack: *ALTERNATE_STACK.lock(),
         umask: UMASK.load(Ordering::Acquire),
         seccomp_strict: SECCOMP_STRICT.load(Ordering::Acquire),
@@ -1230,6 +1517,7 @@ pub fn save_process_state() -> ProcessState {
 pub fn restore_thread_state(state: &ProcessState) {
     SIGNAL_MASK.store(state.signal_mask, Ordering::Release);
     SIGNAL_PENDING.store(state.signal_pending, Ordering::Release);
+    *SIGNAL_INFO.lock() = state.signal_info;
     *ALTERNATE_STACK.lock() = state.alternate_stack;
 }
 
@@ -1252,8 +1540,16 @@ pub fn restore_process_state(state: &ProcessState) {
     *SIGNAL_ACTIONS.lock() = state.signal_actions;
     SIGNAL_MASK.store(state.signal_mask, Ordering::Release);
     SIGNAL_PENDING.store(state.signal_pending, Ordering::Release);
+    *SIGNAL_INFO.lock() = state.signal_info;
     ITIMER_DEADLINE.store(state.itimer_deadline, Ordering::Release);
     ITIMER_INTERVAL.store(state.itimer_interval, Ordering::Release);
+    *POSIX_TIMERS.lock() = state.posix_timers;
+    POSIX_NEXT.store(posix_next_deadline(&state.posix_timers), Ordering::Release);
+    *CPU_TIMERS.lock() = state.cpu_timers;
+    CPU_TIMERS_ARMED.store(
+        state.cpu_timers.iter().any(|timer| timer.deadline != 0),
+        Ordering::Release,
+    );
     UMASK.store(state.umask, Ordering::Release);
     *ALTERNATE_STACK.lock() = state.alternate_stack;
     SECCOMP_STRICT.store(state.seccomp_strict, Ordering::Release);
@@ -1296,8 +1592,12 @@ pub fn reset_scheduled_process_state() {
     *SIGNAL_ACTIONS.lock() = [SignalAction::EMPTY; 64];
     SIGNAL_MASK.store(0, Ordering::Release);
     SIGNAL_PENDING.store(0, Ordering::Release);
+    *SIGNAL_INFO.lock() = [SignalInfo::USER; 64];
     ITIMER_DEADLINE.store(0, Ordering::Release);
     ITIMER_INTERVAL.store(0, Ordering::Release);
+    clear_posix_timers();
+    *CPU_TIMERS.lock() = [CpuTimer::EMPTY; 2];
+    CPU_TIMERS_ARMED.store(false, Ordering::Release);
     *ALTERNATE_STACK.lock() = AlternateStack::EMPTY;
     *CURRENT_DIRECTORY.lock() = CurrentDirectory::ROOT;
     *PROCESS_FDS.lock() = initial_process_fds();
@@ -1318,11 +1618,21 @@ pub fn reset_scheduled_process_state() {
 pub fn exec_reset_process_state() {
     *SIGNAL_ACTIONS.lock() = [SignalAction::EMPTY; 64];
     SIGNAL_PENDING.store(0, Ordering::Release);
+    clear_posix_timers();
     *ALTERNATE_STACK.lock() = AlternateStack::EMPTY;
-    let mut descriptors = PROCESS_FDS.lock();
-    for descriptor in descriptors.iter_mut() {
-        if descriptor.close_on_exec {
-            *descriptor = ProcessFd::EMPTY;
+    // Close-on-exec descriptors are closed like any other, so the pipe end or
+    // file they hold is released (a parent waiting for the end of a pipe is
+    // how `xargs` learns that its child started).
+    let mut closing = [false; PROCESS_FD_COUNT];
+    {
+        let descriptors = PROCESS_FDS.lock();
+        for (index, descriptor) in descriptors.iter().enumerate() {
+            closing[index] = descriptor.open && descriptor.close_on_exec;
+        }
+    }
+    for (index, close) in closing.iter().enumerate() {
+        if *close {
+            linux_close(index as u64);
         }
     }
 }
@@ -1498,8 +1808,8 @@ const LINUX_SECCOMP: u64 = 317;
 const SECCOMP_SET_MODE_STRICT: u64 = 0;
 const SECCOMP_SET_MODE_FILTER: u64 = 1;
 
-const EXEC_STRING_COUNT: usize = 16;
-const EXEC_STRING_MAX: usize = 96;
+const EXEC_STRING_COUNT: usize = 24;
+const EXEC_STRING_MAX: usize = 384;
 
 /// Copies a NULL-terminated user array of C strings (argv/envp) into kernel
 /// buffers; a null array pointer means an empty list.
@@ -1765,6 +2075,9 @@ fn linux_wait4(pid: u64, status_address: u64, options: u64) -> u64 {
         if options & WNOHANG != 0 {
             return 0;
         }
+        if interrupted() {
+            return error(4);
+        }
         yield_in_syscall();
     }
 }
@@ -1772,9 +2085,52 @@ fn linux_wait4(pid: u64, status_address: u64, options: u64) -> u64 {
 /// Returns true when the process image was replaced (frame now points at
 /// the new entry point and stack); the caller must not touch rax then.
 fn linux_execve(frame: &mut LinuxSyscallFrame) -> Result<(), u64> {
+    let (path_address, argv, envp) = (frame.argument0, frame.argument1, frame.argument2);
     let mut buffer = [0u8; MAX_PATH];
-    let length = user::copy_string(frame.argument0, &mut buffer).ok_or_else(|| error(14))?;
-    let path = core::str::from_utf8(&buffer[..length]).map_err(|_| error(84))?;
+    let length = user::copy_string(path_address, &mut buffer).ok_or_else(|| error(14))?;
+    exec_path(frame, &buffer[..length], argv, envp)
+}
+
+/// `execveat`: the path is relative to the working directory or absolute (a
+/// directory descriptor other than AT_FDCWD is not supported), or with
+/// AT_EMPTY_PATH the file `dirfd` itself (`fexecve`).
+fn linux_execveat(frame: &mut LinuxSyscallFrame) -> Result<(), u64> {
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    let (directory, path_address, argv, envp, flags) = (
+        frame.argument0,
+        frame.argument1,
+        frame.argument2,
+        frame.argument3,
+        frame.argument4,
+    );
+    if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
+        return Err(error(22));
+    }
+    let mut buffer = [0u8; MAX_PATH];
+    let length = user::copy_string(path_address, &mut buffer).ok_or_else(|| error(14))?;
+    if length == 0 && flags & AT_EMPTY_PATH != 0 {
+        let process_fd = lookup_file_fd(directory).ok_or_else(|| error(9))?;
+        let (bytes, path_length) =
+            vfs::descriptor_path(process_fd.handle).ok_or_else(|| error(9))?;
+        let mut path = [0u8; MAX_PATH];
+        let count = path_length.min(path.len());
+        path[..count].copy_from_slice(&bytes[..count]);
+        return exec_path(frame, &path[..count], argv, envp);
+    }
+    if buffer.first() != Some(&b'/') && directory as i32 as i64 != AT_FDCWD {
+        return Err(error(9));
+    }
+    exec_path(frame, &buffer[..length], argv, envp)
+}
+
+fn exec_path(
+    frame: &mut LinuxSyscallFrame,
+    path_bytes: &[u8],
+    argv: u64,
+    envp: u64,
+) -> Result<(), u64> {
+    let path = core::str::from_utf8(path_bytes).map_err(|_| error(84))?;
     // argv/envp live in the image that is about to be replaced, so they are
     // copied out first (up to 16 strings of 95 bytes each) - before the new
     // image's own bytes are even read, so it does not matter below that a
@@ -1783,10 +2139,10 @@ fn linux_execve(frame: &mut LinuxSyscallFrame) -> Result<(), u64> {
     // binaries' `'static` storage.
     let mut arg_store = [[0u8; EXEC_STRING_MAX]; EXEC_STRING_COUNT];
     let mut arg_len = [0usize; EXEC_STRING_COUNT];
-    let arg_count = copy_string_vector(frame.argument1, &mut arg_store, &mut arg_len)?;
+    let arg_count = copy_string_vector(argv, &mut arg_store, &mut arg_len)?;
     let mut env_store = [[0u8; EXEC_STRING_MAX]; EXEC_STRING_COUNT];
     let mut env_len = [0usize; EXEC_STRING_COUNT];
-    let env_count = copy_string_vector(frame.argument2, &mut env_store, &mut env_len)?;
+    let env_count = copy_string_vector(envp, &mut env_store, &mut env_len)?;
     let mut args: [&[u8]; EXEC_STRING_COUNT] = [&[]; EXEC_STRING_COUNT];
     let mut env: [&[u8]; EXEC_STRING_COUNT] = [&[]; EXEC_STRING_COUNT];
     for index in 0..arg_count {
@@ -1807,7 +2163,7 @@ fn linux_execve(frame: &mut LinuxSyscallFrame) -> Result<(), u64> {
             )
         }
     };
-    let result = if crate::datafs::route(path).is_some() {
+    let result = if vfs::needs_buffer(path) {
         vfs::with_home_file(path, |data, _mode| do_exec(data)).map_err(|_| error(2))?
     } else {
         let file = vfs::file(path).map_err(|_| error(2))?;
@@ -1816,6 +2172,21 @@ fn linux_execve(frame: &mut LinuxSyscallFrame) -> Result<(), u64> {
     let (entry, stack_top) = result.ok_or_else(|| error(8))?;
     frame.user_rip = entry;
     set_user_stack_pointer(stack_top);
+    // A new program starts with every register clear (rdx is the function
+    // the C runtime registers with atexit, so a leftover pointer there is
+    // called at exit).
+    frame.argument0 = 0;
+    frame.argument1 = 0;
+    frame.argument2 = 0;
+    frame.argument3 = 0;
+    frame.argument4 = 0;
+    frame.argument5 = 0;
+    frame.r15 = 0;
+    frame.r14 = 0;
+    frame.r13 = 0;
+    frame.r12 = 0;
+    frame.rbp = 0;
+    frame.rbx = 0;
     Ok(())
 }
 
@@ -1883,6 +2254,28 @@ pub fn dispatch(number: u64, arguments: [u64; 6]) -> BootstrapResult {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn aeros_linux_syscall_dispatch(frame: *mut LinuxSyscallFrame) -> u64 {
+    if !crate::kernel_lock::active() {
+        return syscall_inner(frame);
+    }
+    let entry = crate::scheduler::enter_from_user();
+    if entry.kill {
+        user::set_exit_code(128 + 9);
+        return 1;
+    }
+    let result = syscall_inner(frame);
+    // 0 returns with `sysretq` and 2 with `iretq`; anything else ends the
+    // process in the kernel, which keeps the lock.
+    if result == 0 || result == 2 {
+        if crate::scheduler::take_kill_pending() {
+            user::set_exit_code(128 + 9);
+            return 1;
+        }
+        crate::scheduler::leave_to_user();
+    }
+    result
+}
+
+fn syscall_inner(frame: *mut LinuxSyscallFrame) -> u64 {
     let frame = unsafe { &mut *frame };
     if crate::scheduler::is_traced() {
         return ptrace::traced_syscall(frame);
@@ -1974,10 +2367,32 @@ fn linux_syscall(frame: &mut LinuxSyscallFrame) -> u64 {
             frame.number = clone3_task(frame, arguments[0], arguments[1]);
             return finish_syscall(frame);
         }
-        LINUX_KILL => {
-            let (pid, signal) = (arguments[0], arguments[1]);
+        LINUX_KILL | LINUX_RT_SIGQUEUEINFO | LINUX_PIDFD_SEND_SIGNAL => {
+            let (pid, signal) = if frame.number == LINUX_PIDFD_SEND_SIGNAL {
+                match pidfd_target(arguments[0]) {
+                    Ok(pid) => (pid, arguments[1]),
+                    Err(failure) => {
+                        frame.number = failure;
+                        return finish_syscall(frame);
+                    }
+                }
+            } else {
+                (arguments[0], arguments[1])
+            };
             let own = crate::scheduler::current_task_pid_for_linux()
                 .unwrap_or_else(crate::process::current_pid);
+            let mut sent = SignalInfo {
+                pid: own as u32,
+                ..SignalInfo::USER
+            };
+            if frame.number == LINUX_RT_SIGQUEUEINFO && arguments[2] != 0 {
+                let mut record = [0u8; 32];
+                if user::copy_from_user(arguments[2], &mut record) {
+                    sent.code = i32::from_le_bytes([record[8], record[9], record[10], record[11]]);
+                    sent.value = read_array_u64(&record, 24);
+                }
+            }
+            *NEXT_SIGNAL_INFO.lock() = Some(sent);
             let exists = || {
                 if crate::scheduler::task_exists(pid) {
                     0
@@ -2015,6 +2430,7 @@ fn linux_syscall(frame: &mut LinuxSyscallFrame) -> u64 {
                     None => error(3),
                 };
             }
+            *NEXT_SIGNAL_INFO.lock() = None;
             return finish_syscall(frame);
         }
         LINUX_SCHED_YIELD => {
@@ -2042,6 +2458,13 @@ fn linux_syscall(frame: &mut LinuxSyscallFrame) -> u64 {
         }
         LINUX_EXECVE => {
             match linux_execve(frame) {
+                Ok(()) => frame.number = 0,
+                Err(failure) => frame.number = failure,
+            }
+            return 0;
+        }
+        LINUX_EXECVEAT => {
+            match linux_execveat(frame) {
                 Ok(()) => frame.number = 0,
                 Err(failure) => frame.number = failure,
             }
@@ -2080,10 +2503,10 @@ fn finish_syscall(frame: &mut LinuxSyscallFrame) -> u64 {
 /// object tables are put back afterwards. Returns how many calls ran.
 #[cfg(feature = "boot-test")]
 pub(crate) fn fuzz_syscalls(next: &mut dyn FnMut() -> u64, rounds: u32) -> u32 {
-    const SKIPPED: [u64; 47] = [
-        7, 15, 23, 34, 35, 42, 43, 45, 47, 56, 57, 58, 59, 60, 61, 62, 80, 81, 95, 101, 126, 128,
-        130, 141, 157, 160, 164, 165, 166, 169, 200, 202, 227, 230, 231, 232, 234, 247, 270, 271,
-        281, 288, 302, 317, 322, 435, 441,
+    const SKIPPED: [u64; 58] = [
+        7, 15, 23, 29, 34, 35, 42, 43, 45, 47, 56, 57, 58, 59, 60, 61, 62, 64, 65, 66, 68, 69, 70,
+        71, 80, 81, 95, 101, 126, 128, 129, 130, 141, 157, 160, 164, 165, 166, 169, 200, 202, 220,
+        227, 230, 231, 232, 234, 247, 270, 271, 281, 288, 299, 302, 317, 322, 435, 441,
     ];
     let saved = save_process_state();
     let mut executed = 0;
@@ -2180,7 +2603,80 @@ fn dispatch_linux(number: u64, arguments: [u64; 6]) -> SyscallResult {
             arguments[2],
             arguments[3],
         )),
-        LINUX_UTIMENSAT => SyscallResult::Return(linux_utimensat(arguments[0], arguments[1])),
+        LINUX_UTIMENSAT | LINUX_FUTIMESAT => {
+            SyscallResult::Return(linux_utimensat(arguments[0], arguments[1]))
+        }
+        LINUX_EPOLL_PWAIT2 => {
+            let timeout = if arguments[3] == 0 {
+                Some(u64::MAX)
+            } else {
+                read_timespec(arguments[3]).map(|nanoseconds| nanoseconds.div_ceil(1_000_000))
+            };
+            SyscallResult::Return(match timeout {
+                Some(milliseconds) => linux_epoll_wait(
+                    arguments[0],
+                    arguments[1],
+                    arguments[2],
+                    milliseconds.min(i32::MAX as u64),
+                ),
+                None => error(22),
+            })
+        }
+        LINUX_PIDFD_OPEN => SyscallResult::Return(linux_pidfd_open(arguments[0], arguments[1])),
+        LINUX_PROCESS_VM_READV | LINUX_PROCESS_VM_WRITEV => SyscallResult::Return(
+            linux_process_vm(number == LINUX_PROCESS_VM_WRITEV, arguments),
+        ),
+        LINUX_MLOCK2 => SyscallResult::Return(if arguments[2] & !1 == 0 { 0 } else { error(22) }),
+        LINUX_UNSHARE => SyscallResult::Return(if arguments[0] == 0 { 0 } else { error(1) }),
+        LINUX_SETNS => SyscallResult::Return(error(1)),
+        LINUX_SCHED_SETATTR => {
+            let mut head = [0u8; 4];
+            SyscallResult::Return(if !user::copy_from_user(arguments[1], &mut head) {
+                error(14)
+            } else {
+                0
+            })
+        }
+        LINUX_SCHED_GETATTR => {
+            let mut attribute = [0u8; 48];
+            attribute[..4].copy_from_slice(&48u32.to_le_bytes());
+            SyscallResult::Return(if arguments[2] < 48 {
+                error(22)
+            } else if user::copy_to_user(arguments[1], &attribute) {
+                0
+            } else {
+                error(14)
+            })
+        }
+        LINUX_PREADV2 | LINUX_PWRITEV2 => {
+            // The flags are hints (RWF_HIPRI, DSYNC, SYNC, NOWAIT, APPEND);
+            // an offset of -1 means the file position, as in readv/writev.
+            let reading = number == LINUX_PREADV2;
+            let at_position = arguments[3] == u64::MAX;
+            SyscallResult::Return(if arguments[5] & !0x1f != 0 {
+                error(95)
+            } else if at_position && reading {
+                linux_readv(arguments[0], arguments[1], arguments[2])
+            } else if at_position {
+                linux_writev(arguments[0], arguments[1], arguments[2])
+            } else if reading {
+                linux_preadv(
+                    arguments[0],
+                    arguments[1],
+                    arguments[2],
+                    arguments[3],
+                    arguments[4],
+                )
+            } else {
+                linux_pwritev(
+                    arguments[0],
+                    arguments[1],
+                    arguments[2],
+                    arguments[3],
+                    arguments[4],
+                )
+            })
+        }
         LINUX_FADVISE64 => SyscallResult::Return(0),
         LINUX_MLOCK | LINUX_MUNLOCK | LINUX_MLOCKALL | LINUX_MUNLOCKALL => SyscallResult::Return(0),
         LINUX_SETUID | LINUX_SETGID => {
@@ -2281,12 +2777,205 @@ fn dispatch_linux(number: u64, arguments: [u64; 6]) -> SyscallResult {
             SyscallResult::Return(linux_madvise(arguments[0], arguments[1], arguments[2]))
         }
         LINUX_NANOSLEEP => SyscallResult::Return(linux_nanosleep(arguments[0], arguments[1])),
+        LINUX_GETDENTS => {
+            SyscallResult::Return(linux_getdents(arguments[0], arguments[1], arguments[2]))
+        }
+        LINUX_LINK | LINUX_LINKAT => SyscallResult::Return(error(1)),
+        LINUX_SYSLOG => {
+            SyscallResult::Return(linux_syslog(arguments[0], arguments[1], arguments[2]))
+        }
+        LINUX_SETREUID | LINUX_SETREGID => SyscallResult::Return(
+            if [arguments[0], arguments[1]]
+                .iter()
+                .all(|id| *id as u32 == u32::MAX || *id as u32 == 0)
+            {
+                0
+            } else {
+                error(1)
+            },
+        ),
+        LINUX_SETRESUID | LINUX_SETRESGID => SyscallResult::Return(
+            if arguments[..3]
+                .iter()
+                .all(|id| *id as u32 == u32::MAX || *id as u32 == 0)
+            {
+                0
+            } else {
+                error(1)
+            },
+        ),
+        // The previous value comes back whether or not the change is allowed.
+        LINUX_SETFSUID | LINUX_SETFSGID => SyscallResult::Return(0),
+        LINUX_RT_SIGPENDING => {
+            SyscallResult::Return(linux_rt_sigpending(arguments[0], arguments[1]))
+        }
+        LINUX_RT_SIGTIMEDWAIT => SyscallResult::Return(linux_rt_sigtimedwait(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+        )),
+        LINUX_RT_SIGSUSPEND => {
+            SyscallResult::Return(linux_rt_sigsuspend(arguments[0], arguments[1]))
+        }
+        LINUX_UTIME | LINUX_UTIMES => {
+            SyscallResult::Return(linux_utimensat(AT_FDCWD as u64, arguments[0]))
+        }
+        LINUX_MKNOD => {
+            SyscallResult::Return(linux_mknodat(AT_FDCWD as u64, arguments[0], arguments[1]))
+        }
+        LINUX_MKNODAT => {
+            SyscallResult::Return(linux_mknodat(arguments[0], arguments[1], arguments[2]))
+        }
+        LINUX_SCHED_SETPARAM => {
+            SyscallResult::Return(if arguments[0] == 0 || arguments[0] < 1 << 32 {
+                0
+            } else {
+                error(3)
+            })
+        }
+        LINUX_SCHED_RR_GET_INTERVAL => {
+            SyscallResult::Return(if write_timespec(arguments[1], 100_000_000) {
+                0
+            } else {
+                error(14)
+            })
+        }
+        LINUX_SETRLIMIT => SyscallResult::Return(linux_prlimit64(0, arguments[0], arguments[1], 0)),
+        LINUX_READAHEAD | LINUX_SYNC_FILE_RANGE => {
+            SyscallResult::Return(if lookup_process_fd(arguments[0]).is_some() {
+                0
+            } else {
+                error(9)
+            })
+        }
+        LINUX_SETXATTR_FIRST..=LINUX_SETXATTR_LAST => SyscallResult::Return(error(95)),
+        LINUX_RESTART_SYSCALL => SyscallResult::Return(error(4)),
+        LINUX_INOTIFY_INIT | LINUX_INOTIFY_INIT1 => {
+            SyscallResult::Return(inotify::linux_init(if number == LINUX_INOTIFY_INIT {
+                0
+            } else {
+                arguments[0]
+            }))
+        }
+        LINUX_INOTIFY_ADD_WATCH => SyscallResult::Return(inotify::linux_add_watch(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+        )),
+        LINUX_INOTIFY_RM_WATCH => {
+            SyscallResult::Return(inotify::linux_rm_watch(arguments[0], arguments[1]))
+        }
+        LINUX_RECVMMSG | LINUX_SENDMMSG => SyscallResult::Return(linux_mmsg(
+            number == LINUX_SENDMMSG,
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+        )),
+        LINUX_OPENAT2 => SyscallResult::Return(linux_openat2(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+        )),
+        LINUX_MREMAP => SyscallResult::Return(linux_mremap(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+        )),
+        LINUX_SPLICE => SyscallResult::Return(linux_splice(arguments)),
+        LINUX_VMSPLICE => SyscallResult::Return(linux_vmsplice(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+        )),
+        LINUX_TEE => SyscallResult::Return(linux_tee(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+        )),
+        LINUX_SIGNALFD | LINUX_SIGNALFD4 => SyscallResult::Return(linux_signalfd(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            if number == LINUX_SIGNALFD4 {
+                arguments[3]
+            } else {
+                0
+            },
+        )),
         LINUX_PAUSE => SyscallResult::Return(linux_pause()),
         LINUX_ALARM => SyscallResult::Return(linux_alarm(arguments[0])),
         LINUX_GETITIMER => SyscallResult::Return(linux_getitimer(arguments[0], arguments[1])),
         LINUX_SETITIMER => {
             SyscallResult::Return(linux_setitimer(arguments[0], arguments[1], arguments[2]))
         }
+        LINUX_SHMGET => {
+            SyscallResult::Return(sysv::linux_shmget(arguments[0], arguments[1], arguments[2]))
+        }
+        LINUX_SHMAT => {
+            SyscallResult::Return(sysv::linux_shmat(arguments[0], arguments[1], arguments[2]))
+        }
+        LINUX_SHMCTL => {
+            SyscallResult::Return(sysv::linux_shmctl(arguments[0], arguments[1], arguments[2]))
+        }
+        LINUX_SHMDT => SyscallResult::Return(sysv::linux_shmdt(arguments[0])),
+        LINUX_MSGGET => SyscallResult::Return(sysv::linux_msgget(arguments[0], arguments[1])),
+        LINUX_MSGSND => SyscallResult::Return(sysv::linux_msgsnd(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+        )),
+        LINUX_MSGRCV => SyscallResult::Return(sysv::linux_msgrcv(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+            arguments[4],
+        )),
+        LINUX_MSGCTL => {
+            SyscallResult::Return(sysv::linux_msgctl(arguments[0], arguments[1], arguments[2]))
+        }
+        LINUX_SEMGET => {
+            SyscallResult::Return(sysv::linux_semget(arguments[0], arguments[1], arguments[2]))
+        }
+        LINUX_SEMOP => SyscallResult::Return(sysv::linux_semop(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            0,
+        )),
+        LINUX_SEMTIMEDOP => SyscallResult::Return(sysv::linux_semop(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+        )),
+        LINUX_SEMCTL => SyscallResult::Return(sysv::linux_semctl(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+        )),
+        LINUX_TIMER_CREATE => {
+            SyscallResult::Return(linux_timer_create(arguments[0], arguments[1], arguments[2]))
+        }
+        LINUX_TIMER_SETTIME => SyscallResult::Return(linux_timer_settime(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+        )),
+        LINUX_TIMER_GETTIME => {
+            SyscallResult::Return(linux_timer_gettime(arguments[0], arguments[1]))
+        }
+        LINUX_TIMER_GETOVERRUN => SyscallResult::Return(linux_timer_getoverrun(arguments[0])),
+        LINUX_TIMER_DELETE => SyscallResult::Return(linux_timer_delete(arguments[0])),
         LINUX_SCHED_YIELD => {
             crate::scheduler::yield_now();
             RUNTIME_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -2492,7 +3181,9 @@ fn dispatch_linux(number: u64, arguments: [u64; 6]) -> SyscallResult {
             crate::scheduler::exit_group(arguments[0] & 0xff);
             SyscallResult::Exit(arguments[0] & 0xff)
         }
-        LINUX_TGKILL => linux_tgkill(arguments[0], arguments[1], arguments[2]),
+        LINUX_TGKILL | LINUX_RT_TGSIGQUEUEINFO => {
+            linux_tgkill(arguments[0], arguments[1], arguments[2])
+        }
         LINUX_SETPGID => SyscallResult::Return(linux_setpgid(arguments[0], arguments[1])),
         LINUX_GETPGID => SyscallResult::Return(linux_getpgid(arguments[0])),
         LINUX_SETSID => SyscallResult::Return(linux_setsid()),
@@ -3155,6 +3846,11 @@ fn linux_pipe2(fds_address: u64, flags: u64) -> u64 {
         PIPES.lock()[slot] = Pipe::EMPTY;
         return error(24);
     };
+    if flags & 0x800 != 0 {
+        let mut descriptors = PROCESS_FDS.lock();
+        descriptors[read_fd as usize].nonblocking = true;
+        descriptors[write_fd as usize].nonblocking = true;
+    }
     let mut encoded = [0u8; 8];
     encoded[..4].copy_from_slice(&(read_fd as u32).to_le_bytes());
     encoded[4..].copy_from_slice(&(write_fd as u32).to_le_bytes());
@@ -3655,6 +4351,15 @@ fn linux_accept(descriptor: u64, address: u64, length: u64, flags: u64) -> u64 {
 /// The filesystem keeps no per-file timestamps (every `modified` is 0), so
 /// this only checks that the path exists and reports success.
 fn linux_utimensat(directory: u64, path_address: u64) -> u64 {
+    // futimens: no path, the descriptor itself is the target.
+    if path_address == 0 {
+        return if lookup_process_fd(directory).is_some_and(|process_fd| process_fd.open) {
+            COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
+            0
+        } else {
+            error(9)
+        };
+    }
     let mut resolved = [0u8; MAX_PATH];
     let (length, _) = match resolve_user_path(directory, path_address, &mut resolved) {
         Ok(value) => value,
@@ -3718,6 +4423,37 @@ pub(crate) fn linux_syscall_name(number: u64) -> &'static str {
         LINUX_TIMERFD_CREATE => "timerfd_create",
         LINUX_TIMERFD_SETTIME => "timerfd_settime",
         LINUX_TIMERFD_GETTIME => "timerfd_gettime",
+        LINUX_SHMGET => "shmget",
+        LINUX_SHMAT => "shmat",
+        LINUX_SHMCTL => "shmctl",
+        LINUX_SHMDT => "shmdt",
+        LINUX_MSGGET => "msgget",
+        LINUX_MSGSND => "msgsnd",
+        LINUX_MSGRCV => "msgrcv",
+        LINUX_MSGCTL => "msgctl",
+        LINUX_SEMGET => "semget",
+        LINUX_SEMOP => "semop",
+        LINUX_SEMTIMEDOP => "semtimedop",
+        LINUX_SEMCTL => "semctl",
+        LINUX_FUTIMESAT => "futimesat",
+        LINUX_UNSHARE => "unshare",
+        LINUX_RT_TGSIGQUEUEINFO => "rt_tgsigqueueinfo",
+        LINUX_SETNS => "setns",
+        LINUX_SCHED_SETATTR => "sched_setattr",
+        LINUX_SCHED_GETATTR => "sched_getattr",
+        LINUX_MLOCK2 => "mlock2",
+        LINUX_PIDFD_OPEN => "pidfd_open",
+        LINUX_PROCESS_VM_READV => "process_vm_readv",
+        LINUX_PROCESS_VM_WRITEV => "process_vm_writev",
+        LINUX_PIDFD_SEND_SIGNAL => "pidfd_send_signal",
+        LINUX_PREADV2 => "preadv2",
+        LINUX_PWRITEV2 => "pwritev2",
+        LINUX_EPOLL_PWAIT2 => "epoll_pwait2",
+        LINUX_TIMER_CREATE => "timer_create",
+        LINUX_TIMER_SETTIME => "timer_settime",
+        LINUX_TIMER_GETTIME => "timer_gettime",
+        LINUX_TIMER_GETOVERRUN => "timer_getoverrun",
+        LINUX_TIMER_DELETE => "timer_delete",
         LINUX_DUP => "dup",
         LINUX_DUP2 => "dup2",
         LINUX_NANOSLEEP => "nanosleep",
@@ -3729,9 +4465,46 @@ pub(crate) fn linux_syscall_name(number: u64) -> &'static str {
         LINUX_CLONE => "clone",
         LINUX_CLONE3 => "clone3",
         LINUX_EXECVE => "execve",
+        LINUX_EXECVEAT => "execveat",
         LINUX_EXIT => "exit",
         LINUX_WAIT4 => "wait4",
         LINUX_KILL => "kill",
+        LINUX_GETDENTS => "getdents",
+        LINUX_LINK => "link",
+        LINUX_SYSLOG => "syslog",
+        LINUX_SETREUID => "setreuid",
+        LINUX_SETREGID => "setregid",
+        LINUX_SETRESUID => "setresuid",
+        LINUX_SETRESGID => "setresgid",
+        LINUX_SETFSUID => "setfsuid",
+        LINUX_SETFSGID => "setfsgid",
+        LINUX_RT_SIGPENDING => "rt_sigpending",
+        LINUX_RT_SIGTIMEDWAIT => "rt_sigtimedwait",
+        LINUX_RT_SIGQUEUEINFO => "rt_sigqueueinfo",
+        LINUX_RT_SIGSUSPEND => "rt_sigsuspend",
+        LINUX_UTIME => "utime",
+        LINUX_MKNOD => "mknod",
+        LINUX_SCHED_SETPARAM => "sched_setparam",
+        LINUX_SCHED_RR_GET_INTERVAL => "sched_rr_get_interval",
+        LINUX_SETRLIMIT => "setrlimit",
+        LINUX_READAHEAD => "readahead",
+        LINUX_SETXATTR_FIRST..=LINUX_SETXATTR_LAST => "xattr",
+        LINUX_RESTART_SYSCALL => "restart_syscall",
+        LINUX_MREMAP => "mremap",
+        LINUX_SPLICE => "splice",
+        LINUX_TEE => "tee",
+        LINUX_VMSPLICE => "vmsplice",
+        LINUX_SIGNALFD | LINUX_SIGNALFD4 => "signalfd",
+        LINUX_UTIMES => "utimes",
+        LINUX_INOTIFY_INIT | LINUX_INOTIFY_INIT1 => "inotify_init",
+        LINUX_INOTIFY_ADD_WATCH => "inotify_add_watch",
+        LINUX_INOTIFY_RM_WATCH => "inotify_rm_watch",
+        LINUX_MKNODAT => "mknodat",
+        LINUX_LINKAT => "linkat",
+        LINUX_SYNC_FILE_RANGE => "sync_file_range",
+        LINUX_RECVMMSG => "recvmmsg",
+        LINUX_SENDMMSG => "sendmmsg",
+        LINUX_OPENAT2 => "openat2",
         LINUX_UNAME => "uname",
         LINUX_FCNTL => "fcntl",
         LINUX_GETCWD => "getcwd",
@@ -4518,6 +5291,13 @@ fn linux_pread64(descriptor: u64, address: u64, requested: u64, offset: u64) -> 
     let (Ok(requested), Ok(offset)) = (usize::try_from(requested), usize::try_from(offset)) else {
         return error(22);
     };
+    // A buffer that really is that big may be asked for more than one call
+    // moves: it gets a short count, as on Linux.
+    let requested = if requested > MAX_IO && user::range_accessible(address, requested, true) {
+        MAX_IO
+    } else {
+        requested
+    };
     if requested > MAX_IO || !user::range_accessible(address, requested, true) {
         return error(14);
     }
@@ -4565,6 +5345,13 @@ fn linux_pwrite64(descriptor: u64, address: u64, requested: u64, offset: u64) ->
     let (Ok(requested), Ok(offset)) = (usize::try_from(requested), usize::try_from(offset)) else {
         return error(22);
     };
+    // A buffer that really is that big may be asked for more than one call
+    // moves: it gets a short count, as on Linux.
+    let requested = if requested > MAX_IO && user::range_accessible(address, requested, false) {
+        MAX_IO
+    } else {
+        requested
+    };
     if requested > MAX_IO || !user::range_accessible(address, requested, false) {
         return error(14);
     }
@@ -4597,6 +5384,179 @@ fn linux_pwrite64(descriptor: u64, address: u64, requested: u64, offset: u64) ->
     WRITES.fetch_add(1, Ordering::Relaxed);
     IO_BYTES.fetch_add(total as u64, Ordering::Relaxed);
     POSITIONAL_CALLS.fetch_add(1, Ordering::Relaxed);
+    if total > 0 {
+        inotify::notify_handle(process_fd.handle, inotify::IN_MODIFY);
+    }
+    total as u64
+}
+
+/// `vmsplice`: the user pages are copied through the pipe (written to the
+/// write end, read from the read end).
+/// `pidfd_open`: a descriptor for the process, readable (for poll) once it
+/// has ended; `pidfd_send_signal` signals it.
+fn linux_pidfd_open(pid: u64, flags: u64) -> u64 {
+    const PIDFD_NONBLOCK: u64 = 0o4000;
+    if flags & !PIDFD_NONBLOCK != 0 || pid == 0 || pid > u64::from(u32::MAX) {
+        return error(22);
+    }
+    let own =
+        crate::scheduler::current_task_pid_for_linux().unwrap_or_else(crate::process::current_pid);
+    if pid != own && !crate::scheduler::task_exists(pid) {
+        return error(3);
+    }
+    let template = Pipe {
+        pidfd: true,
+        counter: pid,
+        ..Pipe::EMPTY
+    };
+    match create_single_fd_pipe(template, true, false) {
+        Ok(descriptor) => {
+            COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
+            descriptor
+        }
+        Err(failure) => error(failure),
+    }
+}
+
+/// `process_vm_readv` / `process_vm_writev`: copies between the caller's
+/// buffers (`local`) and the process `pid`'s memory (`remote`), the two
+/// vectors walked in step.
+fn linux_process_vm(write: bool, arguments: [u64; 6]) -> u64 {
+    let [pid, local, local_count, remote, remote_count, flags] = arguments;
+    if flags != 0 || local_count > 16 || remote_count > 16 {
+        return error(22);
+    }
+    let Some(group) = crate::scheduler::group_of_tid(pid) else {
+        return error(3);
+    };
+    let own = group == crate::scheduler::current_group();
+    let mut chunk = [0u8; IO_CHUNK];
+    let mut total = 0usize;
+    let mut local_index = 0usize;
+    let mut local_done = 0u64;
+    for remote_index in 0..remote_count as usize {
+        let Some((remote_base, remote_length)) = read_iovec(remote, remote_index) else {
+            return if total == 0 { error(14) } else { total as u64 };
+        };
+        let mut remote_done = 0u64;
+        while remote_done < remote_length {
+            let (local_base, local_length) = loop {
+                if local_index >= local_count as usize {
+                    return total as u64;
+                }
+                let Some((base, length)) = read_iovec(local, local_index) else {
+                    return if total == 0 { error(14) } else { total as u64 };
+                };
+                if local_done < length {
+                    break (base, length);
+                }
+                local_index += 1;
+                local_done = 0;
+            };
+            let amount = (remote_length - remote_done)
+                .min(local_length - local_done)
+                .min(chunk.len() as u64) as usize;
+            let remote_at = remote_base.wrapping_add(remote_done);
+            let local_at = local_base.wrapping_add(local_done);
+            let moved = if write {
+                user::copy_from_user(local_at, &mut chunk[..amount])
+                    && if own {
+                        user::copy_to_user(remote_at, &chunk[..amount])
+                    } else {
+                        ptrace::write_memory(pid, remote_at, &chunk[..amount])
+                    }
+            } else {
+                (if own {
+                    user::copy_from_user(remote_at, &mut chunk[..amount])
+                } else {
+                    ptrace::read_memory(pid, remote_at, &mut chunk[..amount])
+                }) && user::copy_to_user(local_at, &chunk[..amount])
+            };
+            if !moved {
+                return if total == 0 { error(14) } else { total as u64 };
+            }
+            total += amount;
+            remote_done += amount as u64;
+            local_done += amount as u64;
+        }
+    }
+    COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
+    total as u64
+}
+
+fn pidfd_target(descriptor: u64) -> Result<u64, u64> {
+    let process_fd = lookup_process_fd(descriptor).ok_or_else(|| error(9))?;
+    if !process_fd.pipe {
+        return Err(error(9));
+    }
+    match PIPES.lock().get(process_fd.handle as usize) {
+        Some(pipe) if pipe.used && pipe.pidfd => Ok(pipe.counter),
+        _ => Err(error(9)),
+    }
+}
+
+fn linux_vmsplice(descriptor: u64, vectors: u64, count: u64, flags: u64) -> u64 {
+    if flags & !0xf != 0 || count > 16 {
+        return error(22);
+    }
+    let Some(process_fd) = lookup_process_fd(descriptor) else {
+        return error(9);
+    };
+    if !process_fd.pipe {
+        return error(9);
+    }
+    let slot = process_fd.handle as usize;
+    let writing = process_fd.writable;
+    let mut total = 0usize;
+    let mut chunk = [0u8; IO_CHUNK];
+    for index in 0..count as usize {
+        let Some((base, length)) = read_iovec(vectors, index) else {
+            return if total == 0 { error(14) } else { total as u64 };
+        };
+        let Ok(length) = usize::try_from(length) else {
+            return error(22);
+        };
+        if total.checked_add(length).is_none_or(|size| size > MAX_IO) {
+            return error(22);
+        }
+        let mut done = 0usize;
+        while done < length {
+            let amount = (length - done).min(chunk.len());
+            let address = base + done as u64;
+            let moved = if writing {
+                if !user::copy_from_user(address, &mut chunk[..amount]) {
+                    return if total == 0 { error(14) } else { total as u64 };
+                }
+                pipe_write(slot, &chunk[..amount])
+            } else {
+                match pipe_read(slot, &mut chunk[..amount]) {
+                    Ok(read) if read > 0 => {
+                        if user::copy_to_user(address, &chunk[..read]) {
+                            Ok(read)
+                        } else {
+                            return if total == 0 { error(14) } else { total as u64 };
+                        }
+                    }
+                    other => other,
+                }
+            };
+            match moved {
+                Ok(0) => return total as u64,
+                Ok(moved) => {
+                    total += moved;
+                    done += moved;
+                }
+                Err(failure) => {
+                    return if total == 0 {
+                        error(failure)
+                    } else {
+                        total as u64
+                    };
+                }
+            }
+        }
+    }
+    COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
     total as u64
 }
 
@@ -4607,7 +5567,7 @@ fn linux_readv(descriptor: u64, vectors: u64, count: u64) -> u64 {
     if !process_fd.readable {
         return error(9);
     }
-    if process_fd.standard == 1 {
+    if process_fd.standard == 1 || process_fd.standard == DEVICE_NULL {
         READS.fetch_add(1, Ordering::Relaxed);
         VECTORED_CALLS.fetch_add(1, Ordering::Relaxed);
         return 0;
@@ -4694,6 +5654,20 @@ fn fd_ready_events(descriptor: u64) -> u32 {
         if pipe.timer {
             timer_expire(&mut pipe, crate::time::monotonic_nanoseconds());
             return if pipe.counter > 0 { EPOLLIN } else { 0 };
+        }
+        if pipe.pidfd {
+            return if crate::scheduler::task_ended(pipe.counter) {
+                EPOLLIN
+            } else {
+                0
+            };
+        }
+        if pipe.signal {
+            return if SIGNAL_PENDING.load(Ordering::Acquire) & pipe.counter != 0 {
+                EPOLLIN
+            } else {
+                0
+            };
         }
         if pipe.event {
             if pipe.counter > 0 {
@@ -5357,6 +6331,7 @@ pub enum RemoteSignal {
 pub fn signal_stored_state(state: &mut ProcessState, signal: u64, traced: bool) -> RemoteSignal {
     if traced && signal != 9 {
         state.signal_pending |= 1 << (signal - 1);
+        state.signal_info[signal as usize - 1] = next_signal_info();
         return RemoteSignal::Queued;
     }
     let action = state.signal_actions[signal as usize - 1];
@@ -5365,6 +6340,7 @@ pub fn signal_stored_state(state: &mut ProcessState, signal: u64, traced: bool) 
         RemoteSignal::Ignored
     } else if catchable && action.handler > 1 {
         state.signal_pending |= 1 << (signal - 1);
+        state.signal_info[signal as usize - 1] = next_signal_info();
         RemoteSignal::Queued
     } else {
         RemoteSignal::Fatal
@@ -5374,8 +6350,11 @@ pub fn signal_stored_state(state: &mut ProcessState, signal: u64, traced: bool) 
 /// A forked child starts with no signals waiting and no interval timer.
 pub fn clear_pending_signals(state: &mut ProcessState) {
     state.signal_pending = 0;
+    state.signal_info = [SignalInfo::USER; 64];
     state.itimer_deadline = 0;
     state.itimer_interval = 0;
+    state.posix_timers = [PosixTimer::EMPTY; POSIX_TIMER_COUNT];
+    state.cpu_timers = [CpuTimer::EMPTY; 2];
 }
 
 /// Signals whose default action is to do nothing.
@@ -5386,8 +6365,15 @@ fn default_ignored(signal: u64) -> bool {
 /// A signal sent to the running process: ignored, queued for its handler,
 /// or (default action) fatal with status 128 + signal.
 fn raise_signal(signal: u64) -> SyscallResult {
+    // A blocked signal waits (kill and stop cannot be blocked); the default
+    // action of a fatal one is taken when it is unblocked and taken.
+    if signal != 9 && signal != 19 && SIGNAL_MASK.load(Ordering::Acquire) & (1 << (signal - 1)) != 0
+    {
+        queue_pending(signal);
+        return SyscallResult::Return(0);
+    }
     if signal != 9 && crate::scheduler::is_traced() {
-        SIGNAL_PENDING.fetch_or(1 << (signal - 1), Ordering::AcqRel);
+        queue_pending(signal);
         return SyscallResult::Return(0);
     }
     let action = SIGNAL_ACTIONS.lock()[signal as usize - 1];
@@ -5396,7 +6382,7 @@ fn raise_signal(signal: u64) -> SyscallResult {
         return SyscallResult::Return(0);
     }
     if catchable && action.handler > 1 {
-        SIGNAL_PENDING.fetch_or(1 << (signal - 1), Ordering::AcqRel);
+        queue_pending(signal);
         return SyscallResult::Return(0);
     }
     if catchable && default_ignored(signal) {
@@ -5406,6 +6392,8 @@ fn raise_signal(signal: u64) -> SyscallResult {
 }
 
 const SA_RESTORER: u64 = 0x0400_0000;
+const SA_ONSTACK: u64 = 0x0800_0000;
+const SA_RESETHAND: u64 = 0x8000_0000;
 const SA_NODEFER: u64 = 0x4000_0000;
 /// Words saved on the user stack for a signal handler (see `deliver_signal`).
 const SIGNAL_SAVED_WORDS: usize = 20;
@@ -5432,6 +6420,17 @@ fn push_signal_frame(
         return Err(128 + 11);
     }
     let block = 8 + SIGNAL_SAVED_WORDS * 8 + SIGNAL_SIGINFO_BYTES + SIGNAL_CONTEXT_BYTES;
+    // SA_ONSTACK: a handler runs on the alternate stack (unless it is off or
+    // the process is already on it), which is what lets a stack overflow be
+    // handled at all.
+    let mut user_rsp = user_rsp;
+    if action.flags & SA_ONSTACK != 0 {
+        let alternate = *ALTERNATE_STACK.lock();
+        let on_it = user_rsp > alternate.pointer && user_rsp <= alternate.pointer + alternate.size;
+        if alternate.flags & 2 == 0 && alternate.size != 0 && !on_it {
+            user_rsp = alternate.pointer + alternate.size;
+        }
+    }
     let Some(base) = user_rsp.checked_sub(128 + block as u64) else {
         return Err(128 + 11);
     };
@@ -5446,6 +6445,22 @@ fn push_signal_frame(
     }
     let info_at = 8 + SIGNAL_SAVED_WORDS * 8;
     bytes[info_at..info_at + 4].copy_from_slice(&(signal as u32).to_le_bytes());
+    let info = core::mem::replace(
+        &mut SIGNAL_INFO.lock()[signal as usize - 1],
+        SignalInfo::USER,
+    );
+    bytes[info_at + 8..info_at + 12].copy_from_slice(&info.code.to_le_bytes());
+    if info.fault {
+        bytes[info_at + 16..info_at + 24].copy_from_slice(&info.address.to_le_bytes());
+    } else if info.code == SI_TIMER {
+        bytes[info_at + 16..info_at + 20].copy_from_slice(&info.tid.to_le_bytes());
+        bytes[info_at + 20..info_at + 24].copy_from_slice(&info.overrun.to_le_bytes());
+    } else {
+        bytes[info_at + 16..info_at + 20].copy_from_slice(&info.pid.to_le_bytes());
+    }
+    if !info.fault {
+        bytes[info_at + 24..info_at + 32].copy_from_slice(&info.value.to_le_bytes());
+    }
     if !user::copy_to_user(sp, &bytes) {
         return Err(128 + 11);
     }
@@ -5457,35 +6472,113 @@ fn push_signal_frame(
     Ok(sp)
 }
 
-/// Expires the ITIMER_REAL if it is due: SIGALRM is queued for its handler
-/// (or dropped when ignored); with the default action the process has to die,
-/// which the exit status says. Runs before every delivery attempt.
-fn check_itimer() -> Option<u64> {
+/// Expires the ITIMER_REAL and the POSIX timers that are due: the signal is
+/// left pending for `take_signal` (which runs its handler, drops it when
+/// ignored or kills the process when the default action is fatal and the
+/// signal is not blocked). Runs before every delivery attempt.
+fn check_itimer() {
     let deadline = ITIMER_DEADLINE.load(Ordering::Acquire);
-    if deadline == 0 {
-        return None;
+    let posix = POSIX_NEXT.load(Ordering::Acquire);
+    if deadline == 0 && posix == 0 && !CPU_TIMERS_ARMED.load(Ordering::Acquire) {
+        return;
     }
     let now = crate::time::monotonic_nanoseconds();
-    if now < deadline {
-        return None;
+    let mut due = 0u64;
+    if deadline != 0 && now >= deadline {
+        let interval = ITIMER_INTERVAL.load(Ordering::Acquire);
+        let next = if interval == 0 {
+            0
+        } else {
+            deadline + interval * (1 + (now - deadline) / interval)
+        };
+        ITIMER_DEADLINE.store(next, Ordering::Release);
+        due |= 1 << (14 - 1);
+        SIGNAL_INFO.lock()[14 - 1] = SignalInfo {
+            code: SI_KERNEL,
+            ..SignalInfo::USER
+        };
     }
-    let interval = ITIMER_INTERVAL.load(Ordering::Acquire);
-    let next = if interval == 0 {
-        0
-    } else {
-        deadline + interval * (1 + (now - deadline) / interval)
-    };
-    ITIMER_DEADLINE.store(next, Ordering::Release);
-    const SIGALRM: u64 = 14;
-    let action = SIGNAL_ACTIONS.lock()[SIGALRM as usize - 1];
-    match action.handler {
-        1 => None,
-        0 => (!default_ignored(SIGALRM)).then_some(128 + SIGALRM),
-        _ => {
-            SIGNAL_PENDING.fetch_or(1 << (SIGALRM - 1), Ordering::AcqRel);
-            None
+    if posix != 0 && now >= posix {
+        due |= expire_posix_timers(now);
+    }
+    if CPU_TIMERS_ARMED.load(Ordering::Acquire) {
+        due |= expire_cpu_timers();
+    }
+    while due != 0 {
+        let signal = u64::from(due.trailing_zeros()) + 1;
+        due &= due - 1;
+        let action = SIGNAL_ACTIONS.lock()[signal as usize - 1];
+        let ignored = action.handler == 1 || (action.handler == 0 && default_ignored(signal));
+        if !ignored {
+            SIGNAL_PENDING.fetch_or(1 << (signal - 1), Ordering::AcqRel);
         }
     }
+}
+
+/// Advances the POSIX timers that are due at `now`; the result has the bit
+/// of every signal to raise.
+fn expire_posix_timers(now: u64) -> u64 {
+    let mut timers = POSIX_TIMERS.lock();
+    let mut due = 0u64;
+    for (index, timer) in timers.iter_mut().enumerate() {
+        if !timer.used || timer.deadline == 0 || now < timer.deadline {
+            continue;
+        }
+        match (now - timer.deadline).checked_div(timer.interval) {
+            None => {
+                timer.deadline = 0;
+                timer.overrun = 0;
+            }
+            Some(missed) => {
+                timer.overrun = missed.min(i32::MAX as u64) as u32;
+                timer.deadline += timer.interval * (1 + missed);
+            }
+        }
+        if timer.signal != 0 {
+            due |= 1 << (timer.signal - 1);
+            SIGNAL_INFO.lock()[timer.signal as usize - 1] = SignalInfo {
+                code: SI_TIMER,
+                value: timer.value,
+                tid: index as u32,
+                overrun: timer.overrun,
+                ..SignalInfo::USER
+            };
+        }
+    }
+    POSIX_NEXT.store(posix_next_deadline(&timers), Ordering::Release);
+    due
+}
+
+/// The signals (SIGVTALRM, SIGPROF) of the CPU-time interval timers that are
+/// due, advancing the periodic ones.
+fn expire_cpu_timers() -> u64 {
+    const SIGNALS: [u64; 2] = [26, 27];
+    let mut due = 0u64;
+    let mut timers = CPU_TIMERS.lock();
+    for (index, timer) in timers.iter_mut().enumerate() {
+        if timer.deadline == 0 {
+            continue;
+        }
+        let reading = cpu_timer_reading(index);
+        if reading < timer.deadline {
+            continue;
+        }
+        timer.deadline = match (reading - timer.deadline).checked_div(timer.interval) {
+            Some(missed) => timer.deadline + timer.interval * (1 + missed),
+            None => 0,
+        };
+        due |= 1 << (SIGNALS[index] - 1);
+    }
+    CPU_TIMERS_ARMED.store(
+        timers.iter().any(|timer| timer.deadline != 0),
+        Ordering::Release,
+    );
+    due
+}
+
+fn clear_posix_timers() {
+    *POSIX_TIMERS.lock() = [PosixTimer::EMPTY; POSIX_TIMER_COUNT];
+    POSIX_NEXT.store(0, Ordering::Release);
 }
 
 /// The next pending, unblocked signal with a real handler (signals without
@@ -5510,9 +6603,12 @@ fn take_signal(context: &mut ptrace::Context) -> Result<Option<(u64, SignalActio
     }
     let action = SIGNAL_ACTIONS.lock()[signal as usize - 1];
     if action.handler > 1 {
+        if action.flags & SA_RESETHAND != 0 && signal != 4 && signal != 5 {
+            SIGNAL_ACTIONS.lock()[signal as usize - 1] = SignalAction::EMPTY;
+        }
         return Ok(Some((signal, action)));
     }
-    if traced && action.handler == 0 && !default_ignored(signal) && !matches!(signal, 19..=22) {
+    if action.handler == 0 && !default_ignored(signal) && !matches!(signal, 19..=22) {
         return Err(128 + signal);
     }
     Ok(None)
@@ -5524,9 +6620,7 @@ fn take_signal(context: &mut ptrace::Context) -> Result<Option<(u64, SignalActio
 /// `sa_restorer`, which calls rt_sigreturn. Returns an exit status when the
 /// process has to die instead (no usable handler frame).
 fn deliver_signal(frame: &mut LinuxSyscallFrame) -> Option<u64> {
-    if let Some(code) = check_itimer() {
-        return Some(code);
-    }
+    check_itimer();
     let (signal, action) = match take_signal(&mut ptrace::Context::Syscall(&mut *frame)) {
         Ok(Some(taken)) => taken,
         Ok(None) => return None,
@@ -5573,10 +6667,47 @@ fn deliver_signal(frame: &mut LinuxSyscallFrame) -> Option<u64> {
 /// interrupted it redirects it instead. All registers are saved (the handler
 /// may clobber any of them) and `rt_sigreturn` restores them via `iretq`.
 /// Returns an exit status when the process has to die instead.
-pub fn deliver_async_signal(regs: &mut user::UserRegs) -> Option<u64> {
-    if let Some(code) = check_itimer() {
-        return Some(code);
+/// SIGCHLD for a parent whose child `child` ended with `status`, queued in
+/// the parent's stored state (the child is the running task, never the
+/// parent). The default action ignores it, so only a handler sees it.
+pub fn notify_parent_of_exit(state: &mut ProcessState, child: u64, status: u64) {
+    const CLD_EXITED: i32 = 1;
+    *NEXT_SIGNAL_INFO.lock() = Some(SignalInfo {
+        code: CLD_EXITED,
+        pid: child as u32,
+        value: status & 0xff,
+        ..SignalInfo::USER
+    });
+    let _ = signal_stored_state(state, 17, false);
+    *NEXT_SIGNAL_INFO.lock() = None;
+}
+
+/// A synchronous fault in user mode (`signal` SIGSEGV, SIGBUS, SIGFPE or
+/// SIGILL at `address`): runs the process's handler for it when there is one
+/// and the signal is not blocked. False means the process has to be ended.
+pub fn deliver_fault_signal(
+    regs: &mut user::UserRegs,
+    signal: u64,
+    code: i32,
+    address: u64,
+) -> bool {
+    let action = SIGNAL_ACTIONS.lock()[signal as usize - 1];
+    let bit = 1u64 << (signal - 1);
+    if action.handler <= 1 || SIGNAL_MASK.load(Ordering::Acquire) & bit != 0 {
+        return false;
     }
+    SIGNAL_INFO.lock()[signal as usize - 1] = SignalInfo {
+        code,
+        fault: true,
+        address,
+        ..SignalInfo::USER
+    };
+    SIGNAL_PENDING.fetch_or(bit, Ordering::AcqRel);
+    deliver_async_signal(regs).is_none()
+}
+
+pub fn deliver_async_signal(regs: &mut user::UserRegs) -> Option<u64> {
+    check_itimer();
     if SIGNAL_PENDING.load(Ordering::Acquire) & !SIGNAL_MASK.load(Ordering::Acquire) == 0 {
         return None;
     }
@@ -5743,8 +6874,10 @@ fn linux_writev(descriptor: u64, vectors: u64, count: u64) -> u64 {
                 return if total == 0 { error(14) } else { total as u64 };
             }
             if process_fd.standard != 0 {
-                for byte in &chunk[..amount] {
-                    crate::serial::byte(*byte);
+                if process_fd.standard < DEVICE_NULL {
+                    for byte in &chunk[..amount] {
+                        crate::serial::byte(*byte);
+                    }
                 }
                 vector_total += amount;
                 total += amount;
@@ -5774,6 +6907,9 @@ fn linux_writev(descriptor: u64, vectors: u64, count: u64) -> u64 {
     WRITES.fetch_add(1, Ordering::Relaxed);
     IO_BYTES.fetch_add(total as u64, Ordering::Relaxed);
     VECTORED_CALLS.fetch_add(1, Ordering::Relaxed);
+    if total > 0 && process_fd.standard == 0 {
+        inotify::notify_handle(process_fd.handle, inotify::IN_MODIFY);
+    }
     total as u64
 }
 
@@ -5815,7 +6951,7 @@ fn linux_faccessat2(directory: u64, path_address: u64, mode: u64, flags: u64) ->
 
 fn linux_statx(arguments: [u64; 6]) -> u64 {
     let [directory, path_address, flags, _, address, _] = arguments;
-    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_STATX_SYNC_MASK) != 0 {
         return error(22);
     }
     let mut input = [0u8; MAX_PATH];
@@ -5842,7 +6978,12 @@ fn linux_statx(arguments: [u64; 6]) -> u64 {
         let Ok(path) = core::str::from_utf8(&resolved[..length]) else {
             return error(84);
         };
-        match vfs::metadata(path) {
+        let found = if flags & AT_SYMLINK_NOFOLLOW != 0 {
+            vfs::symlink_metadata(path)
+        } else {
+            vfs::metadata(path)
+        };
+        match found {
             Ok(metadata) => metadata,
             Err(failure) => return vfs_error(failure),
         }
@@ -5915,15 +7056,33 @@ fn mmap_fill_from_file(
 fn linux_mmap(arguments: [u64; 6]) -> u64 {
     let [address, length, protection, flags, descriptor, offset] = arguments;
     let anonymous = flags & MAP_ANONYMOUS != 0;
-    if address != 0
-        || flags & MAP_PRIVATE == 0
-        || flags & !(MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK) != 0
+    let kind = flags & (MAP_SHARED | MAP_PRIVATE);
+    // A shared file mapping is only usable read-only here (writes would
+    // have to reach the file), and then it is the same as a private one.
+    let shared_file = kind == MAP_SHARED && !anonymous;
+    // Without MAP_FIXED an address is only a hint, which is ignored.
+    let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
+    if !matches!(kind, MAP_SHARED | MAP_PRIVATE)
+        || flags
+            & !(MAP_SHARED
+                | MAP_PRIVATE
+                | MAP_ANONYMOUS
+                | MAP_STACK
+                | MAP_FIXED
+                | MAP_FIXED_NOREPLACE
+                | MAP_DENYWRITE
+                | MAP_NORESERVE
+                | MAP_POPULATE)
+            != 0
         || protection > u8::MAX as u64
+        || (shared_file && protection & 2 != 0)
+        || (fixed && (address & 0xfff != 0 || (kind == MAP_SHARED && anonymous)))
     {
         return error(22);
     }
+    let shared = kind == MAP_SHARED && anonymous;
     let file = if anonymous {
-        if descriptor != u64::MAX || offset != 0 {
+        if descriptor as i32 != -1 || offset != 0 {
             return error(22);
         }
         None
@@ -5948,7 +7107,19 @@ fn linux_mmap(arguments: [u64; 6]) -> u64 {
     // get file-backed mmap mapped into their own dedicated region, not the
     // shared singleton below - `None` here means this task has no
     // `process_space` at all, so it falls through to that singleton path.
-    if let Some(result) = crate::scheduler::linux_mmap_for_current_task(pages, protection as u8) {
+    let placed = if fixed {
+        crate::scheduler::linux_mmap_fixed_for_current_task(
+            address,
+            pages,
+            protection as u8,
+            flags & MAP_FIXED_NOREPLACE == 0,
+        )
+    } else if shared {
+        crate::scheduler::linux_mmap_shared_for_current_task(pages, protection as u8, None)
+    } else {
+        crate::scheduler::linux_mmap_for_current_task(pages, protection as u8)
+    };
+    if let Some(result) = placed {
         let Some(mapped_address) = result else {
             crate::oom::relieve();
             return error(12);
@@ -6163,7 +7334,7 @@ fn linux_ioctl(descriptor: u64, request: u64, address: u64) -> u64 {
     if is_socket_fd(&process_fd) && matches!(request, 0x541b | 0x5421) {
         return socket_ioctl(descriptor, &process_fd, request, address);
     }
-    if process_fd.standard == 0 {
+    if process_fd.standard == 0 || process_fd.standard >= DEVICE_NULL {
         return error(25);
     }
     let result = match request {
@@ -6490,6 +7661,7 @@ fn linux_mkdirat(directory: u64, path_address: u64, mode: u64) -> u64 {
     };
     match vfs::create_directory(path, apply_umask(mode as u16)) {
         Ok(()) => {
+            inotify::notify(path, inotify::IN_CREATE | inotify::IN_ISDIR, 0);
             CREATE_CALLS.fetch_add(1, Ordering::Relaxed);
             PATH_CALLS.fetch_add(1, Ordering::Relaxed);
             COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -6530,6 +7702,13 @@ fn linux_renameat(
     let Ok(destination_path) = core::str::from_utf8(&destination[..destination_length]) else {
         return error(84);
     };
+    let directory_flag = if inotify::any_watches()
+        && vfs::metadata(source_path).is_ok_and(|entry| entry.mode & 0o170000 == 0o040000)
+    {
+        inotify::IN_ISDIR
+    } else {
+        0
+    };
     let renamed = if flags & RENAME_NOREPLACE != 0 {
         vfs::rename_noreplace(source_path, destination_path)
     } else {
@@ -6537,6 +7716,15 @@ fn linux_renameat(
     };
     match renamed {
         Ok(()) => {
+            if inotify::any_watches() {
+                let cookie = inotify::next_cookie();
+                inotify::notify(source_path, inotify::IN_MOVED_FROM | directory_flag, cookie);
+                inotify::notify(
+                    destination_path,
+                    inotify::IN_MOVED_TO | directory_flag,
+                    cookie,
+                );
+            }
             RENAME_CALLS.fetch_add(1, Ordering::Relaxed);
             PATH_CALLS.fetch_add(1, Ordering::Relaxed);
             COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -6561,8 +7749,16 @@ fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
     let Ok(path) = core::str::from_utf8(&resolved[..length]) else {
         return error(84);
     };
+    let directory_flag = if inotify::any_watches()
+        && vfs::metadata(path).is_ok_and(|entry| entry.mode & 0o170000 == 0o040000)
+    {
+        inotify::IN_ISDIR
+    } else {
+        0
+    };
     match vfs::remove(path, flags & AT_REMOVEDIR != 0) {
         Ok(()) => {
+            inotify::notify(path, inotify::IN_DELETE | directory_flag, 0);
             REMOVE_CALLS.fetch_add(1, Ordering::Relaxed);
             PATH_CALLS.fetch_add(1, Ordering::Relaxed);
             COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -6872,7 +8068,54 @@ fn process_fd_v6(process_fd: &ProcessFd) -> bool {
     process_fd.inet6
 }
 
+/// The credential, xattr, inotify, mmsg and openat2 corners that need no
+/// user pointers.
+fn extra_syscalls_self_test() -> bool {
+    let call = |number: u64, arguments: [u64; 6]| match dispatch_linux(number, arguments) {
+        SyscallResult::Return(value) => value,
+        _ => u64::MAX - 1000,
+    };
+    let any = u64::MAX;
+    let credentials = call(LINUX_SETREUID, [any, 0, 0, 0, 0, 0]) == 0
+        && call(LINUX_SETREUID, [5, 0, 0, 0, 0, 0]) == error(1)
+        && call(LINUX_SETRESGID, [any, any, any, 0, 0, 0]) == 0
+        && call(LINUX_SETRESUID, [0, 0, 7, 0, 0, 0]) == error(1)
+        && call(LINUX_SETFSUID, [5, 0, 0, 0, 0, 0]) == 0;
+    let refusals = call(LINUX_LINK, [0; 6]) == error(1)
+        && call(LINUX_LINKAT, [0; 6]) == error(1)
+        && call(LINUX_SETXATTR_FIRST, [0; 6]) == error(95)
+        && call(LINUX_SETXATTR_LAST, [0; 6]) == error(95)
+        && call(LINUX_RESTART_SYSCALL, [0; 6]) == error(4)
+        && call(LINUX_MKNOD, [0, 0o010000 | 0o644, 0, 0, 0, 0]) == error(1);
+    let advice = call(LINUX_READAHEAD, [9999, 0, 0, 0, 0, 0]) == error(9)
+        && call(LINUX_SYNC_FILE_RANGE, [9999, 0, 0, 0, 0, 0]) == error(9);
+    let inotify = inotify::self_test()
+        && call(LINUX_INOTIFY_ADD_WATCH, [9999, 0, 2, 0, 0, 0]) == error(9)
+        && call(LINUX_INOTIFY_INIT1, [1, 0, 0, 0, 0, 0]) == error(22);
+    let batches = call(LINUX_SENDMMSG, [3, 0, 0, 0, 0, 0]) == 0
+        && call(LINUX_OPENAT2, [AT_FDCWD as u64, 0, 0, 8, 0, 0]) == error(22)
+        && call(LINUX_SYSLOG, [8, 0, 0, 0, 0, 0]) == 0
+        && call(LINUX_SYSLOG, [10, 0, 0, 0, 0, 0]) == 16 * 1024
+        && call(LINUX_SYSLOG, [99, 0, 0, 0, 0, 0]) == error(22)
+        && call(LINUX_UNSHARE, [0; 6]) == 0
+        && call(LINUX_UNSHARE, [0x2000_0000, 0, 0, 0, 0, 0]) == error(1)
+        && call(LINUX_SETNS, [3, 0, 0, 0, 0, 0]) == error(1)
+        && call(LINUX_MLOCK2, [0, 0, 4, 0, 0, 0]) == error(22)
+        && call(LINUX_PREADV2, [0, 0, 0, 0, 0, 0x100]) == error(95)
+        && call(LINUX_SCHED_GETATTR, [0, 0, 8, 0, 0, 0]) == error(22);
+    credentials
+        && refusals
+        && advice
+        && inotify
+        && batches
+        && posix_timer_self_test()
+        && sysv::self_test()
+}
+
 pub(crate) fn misc_syscalls_self_test() -> bool {
+    if !extra_syscalls_self_test() {
+        return false;
+    }
     let flock_ok = [1, 2, 8, 1 | 4, 2 | 4, 8 | 4]
         .iter()
         .all(|operation| flock_operation_valid(*operation))
@@ -6983,8 +8226,10 @@ fn errno_of(failure: VfsError) -> u64 {
 /// Writes to any descriptor `write` accepts, from a kernel buffer.
 fn write_kernel_bytes(output: ProcessFd, offset: Option<u64>, data: &[u8]) -> Result<usize, u64> {
     if output.standard != 0 {
-        for byte in data {
-            crate::serial::byte(*byte);
+        if output.standard < DEVICE_NULL {
+            for byte in data {
+                crate::serial::byte(*byte);
+            }
         }
         return Ok(data.len());
     }
@@ -7527,6 +8772,7 @@ fn linux_ftruncate(descriptor: u64, length: u64) -> u64 {
     };
     match vfs::truncate(process_fd.handle, length) {
         Ok(()) => {
+            inotify::notify_handle(process_fd.handle, inotify::IN_MODIFY);
             TRUNCATE_CALLS.fetch_add(1, Ordering::Relaxed);
             COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
             0
@@ -7555,6 +8801,7 @@ fn linux_truncate(path_address: u64, length: u64) -> u64 {
     let _ = vfs::close(handle);
     match result {
         Ok(()) => {
+            inotify::notify(path, inotify::IN_MODIFY, 0);
             TRUNCATE_CALLS.fetch_add(1, Ordering::Relaxed);
             COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
             0
@@ -7572,6 +8819,7 @@ fn linux_fchmod(descriptor: u64, mode: u64) -> u64 {
     };
     match vfs::fchmod(process_fd.handle, mode as u16) {
         Ok(()) => {
+            inotify::notify_handle(process_fd.handle, inotify::IN_ATTRIB);
             CHMOD_CALLS.fetch_add(1, Ordering::Relaxed);
             COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
             0
@@ -7660,6 +8908,7 @@ fn linux_chmodat(directory: u64, path_address: u64, mode: u64, flags: u64) -> u6
     };
     match vfs::chmod(path, mode as u16) {
         Ok(()) => {
+            inotify::notify(path, inotify::IN_ATTRIB, 0);
             CHMOD_CALLS.fetch_add(1, Ordering::Relaxed);
             PATH_CALLS.fetch_add(1, Ordering::Relaxed);
             COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -7684,8 +8933,26 @@ fn resolve_user_path(
         return Err(error(2));
     }
     let relative = !path.starts_with('/');
-    if relative && directory as i64 != AT_FDCWD {
-        return Err(error(9));
+    // A path relative to a directory descriptor starts at that directory.
+    let mut base = [0u8; 128];
+    let mut base_length = None;
+    if relative && directory as i32 as i64 != AT_FDCWD {
+        let process_fd = lookup_file_fd(directory).ok_or_else(|| error(9))?;
+        let metadata = vfs::descriptor_metadata(process_fd.handle).map_err(vfs_error)?;
+        if metadata.mode & 0o170000 != 0o040000 {
+            return Err(error(20));
+        }
+        let length = if process_fd.dir_length > 0 {
+            let length = process_fd.dir_length as usize;
+            base[..length].copy_from_slice(&process_fd.dir_path[..length]);
+            length
+        } else {
+            let (bytes, length) =
+                vfs::descriptor_path(process_fd.handle).ok_or_else(|| error(9))?;
+            base[..length].copy_from_slice(&bytes[..length]);
+            length
+        };
+        base_length = Some(length);
     }
     let mut component_starts = [0usize; 32];
     let mut depth = 0usize;
@@ -7694,8 +8961,12 @@ fn resolve_user_path(
     output[0] = b'/';
     if relative {
         let current = *CURRENT_DIRECTORY.lock();
-        let current_path =
-            core::str::from_utf8(&current.bytes[..current.length]).map_err(|_| error(84))?;
+        let current_path = match base_length {
+            Some(length) => core::str::from_utf8(&base[..length]).map_err(|_| error(84))?,
+            None => {
+                core::str::from_utf8(&current.bytes[..current.length]).map_err(|_| error(84))?
+            }
+        };
         append_path_components(
             current_path,
             output,
@@ -8235,7 +9506,7 @@ fn linux_fstat(descriptor: u64, address: u64) -> u64 {
 }
 
 fn linux_newfstatat(directory: u64, path_address: u64, address: u64, flags: u64) -> u64 {
-    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT) != 0 {
         return error(22);
     }
     let mut input = [0u8; MAX_PATH];
@@ -8338,10 +9609,15 @@ fn linux_readlinkat(directory: u64, path_address: u64, address: u64, capacity: u
         return error(84);
     };
     let mut target = [0u8; MAX_PATH];
-    let count = if directory as i64 == AT_FDCWD && path == "/proc/self/exe" {
-        let exe = b"/bin/init";
-        target[..exe.len()].copy_from_slice(exe);
-        exe.len()
+    let count = if directory as i32 as i64 == AT_FDCWD && path == "/proc/self/exe" {
+        let (exe, length) = crate::scheduler::current_exe_path();
+        let program: &[u8] = if length == 0 {
+            b"/bin/init"
+        } else {
+            &exe[..length]
+        };
+        target[..program.len()].copy_from_slice(program);
+        program.len()
     } else {
         let mut resolved = [0u8; MAX_PATH];
         let (resolved_length, _) = match resolve_user_path(directory, path_address, &mut resolved) {
@@ -8402,7 +9678,19 @@ fn linux_getrusage(who: u64, address: u64) -> u64 {
     if !(-1..=1).contains(&(who as i64)) {
         return error(22);
     }
-    if !user::copy_to_user(address, &[0u8; 144]) {
+    let mut record = [0u8; 144];
+    {
+        let (user_ns, system_ns) = if who as i64 == -1 {
+            crate::scheduler::current_children_cpu_time()
+        } else {
+            crate::scheduler::current_cpu_time()
+        };
+        let mut times = [0u8; 32];
+        write_timeval(&mut times, 0, user_ns);
+        write_timeval(&mut times, 16, system_ns);
+        record[..32].copy_from_slice(&times);
+    }
+    if !user::copy_to_user(address, &record) {
         return error(14);
     }
     RESOURCE_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -8412,8 +9700,18 @@ fn linux_getrusage(who: u64, address: u64) -> u64 {
 
 fn linux_times(address: u64) -> u64 {
     let ticks = crate::time::monotonic_nanoseconds() / (1_000_000_000 / CLOCK_TICKS_PER_SECOND);
-    if address != 0 && !user::copy_to_user(address, &[0u8; 32]) {
-        return error(14);
+    if address != 0 {
+        let (user_ns, system_ns) = crate::scheduler::current_cpu_time();
+        let per_tick = 1_000_000_000 / CLOCK_TICKS_PER_SECOND;
+        let mut record = [0u8; 32];
+        record[..8].copy_from_slice(&(user_ns / per_tick).to_le_bytes());
+        record[8..16].copy_from_slice(&(system_ns / per_tick).to_le_bytes());
+        let (child_user, child_system) = crate::scheduler::current_children_cpu_time();
+        record[16..24].copy_from_slice(&(child_user / per_tick).to_le_bytes());
+        record[24..32].copy_from_slice(&(child_system / per_tick).to_le_bytes());
+        if !user::copy_to_user(address, &record) {
+            return error(14);
+        }
     }
     COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
     ticks
@@ -8491,6 +9789,13 @@ fn linux_getrandom(address: u64, requested: u64, flags: u64) -> u64 {
     let Ok(requested) = usize::try_from(requested) else {
         return error(22);
     };
+    // A buffer that really is that big may be asked for more than one call
+    // moves: it gets a short count, as on Linux.
+    let requested = if requested > MAX_IO && user::range_accessible(address, requested, true) {
+        MAX_IO
+    } else {
+        requested
+    };
     if requested > MAX_IO || !user::range_accessible(address, requested, true) {
         return error(14);
     }
@@ -8513,15 +9818,19 @@ fn linux_getrandom(address: u64, requested: u64, flags: u64) -> u64 {
 }
 
 /// Nanoseconds on one of the clocks `clock_gettime` knows: the wall clock
-/// (0, 5), or time since boot for the monotonic, raw, coarse, boot-time and
-/// CPU-time clocks (the last two report elapsed time, not CPU time).
+/// (0, 5), CPU time of the running process for the two CPU-time clocks, and
+/// time since boot for the monotonic, raw, coarse and boot-time clocks.
 fn clock_nanoseconds(clock: u64) -> Result<u128, u64> {
     match clock {
         0 | 5 => match crate::rtc::unix_nanoseconds() {
             0 => Err(error(5)),
             wall => Ok(wall),
         },
-        1..=4 | 6 | 7 => Ok(u128::from(crate::time::monotonic_nanoseconds())),
+        2 | 3 => {
+            let (user_ns, system_ns) = crate::scheduler::current_cpu_time();
+            Ok(u128::from(user_ns) + u128::from(system_ns))
+        }
+        1 | 4 | 6 | 7 => Ok(u128::from(crate::time::monotonic_nanoseconds())),
         _ => Err(error(22)),
     }
 }
@@ -8704,41 +10013,728 @@ fn current_itimerval() -> [u8; 32] {
     bytes
 }
 
+fn cpu_itimerval(which: u64) -> [u8; 32] {
+    let index = which as usize - 1;
+    let timer = CPU_TIMERS.lock()[index];
+    let mut bytes = [0u8; 32];
+    write_timeval(&mut bytes, 0, timer.interval);
+    if timer.deadline != 0 {
+        let left = timer
+            .deadline
+            .saturating_sub(cpu_timer_reading(index))
+            .max(1000);
+        write_timeval(&mut bytes, 16, left);
+    }
+    bytes
+}
+
 fn linux_getitimer(which: u64, current: u64) -> u64 {
-    if which != 0 {
+    if which > 2 {
         return error(22);
     }
-    if !user::copy_to_user(current, &current_itimerval()) {
+    let value = if which == 0 {
+        current_itimerval()
+    } else {
+        cpu_itimerval(which)
+    };
+    if !user::copy_to_user(current, &value) {
         return error(14);
     }
     0
 }
 
 fn linux_setitimer(which: u64, new_value: u64, old_value: u64) -> u64 {
-    if which != 0 {
+    if which > 2 {
         return error(22);
     }
     let mut request = [0u8; 32];
     if new_value != 0 && !user::copy_from_user(new_value, &mut request) {
         return error(14);
     }
-    if old_value != 0 && !user::copy_to_user(old_value, &current_itimerval()) {
+    let previous = if which == 0 {
+        current_itimerval()
+    } else {
+        cpu_itimerval(which)
+    };
+    if old_value != 0 && !user::copy_to_user(old_value, &previous) {
         return error(14);
     }
     if new_value != 0 {
-        arm_itimer(timeval_ns(&request, 16), timeval_ns(&request, 0));
+        let value = timeval_ns(&request, 16);
+        let interval = timeval_ns(&request, 0);
+        if which == 0 {
+            arm_itimer(value, interval);
+        } else {
+            let index = which as usize - 1;
+            let reading = cpu_timer_reading(index);
+            let mut timers = CPU_TIMERS.lock();
+            timers[index] = if value == 0 {
+                CpuTimer::EMPTY
+            } else {
+                CpuTimer {
+                    deadline: reading.saturating_add(value).max(1),
+                    interval,
+                }
+            };
+            CPU_TIMERS_ARMED.store(
+                timers.iter().any(|timer| timer.deadline != 0),
+                Ordering::Release,
+            );
+        }
     }
     SLEEP_CALLS.fetch_add(1, Ordering::Relaxed);
     0
 }
 
+fn read_itimerspec(address: u64) -> Result<(u64, u64), u64> {
+    let mut encoded = [0u8; 32];
+    if !user::copy_from_user(address, &mut encoded) {
+        return Err(error(14));
+    }
+    let field = |offset: usize| read_array_u64(&encoded, offset);
+    let nanoseconds = |seconds: u64, fraction: u64| {
+        if fraction >= 1_000_000_000 {
+            return None;
+        }
+        seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|total| total.checked_add(fraction))
+    };
+    match (
+        nanoseconds(field(16), field(24)),
+        nanoseconds(field(0), field(8)),
+    ) {
+        (Some(value), Some(interval)) => Ok((value, interval)),
+        _ => Err(error(22)),
+    }
+}
+
+fn posix_timer_slot(identifier: u64) -> Option<usize> {
+    let index = usize::try_from(identifier).ok()?;
+    (index < POSIX_TIMER_COUNT && POSIX_TIMERS.lock()[index].used).then_some(index)
+}
+
+fn posix_timer_allocate(clock: u8, signal: u8, value: u64) -> Option<usize> {
+    let mut timers = POSIX_TIMERS.lock();
+    let index = timers.iter().position(|timer| !timer.used)?;
+    timers[index] = PosixTimer {
+        used: true,
+        clock,
+        signal,
+        value,
+        ..PosixTimer::EMPTY
+    };
+    Some(index)
+}
+
+/// Arms (or with `value == 0` disarms) a timer; `absolute` is a time on the
+/// timer's clock. Returns what was left and the interval before the change.
+fn posix_timer_arm(
+    index: usize,
+    value: u64,
+    interval: u64,
+    absolute: bool,
+    now: u64,
+) -> (u64, u64) {
+    let mut timers = POSIX_TIMERS.lock();
+    let timer = &mut timers[index];
+    let previous = (
+        if timer.deadline == 0 {
+            0
+        } else {
+            timer.deadline.saturating_sub(now).max(1)
+        },
+        timer.interval,
+    );
+    let relative = if absolute {
+        let on_clock = clock_nanoseconds(u64::from(timer.clock))
+            .map_or(0, |clock| u64::try_from(clock).unwrap_or(u64::MAX));
+        value.saturating_sub(on_clock).max(1)
+    } else {
+        value
+    };
+    timer.overrun = 0;
+    timer.interval = interval;
+    timer.deadline = if value == 0 {
+        0
+    } else {
+        now.saturating_add(relative).max(1)
+    };
+    POSIX_NEXT.store(posix_next_deadline(&timers), Ordering::Release);
+    previous
+}
+
+fn linux_timer_create(clock: u64, event: u64, identifier_address: u64) -> u64 {
+    const SIGEV_SIGNAL: i32 = 0;
+    const SIGEV_NONE: i32 = 1;
+    const SIGEV_THREAD: i32 = 2;
+    const SIGEV_THREAD_ID: i32 = 4;
+    if !matches!(clock, 0 | 1 | 4..=7) {
+        return error(22);
+    }
+    let mut value = 0u64;
+    let signal = if event == 0 {
+        14
+    } else {
+        let mut raw = [0u8; 16];
+        if !user::copy_from_user(event, &mut raw) {
+            return error(14);
+        }
+        value = read_array_u64(&raw, 0);
+        let number = i32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+        let notify = i32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]);
+        match notify {
+            SIGEV_NONE => 0,
+            SIGEV_SIGNAL | SIGEV_THREAD | SIGEV_THREAD_ID if (1..=64).contains(&number) => {
+                number as u8
+            }
+            _ => return error(22),
+        }
+    };
+    let Some(index) = posix_timer_allocate(clock as u8, signal, value) else {
+        return error(11);
+    };
+    if !user::copy_to_user(identifier_address, &(index as i32).to_le_bytes()) {
+        POSIX_TIMERS.lock()[index] = PosixTimer::EMPTY;
+        return error(14);
+    }
+    COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
+    0
+}
+
+fn linux_timer_settime(identifier: u64, flags: u64, new_value: u64, old_value: u64) -> u64 {
+    const TIMER_ABSTIME: u64 = 1;
+    if flags & !TIMER_ABSTIME != 0 {
+        return error(22);
+    }
+    let Some(index) = posix_timer_slot(identifier) else {
+        return error(22);
+    };
+    let (value, interval) = match read_itimerspec(new_value) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure,
+    };
+    let now = crate::time::monotonic_nanoseconds();
+    let previous = posix_timer_arm(index, value, interval, flags & TIMER_ABSTIME != 0, now);
+    if old_value != 0 && !write_itimerspec(old_value, previous.0, previous.1) {
+        return error(14);
+    }
+    COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
+    0
+}
+
+fn linux_timer_gettime(identifier: u64, current: u64) -> u64 {
+    let Some(index) = posix_timer_slot(identifier) else {
+        return error(22);
+    };
+    let (deadline, interval) = {
+        let timers = POSIX_TIMERS.lock();
+        (timers[index].deadline, timers[index].interval)
+    };
+    let left = if deadline == 0 {
+        0
+    } else {
+        deadline
+            .saturating_sub(crate::time::monotonic_nanoseconds())
+            .max(1)
+    };
+    if !write_itimerspec(current, left, interval) {
+        return error(14);
+    }
+    COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
+    0
+}
+
+fn linux_timer_getoverrun(identifier: u64) -> u64 {
+    let Some(index) = posix_timer_slot(identifier) else {
+        return error(22);
+    };
+    u64::from(POSIX_TIMERS.lock()[index].overrun)
+}
+
+fn linux_timer_delete(identifier: u64) -> u64 {
+    let Some(index) = posix_timer_slot(identifier) else {
+        return error(22);
+    };
+    let mut timers = POSIX_TIMERS.lock();
+    timers[index] = PosixTimer::EMPTY;
+    POSIX_NEXT.store(posix_next_deadline(&timers), Ordering::Release);
+    COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
+    0
+}
+
+/// Timers armed and expired without user pointers: one-shot and periodic
+/// expiry, the overrun count, and delete.
+fn posix_timer_self_test() -> bool {
+    let Some(index) = posix_timer_allocate(1, 10, 0) else {
+        return false;
+    };
+    let base = 1_000_000_000u64;
+    let armed = posix_timer_arm(index, 1000, 1000, false, base);
+    let early = expire_posix_timers(base + 500) == 0;
+    let late = expire_posix_timers(base + 4500);
+    let overrun = POSIX_TIMERS.lock()[index].overrun == 3;
+    let next = POSIX_TIMERS.lock()[index].deadline == base + 5000
+        && POSIX_NEXT.load(Ordering::Acquire) == base + 5000;
+    let rearmed = posix_timer_arm(index, 0, 0, false, base + 4600);
+    let quiet = expire_posix_timers(base + 9000) == 0;
+    POSIX_TIMERS.lock()[index] = PosixTimer::EMPTY;
+    POSIX_NEXT.store(0, Ordering::Release);
+    armed == (0, 0)
+        && early
+        && late == 1 << 9
+        && overrun
+        && next
+        && rearmed == (400, 1000)
+        && quiet
+        && posix_timer_slot(index as u64).is_none()
+}
+
 /// pause(): waits (yielding) until a signal is ready for delivery, then fails
 /// with EINTR so the handler runs at syscall return.
+/// Old-style directory read: one entry per call, in the `linux_dirent`
+/// layout (the type byte sits in the last byte of the record).
+fn linux_getdents(descriptor: u64, address: u64, capacity: u64) -> u64 {
+    let Some(process_fd) = lookup_file_fd(descriptor) else {
+        return error(9);
+    };
+    let Ok(capacity) = usize::try_from(capacity) else {
+        return error(22);
+    };
+    if capacity < 24 || !user::range_accessible(address, capacity, true) {
+        return error(14);
+    }
+    let entry = match vfs::next_directory_entry(process_fd.handle) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return 0,
+        Err(failure) => return vfs_error(failure),
+    };
+    let record_length = (18usize + entry.name_len as usize + 2).next_multiple_of(8);
+    if record_length > capacity || record_length > 288 {
+        return error(22);
+    }
+    let mut record = [0u8; 288];
+    record[..8].copy_from_slice(&entry.inode.to_le_bytes());
+    record[8..16].copy_from_slice(&1i64.to_le_bytes());
+    record[16..18].copy_from_slice(&(record_length as u16).to_le_bytes());
+    record[18..18 + entry.name_len as usize]
+        .copy_from_slice(&entry.name[..entry.name_len as usize]);
+    record[record_length - 1] = entry.kind;
+    if !user::copy_to_user(address, &record[..record_length]) {
+        return error(14);
+    }
+    DIRECTORY_CALLS.fetch_add(1, Ordering::Relaxed);
+    COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
+    record_length as u64
+}
+
+/// `syslog(2)`: the kernel log. Reading returns the tail of the same ring
+/// `dmesg` shows; the console-level calls are accepted and ignored.
+fn linux_syslog(action: u64, address: u64, length: u64) -> u64 {
+    match action {
+        0 | 1 | 5 | 6 | 7 | 8 => 0,
+        2..=4 => {
+            let Ok(length) = usize::try_from(length) else {
+                return error(22);
+            };
+            if length == 0 || length > 16 * 1024 || !user::range_accessible(address, length, true) {
+                return error(22);
+            }
+            let mut buffer = [0u8; 4096];
+            let take = length.min(buffer.len());
+            let count = crate::serial::log_tail(&mut buffer[..take]);
+            if !user::copy_to_user(address, &buffer[..count]) {
+                return error(14);
+            }
+            count as u64
+        }
+        9 => 0,
+        10 => 16 * 1024,
+        _ => error(22),
+    }
+}
+
+fn linux_rt_sigpending(set: u64, set_size: u64) -> u64 {
+    if set_size != 8 {
+        return error(22);
+    }
+    let pending = SIGNAL_PENDING.load(Ordering::Acquire) & SIGNAL_MASK.load(Ordering::Acquire);
+    if !user::copy_to_user(set, &pending.to_le_bytes()) {
+        return error(14);
+    }
+    0
+}
+
+/// Waits for a signal in `set` to be pending, takes it (it is not delivered)
+/// and returns its number; `timeout` is a timespec or 0 for no limit.
+fn linux_rt_sigtimedwait(set: u64, info: u64, timeout: u64, set_size: u64) -> u64 {
+    if set_size != 8 {
+        return error(22);
+    }
+    let mut encoded = [0u8; 8];
+    if !user::copy_from_user(set, &mut encoded) {
+        return error(14);
+    }
+    let wanted = u64::from_le_bytes(encoded);
+    let deadline = if timeout == 0 {
+        None
+    } else {
+        let Some(duration) = read_timespec(timeout) else {
+            return error(22);
+        };
+        Some(crate::time::monotonic_nanoseconds().saturating_add(duration))
+    };
+    loop {
+        check_itimer();
+        let pending = SIGNAL_PENDING.load(Ordering::Acquire) & wanted;
+        if pending != 0 {
+            let bit = pending.trailing_zeros();
+            SIGNAL_PENDING.fetch_and(!(1u64 << bit), Ordering::AcqRel);
+            if info != 0 {
+                let mut record = [0u8; 128];
+                record[..4].copy_from_slice(&(bit + 1).to_le_bytes());
+                if !user::copy_to_user(info, &record) {
+                    return error(14);
+                }
+            }
+            return bit as u64 + 1;
+        }
+        if deadline.is_some_and(|limit| crate::time::monotonic_nanoseconds() >= limit) {
+            return error(11);
+        }
+        yield_in_syscall();
+    }
+}
+
+/// Replaces the signal mask while waiting for a signal, then puts it back.
+fn linux_rt_sigsuspend(set: u64, set_size: u64) -> u64 {
+    if set_size != 8 {
+        return error(22);
+    }
+    let mut encoded = [0u8; 8];
+    if !user::copy_from_user(set, &mut encoded) {
+        return error(14);
+    }
+    let previous = SIGNAL_MASK.load(Ordering::Acquire);
+    SIGNAL_MASK.store(
+        u64::from_le_bytes(encoded) & !unblockable_signals(),
+        Ordering::Release,
+    );
+    let result = linux_pause();
+    SIGNAL_MASK.store(previous, Ordering::Release);
+    result
+}
+
+/// `mknod`: regular files only; devices, fifos and sockets need support this
+/// kernel's filesystems do not have.
+fn linux_mknodat(directory: u64, path_address: u64, mode: u64) -> u64 {
+    const S_IFMT: u64 = 0o170000;
+    const S_IFREG: u64 = 0o100000;
+    let kind = mode & S_IFMT;
+    if kind != 0 && kind != S_IFREG {
+        return error(1);
+    }
+    let created = linux_openat(directory, path_address, O_CREAT | 0o200 | 1, mode & 0o7777);
+    if (created as i64) < 0 {
+        return created;
+    }
+    let _ = linux_close(created);
+    0
+}
+
+/// `sendmmsg` / `recvmmsg`: the single-message call in a loop over 64-byte
+/// `mmsghdr` records (a `msghdr` and the byte count).
+fn linux_mmsg(send: bool, descriptor: u64, vector: u64, count: u64, flags: u64) -> u64 {
+    let count = count.min(1024);
+    let mut done = 0u64;
+    while done < count {
+        let record = vector + done * 64;
+        let result = if send {
+            linux_sendmsg(descriptor, record, flags)
+        } else {
+            linux_recvmsg(descriptor, record, flags & !0x10000)
+        };
+        if (result as i64) < 0 {
+            return if done == 0 { result } else { done };
+        }
+        if !user::copy_to_user(record + 56, &(result as u32).to_le_bytes()) {
+            return error(14);
+        }
+        done += 1;
+    }
+    done
+}
+
+/// `openat2`: `open_how` is flags, mode, resolve; no resolve restrictions
+/// are implemented, so any are refused.
+fn linux_openat2(directory: u64, path_address: u64, how: u64, size: u64) -> u64 {
+    if !(24..=4096).contains(&size) {
+        return error(22);
+    }
+    let mut encoded = [0u8; 24];
+    if !user::copy_from_user(how, &mut encoded) {
+        return error(14);
+    }
+    if read_array_u64(&encoded, 16) != 0 {
+        return error(38);
+    }
+    linux_openat(
+        directory,
+        path_address,
+        read_array_u64(&encoded, 0),
+        read_array_u64(&encoded, 8),
+    )
+}
+
+fn is_signalfd(slot: usize) -> bool {
+    PIPES
+        .lock()
+        .get(slot)
+        .is_some_and(|pipe| pipe.used && pipe.signal)
+}
+
+/// Each pending signal in the mask comes back as a 128-byte
+/// `signalfd_siginfo` (only `ssi_signo` is filled in) and is consumed.
+fn signalfd_read(slot: usize, destination: &mut [u8]) -> Result<usize, u64> {
+    if destination.len() < 128 {
+        return Err(22);
+    }
+    for attempt in 0..PIPE_WAIT_ITERATIONS {
+        let mask = match PIPES.lock().get(slot) {
+            Some(pipe) if pipe.used => pipe.counter,
+            _ => return Err(9),
+        };
+        let mut pending = SIGNAL_PENDING.load(Ordering::Acquire) & mask;
+        if pending != 0 {
+            let mut count = 0usize;
+            while pending != 0 && (count + 1) * 128 <= destination.len() {
+                let bit = pending.trailing_zeros();
+                SIGNAL_PENDING.fetch_and(!(1u64 << bit), Ordering::AcqRel);
+                let info =
+                    core::mem::replace(&mut SIGNAL_INFO.lock()[bit as usize], SignalInfo::USER);
+                let record = &mut destination[count * 128..(count + 1) * 128];
+                record.fill(0);
+                record[..4].copy_from_slice(&(bit + 1).to_le_bytes());
+                record[8..12].copy_from_slice(&info.code.to_le_bytes());
+                record[12..16].copy_from_slice(&info.pid.to_le_bytes());
+                record[24..28].copy_from_slice(&info.tid.to_le_bytes());
+                record[32..36].copy_from_slice(&info.overrun.to_le_bytes());
+                record[44..48].copy_from_slice(&(info.value as u32).to_le_bytes());
+                record[48..56].copy_from_slice(&info.value.to_le_bytes());
+                pending &= pending - 1;
+                count += 1;
+            }
+            return Ok(count * 128);
+        }
+        if attempt + 1 < PIPE_WAIT_ITERATIONS {
+            yield_in_syscall();
+        }
+    }
+    Err(11)
+}
+
+fn linux_signalfd(descriptor: u64, mask_address: u64, size: u64, flags: u64) -> u64 {
+    const SFD_NONBLOCK: u64 = 0o4000;
+    if size != 8 || flags & !(SFD_NONBLOCK | O_CLOEXEC) != 0 {
+        return error(22);
+    }
+    let mut encoded = [0u8; 8];
+    if !user::copy_from_user(mask_address, &mut encoded) {
+        return error(14);
+    }
+    let mask = u64::from_le_bytes(encoded) & !unblockable_signals();
+    if descriptor as i64 == -1 {
+        let template = Pipe {
+            signal: true,
+            counter: mask,
+            ..Pipe::EMPTY
+        };
+        return match create_single_fd_pipe(template, flags & O_CLOEXEC != 0, false) {
+            Ok(created) => created,
+            Err(failure) => error(failure),
+        };
+    }
+    let Some(process_fd) = lookup_process_fd(descriptor) else {
+        return error(9);
+    };
+    if !process_fd.pipe || !is_signalfd(process_fd.handle as usize) {
+        return error(22);
+    }
+    PIPES.lock()[process_fd.handle as usize].counter = mask;
+    descriptor
+}
+
+/// Moves a region by copying: growing needs MREMAP_MAYMOVE (a fixed address
+/// is not supported), shrinking gives the tail back in place.
+fn linux_mremap(old_address: u64, old_size: u64, new_size: u64, flags: u64) -> u64 {
+    const MREMAP_MAYMOVE: u64 = 1;
+    if old_address & 0xfff != 0 || new_size == 0 || old_size == 0 || flags & !MREMAP_MAYMOVE != 0 {
+        return error(22);
+    }
+    let old_pages = old_size.div_ceil(4096);
+    let new_pages = new_size.div_ceil(4096);
+    if new_pages == old_pages {
+        return old_address;
+    }
+    if new_pages < old_pages {
+        let tail = old_address + new_pages * 4096;
+        let result = linux_munmap(tail, (old_pages - new_pages) * 4096);
+        return if result == 0 { old_address } else { result };
+    }
+    if flags & MREMAP_MAYMOVE == 0 {
+        return error(12);
+    }
+    let created = linux_mmap([0, new_size, 3, MAP_PRIVATE | MAP_ANONYMOUS, u64::MAX, 0]);
+    if (created as i64) < 0 && created > u64::MAX - 4096 {
+        return created;
+    }
+    let mut chunk = [0u8; 4096];
+    let mut copied = 0u64;
+    while copied < old_size {
+        let amount = ((old_size - copied) as usize).min(chunk.len());
+        if !user::copy_from_user(old_address + copied, &mut chunk[..amount])
+            || !user::copy_to_user(created + copied, &chunk[..amount])
+        {
+            let _ = linux_munmap(created, new_pages * 4096);
+            return error(14);
+        }
+        copied += amount as u64;
+    }
+    let _ = linux_munmap(old_address, old_pages * 4096);
+    created
+}
+
+fn linux_splice(arguments: [u64; 6]) -> u64 {
+    let [fd_in, off_in, fd_out, off_out, length, flags] = arguments;
+    if flags & !0xf != 0 {
+        return error(22);
+    }
+    let (Some(input), Some(output)) = (lookup_process_fd(fd_in), lookup_process_fd(fd_out)) else {
+        return error(9);
+    };
+    if !input.readable || !output.writable {
+        return error(9);
+    }
+    let count = usize::try_from(length).unwrap_or(usize::MAX).min(MAX_IO);
+    if count == 0 {
+        return 0;
+    }
+    if !input.pipe && output.pipe {
+        let Some(source) = lookup_file_fd(fd_in) else {
+            return error(22);
+        };
+        if off_out != 0 {
+            return error(29);
+        }
+        let offset = match read_offset(off_in) {
+            Ok(offset) => offset,
+            Err(failure) => return failure,
+        };
+        return match copy_file_data(source, offset, output, None, count) {
+            Ok((copied, end, _)) => {
+                if !write_offset(off_in, end) {
+                    return error(14);
+                }
+                IO_BYTES.fetch_add(copied as u64, Ordering::Relaxed);
+                COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
+                copied as u64
+            }
+            Err(failure) => error(failure),
+        };
+    }
+    if input.pipe {
+        if off_in != 0 {
+            return error(29);
+        }
+        let position = match read_offset(off_out) {
+            Ok(position) => position,
+            Err(failure) => return failure,
+        };
+        let mut chunk = [0u8; IO_CHUNK];
+        let mut total = 0usize;
+        while total < count {
+            let amount = (count - total).min(chunk.len());
+            let read = match pipe_read(input.handle as usize, &mut chunk[..amount]) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(failure) if total == 0 => return error(failure),
+                Err(_) => break,
+            };
+            let mut written = 0usize;
+            while written < read {
+                let at = position.map(|start| start + (total + written) as u64);
+                match write_kernel_bytes(output, at, &chunk[written..read]) {
+                    Ok(0) => break,
+                    Ok(done) => written += done,
+                    Err(failure) if total + written == 0 => return error(failure),
+                    Err(_) => break,
+                }
+            }
+            total += written;
+            if written < read || read < amount {
+                break;
+            }
+        }
+        if !write_offset(off_out, position.map(|start| start + total as u64)) {
+            return error(14);
+        }
+        IO_BYTES.fetch_add(total as u64, Ordering::Relaxed);
+        COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
+        return total as u64;
+    }
+    error(22)
+}
+
+/// Copies pipe data to another pipe without taking it from the first.
+fn linux_tee(fd_in: u64, fd_out: u64, length: u64, flags: u64) -> u64 {
+    if flags & !0xf != 0 {
+        return error(22);
+    }
+    let (Some(input), Some(output)) = (lookup_process_fd(fd_in), lookup_process_fd(fd_out)) else {
+        return error(9);
+    };
+    if !input.pipe || !output.pipe || input.handle == output.handle {
+        return error(22);
+    }
+    if !input.readable || !output.writable {
+        return error(9);
+    }
+    let (source, destination) = (input.handle as usize, output.handle as usize);
+    let count = usize::try_from(length)
+        .unwrap_or(usize::MAX)
+        .min(PIPE_BUFFER_BYTES);
+    let mut pipes = PIPES.lock();
+    let plain = |pipe: &Pipe| {
+        pipe.used && !pipe.event && !pipe.timer && !pipe.signal && !pipe.inotify && !pipe.pidfd
+    };
+    if !plain(&pipes[source]) || !plain(&pipes[destination]) {
+        return error(22);
+    }
+    let available = pipes[source].length;
+    if available == 0 {
+        return if pipes[source].write_open {
+            error(11)
+        } else {
+            0
+        };
+    }
+    let room = PIPE_BUFFER_BYTES - pipes[destination].length;
+    let take = count.min(available).min(room);
+    if take == 0 {
+        return error(11);
+    }
+    for index in 0..take {
+        let byte = pipes[source].data[(pipes[source].head + index) % PIPE_BUFFER_BYTES];
+        let tail = (pipes[destination].head + pipes[destination].length) % PIPE_BUFFER_BYTES;
+        pipes[destination].data[tail] = byte;
+        pipes[destination].length += 1;
+    }
+    take as u64
+}
+
 fn linux_pause() -> u64 {
     loop {
-        if check_itimer().is_some()
-            || SIGNAL_PENDING.load(Ordering::Acquire) & !SIGNAL_MASK.load(Ordering::Acquire) != 0
-        {
+        if interrupted() {
             return error(4);
         }
         yield_in_syscall();
@@ -8809,9 +10805,7 @@ fn sleep_until(deadline: u64) -> Option<u64> {
         if now >= deadline {
             return None;
         }
-        if check_itimer().is_some()
-            || SIGNAL_PENDING.load(Ordering::Acquire) & !SIGNAL_MASK.load(Ordering::Acquire) != 0
-        {
+        if interrupted() {
             return Some(deadline - now);
         }
         yield_in_syscall();
@@ -8829,13 +10823,22 @@ fn linux_openat(directory: u64, path_address: u64, flags: u64, mode: u64) -> u64
     let access = flags & 3;
     if access == 3
         || flags
-            & !(3 | O_CLOEXEC | O_DIRECTORY | O_CREAT | O_EXCL | O_TRUNC | O_APPEND | O_LARGEFILE)
+            & !(3
+                | O_CLOEXEC
+                | O_DIRECTORY
+                | O_CREAT
+                | O_EXCL
+                | O_TRUNC
+                | O_APPEND
+                | O_LARGEFILE
+                | O_OPEN_HINTS)
             != 0
-        || mode & !0o777 != 0
         || flags & O_TRUNC != 0 && access == 0
     {
         return error(22);
     }
+    // The file type bits a program copies from `stat` are ignored, as on Linux.
+    let mode = mode & 0o777;
     let mut resolved = [0u8; MAX_PATH];
     let (length, relative) = match resolve_user_path(directory, path_address, &mut resolved) {
         Ok(value) => value,
@@ -8846,6 +10849,22 @@ fn linux_openat(directory: u64, path_address: u64, flags: u64, mode: u64) -> u64
     };
     let readable = access != 1;
     let writable = access != 0;
+    if flags & O_DIRECTORY == 0
+        && let Some(kind) = device_kind(path)
+    {
+        let Some(descriptor) =
+            install_process_fd(0, flags & O_CLOEXEC != 0, false, readable, writable, false)
+        else {
+            return error(24);
+        };
+        if let Some(index) = process_fd_index(descriptor) {
+            PROCESS_FDS.lock()[index].standard = kind;
+        }
+        OPENS.fetch_add(1, Ordering::Relaxed);
+        return descriptor;
+    }
+    let watched = inotify::any_watches();
+    let existed = watched && vfs::metadata(path).is_ok();
     let opened = if flags & O_DIRECTORY != 0 {
         if flags & (O_CREAT | O_TRUNC) != 0 || writable {
             return error(21);
@@ -8876,8 +10895,24 @@ fn linux_openat(directory: u64, path_address: u64, flags: u64, mode: u64) -> u64
             };
             OPENS.fetch_add(1, Ordering::Relaxed);
             LAST_OPEN_FD.store(descriptor, Ordering::Release);
+            if path.len() <= DIR_PATH_MAX
+                && vfs::descriptor_metadata(handle).is_ok_and(|m| m.mode & 0o170000 == 0o040000)
+                && let Some(index) = process_fd_index(descriptor)
+            {
+                let mut descriptors = PROCESS_FDS.lock();
+                descriptors[index].dir_path[..path.len()].copy_from_slice(path.as_bytes());
+                descriptors[index].dir_length = path.len() as u8;
+            }
             if relative {
                 RELATIVE_PATH_CALLS.fetch_add(1, Ordering::Relaxed);
+            }
+            if watched {
+                if flags & O_CREAT != 0 && !existed {
+                    inotify::notify(path, inotify::IN_CREATE, 0);
+                } else if flags & O_TRUNC != 0 {
+                    inotify::notify(path, inotify::IN_MODIFY, 0);
+                }
+                inotify::notify(path, inotify::IN_OPEN, 0);
             }
             descriptor
         }
@@ -8919,6 +10954,60 @@ fn linux_getdents64(descriptor: u64, address: u64, capacity: u64) -> u64 {
     record_length as u64
 }
 
+/// The descriptor kinds `/dev/null`, `/dev/zero` and `/dev/urandom` open as
+/// (`ProcessFd::standard`, after the console's 1 to 3).
+const DEVICE_NULL: u8 = 4;
+const DEVICE_ZERO: u8 = 5;
+const DEVICE_RANDOM: u8 = 6;
+
+/// The descriptor kind a `/dev` path opens as, if it is one of the devices
+/// handled here (`tty` and `console` act as the console).
+fn device_kind(path: &str) -> Option<u8> {
+    match path.strip_prefix("/dev/")? {
+        "null" => Some(DEVICE_NULL),
+        "zero" => Some(DEVICE_ZERO),
+        "urandom" | "random" => Some(DEVICE_RANDOM),
+        "tty" | "console" | "stdout" | "stderr" => Some(3),
+        _ => None,
+    }
+}
+
+fn read_device(kind: u8, address: u64, requested: u64) -> u64 {
+    let Ok(requested) = usize::try_from(requested) else {
+        return error(22);
+    };
+    // A buffer that really is that big may be asked for more than one call
+    // moves: it gets a short count, as on Linux.
+    let requested = if requested > MAX_IO && user::range_accessible(address, requested, true) {
+        MAX_IO
+    } else {
+        requested
+    };
+    if requested > MAX_IO || !user::range_accessible(address, requested, true) {
+        return error(14);
+    }
+    if kind == DEVICE_NULL {
+        return 0;
+    }
+    let mut total = 0usize;
+    let mut chunk = [0u8; IO_CHUNK];
+    while total < requested {
+        let amount = (requested - total).min(chunk.len());
+        if kind == DEVICE_RANDOM {
+            crate::random::fill(&mut chunk[..amount]);
+        } else {
+            chunk[..amount].fill(0);
+        }
+        if !user::copy_to_user(address + total as u64, &chunk[..amount]) {
+            return if total == 0 { error(14) } else { total as u64 };
+        }
+        total += amount;
+    }
+    READS.fetch_add(1, Ordering::Relaxed);
+    IO_BYTES.fetch_add(total as u64, Ordering::Relaxed);
+    total as u64
+}
+
 fn linux_read(descriptor: u64, address: u64, requested: u64) -> u64 {
     let Some(process_fd) = lookup_process_fd(descriptor) else {
         return error(9);
@@ -8930,11 +11019,21 @@ fn linux_read(descriptor: u64, address: u64, requested: u64) -> u64 {
         READS.fetch_add(1, Ordering::Relaxed);
         return 0;
     }
+    if process_fd.standard >= DEVICE_NULL {
+        return read_device(process_fd.standard, address, requested);
+    }
     if process_fd.standard != 0 || (process_fd.socket && !process_fd.unix_socket) {
         return error(9);
     }
     let Ok(requested) = usize::try_from(requested) else {
         return error(22);
+    };
+    // A buffer that really is that big may be asked for more than one call
+    // moves: it gets a short count, as on Linux.
+    let requested = if requested > MAX_IO && user::range_accessible(address, requested, true) {
+        MAX_IO
+    } else {
+        requested
     };
     if requested > MAX_IO || !user::range_accessible(address, requested, true) {
         return error(14);
@@ -8944,7 +11043,11 @@ fn linux_read(descriptor: u64, address: u64, requested: u64) -> u64 {
     while total < requested {
         let amount = (requested - total).min(chunk.len());
         let read = if process_fd.pipe {
-            match pipe_read(process_fd.handle as usize, &mut chunk[..amount]) {
+            match pipe_read_waiting(
+                process_fd.handle as usize,
+                &mut chunk[..amount],
+                process_fd.nonblocking || total > 0,
+            ) {
                 Ok(read) => read,
                 Err(failure) => {
                     return if total == 0 {
@@ -9021,6 +11124,13 @@ fn linux_write(descriptor: u64, address: u64, requested: u64) -> u64 {
     let Ok(requested) = usize::try_from(requested) else {
         return error(22);
     };
+    // A buffer that really is that big may be asked for more than one call
+    // moves: it gets a short count, as on Linux.
+    let requested = if requested > MAX_IO && user::range_accessible(address, requested, false) {
+        MAX_IO
+    } else {
+        requested
+    };
     if requested > MAX_IO || !user::range_accessible(address, requested, false) {
         return error(14);
     }
@@ -9031,12 +11141,18 @@ fn linux_write(descriptor: u64, address: u64, requested: u64) -> u64 {
         if !user::copy_from_user(address + total as u64, &mut chunk[..amount]) {
             return if total == 0 { error(14) } else { total as u64 };
         }
-        if process_fd.standard != 0 {
+        if process_fd.standard >= DEVICE_NULL {
+            // /dev/null and friends take everything and keep nothing.
+        } else if process_fd.standard != 0 {
             for byte in &chunk[..amount] {
                 crate::serial::byte(*byte);
             }
         } else if process_fd.pipe {
-            match pipe_write(process_fd.handle as usize, &chunk[..amount]) {
+            match pipe_write_waiting(
+                process_fd.handle as usize,
+                &chunk[..amount],
+                process_fd.nonblocking || total > 0,
+            ) {
                 Ok(written) => {
                     total += written;
                     if written < amount {
@@ -9112,6 +11228,9 @@ fn linux_write(descriptor: u64, address: u64, requested: u64) -> u64 {
     }
     WRITES.fetch_add(1, Ordering::Relaxed);
     IO_BYTES.fetch_add(total as u64, Ordering::Relaxed);
+    if total > 0 && process_fd.standard == 0 && !process_fd.pipe && !process_fd.socket {
+        inotify::notify_handle(process_fd.handle, inotify::IN_MODIFY);
+    }
     total as u64
 }
 
@@ -9119,6 +11238,23 @@ fn linux_close(descriptor: u64) -> u64 {
     let Some((process_fd, last_reference)) = remove_process_fd(descriptor) else {
         return error(9);
     };
+    if last_reference
+        && inotify::any_watches()
+        && !process_fd.pipe
+        && !process_fd.socket
+        && !process_fd.epoll
+        && !process_fd.unix_socket
+        && !process_fd.unix_listener
+        && !process_fd.tcp
+        && process_fd.standard == 0
+    {
+        let mask = if process_fd.writable {
+            inotify::IN_CLOSE_WRITE
+        } else {
+            inotify::IN_CLOSE_NOWRITE
+        };
+        inotify::notify_handle(process_fd.handle, mask);
+    }
     if last_reference {
         let result = release_process_fd(process_fd);
         if result != 0 {
@@ -9337,8 +11473,109 @@ fn install_process_fd_kind(
         tcp: false,
         nonblocking: false,
         inet6: false,
+        dir_path: [0; DIR_PATH_MAX],
+        dir_length: 0,
     };
     Some(index as u64)
+}
+
+/// The working directory of the running process and its soft descriptor
+/// limit, for `/proc/self/cwd` and `/proc/self/limits`.
+pub(crate) fn proc_working_directory() -> ([u8; MAX_PATH], usize) {
+    let current = *CURRENT_DIRECTORY.lock();
+    let mut path = [0u8; MAX_PATH];
+    let length = current.length.min(MAX_PATH);
+    path[..length].copy_from_slice(&current.bytes[..length]);
+    (path, length)
+}
+
+pub(crate) fn proc_descriptor_limit() -> u64 {
+    NOFILE_LIMIT.load(Ordering::Acquire)
+}
+
+struct LabelBuffer {
+    bytes: [u8; 128],
+    length: usize,
+}
+
+impl core::fmt::Write for LabelBuffer {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let count = text.len().min(self.bytes.len() - self.length);
+        self.bytes[self.length..self.length + count].copy_from_slice(&text.as_bytes()[..count]);
+        self.length += count;
+        Ok(())
+    }
+}
+
+/// Calls `visit(descriptor, target)` for every descriptor the running
+/// process has open: the path of a file, `pipe:[n]`, `socket:[n]` or an
+/// `anon_inode:[kind]` label (what `/proc/self/fd` links point at).
+pub(crate) fn proc_open_descriptors(visit: &mut dyn FnMut(usize, &str)) {
+    use core::fmt::Write;
+    let table = *PROCESS_FDS.lock();
+    for (index, process_fd) in table.iter().enumerate() {
+        if !process_fd.open {
+            continue;
+        }
+        let mut label = LabelBuffer {
+            bytes: [0; 128],
+            length: 0,
+        };
+        if process_fd.standard != 0 {
+            let _ = write!(
+                label,
+                "{}",
+                match process_fd.standard {
+                    DEVICE_NULL => "/dev/null",
+                    DEVICE_ZERO => "/dev/zero",
+                    DEVICE_RANDOM => "/dev/urandom",
+                    _ => "/dev/console",
+                }
+            );
+        } else if process_fd.pipe {
+            let kind = PIPES.lock().get(process_fd.handle as usize).map(|pipe| {
+                if pipe.event {
+                    "eventfd"
+                } else if pipe.timer {
+                    "timerfd"
+                } else if pipe.signal {
+                    "signalfd"
+                } else if pipe.inotify {
+                    "inotify"
+                } else if pipe.pidfd {
+                    "pidfd"
+                } else {
+                    ""
+                }
+            });
+            match kind {
+                Some("") | None => {
+                    let _ = write!(label, "pipe:[{}]", process_fd.handle);
+                }
+                Some(kind) => {
+                    let _ = write!(label, "anon_inode:[{kind}]");
+                }
+            }
+        } else if process_fd.epoll {
+            let _ = write!(label, "anon_inode:[eventpoll]");
+        } else if process_fd.socket
+            || process_fd.unix_socket
+            || process_fd.unix_listener
+            || process_fd.tcp
+        {
+            let _ = write!(label, "socket:[{}]", process_fd.handle);
+        } else if let Some((bytes, length)) = vfs::descriptor_path(process_fd.handle) {
+            let count = length.min(label.bytes.len());
+            label.bytes[..count].copy_from_slice(&bytes[..count]);
+            label.length = count;
+        }
+        if label.length == 0 {
+            let _ = write!(label, "anon_inode:[file]");
+        }
+        if let Ok(target) = core::str::from_utf8(&label.bytes[..label.length]) {
+            visit(index, target);
+        }
+    }
 }
 
 fn process_fd_index(descriptor: u64) -> Option<usize> {
@@ -9460,8 +11697,14 @@ fn release_process_fd(process_fd: ProcessFd) -> u64 {
         if process_fd.writable {
             pipe.write_open = false;
         }
+        let mut dropped_instance = false;
         if !pipe.read_open && !pipe.write_open {
+            dropped_instance = pipe.inotify;
             *pipe = Pipe::EMPTY;
+        }
+        drop(pipes);
+        if dropped_instance {
+            inotify::drop_instance(process_fd.handle as usize);
         }
         return 0;
     }

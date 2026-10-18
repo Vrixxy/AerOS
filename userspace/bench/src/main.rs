@@ -89,6 +89,10 @@ fn pipe_pingpong() {
     let child = syscall(SYS_FORK, [0; 6]);
     let mut byte = [7u8; 1];
     if child == 0 {
+        // The child keeps only its ends, so the parent closing `down` is seen
+        // as the end of the stream.
+        syscall(3, [down[1] as usize, 0, 0, 0, 0, 0]);
+        syscall(3, [up[0] as usize, 0, 0, 0, 0, 0]);
         loop {
             if syscall(SYS_READ, [down[0] as usize, byte.as_mut_ptr() as usize, 1, 0, 0, 0]) <= 0 {
                 syscall(SYS_EXIT_GROUP, [0; 6]);

@@ -86,6 +86,7 @@ pub fn recent(mut visit: impl FnMut(u64, &str)) {
 /// on-disk log (a real, separate read back from `/data/audit.log`) reflect
 /// them - the persistence half is what actually survives a reboot, so it's
 /// worth confirming independently of the in-memory copy.
+#[cfg_attr(not(feature = "boot-test"), allow(dead_code))]
 pub(crate) fn self_test() -> bool {
     record("SELFTEST", format_args!("marker=AEROS_AUDIT_ALPHA"));
     record("SELFTEST", format_args!("marker=AEROS_AUDIT_BETA"));
@@ -106,6 +107,7 @@ pub(crate) fn self_test() -> bool {
     saw_alpha && saw_beta && persisted
 }
 
+#[cfg_attr(not(feature = "boot-test"), allow(dead_code))]
 fn read_log_contains(needle: &str) -> bool {
     let Ok(descriptor) = vfs::open_file_raw(LOG_PATH) else {
         return false;

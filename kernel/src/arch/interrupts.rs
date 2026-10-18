@@ -182,6 +182,20 @@ impl InterruptFrame {
         }
     }
 
+    /// A fault in user mode goes to the process's own handler for the signal
+    /// it raises, when it has one. False when nothing was delivered.
+    fn deliver_fault(&mut self, signal: u64, code: i32, address: u64) -> bool {
+        let Some(mut regs) = self.user_regs() else {
+            return false;
+        };
+        if crate::syscall::deliver_fault_signal(&mut regs, signal, code, address) {
+            self.set_user_regs(&regs);
+            true
+        } else {
+            false
+        }
+    }
+
     /// A trap or fault of a traced task in user mode goes to its tracer first.
     fn user_trap(&mut self, signal: u64, fault: bool) -> crate::syscall::Trap {
         let Some(mut regs) = self.user_regs() else {
@@ -427,6 +441,37 @@ pub fn self_test() -> bool {
 }
 
 extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
+    let from_user = unsafe { (*frame).cs } & 3 == 3;
+    if !from_user || !crate::kernel_lock::active() {
+        return interrupt_inner(frame);
+    }
+    // A processor trapped out of user mode while user tasks run on several:
+    // take the kernel lock and make its task the live one.
+    let entry = crate::scheduler::enter_from_user();
+    if entry.kill {
+        // The task ends without the handler running, so the interrupt that
+        // caught it must still be acknowledged or its line stays blocked.
+        let vector = unsafe { (*frame).vector };
+        match vector {
+            32..=47 => end_legacy_interrupt(vector as u8),
+            48..=254 => crate::arch::apic::end_interrupt(),
+            _ => {}
+        }
+        user::set_exit_code(128 + 9);
+        return 1;
+    }
+    let result = interrupt_inner(frame);
+    if result == 0 {
+        if crate::scheduler::take_kill_pending() {
+            user::set_exit_code(128 + 9);
+            return 1;
+        }
+        crate::scheduler::leave_to_user();
+    }
+    result
+}
+
+fn interrupt_inner(frame: *mut InterruptFrame) -> u64 {
     let frame = unsafe { &mut *frame };
     match frame.vector {
         1 | 3 if frame.cs & 3 == 3 && crate::scheduler::is_traced() => {
@@ -445,7 +490,10 @@ extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
         32 => {
             TIMER_TICKS.fetch_add(1, Ordering::Release);
             end_legacy_interrupt(32);
-            crate::scheduler::on_timer_tick();
+            if !crate::kernel_lock::active() || frame.cs & 3 == 3 {
+                crate::scheduler::account_tick(frame.cs & 3 == 3);
+                crate::scheduler::on_timer_tick();
+            }
             crate::time::tick();
             frame.deliver_user_signal()
         }
@@ -456,8 +504,16 @@ extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
         48 => {
             LOCAL_TIMER_TICKS.fetch_add(1, Ordering::Release);
             crate::arch::apic::end_interrupt();
-            crate::scheduler::on_timer_tick();
-            crate::time::tick();
+            // With user tasks on several processors only the tick that caught
+            // a task in user mode preempts (that processor holds the kernel
+            // lock then), and only the bootstrap processor keeps the clock.
+            if !crate::kernel_lock::active() || frame.cs & 3 == 3 {
+                crate::scheduler::account_tick(frame.cs & 3 == 3);
+                crate::scheduler::on_timer_tick();
+            }
+            if crate::kernel_lock::this_cpu() == 0 {
+                crate::time::tick();
+            }
             frame.deliver_user_signal()
         }
         49 => {
@@ -473,7 +529,11 @@ extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
         51 => {
             crate::arch::apic::end_interrupt();
             crate::smp::handle_work_ipi();
-            0
+            if frame.cs & 3 == 3 && crate::kernel_lock::active() {
+                frame.deliver_user_signal()
+            } else {
+                0
+            }
         }
         52 => {
             crate::keyboard::handle_interrupt();
@@ -610,6 +670,17 @@ extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
                 }
             }
             if frame.cs & 3 == 3 && frame.vector < 32 {
+                let (signal, code) = match frame.vector {
+                    0 => (8, 1),
+                    16 | 19 => (8, 0),
+                    6 => (4, 1),
+                    17 => (7, 1),
+                    14 => (11, if frame.error & 1 == 0 { 1 } else { 2 }),
+                    _ => (11, 0x80),
+                };
+                if frame.deliver_fault(signal, code, fault_address) {
+                    return 0;
+                }
                 #[cfg(feature = "boot-test")]
                 serial::format(format_args!(
                     "AEROS_USER_FAULT task={} vector={} error={:#x} address={:#x} rip={:#x}\n",
@@ -619,6 +690,24 @@ extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
                     fault_address,
                     frame.rip
                 ));
+                #[cfg(feature = "boot-test")]
+                {
+                    let skip = crate::trace::total().min(64).saturating_sub(6) as usize;
+                    let mut index = 0usize;
+                    crate::trace::for_each(|entry| {
+                        if index >= skip {
+                            serial::format(format_args!(
+                                "AEROS_FAULT_TRACE pid={} {}({}) arg0={:#x}
+",
+                                entry.task,
+                                crate::syscall::linux_syscall_name(entry.number),
+                                entry.number,
+                                entry.argument
+                            ));
+                        }
+                        index += 1;
+                    });
+                }
                 crate::crash::record(
                     crate::scheduler::current_task_id(),
                     frame.vector,
@@ -641,7 +730,40 @@ extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
                 fault_address,
                 saved_rsp
             ));
-            arch::halt_forever();
+            // A few words of the interrupted stack: what called into here.
+            if saved_rsp >= 0x1000 && saved_rsp & 7 == 0 {
+                let mut words = [0u64; 8];
+                for (index, word) in words.iter_mut().enumerate() {
+                    *word = unsafe {
+                        core::ptr::read_volatile((saved_rsp as usize as *const u64).add(index))
+                    };
+                }
+                serial::format(format_args!(
+                    "AEROS_EXCEPTION_STACK {words:x?}
+"
+                ));
+            }
+            serial::format(format_args!(
+                "AEROS_EXCEPTION_CPU cpu={} apic={} task={} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} r12={:#x} r15={:#x}
+",
+                crate::kernel_lock::this_cpu(),
+                crate::arch::apic::current_id(),
+                crate::scheduler::current_task_id(),
+                frame.rax,
+                frame.rbx,
+                frame.rcx,
+                frame.rdx,
+                frame.rsi,
+                frame.rdi,
+                frame.rbp,
+                frame.r12,
+                frame.r15
+            ));
+            // The panic handler puts the details on the screen.
+            panic!(
+                "CPU exception {} (error {:#x}) in the kernel at {:#x}, address {:#x}",
+                frame.vector, frame.error, frame.rip, fault_address
+            );
         }
     }
 }

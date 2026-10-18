@@ -22,6 +22,8 @@ const TIMER_VECTOR: u32 = 48;
 static MODE: AtomicU8 = AtomicU8::new(0);
 static BASE: AtomicU64 = AtomicU64::new(0);
 static COUNTS_PER_100HZ: AtomicU32 = AtomicU32::new(0);
+static TIMER_HZ: AtomicU32 = AtomicU32::new(0);
+static SAVED_BASE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 pub struct ApicReport {
@@ -114,6 +116,7 @@ pub fn start_timer(frequency: u32) -> bool {
     write(DIVIDE, 3);
     write(LVT_TIMER, (1 << 17) | TIMER_VECTOR);
     write(INITIAL_COUNT, count);
+    TIMER_HZ.store(frequency, Ordering::Release);
     unsafe {
         asm!("sti", options(nomem, nostack, preserves_flags));
     }
@@ -122,8 +125,31 @@ pub fn start_timer(frequency: u32) -> bool {
 
 pub fn stop_timer() {
     arch::disable_interrupts();
+    TIMER_HZ.store(0, Ordering::Release);
     write(LVT_TIMER, (1 << 16) | TIMER_VECTOR);
     write(INITIAL_COUNT, 0);
+}
+
+/// The rate the local timer was last started at, 0 when it is stopped.
+pub fn timer_frequency() -> u32 {
+    TIMER_HZ.load(Ordering::Acquire)
+}
+
+/// Remembers the base register so a resume can put it back.
+pub fn save_state() {
+    SAVED_BASE.store(read_msr(APIC_BASE_MSR), Ordering::Release);
+}
+
+/// Brings the boot processor's local controller back after a sleep: the
+/// base register and the spurious vector, with the timer stopped (the
+/// caller restarts it).
+pub fn resume_boot_cpu() -> bool {
+    let saved = SAVED_BASE.load(Ordering::Acquire);
+    if saved != 0 && read_msr(APIC_BASE_MSR) != saved {
+        unsafe { write_msr(APIC_BASE_MSR, saved) };
+    }
+    let id = initialize_secondary();
+    id == current_id() && read(SPURIOUS) & (1 << 8) != 0
 }
 
 pub fn end_interrupt() {
