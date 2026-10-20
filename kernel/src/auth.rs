@@ -362,6 +362,20 @@ impl Lockout {
     pub fn record_success(&mut self) {
         *self = Self::new();
     }
+
+    /// A lockout picked up again after a restart: `failures` misses, still
+    /// locked for `remaining_s` more seconds (0 = the wait is over, but the
+    /// next miss keeps counting from `failures`).
+    pub fn restored(failures: u32, remaining_s: u64, now_ns: u64) -> Self {
+        Self {
+            failures,
+            locked_until_ns: if remaining_s == 0 {
+                0
+            } else {
+                now_ns.saturating_add(remaining_s.min(MAX_DELAY_S).saturating_mul(1_000_000_000))
+            },
+        }
+    }
 }
 
 /// Known-answer checks for the primitives plus the policy and lockout rules.
@@ -400,7 +414,18 @@ pub fn self_test() -> bool {
     let capped = lockout.seconds_left(now) == MAX_DELAY_S;
     lockout.record_success();
     let reset = !lockout.is_locked(now) && lockout.failures() == 0;
+    // A wait that was running when the machine restarted still runs, and the
+    // next miss after it keeps counting.
+    let mut again = Lockout::restored(5, 40, now);
+    let restored = again.is_locked(now)
+        && again.seconds_left(now) == 40
+        && again.failures() == 5
+        && !Lockout::restored(5, 0, now).is_locked(now);
+    again.record_failure(now + 41_000_000_000);
+    let keeps_counting = again.failures() == 6;
     sha_ok
+        && restored
+        && keeps_counting
         && kdf_ok
         && verify_ok
         && eq_ok

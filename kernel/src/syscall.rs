@@ -320,7 +320,7 @@ mod tcpsock;
 
 const IO_CHUNK: usize = 256;
 const MAX_IO: usize = 64 * 1024;
-const PROCESS_FD_COUNT: usize = 24;
+const PROCESS_FD_COUNT: usize = 64;
 const SOCKET_COUNT: usize = 8;
 const MAX_DATAGRAM: usize = 1472;
 
@@ -453,6 +453,9 @@ struct UdpSocket {
     remote: crate::ip::Address,
     /// This socket's slot in the `udp` port table.
     binding: usize,
+    /// An ICMP echo socket (`SOCK_DGRAM`, `IPPROTO_ICMP`): it sends echo
+    /// requests and receives the replies, its port being the identifier.
+    echo: bool,
     options: crate::sockopt::Options,
 }
 
@@ -464,6 +467,7 @@ impl UdpSocket {
         remote_port: 0,
         remote: [0; 16],
         binding: 0,
+        echo: false,
         options: crate::sockopt::Options::DEFAULT,
     };
 }
@@ -471,7 +475,7 @@ impl UdpSocket {
 static SOCKETS: TicketLock<[UdpSocket; SOCKET_COUNT]> =
     TicketLock::new([UdpSocket::EMPTY; SOCKET_COUNT]);
 
-const PIPE_COUNT: usize = 8;
+const PIPE_COUNT: usize = 32;
 const PIPE_BUFFER_BYTES: usize = 4096;
 
 /// A minimal, deliberately non-blocking pipe: `pipe_read`/`pipe_write`
@@ -534,7 +538,7 @@ impl Pipe {
 
 static PIPES: TicketLock<[Pipe; PIPE_COUNT]> = TicketLock::new([Pipe::EMPTY; PIPE_COUNT]);
 
-const UNIX_PAIR_COUNT: usize = 8;
+const UNIX_PAIR_COUNT: usize = 32;
 
 #[derive(Clone, Copy)]
 struct UnixBuffer {
@@ -561,6 +565,15 @@ impl UnixBuffer {
 #[derive(Clone, Copy)]
 struct UnixPair {
     used: bool,
+    /// `SOCK_DGRAM` / `SOCK_SEQPACKET`: the buffers hold whole messages, each
+    /// behind a two-byte length, and a read takes exactly one.
+    message: bool,
+    /// The `SOCK_*` type `getsockopt(SO_TYPE)` reports.
+    kind: u8,
+    /// A `socket(AF_UNIX, SOCK_DGRAM)`: its one descriptor is end B and reads
+    /// `a_to_b`, which every sender fills; what it writes goes to `peer`.
+    inbox: bool,
+    peer: u32,
     a_to_b: UnixBuffer,
     b_to_a: UnixBuffer,
     end_a_open: bool,
@@ -570,6 +583,10 @@ struct UnixPair {
 impl UnixPair {
     const EMPTY: Self = Self {
         used: false,
+        message: false,
+        kind: 1,
+        inbox: false,
+        peer: PEER_NONE,
         a_to_b: UnixBuffer::EMPTY,
         b_to_a: UnixBuffer::EMPTY,
         end_a_open: false,
@@ -577,27 +594,39 @@ impl UnixPair {
     };
 }
 
+/// A datagram socket that never connected, and one whose peer has closed.
+const PEER_NONE: u32 = u32::MAX;
+const PEER_GONE: u32 = u32::MAX - 1;
+
 static UNIX_PAIRS: TicketLock<[UnixPair; UNIX_PAIR_COUNT]> =
     TicketLock::new([UnixPair::EMPTY; UNIX_PAIR_COUNT]);
 
 /// A `unix_socket` fd not yet connected to a pair, nor bound to a listener -
 /// the state `socket(AF_UNIX, SOCK_STREAM, 0)` returns.
 const UNIX_UNBOUND: u32 = u32::MAX;
-const UNIX_LISTENER_COUNT: usize = 4;
+/// The same state for a `SOCK_SEQPACKET` socket, whose connection keeps
+/// message boundaries.
+const UNIX_UNBOUND_MESSAGE: u32 = u32::MAX - 1;
+
+fn unix_unbound(handle: u32) -> bool {
+    handle >= UNIX_UNBOUND_MESSAGE
+}
+const UNIX_LISTENER_COUNT: usize = 16;
 const UNIX_LISTENER_BACKLOG: usize = 4;
 /// Matches `sizeof(sockaddr_un.sun_path)` on real Linux, though there's no
 /// filesystem entry behind it here - `bind()`/`connect()` just match this
 /// byte string against an in-kernel table (closer to Linux's "abstract
 /// namespace" sockets, which also never touch the filesystem, than to a
-/// real path-backed one). Real path-backed `AF_UNIX` binding would need the
-/// VFS to understand a new "socket" node type; out of scope here, the same
-/// way `AF_UNIX` only gets `socketpair()`'s anonymous pairs otherwise.
+/// real path-backed one). Path-backed binding would need a VFS socket node.
 const UNIX_NAME_CAP: usize = 108;
 
 #[derive(Clone, Copy)]
 struct UnixListener {
     used: bool,
     listening: bool,
+    message: bool,
+    /// A name bound by a datagram socket: the `UNIX_PAIRS` inbox it delivers to.
+    inbox: u32,
     name: [u8; UNIX_NAME_CAP],
     name_len: u8,
     /// Pending connections: a `UNIX_PAIRS` slot per queued `connect()`,
@@ -609,6 +638,8 @@ impl UnixListener {
     const EMPTY: Self = Self {
         used: false,
         listening: false,
+        message: false,
+        inbox: PEER_NONE,
         name: [0; UNIX_NAME_CAP],
         name_len: 0,
         backlog: [None; UNIX_LISTENER_BACKLOG],
@@ -622,7 +653,7 @@ impl UnixListener {
 static UNIX_LISTENERS: TicketLock<[UnixListener; UNIX_LISTENER_COUNT]> =
     TicketLock::new([UnixListener::EMPTY; UNIX_LISTENER_COUNT]);
 
-const EPOLL_INSTANCE_COUNT: usize = 8;
+const EPOLL_INSTANCE_COUNT: usize = 32;
 const EPOLL_MAX_WATCHES: usize = 32;
 /// `EPOLLIN`; the only readiness bit anything here can report (see
 /// `linux_poll`'s identical `readable`/`writable` -> bitmask mapping).
@@ -1062,6 +1093,44 @@ fn pipe_read_waiting(slot: usize, destination: &mut [u8], nonblocking: bool) -> 
     }
 }
 
+fn unix_read_waiting(
+    slot: usize,
+    end_b: bool,
+    destination: &mut [u8],
+    nonblocking: bool,
+) -> Result<usize, u64> {
+    let nonblocking = nonblocking || crate::scheduler::current_task_pid_for_linux().is_none();
+    loop {
+        match unix_socket_read(slot, end_b, destination) {
+            Err(11) if !nonblocking => {
+                if interrupted() {
+                    return Err(4);
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
+fn unix_write_waiting(
+    slot: usize,
+    end_b: bool,
+    source: &[u8],
+    nonblocking: bool,
+) -> Result<usize, u64> {
+    let nonblocking = nonblocking || crate::scheduler::current_task_pid_for_linux().is_none();
+    loop {
+        match unix_socket_write(slot, end_b, source) {
+            Err(11) if !nonblocking => {
+                if interrupted() {
+                    return Err(4);
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
 fn pipe_write_waiting(slot: usize, source: &[u8], nonblocking: bool) -> Result<usize, u64> {
     let in_process = crate::scheduler::current_task_pid_for_linux().is_some();
     let nonblocking = nonblocking || !in_process;
@@ -1141,7 +1210,20 @@ fn pipe_write(slot: usize, source: &[u8]) -> Result<usize, u64> {
 /// Mirrors `pipe_read`, but for one end of a `socketpair()` pair: `end_b`
 /// selects which of the pair's two directional buffers is this end's
 /// "incoming" side (see `UnixPair`'s doc comment).
+/// The most one `SOCK_DGRAM` message can carry.
+const MAX_MESSAGE: usize = 4000;
+
 fn unix_socket_read(slot: usize, end_b: bool, destination: &mut [u8]) -> Result<usize, u64> {
+    unix_socket_take(slot, end_b, destination, false)
+}
+
+/// `peek` copies what a read would return and leaves it queued (`MSG_PEEK`).
+fn unix_socket_take(
+    slot: usize,
+    end_b: bool,
+    destination: &mut [u8],
+    peek: bool,
+) -> Result<usize, u64> {
     for attempt in 0..PIPE_WAIT_ITERATIONS {
         {
             let mut pairs = UNIX_PAIRS.lock();
@@ -1151,18 +1233,36 @@ fn unix_socket_read(slot: usize, end_b: bool, destination: &mut [u8]) -> Result<
             if !pair.used {
                 return Err(9);
             }
+            let message = pair.message;
             let (buffer, peer_open) = if end_b {
                 (&mut pair.a_to_b, pair.end_a_open)
             } else {
                 (&mut pair.b_to_a, pair.end_b_open)
             };
+            if buffer.length > 0 && message {
+                // One message: what does not fit the caller's buffer is dropped.
+                let size = usize::from(buffer.data[buffer.head % PIPE_BUFFER_BYTES])
+                    | usize::from(buffer.data[(buffer.head + 1) % PIPE_BUFFER_BYTES]) << 8;
+                let count = size.min(destination.len());
+                for (index, slot) in destination.iter_mut().enumerate().take(count) {
+                    *slot = buffer.data[(buffer.head + 2 + index) % PIPE_BUFFER_BYTES];
+                }
+                if !peek {
+                    let taken = (2 + size).min(buffer.length);
+                    buffer.head = (buffer.head + taken) % PIPE_BUFFER_BYTES;
+                    buffer.length -= taken;
+                }
+                return Ok(count);
+            }
             if buffer.length > 0 {
                 let count = buffer.length.min(destination.len());
                 for (index, slot) in destination.iter_mut().enumerate().take(count) {
                     *slot = buffer.data[(buffer.head + index) % PIPE_BUFFER_BYTES];
                 }
-                buffer.head = (buffer.head + count) % PIPE_BUFFER_BYTES;
-                buffer.length -= count;
+                if !peek {
+                    buffer.head = (buffer.head + count) % PIPE_BUFFER_BYTES;
+                    buffer.length -= count;
+                }
                 return Ok(count);
             }
             if !peer_open {
@@ -1176,8 +1276,53 @@ fn unix_socket_read(slot: usize, end_b: bool, destination: &mut [u8]) -> Result<
     Err(11)
 }
 
+/// A datagram or sequenced-packet socket, whose reads and writes move whole
+/// messages.
+fn unix_keeps_messages(handle: u32) -> bool {
+    !unix_unbound(handle)
+        && UNIX_PAIRS
+            .lock()
+            .get(handle as usize)
+            .is_some_and(|pair| pair.used && pair.message)
+}
+
+/// One datagram into a bound datagram socket's inbox.
+fn unix_inbox_deliver(inbox: usize, source: &[u8]) -> Result<usize, u64> {
+    let open = UNIX_PAIRS
+        .lock()
+        .get(inbox)
+        .is_some_and(|pair| pair.used && pair.inbox && pair.end_b_open);
+    if !open {
+        return Err(111);
+    }
+    unix_socket_write(inbox, false, source)
+        .map_err(|failure| if failure == 32 { 111 } else { failure })
+}
+
+/// The inbox bound to `name` by a datagram socket.
+fn unix_datagram_target(name: &[u8]) -> Option<usize> {
+    UNIX_LISTENERS
+        .lock()
+        .iter()
+        .find(|listener| listener.used && listener.inbox != PEER_NONE && listener.name() == name)
+        .map(|listener| listener.inbox as usize)
+}
+
 /// Mirrors `pipe_write`, but for one end of a `socketpair()` pair.
 fn unix_socket_write(slot: usize, end_b: bool, source: &[u8]) -> Result<usize, u64> {
+    if end_b {
+        let peer = UNIX_PAIRS
+            .lock()
+            .get(slot)
+            .filter(|pair| pair.used && pair.inbox)
+            .map(|pair| pair.peer);
+        match peer {
+            Some(PEER_NONE) => return Err(107),
+            Some(PEER_GONE) => return Err(111),
+            Some(peer) => return unix_inbox_deliver(peer as usize, source),
+            None => {}
+        }
+    }
     if source.is_empty() {
         let pairs = UNIX_PAIRS.lock();
         let Some(pair) = pairs.get(slot) else {
@@ -1207,13 +1352,28 @@ fn unix_socket_write(slot: usize, end_b: bool, source: &[u8]) -> Result<usize, u
             if !pair.used || !peer_open {
                 return Err(32);
             }
+            let message = pair.message;
             let buffer = if end_b {
                 &mut pair.b_to_a
             } else {
                 &mut pair.a_to_b
             };
             let space = PIPE_BUFFER_BYTES - buffer.length;
-            if space > 0 {
+            if message {
+                // A message goes in whole or not at all.
+                if source.len() > MAX_MESSAGE {
+                    return Err(90);
+                }
+                if space >= 2 + source.len() {
+                    let tail = (buffer.head + buffer.length) % PIPE_BUFFER_BYTES;
+                    let header = (source.len() as u16).to_le_bytes();
+                    for (index, byte) in header.iter().chain(source.iter()).enumerate() {
+                        buffer.data[(tail + index) % PIPE_BUFFER_BYTES] = *byte;
+                    }
+                    buffer.length += 2 + source.len();
+                    return Ok(source.len());
+                }
+            } else if space > 0 {
                 let count = source.len().min(space);
                 let tail = (buffer.head + buffer.length) % PIPE_BUFFER_BYTES;
                 for (index, byte) in source[..count].iter().enumerate() {
@@ -1343,8 +1503,8 @@ fn cpu_timer_reading(index: usize) -> u64 {
 
 const POSIX_TIMER_COUNT: usize = 8;
 
-/// A POSIX timer (`timer_create`); `signal` 0 is SIGEV_NONE. The
-/// `sigev_value` is not passed on: signals here carry no payload.
+/// A POSIX timer (`timer_create`); `signal` 0 is SIGEV_NONE. `value` is the
+/// `sigev_value` its signal's `siginfo` carries.
 #[derive(Clone, Copy)]
 struct PosixTimer {
     used: bool,
@@ -1390,9 +1550,7 @@ static UMASK: AtomicU64 = AtomicU64::new(DEFAULT_UMASK);
 /// process's life (real Linux allows only `exit`, not `exit_group`, in
 /// strict mode; `exit_group` is included here too since that's what a real
 /// compiled Rust/musl binary actually calls on exit, and excluding it would
-/// make the mode unusable for testing against real binaries). There is no
-/// `SECCOMP_SET_MODE_FILTER` (BPF) support - deliberately out of scope, the
-/// same way AF_UNIX only gets `socketpair()` rather than full bind/listen.
+/// make the mode unusable for testing against real binaries).
 /// Once on, it can never be turned off, matching real seccomp semantics.
 static SECCOMP_STRICT: AtomicBool = AtomicBool::new(false);
 /// The SECCOMP_SET_MODE_FILTER program of this process, if any. One filter
@@ -1584,6 +1742,71 @@ pub fn close_all_process_fds() {
             && last_reference
         {
             let _ = release_process_fd(process_fd);
+        }
+    }
+}
+
+/// A pipe the shell reads a program's output from (descriptors 1 and 2 of
+/// the program are its write end, see `attach_capture_pipe`).
+pub fn capture_create() -> Option<usize> {
+    let mut pipes = PIPES.lock();
+    let slot = pipes.iter().position(|pipe| !pipe.used)?;
+    pipes[slot] = Pipe {
+        used: true,
+        read_open: true,
+        write_open: true,
+        ..Pipe::EMPTY
+    };
+    Some(slot)
+}
+
+pub fn set_state_capabilities(
+    state: &mut ProcessState,
+    capabilities: crate::capability::Capabilities,
+) {
+    state.capabilities = capabilities;
+}
+
+/// Whether the running task may change the system's protected files
+/// (`vfs::caller_restricted`); kernel tasks always may.
+pub(crate) fn may_override_file_protection() -> bool {
+    has_capability(crate::capability::CAP_DAC_OVERRIDE)
+}
+
+pub fn attach_capture_pipe(state: &mut ProcessState, slot: usize) {
+    let descriptor = ProcessFd {
+        handle: slot as u32,
+        open: true,
+        pipe: true,
+        writable: true,
+        ..ProcessFd::EMPTY
+    };
+    state.fds[1] = descriptor;
+    state.fds[2] = descriptor;
+}
+
+/// Takes what the program has written so far, without waiting.
+pub fn capture_read(slot: usize, destination: &mut [u8]) -> usize {
+    let mut pipes = PIPES.lock();
+    let Some(pipe) = pipes.get_mut(slot) else {
+        return 0;
+    };
+    let count = pipe.length.min(destination.len());
+    for (index, byte) in destination.iter_mut().enumerate().take(count) {
+        *byte = pipe.data[(pipe.head + index) % PIPE_BUFFER_BYTES];
+    }
+    pipe.head = (pipe.head + count) % PIPE_BUFFER_BYTES;
+    pipe.length -= count;
+    count
+}
+
+/// The reader is done: the pipe is freed once the program has let go of it.
+pub fn capture_close(slot: usize) {
+    let mut pipes = PIPES.lock();
+    if let Some(pipe) = pipes.get_mut(slot) {
+        pipe.read_open = false;
+        if !pipe.write_open {
+            *pipe = Pipe::EMPTY;
         }
     }
 }
@@ -1808,15 +2031,18 @@ const LINUX_SECCOMP: u64 = 317;
 const SECCOMP_SET_MODE_STRICT: u64 = 0;
 const SECCOMP_SET_MODE_FILTER: u64 = 1;
 
-const EXEC_STRING_COUNT: usize = 24;
-const EXEC_STRING_MAX: usize = 384;
+/// argv and envp each hold up to this many strings, sharing `EXEC_STRING_BYTES`
+/// (the new program's first stack pages hold them all, plus the auxiliary vector).
+const EXEC_STRING_COUNT: usize = crate::process::EXEC_STRINGS_MAX;
+const EXEC_STRING_BYTES: usize = 12 * 1024;
 
-/// Copies a NULL-terminated user array of C strings (argv/envp) into kernel
-/// buffers; a null array pointer means an empty list.
+/// Copies a NULL-terminated user array of C strings (argv/envp) into `pool`
+/// after its first `used` bytes; a null array pointer means an empty list.
 fn copy_string_vector(
     array: u64,
-    store: &mut [[u8; EXEC_STRING_MAX]; EXEC_STRING_COUNT],
-    lengths: &mut [usize; EXEC_STRING_COUNT],
+    pool: &mut [u8; EXEC_STRING_BYTES],
+    used: &mut usize,
+    spans: &mut [(usize, usize); EXEC_STRING_COUNT],
 ) -> Result<usize, u64> {
     if array == 0 {
         return Ok(0);
@@ -1837,10 +2063,10 @@ fn copy_string_vector(
         if count == EXEC_STRING_COUNT {
             return Err(error(7));
         }
-        // One byte is kept for the terminator `copy_string` looks for.
-        let length = user::copy_string(pointer, &mut store[count][..EXEC_STRING_MAX - 1])
-            .ok_or_else(|| error(7))?;
-        lengths[count] = length;
+        let start = *used;
+        let length = user::copy_string(pointer, &mut pool[start..]).ok_or_else(|| error(7))?;
+        spans[count] = (start, length);
+        *used = start + length + 1;
         count += 1;
     }
 }
@@ -2131,25 +2357,28 @@ fn exec_path(
     envp: u64,
 ) -> Result<(), u64> {
     let path = core::str::from_utf8(path_bytes).map_err(|_| error(84))?;
+    // Only a regular file with an execute bit runs.
+    vfs::metadata(path).map_err(vfs_error)?;
+    if !vfs::may_execute(path) {
+        return Err(error(13));
+    }
     // argv/envp live in the image that is about to be replaced, so they are
-    // copied out first (up to 16 strings of 95 bytes each) - before the new
-    // image's own bytes are even read, so it does not matter below that a
-    // `/home`/`/media` file's bytes only live for the one call that reads
-    // them (see `vfs::with_home_file`), unlike the embedded `/bin/*`
-    // binaries' `'static` storage.
-    let mut arg_store = [[0u8; EXEC_STRING_MAX]; EXEC_STRING_COUNT];
-    let mut arg_len = [0usize; EXEC_STRING_COUNT];
-    let arg_count = copy_string_vector(argv, &mut arg_store, &mut arg_len)?;
-    let mut env_store = [[0u8; EXEC_STRING_MAX]; EXEC_STRING_COUNT];
-    let mut env_len = [0usize; EXEC_STRING_COUNT];
-    let env_count = copy_string_vector(envp, &mut env_store, &mut env_len)?;
+    // copied out first - before the new image's own bytes are even read, so
+    // it does not matter below that a `/home`/`/media` file's bytes only live
+    // for the one call that reads them (see `vfs::with_home_file`).
+    let mut pool = [0u8; EXEC_STRING_BYTES];
+    let mut used = 0;
+    let mut arg_spans = [(0usize, 0usize); EXEC_STRING_COUNT];
+    let arg_count = copy_string_vector(argv, &mut pool, &mut used, &mut arg_spans)?;
+    let mut env_spans = [(0usize, 0usize); EXEC_STRING_COUNT];
+    let env_count = copy_string_vector(envp, &mut pool, &mut used, &mut env_spans)?;
     let mut args: [&[u8]; EXEC_STRING_COUNT] = [&[]; EXEC_STRING_COUNT];
     let mut env: [&[u8]; EXEC_STRING_COUNT] = [&[]; EXEC_STRING_COUNT];
-    for index in 0..arg_count {
-        args[index] = &arg_store[index][..arg_len[index]];
+    for (slot, &(start, length)) in args.iter_mut().zip(&arg_spans[..arg_count]) {
+        *slot = &pool[start..start + length];
     }
-    for index in 0..env_count {
-        env[index] = &env_store[index][..env_len[index]];
+    for (slot, &(start, length)) in env.iter_mut().zip(&env_spans[..env_count]) {
+        *slot = &pool[start..start + length];
     }
     let do_exec = |data: &[u8]| -> Option<(u64, u64)> {
         if arg_count == 0 {
@@ -2402,7 +2631,9 @@ fn linux_syscall(frame: &mut LinuxSyscallFrame) -> u64 {
             };
             if signal > 64 {
                 frame.number = error(22);
-            } else if pid != own && !has_capability(crate::capability::CAP_KILL) {
+            } else if pid != own
+                && !crate::scheduler::may_signal(pid, has_capability(crate::capability::CAP_KILL))
+            {
                 frame.number = error(1);
             } else if pid == own {
                 SIGNAL_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -2534,12 +2765,12 @@ pub(crate) fn fuzz_syscalls(next: &mut dyn FnMut() -> u64, rounds: u32) -> u32 {
         executed += 1;
     }
     restore_process_state(&saved);
-    *PIPES.lock() = [Pipe::EMPTY; PIPE_COUNT];
+    PIPES.lock().fill(Pipe::EMPTY);
     reset_udp_sockets();
     crate::udp::reset();
-    *UNIX_PAIRS.lock() = [UnixPair::EMPTY; UNIX_PAIR_COUNT];
-    *UNIX_LISTENERS.lock() = [UnixListener::EMPTY; UNIX_LISTENER_COUNT];
-    *EPOLL_INSTANCES.lock() = [EpollInstance::EMPTY; EPOLL_INSTANCE_COUNT];
+    UNIX_PAIRS.lock().fill(UnixPair::EMPTY);
+    UNIX_LISTENERS.lock().fill(UnixListener::EMPTY);
+    EPOLL_INSTANCES.lock().fill(EpollInstance::EMPTY);
     crate::tcpnet::reset();
     executed
 }
@@ -3613,6 +3844,42 @@ pub(crate) fn epoll_self_test() -> bool {
         && mod_ready_again
 }
 
+/// A datagram pair keeps message boundaries: two writes are two reads, a short
+/// buffer drops the rest of its message, an empty buffer is not a message, and
+/// a message that is too big is refused.
+fn unix_datagram_pair_self_test() -> bool {
+    let mut pairs = UNIX_PAIRS.lock();
+    let Some(slot) = pairs.iter().position(|pair| !pair.used) else {
+        return false;
+    };
+    pairs[slot] = UnixPair {
+        used: true,
+        message: true,
+        end_a_open: true,
+        end_b_open: true,
+        ..UnixPair::EMPTY
+    };
+    drop(pairs);
+    let wrote = unix_socket_write(slot, false, b"first") == Ok(5)
+        && unix_socket_write(slot, false, b"second message") == Ok(14);
+    let mut small = [0u8; 3];
+    let mut big = [0u8; 64];
+    let truncated = unix_socket_read(slot, true, &mut small) == Ok(3) && small == *b"fir";
+    let whole = unix_socket_read(slot, true, &mut big) == Ok(14) && big[..14] == *b"second message";
+    let empty = unix_socket_read(slot, true, &mut big) == Err(11);
+    let oversized = unix_socket_write(slot, false, &[0u8; MAX_MESSAGE + 1]) == Err(90);
+    // The ring wraps: many messages in a row all come out whole.
+    let mut wrapped = true;
+    for round in 0..40u8 {
+        let text = [round; 300];
+        wrapped &= unix_socket_write(slot, true, &text) == Ok(300);
+        let mut back = [0u8; 300];
+        wrapped &= unix_socket_read(slot, false, &mut back) == Ok(300) && back == text;
+    }
+    UNIX_PAIRS.lock()[slot] = UnixPair::EMPTY;
+    wrote && truncated && whole && empty && oversized && wrapped
+}
+
 /// Exercises `AF_UNIX`/`SOCK_STREAM` `socketpair()` directly against the
 /// testable cores (`unix_socket_read`/`unix_socket_write`), the same way
 /// `pipe_self_test`/`epoll_self_test` bypass `linux_socketpair`'s user-memory
@@ -3647,6 +3914,7 @@ pub(crate) fn unix_socketpair_self_test() -> bool {
     let mut pong = [0u8; 5];
     let a_reads_ok = unix_socket_read(slot, false, &mut pong) == Ok(5) && pong == *b"pong!";
     let eagain_ok = unix_socket_read(slot, false, &mut pong) == Err(11);
+    let datagrams_ok = unix_datagram_pair_self_test();
 
     let a_events_empty = fd_ready_events(fd_a) & EPOLLIN == 0;
     let _ = unix_socket_write(slot, true, b"x");
@@ -3667,6 +3935,7 @@ pub(crate) fn unix_socketpair_self_test() -> bool {
         && b_to_a_ok
         && a_reads_ok
         && eagain_ok
+        && datagrams_ok
         && a_events_empty
         && a_events_ready
         && close_ok
@@ -3683,7 +3952,7 @@ pub(crate) fn unix_socketpair_self_test() -> bool {
 /// connect to a name nobody bound correctly refused.
 pub(crate) fn unix_domain_socket_self_test() -> bool {
     let name = b"AEROS-TEST-SOCK";
-    let Some(server_fd) = install_unbound_unix_socket_fd(false) else {
+    let Some(server_fd) = install_unbound_unix_socket_fd(false, false) else {
         return false;
     };
     let Some(server_index) = process_fd_index(server_fd) else {
@@ -3692,7 +3961,7 @@ pub(crate) fn unix_domain_socket_self_test() -> bool {
     };
     let bind_ok = unix_bind_apply(server_index, name) == 0;
     let duplicate_bind_rejected = {
-        let Some(second_fd) = install_unbound_unix_socket_fd(false) else {
+        let Some(second_fd) = install_unbound_unix_socket_fd(false, false) else {
             return false;
         };
         let rejected = process_fd_index(second_fd)
@@ -3704,7 +3973,7 @@ pub(crate) fn unix_domain_socket_self_test() -> bool {
     let listen_ok = unix_listen_apply(server_index) == 0;
 
     let refused_before_anyone_connects = {
-        let Some(client_fd) = install_unbound_unix_socket_fd(false) else {
+        let Some(client_fd) = install_unbound_unix_socket_fd(false, false) else {
             return false;
         };
         let refused = process_fd_index(client_fd)
@@ -3715,7 +3984,7 @@ pub(crate) fn unix_domain_socket_self_test() -> bool {
     };
 
     // First connect/accept cycle.
-    let Some(client_a_fd) = install_unbound_unix_socket_fd(false) else {
+    let Some(client_a_fd) = install_unbound_unix_socket_fd(false, false) else {
         return false;
     };
     let Some(client_a_index) = process_fd_index(client_a_fd) else {
@@ -3751,7 +4020,7 @@ pub(crate) fn unix_domain_socket_self_test() -> bool {
     let _ = linux_close(accepted_a_fd);
 
     // Second cycle through the SAME listener, proving it's reusable.
-    let Some(client_b_fd) = install_unbound_unix_socket_fd(false) else {
+    let Some(client_b_fd) = install_unbound_unix_socket_fd(false, false) else {
         return false;
     };
     let Some(client_b_index) = process_fd_index(client_b_fd) else {
@@ -3776,8 +4045,10 @@ pub(crate) fn unix_domain_socket_self_test() -> bool {
         UNIX_PAIRS.lock()[accepted_b_pair_slot] = UnixPair::EMPTY;
     }
     let _ = linux_close(server_fd);
+    let seqpacket_ok = unix_seqpacket_self_test() && unix_datagram_socket_self_test();
 
     bind_ok
+        && seqpacket_ok
         && duplicate_bind_rejected
         && listen_ok
         && refused_before_anyone_connects
@@ -3790,6 +4061,105 @@ pub(crate) fn unix_domain_socket_self_test() -> bool {
         && connect_b_ok
         && second_cycle_ok
         && second_cycle_read_ok
+}
+
+/// A `SOCK_SEQPACKET` listener takes only `SOCK_SEQPACKET` clients, and the
+/// connection it accepts keeps message boundaries.
+fn unix_seqpacket_self_test() -> bool {
+    let name = b"AEROS-TEST-SEQPACKET";
+    let unbound = |message| {
+        install_unbound_unix_socket_fd(false, message)
+            .and_then(|fd| process_fd_index(fd).map(|index| (fd, index)))
+    };
+    let Some((server_fd, server_index)) = unbound(true) else {
+        return false;
+    };
+    let type_of = |index: usize| {
+        let process_fd = PROCESS_FDS.lock()[index];
+        unix_type(&process_fd)
+    };
+    let listening = unix_bind_apply(server_index, name) == 0
+        && unix_listen_apply(server_index) == 0
+        && type_of(server_index) == 5;
+    let stream_refused = match unbound(false) {
+        Some((fd, index)) => {
+            let refused = type_of(index) == 1 && unix_connect_apply(index, name) == error(111);
+            let _ = linux_close(fd);
+            refused
+        }
+        None => false,
+    };
+    let mut kept = false;
+    if let Some((client_fd, client_index)) = unbound(true) {
+        if unix_connect_apply(client_index, name) == 0 {
+            let client_slot = PROCESS_FDS.lock()[client_index].handle as usize;
+            let server_handle = PROCESS_FDS.lock()[server_index].handle;
+            if let Some(accepted) = unix_accept_apply(server_handle) {
+                let mut back = [0u8; 16];
+                kept = accepted == client_slot
+                    && type_of(client_index) == 5
+                    && unix_socket_write(client_slot, false, b"one") == Ok(3)
+                    && unix_socket_write(client_slot, false, b"two") == Ok(3)
+                    && unix_socket_read(accepted, true, &mut back) == Ok(3)
+                    && unix_socket_read(accepted, true, &mut back) == Ok(3)
+                    && back[..3] == *b"two";
+                match install_unix_socket_fd(accepted as u32, true, false) {
+                    Some(fd) => {
+                        let _ = linux_close(fd);
+                    }
+                    None => UNIX_PAIRS.lock()[accepted] = UnixPair::EMPTY,
+                }
+            }
+        }
+        let _ = linux_close(client_fd);
+    }
+    let _ = linux_close(server_fd);
+    listening && stream_refused && kept
+}
+
+/// Named datagram sockets: a message sent to a bound name arrives whole, a
+/// connected socket's writes reach its peer, an unconnected write is
+/// `ENOTCONN`, and once the receiver closes its name is free and its peer's
+/// writes are refused.
+fn unix_datagram_socket_self_test() -> bool {
+    let name = b"AEROS-TEST-DGRAM";
+    let socket = || {
+        install_unix_datagram_fd(false).and_then(|fd| {
+            let process_fd = lookup_process_fd(fd)?;
+            Some((fd, unix_inbox_of(&process_fd)?))
+        })
+    };
+    let Some((server_fd, server)) = socket() else {
+        return false;
+    };
+    let Some((client_fd, client)) = socket() else {
+        let _ = linux_close(server_fd);
+        return false;
+    };
+    let mut back = [0u8; 16];
+    let bound = unix_datagram_bind(server, name) == 0
+        && unix_datagram_bind(client, name) == error(98)
+        && unix_datagram_bind(server, b"AEROS-OTHER") == error(22);
+    let unconnected = unix_socket_write(client, true, b"lost") == Err(107);
+    let sent = unix_datagram_target(name) == Some(server)
+        && unix_inbox_deliver(server, b"to-name") == Ok(7)
+        && unix_socket_take(server, true, &mut back[..2], true) == Ok(2)
+        && unix_socket_read(server, true, &mut back) == Ok(7)
+        && back[..7] == *b"to-name";
+    let connected = unix_datagram_connect(client, name) == 0
+        && unix_socket_write(client, true, b"one") == Ok(3)
+        && unix_socket_write(client, true, b"two!") == Ok(4)
+        && unix_socket_read(server, true, &mut back) == Ok(3)
+        && unix_socket_read(server, true, &mut back) == Ok(4)
+        && back[..4] == *b"two!"
+        && unix_socket_read(server, true, &mut back) == Err(11);
+    let typed = lookup_process_fd(server_fd).is_some_and(|fd| unix_type(&fd) == 2);
+    let closed = linux_close(server_fd) == 0
+        && unix_socket_write(client, true, b"gone") == Err(111)
+        && unix_datagram_target(name).is_none();
+    let _ = linux_close(client_fd);
+    let released = !UNIX_PAIRS.lock()[client].used;
+    bound && unconnected && sent && connected && typed && closed && released
 }
 
 fn linux_pipe2(fds_address: u64, flags: u64) -> u64 {
@@ -3867,16 +4237,23 @@ fn linux_pipe2(fds_address: u64, flags: u64) -> u64 {
 fn linux_socket(domain: u64, kind: u64, protocol: u64) -> u64 {
     let base_kind = kind & 0xf;
     if domain == 1 {
-        // AF_UNIX: only SOCK_STREAM, and only as an unbound socket that
-        // `bind()`+`listen()`+`accept()` or `connect()` gives real meaning
-        // to afterward - see `UnixListener`'s doc comment for what `bind()`
-        // actually does here (no filesystem entry, an in-kernel name table).
-        if base_kind != 1 || kind & !(0xf | 0x800 | O_CLOEXEC) != 0 || protocol != 0 {
+        // AF_UNIX names live in an in-kernel table, not the filesystem (see
+        // `UnixListener`).
+        if !matches!(base_kind, 1 | 2 | 5)
+            || kind & !(0xf | 0x800 | O_CLOEXEC) != 0
+            || protocol != 0
+        {
             return error(93);
         }
-        let Some(descriptor) = install_unbound_unix_socket_fd(kind & O_CLOEXEC != 0) else {
+        let installed = if base_kind == 2 {
+            install_unix_datagram_fd(kind & O_CLOEXEC != 0)
+        } else {
+            install_unbound_unix_socket_fd(kind & O_CLOEXEC != 0, base_kind == 5)
+        };
+        let Some(descriptor) = installed else {
             return error(24);
         };
+        PROCESS_FDS.lock()[descriptor as usize].nonblocking = kind & 0x800 != 0;
         SOCKET_CALLS.fetch_add(1, Ordering::Relaxed);
         return descriptor;
     }
@@ -3896,10 +4273,20 @@ fn linux_socket(domain: u64, kind: u64, protocol: u64) -> u64 {
             Err(failure) => error(failure),
         };
     }
-    if base_kind != 2 || kind & !(0xf | 0x800 | O_CLOEXEC) != 0 || protocol != 0 && protocol != 17 {
+    // Raw sockets are refused as Linux refuses them to a process without
+    // CAP_NET_RAW, which is what makes `ping` fall back to a ping socket.
+    if base_kind == 3 {
+        return error(1);
+    }
+    // `IPPROTO_ICMP` on a datagram socket is a ping socket (IPv4 only).
+    let echo = protocol == 1 && !inet6;
+    if base_kind != 2
+        || kind & !(0xf | 0x800 | O_CLOEXEC) != 0
+        || protocol != 0 && protocol != 17 && !echo
+    {
         return error(93);
     }
-    match create_udp_socket(kind & O_CLOEXEC != 0, kind & 0x800 != 0, inet6) {
+    match create_udp_socket(kind & O_CLOEXEC != 0, kind & 0x800 != 0, inet6, echo) {
         Ok(descriptor) => {
             SOCKET_CALLS.fetch_add(1, Ordering::Relaxed);
             descriptor
@@ -3908,13 +4295,22 @@ fn linux_socket(domain: u64, kind: u64, protocol: u64) -> u64 {
     }
 }
 
-fn create_udp_socket(close_on_exec: bool, nonblocking: bool, inet6: bool) -> Result<u64, u64> {
+fn create_udp_socket(
+    close_on_exec: bool,
+    nonblocking: bool,
+    inet6: bool,
+    echo: bool,
+) -> Result<u64, u64> {
     let mut sockets = SOCKETS.lock();
     let index = sockets
         .iter()
         .position(|socket| !socket.open)
         .ok_or(24u64)?;
-    let binding = crate::udp::bind_socket(0)?;
+    let binding = if echo {
+        crate::udp::bind_echo()?
+    } else {
+        crate::udp::bind_socket(0)?
+    };
     crate::tcpnet::activate();
     sockets[index] = UdpSocket {
         open: true,
@@ -3923,6 +4319,7 @@ fn create_udp_socket(close_on_exec: bool, nonblocking: bool, inet6: bool) -> Res
         remote_port: 0,
         remote: [0; 16],
         binding,
+        echo,
         options: crate::sockopt::Options::DEFAULT,
     };
     drop(sockets);
@@ -4040,7 +4437,9 @@ fn linux_socketpair(domain: u64, kind: u64, protocol: u64, fds_address: u64) -> 
         return error(97);
     }
     let base_kind = kind & 0xf;
-    if base_kind != 1 || kind & !(0xf | 0x800 | O_CLOEXEC) != 0 || protocol != 0 {
+    // Stream, datagram and sequenced-packet pairs; the last two keep message
+    // boundaries.
+    if !matches!(base_kind, 1 | 2 | 5) || kind & !(0xf | 0x800 | O_CLOEXEC) != 0 || protocol != 0 {
         return error(93);
     }
     if !user::range_accessible(fds_address, 8, true) {
@@ -4052,6 +4451,8 @@ fn linux_socketpair(domain: u64, kind: u64, protocol: u64, fds_address: u64) -> 
     };
     pairs[slot] = UnixPair {
         used: true,
+        message: base_kind != 1,
+        kind: base_kind as u8,
         end_a_open: true,
         end_b_open: true,
         ..UnixPair::EMPTY
@@ -4066,6 +4467,11 @@ fn linux_socketpair(domain: u64, kind: u64, protocol: u64, fds_address: u64) -> 
         let _ = linux_close(fd_a);
         return error(24);
     };
+    {
+        let mut descriptors = PROCESS_FDS.lock();
+        descriptors[fd_a as usize].nonblocking = kind & 0x800 != 0;
+        descriptors[fd_b as usize].nonblocking = kind & 0x800 != 0;
+    }
     if !user::copy_to_user(fds_address, &(fd_a as u32).to_le_bytes())
         || !user::copy_to_user(fds_address + 4, &(fd_b as u32).to_le_bytes())
     {
@@ -4081,8 +4487,14 @@ fn linux_connect(descriptor: u64, address: u64, length: u64) -> u64 {
     let Some(process_fd) = lookup_process_fd(descriptor) else {
         return error(9);
     };
-    if process_fd.unix_socket && process_fd.handle == UNIX_UNBOUND {
+    if process_fd.unix_socket && unix_unbound(process_fd.handle) {
         return unix_connect(descriptor, address, length);
+    }
+    if let Some(inbox) = unix_inbox_of(&process_fd) {
+        let Some((name, name_len)) = read_unix_name(address, length) else {
+            return error(22);
+        };
+        return unix_datagram_connect(inbox, &name[..name_len]);
     }
     if process_fd.tcp {
         return tcpsock::connect(process_fd, address, length);
@@ -4143,7 +4555,7 @@ fn read_unix_name(address: u64, length: u64) -> Option<([u8; UNIX_NAME_CAP], usi
 /// to this module's self-test the same way `epoll_ctl_apply` is.
 fn unix_bind_apply(fd_index: usize, name: &[u8]) -> u64 {
     let process_fd = PROCESS_FDS.lock()[fd_index];
-    if !process_fd.open || !process_fd.unix_socket || process_fd.handle != UNIX_UNBOUND {
+    if !process_fd.open || !process_fd.unix_socket || !unix_unbound(process_fd.handle) {
         return error(88);
     }
     let mut listeners = UNIX_LISTENERS.lock();
@@ -4161,6 +4573,8 @@ fn unix_bind_apply(fd_index: usize, name: &[u8]) -> u64 {
     listeners[slot] = UnixListener {
         used: true,
         listening: false,
+        message: process_fd.handle == UNIX_UNBOUND_MESSAGE,
+        inbox: PEER_NONE,
         name: stored_name,
         name_len: name.len() as u8,
         backlog: [None; UNIX_LISTENER_BACKLOG],
@@ -4198,14 +4612,18 @@ fn unix_listen_apply(fd_index: usize) -> u64 {
 /// away, and queues end B on the listener's backlog for its `accept()`.
 fn unix_connect_apply(fd_index: usize, name: &[u8]) -> u64 {
     let process_fd = PROCESS_FDS.lock()[fd_index];
-    if !process_fd.open || !process_fd.unix_socket || process_fd.handle != UNIX_UNBOUND {
+    if !process_fd.open || !process_fd.unix_socket || !unix_unbound(process_fd.handle) {
         return error(88);
     }
+    let message = process_fd.handle == UNIX_UNBOUND_MESSAGE;
     let listener_slot = {
         let listeners = UNIX_LISTENERS.lock();
-        listeners
-            .iter()
-            .position(|listener| listener.used && listener.listening && listener.name() == name)
+        listeners.iter().position(|listener| {
+            listener.used
+                && listener.listening
+                && listener.message == message
+                && listener.name() == name
+        })
     };
     let Some(listener_slot) = listener_slot else {
         return error(111);
@@ -4216,6 +4634,8 @@ fn unix_connect_apply(fd_index: usize, name: &[u8]) -> u64 {
     };
     pairs[pair_slot] = UnixPair {
         used: true,
+        message,
+        kind: if message { 5 } else { 1 },
         end_a_open: true,
         end_b_open: true,
         ..UnixPair::EMPTY
@@ -4278,6 +4698,10 @@ fn linux_bind(descriptor: u64, address: u64, length: u64) -> u64 {
     let Some((name, name_len)) = read_unix_name(address, length) else {
         return error(22);
     };
+    let process_fd = PROCESS_FDS.lock()[index];
+    if let Some(inbox) = unix_inbox_of(&process_fd) {
+        return unix_datagram_bind(inbox, &name[..name_len]);
+    }
     unix_bind_apply(index, &name[..name_len])
 }
 
@@ -4568,6 +4992,11 @@ fn linux_setpriority(which: u64, who: u64, value: u64) -> u64 {
     if raises_priority && !has_capability(crate::capability::CAP_SYS_NICE) {
         return error(1);
     }
+    if target != crate::scheduler::current_task_id()
+        && !crate::scheduler::may_signal(target, has_capability(crate::capability::CAP_SYS_NICE))
+    {
+        return error(1);
+    }
     if crate::scheduler::set_nice(target, nice) {
         COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
         0
@@ -4646,7 +5075,28 @@ pub(crate) fn capability_enforcement_self_test() -> bool {
         && bind_port_allowed(1024)
         && bind_port_allowed(8080);
 
+    set_capabilities(crate::capability::Capabilities::UNPRIVILEGED);
+    let account = || vfs::open_file("/data/ACCOUNT.DAT", true, false, false, 0o600, true);
+    let files_refused = account() == Err(vfs::VfsError::PermissionDenied)
+        && vfs::create_directory("/data/QUAR/PROBE", 0o700).is_err()
+        && vfs::open_file("/data/AVSIG.DAT", true, false, true, 0o644, true)
+            == Err(vfs::VfsError::PermissionDenied)
+        && vfs::open_file("/tmp/CAPPROBE", true, false, true, 0o644, true)
+            .is_ok_and(|descriptor| vfs::close(descriptor).is_ok())
+        && vfs::remove("/tmp/CAPPROBE", false).is_ok();
     set_capabilities(saved);
+    let shell_refused = vfs::as_user(true, || account() == Err(vfs::VfsError::PermissionDenied));
+    let system_allowed = vfs::as_user(true, || {
+        vfs::as_system(|| {
+            vfs::open_file("/data/ACCOUNT.DAT", false, false, false, 0, false).map(vfs::close)
+                != Err(vfs::VfsError::PermissionDenied)
+        })
+    });
+    let protection_ok = files_refused && shell_refused && system_allowed;
+    crate::serial::format(format_args!(
+        "AEROS_PROTECTED_FILES unprivileged_refused={files_refused} shell_refused={shell_refused} system_allowed={system_allowed}\n"
+    ));
+
     let allowed_again = bind_port_allowed(80)
         && linux_reboot(REBOOT_MAGIC, 1, 0x0123_4567) == error(22)
         && linux_reboot(1, REBOOT_MAGIC2[0], 0x0123_4567) == error(22)
@@ -4661,6 +5111,7 @@ pub(crate) fn capability_enforcement_self_test() -> bool {
         && boot_refused
         && admin_refused
         && low_port_refused
+        && protection_ok
         && allowed_again
 }
 
@@ -4751,6 +5202,23 @@ fn sockaddr_bytes(address: &crate::ip::Address, port: u16, v6: bool) -> ([u8; 28
         bytes[4..8].copy_from_slice(&crate::ip::as_v4(address).unwrap_or([0; 4]));
         (bytes, 16)
     }
+}
+
+fn unix_type(process_fd: &ProcessFd) -> u32 {
+    let message = if process_fd.unix_listener {
+        UNIX_LISTENERS
+            .lock()
+            .get(process_fd.handle as usize)
+            .is_some_and(|listener| listener.message)
+    } else if unix_unbound(process_fd.handle) {
+        process_fd.handle == UNIX_UNBOUND_MESSAGE
+    } else {
+        return UNIX_PAIRS
+            .lock()
+            .get(process_fd.handle as usize)
+            .map_or(1, |pair| u32::from(pair.kind));
+    };
+    if message { 5 } else { 1 }
 }
 
 /// Value of a `SOL_SOCKET` option this kernel can answer truthfully; `None`
@@ -4855,6 +5323,8 @@ fn linux_getsockopt(arguments: [u64; 6]) -> u64 {
             (crate::sockopt::IPPROTO_IPV6, _) if !process_fd.inet6 => None,
             _ => options.get(level, option),
         }
+    } else if level == SOL_SOCKET && option == SO_TYPE && !process_fd.socket {
+        integer(unix_type(&process_fd))
     } else if level == SOL_SOCKET {
         socket_option_value(process_fd.socket, process_fd.unix_listener, option).and_then(integer)
     } else {
@@ -4977,6 +5447,18 @@ fn linux_sendto(arguments: [u64; 6]) -> u64 {
     if flags & !(0x4000 | 0x40 | 0x800) != 0 {
         return error(95);
     }
+    if let Some(process_fd) = lookup_process_fd(descriptor).filter(|fd| fd.unix_socket) {
+        if destination == 0 {
+            return linux_write(descriptor, address, requested);
+        }
+        return unix_sendto(
+            &process_fd,
+            address,
+            requested,
+            destination,
+            destination_length,
+        );
+    }
     let Some(process_fd) = lookup_socket_fd(descriptor) else {
         return error(9);
     };
@@ -5010,13 +5492,65 @@ fn linux_sendto(arguments: [u64; 6]) -> u64 {
     if !user::copy_from_user(address, &mut payload[..requested]) {
         return error(14);
     }
-    if !crate::net::send_datagram(&remote, socket.local_port, port, &payload[..requested]) {
+    if socket.echo {
+        let Some(v4) = crate::ip::as_v4(&remote) else {
+            return error(22);
+        };
+        if requested < 8 || payload[0] != 8 || payload[1] != 0 {
+            return error(22);
+        }
+        if !crate::net::send_echo(v4, socket.local_port, &payload[..requested]) {
+            return error(5);
+        }
+    } else if !crate::net::send_datagram(&remote, socket.local_port, port, &payload[..requested]) {
         return error(5);
     }
     SOCKET_CALLS.fetch_add(1, Ordering::Relaxed);
     DATAGRAMS.fetch_add(1, Ordering::Relaxed);
     NETWORK_BYTES.fetch_add(requested as u64, Ordering::Relaxed);
     requested as u64
+}
+
+/// `sendto` with an address on an AF_UNIX socket: a datagram socket sends one
+/// message to the inbox bound there; a connected stream refuses it.
+#[inline(never)]
+fn unix_sendto(
+    process_fd: &ProcessFd,
+    address: u64,
+    requested: u64,
+    destination: u64,
+    destination_length: u64,
+) -> u64 {
+    if unix_inbox_of(process_fd).is_none() {
+        return error(if unix_unbound(process_fd.handle) {
+            107
+        } else {
+            106
+        });
+    }
+    let Some((name, name_len)) = read_unix_name(destination, destination_length) else {
+        return error(22);
+    };
+    let Some(target) = unix_datagram_target(&name[..name_len]) else {
+        return error(111);
+    };
+    let Ok(requested) = usize::try_from(requested) else {
+        return error(90);
+    };
+    if requested > MAX_MESSAGE {
+        return error(90);
+    }
+    let mut payload = [0u8; MAX_MESSAGE];
+    if !user::copy_from_user(address, &mut payload[..requested]) {
+        return error(14);
+    }
+    match unix_inbox_deliver(target, &payload[..requested]) {
+        Ok(sent) => {
+            SOCKET_CALLS.fetch_add(1, Ordering::Relaxed);
+            sent as u64
+        }
+        Err(failure) => error(failure),
+    }
 }
 
 fn linux_recvfrom(arguments: [u64; 6]) -> u64 {
@@ -5039,6 +5573,28 @@ fn linux_recvfrom(arguments: [u64; 6]) -> u64 {
     }
     if flags & !(0x2 | 0x20 | 0x40) != 0 {
         return error(95);
+    }
+    if let Some(process_fd) = lookup_process_fd(descriptor).filter(|fd| fd.unix_socket) {
+        if unix_unbound(process_fd.handle) {
+            return error(107);
+        }
+        if flags & 0x40 != 0 && fd_ready_events(descriptor) & EPOLLIN == 0 {
+            return error(11);
+        }
+        let received = if flags & 0x2 != 0 {
+            unix_peek(&process_fd, address, capacity)
+        } else {
+            linux_read(descriptor, address, capacity)
+        };
+        // The sender of an AF_UNIX message has no name here: an empty address.
+        if received as i64 >= 0
+            && source_address != 0
+            && source_length != 0
+            && !user::copy_to_user(source_length, &0u32.to_le_bytes())
+        {
+            return error(14);
+        }
+        return received;
     }
     let Some(process_fd) = lookup_socket_fd(descriptor) else {
         return error(9);
@@ -5154,6 +5710,19 @@ fn linux_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
     if !is_socket_fd(&process_fd) || flags & !0x4040 != 0 {
         return error(if is_socket_fd(&process_fd) { 95 } else { 88 });
     }
+    if process_fd.unix_socket && (header.name != 0 || unix_keeps_messages(process_fd.handle)) {
+        let Some((base, length)) = first_vector(&header) else {
+            return error(22);
+        };
+        return linux_sendto([
+            descriptor,
+            base,
+            length,
+            flags,
+            header.name,
+            header.name_length as u64,
+        ]);
+    }
     vectored_positional(
         header.vector_count,
         0,
@@ -5193,16 +5762,31 @@ fn linux_recvmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
         if !is_socket_fd(&process_fd) {
             return error(88);
         }
+        if process_fd.unix_socket && flags & !0x42 == 0 && flags & 0x2 != 0 {
+            let Some((base, length)) = first_vector(&header) else {
+                return error(22);
+            };
+            let received = linux_recvfrom([descriptor, base, length, flags, 0, 0]);
+            if received as i64 >= 0
+                && !(user::copy_to_user(message + 8, &0u32.to_le_bytes())
+                    && user::copy_to_user(message + 40, &0u64.to_le_bytes())
+                    && user::copy_to_user(message + 48, &0u32.to_le_bytes()))
+            {
+                return error(14);
+            }
+            return received;
+        }
         if flags & !0x40 != 0 {
             return error(95);
         }
         let mut first = true;
+        let one_message = process_fd.unix_socket && unix_keeps_messages(process_fd.handle);
         vectored_positional(
             header.vector_count,
             0,
             |index| read_iovec(header.vectors, index),
             |base, length, _| {
-                if !first && fd_ready_events(descriptor) & EPOLLIN == 0 {
+                if !first && (one_message || fd_ready_events(descriptor) & EPOLLIN == 0) {
                     return 0;
                 }
                 first = false;
@@ -5430,6 +6014,11 @@ fn linux_process_vm(write: bool, arguments: [u64; 6]) -> u64 {
         return error(3);
     };
     let own = group == crate::scheduler::current_group();
+    // Another process's memory is as open as it is to ptrace.
+    if !own && !crate::scheduler::may_signal(pid, has_capability(crate::capability::CAP_SYS_PTRACE))
+    {
+        return error(1);
+    }
     let mut chunk = [0u8; IO_CHUNK];
     let mut total = 0usize;
     let mut local_index = 0usize;
@@ -6299,6 +6888,11 @@ fn linux_tkill(thread: u64, signal: u64) -> SyscallResult {
     let Some(group) = crate::scheduler::group_of_tid(thread) else {
         return SyscallResult::Return(error(3));
     };
+    if group != crate::scheduler::current_group()
+        && !crate::scheduler::may_signal(thread, has_capability(crate::capability::CAP_KILL))
+    {
+        return SyscallResult::Return(error(1));
+    }
     if signal == 0 {
         return SyscallResult::Return(0);
     }
@@ -6431,11 +7025,13 @@ fn push_signal_frame(
             user_rsp = alternate.pointer + alternate.size;
         }
     }
-    let Some(base) = user_rsp.checked_sub(128 + block as u64) else {
+    // Handler entry needs rsp = 8 (mod 16), as right after a `call`.
+    let Some(sp) = user_rsp
+        .checked_sub(128 + block as u64)
+        .and_then(|base| (base & !15).checked_sub(8))
+    else {
         return Err(128 + 11);
     };
-    // Handler entry needs rsp = 8 (mod 16), as right after a `call`.
-    let sp = (base & !15) - 8;
     let old_mask = SIGNAL_MASK.load(Ordering::Acquire);
     saved[16] = old_mask;
     let mut bytes = [0u8; 8 + SIGNAL_SAVED_WORDS * 8 + SIGNAL_SIGINFO_BYTES];
@@ -6489,7 +7085,7 @@ fn check_itimer() {
         let next = if interval == 0 {
             0
         } else {
-            deadline + interval * (1 + (now - deadline) / interval)
+            next_period(deadline, interval, (now - deadline) / interval)
         };
         ITIMER_DEADLINE.store(next, Ordering::Release);
         due |= 1 << (14 - 1);
@@ -6515,6 +7111,12 @@ fn check_itimer() {
     }
 }
 
+/// The deadline after `missed` more periods have gone by. The interval is the
+/// program's, so this saturates instead of overflowing.
+fn next_period(deadline: u64, interval: u64, missed: u64) -> u64 {
+    deadline.saturating_add(interval.saturating_mul(missed.saturating_add(1)))
+}
+
 /// Advances the POSIX timers that are due at `now`; the result has the bit
 /// of every signal to raise.
 fn expire_posix_timers(now: u64) -> u64 {
@@ -6531,7 +7133,7 @@ fn expire_posix_timers(now: u64) -> u64 {
             }
             Some(missed) => {
                 timer.overrun = missed.min(i32::MAX as u64) as u32;
-                timer.deadline += timer.interval * (1 + missed);
+                timer.deadline = next_period(timer.deadline, timer.interval, missed);
             }
         }
         if timer.signal != 0 {
@@ -6564,7 +7166,7 @@ fn expire_cpu_timers() -> u64 {
             continue;
         }
         timer.deadline = match (reading - timer.deadline).checked_div(timer.interval) {
-            Some(missed) => timer.deadline + timer.interval * (1 + missed),
+            Some(missed) => next_period(timer.deadline, timer.interval, missed),
             None => 0,
         };
         due |= 1 << (SIGNALS[index] - 1);
@@ -7648,9 +8250,9 @@ fn linux_umount2(target_address: u64) -> u64 {
 }
 
 fn linux_mkdirat(directory: u64, path_address: u64, mode: u64) -> u64 {
-    if mode & !0o777 != 0 {
-        return error(22);
-    }
+    // Bits beyond the permissions (the file type a program copies from
+    // `stat`, setuid and sticky) are ignored.
+    let mode = mode & 0o777;
     let mut resolved = [0u8; MAX_PATH];
     let (length, relative) = match resolve_user_path(directory, path_address, &mut resolved) {
         Ok(value) => value,
@@ -7863,8 +8465,8 @@ fn udp_scenario() -> bool {
     let loopback4 = [127, 0, 0, 1];
     let loopback = crate::ip::v4(loopback4);
     let (Ok(server_fd), Ok(client_fd)) = (
-        create_udp_socket(false, true, false),
-        create_udp_socket(false, true, false),
+        create_udp_socket(false, true, false, false),
+        create_udp_socket(false, true, false, false),
     ) else {
         return false;
     };
@@ -7912,7 +8514,7 @@ fn udp_scenario() -> bool {
             .is_ok_and(|datagram| datagram.bytes == 4 && datagram.source_port == 6101);
 
     let closed = linux_close(server_fd) == 0 && crate::udp::slot_of_port(6101).is_none();
-    let reuse = create_udp_socket(false, false, false)
+    let reuse = create_udp_socket(false, false, false, false)
         .ok()
         .and_then(lookup_process_fd)
         .is_some_and(|process_fd| {
@@ -7964,8 +8566,8 @@ pub(crate) fn socket_options_self_test() -> bool {
 #[cfg(feature = "boot-test")]
 fn udp_options_scenario() -> bool {
     let (Ok(server_fd), Ok(client_fd)) = (
-        create_udp_socket(false, false, false),
-        create_udp_socket(false, false, false),
+        create_udp_socket(false, false, false, false),
+        create_udp_socket(false, false, false, false),
     ) else {
         return false;
     };
@@ -8017,8 +8619,8 @@ pub(crate) fn inet6_socket_self_test() -> bool {
 fn udp6_scenario() -> bool {
     use crate::ip;
     let (Ok(server_fd), Ok(client_fd)) = (
-        create_udp_socket(false, true, true),
-        create_udp_socket(false, true, true),
+        create_udp_socket(false, true, true, false),
+        create_udp_socket(false, true, true, false),
     ) else {
         return false;
     };
@@ -8811,9 +9413,7 @@ fn linux_truncate(path_address: u64, length: u64) -> u64 {
 }
 
 fn linux_fchmod(descriptor: u64, mode: u64) -> u64 {
-    if mode & !0o777 != 0 {
-        return error(22);
-    }
+    let mode = mode & 0o777;
     let Some(process_fd) = lookup_file_fd(descriptor) else {
         return error(9);
     };
@@ -8895,9 +9495,10 @@ fn linux_fchown(descriptor: u64) -> u64 {
 }
 
 fn linux_chmodat(directory: u64, path_address: u64, mode: u64, flags: u64) -> u64 {
-    if mode & !0o777 != 0 || flags != 0 {
+    if flags != 0 {
         return error(22);
     }
+    let mode = mode & 0o777;
     let mut resolved = [0u8; MAX_PATH];
     let (length, relative) = match resolve_user_path(directory, path_address, &mut resolved) {
         Ok(value) => value,
@@ -9387,12 +9988,13 @@ fn linux_prlimit64(pid: u64, resource: u64, new_limit: u64, old_limit: u64) -> u
         NOFILE_LIMIT.store(soft, Ordering::Release);
     }
     let (current, maximum) = match resource {
-        3 => (8 * 1024 * 1024u64, 8 * 1024 * 1024u64),
+        // The stack a process (and glibc: the stack of each thread it creates) can use.
+        3 => (512 * 1024u64, 512 * 1024u64),
         7 => (
             NOFILE_LIMIT.load(Ordering::Acquire),
             PROCESS_FD_COUNT as u64,
         ),
-        9 => (2 * 1024 * 1024u64, 2 * 1024 * 1024u64),
+        9 => (12 * 1024 * 1024u64, 12 * 1024 * 1024u64),
         0..=15 => (u64::MAX, u64::MAX),
         _ => return error(22),
     };
@@ -10571,6 +11173,10 @@ fn linux_mremap(old_address: u64, old_size: u64, new_size: u64, flags: u64) -> u
     if old_address & 0xfff != 0 || new_size == 0 || old_size == 0 || flags & !MREMAP_MAYMOVE != 0 {
         return error(22);
     }
+    // Sizes past the address space are refused before any arithmetic on them.
+    if old_size > 1 << 47 || new_size > 1 << 47 || old_address > 1 << 47 {
+        return error(22);
+    }
     let old_pages = old_size.div_ceil(4096);
     let new_pages = new_size.div_ceil(4096);
     if new_pages == old_pages {
@@ -11008,6 +11614,82 @@ fn read_device(kind: u8, address: u64, requested: u64) -> u64 {
     total as u64
 }
 
+/// `recv(MSG_PEEK)` on an AF_UNIX socket: waits like a read, takes nothing.
+#[inline(never)]
+fn unix_peek(process_fd: &ProcessFd, address: u64, capacity: u64) -> u64 {
+    if !process_fd.readable {
+        return error(9);
+    }
+    let capacity = usize::try_from(capacity)
+        .unwrap_or(usize::MAX)
+        .min(MAX_MESSAGE);
+    let mut buffer = [0u8; MAX_MESSAGE];
+    let nonblocking =
+        process_fd.nonblocking || crate::scheduler::current_task_pid_for_linux().is_none();
+    let slot = process_fd.handle as usize;
+    loop {
+        match unix_socket_take(slot, process_fd.unix_end_b, &mut buffer[..capacity], true) {
+            Ok(count) if user::copy_to_user(address, &buffer[..count]) => return count as u64,
+            Ok(_) => return error(14),
+            Err(11) if !nonblocking => {
+                if interrupted() {
+                    return error(4);
+                }
+            }
+            Err(failure) => return error(failure),
+        }
+    }
+}
+
+/// `read` on a message socket takes one whole message.
+#[inline(never)]
+fn unix_message_read(process_fd: &ProcessFd, address: u64, requested: usize) -> u64 {
+    let mut message = [0u8; MAX_MESSAGE];
+    let capacity = requested.min(MAX_MESSAGE);
+    match unix_read_waiting(
+        process_fd.handle as usize,
+        process_fd.unix_end_b,
+        &mut message[..capacity],
+        process_fd.nonblocking,
+    ) {
+        Ok(read) if user::copy_to_user(address, &message[..read]) => {
+            READS.fetch_add(1, Ordering::Relaxed);
+            IO_BYTES.fetch_add(read as u64, Ordering::Relaxed);
+            read as u64
+        }
+        Ok(_) => error(14),
+        Err(failure) => error(failure),
+    }
+}
+
+/// `write` on a message socket sends it as one message.
+#[inline(never)]
+fn unix_message_write(process_fd: &ProcessFd, address: u64, requested: u64) -> u64 {
+    let Some(requested) = usize::try_from(requested)
+        .ok()
+        .filter(|&requested| requested <= MAX_MESSAGE)
+    else {
+        return error(90);
+    };
+    let mut message = [0u8; MAX_MESSAGE];
+    if !user::copy_from_user(address, &mut message[..requested]) {
+        return error(14);
+    }
+    match unix_write_waiting(
+        process_fd.handle as usize,
+        process_fd.unix_end_b,
+        &message[..requested],
+        process_fd.nonblocking,
+    ) {
+        Ok(written) => {
+            WRITES.fetch_add(1, Ordering::Relaxed);
+            IO_BYTES.fetch_add(written as u64, Ordering::Relaxed);
+            written as u64
+        }
+        Err(failure) => error(failure),
+    }
+}
+
 fn linux_read(descriptor: u64, address: u64, requested: u64) -> u64 {
     let Some(process_fd) = lookup_process_fd(descriptor) else {
         return error(9);
@@ -11037,6 +11719,9 @@ fn linux_read(descriptor: u64, address: u64, requested: u64) -> u64 {
     };
     if requested > MAX_IO || !user::range_accessible(address, requested, true) {
         return error(14);
+    }
+    if process_fd.unix_socket && unix_keeps_messages(process_fd.handle) {
+        return unix_message_read(&process_fd, address, requested);
     }
     let mut total = 0usize;
     let mut chunk = [0u8; IO_CHUNK];
@@ -11069,10 +11754,11 @@ fn linux_read(descriptor: u64, address: u64, requested: u64) -> u64 {
                 }
             }
         } else if process_fd.unix_socket {
-            match unix_socket_read(
+            match unix_read_waiting(
                 process_fd.handle as usize,
                 process_fd.unix_end_b,
                 &mut chunk[..amount],
+                process_fd.nonblocking || total > 0,
             ) {
                 Ok(read) => read,
                 Err(failure) => {
@@ -11120,6 +11806,9 @@ fn linux_write(descriptor: u64, address: u64, requested: u64) -> u64 {
         || process_fd.standard == 1
     {
         return error(9);
+    }
+    if process_fd.unix_socket && unix_keeps_messages(process_fd.handle) {
+        return unix_message_write(&process_fd, address, requested);
     }
     let Ok(requested) = usize::try_from(requested) else {
         return error(22);
@@ -11186,10 +11875,11 @@ fn linux_write(descriptor: u64, address: u64, requested: u64) -> u64 {
                 }
             }
         } else if process_fd.unix_socket {
-            match unix_socket_write(
+            match unix_write_waiting(
                 process_fd.handle as usize,
                 process_fd.unix_end_b,
                 &chunk[..amount],
+                process_fd.nonblocking || total > 0,
             ) {
                 Ok(written) => {
                     total += written;
@@ -11328,12 +12018,23 @@ fn linux_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
                 | (u64::from(process_fd.nonblocking) * 0x800)
         }
         4 => {
-            if argument & !(O_APPEND | 0x800) != 0 {
-                return error(22);
-            }
+            // Only the append and non-blocking flags can be changed; the
+            // rest (the access mode a program read back with F_GETFL) is
+            // ignored.
             set_status_flags(process_fd, argument & O_APPEND != 0, argument & 0x800 != 0);
             0
         }
+        // Record locks: one process at a time uses each file here, so a lock
+        // is always granted.
+        5 | 36 => {
+            if user::copy_to_user(argument, &2u16.to_le_bytes()) {
+                0
+            } else {
+                return error(14);
+            }
+        }
+        6 | 7 | 37 | 38 => 0,
+        1031 | 1032 => 65536,
         1030 => duplicate_process_fd(descriptor, argument, true),
         _ => return error(22),
     };
@@ -11402,10 +12103,92 @@ fn install_unix_socket_fd(handle: u32, end_b: bool, close_on_exec: bool) -> Opti
     )
 }
 
-/// A fresh `socket(AF_UNIX, SOCK_STREAM, 0)`: not yet bound or connected.
-fn install_unbound_unix_socket_fd(close_on_exec: bool) -> Option<u64> {
+fn install_unix_datagram_fd(close_on_exec: bool) -> Option<u64> {
+    let slot = {
+        let mut pairs = UNIX_PAIRS.lock();
+        let slot = pairs.iter().position(|pair| !pair.used)?;
+        pairs[slot] = UnixPair {
+            used: true,
+            message: true,
+            kind: 2,
+            inbox: true,
+            end_a_open: true,
+            end_b_open: true,
+            ..UnixPair::EMPTY
+        };
+        slot
+    };
+    let descriptor = install_unix_socket_fd(slot as u32, true, close_on_exec);
+    if descriptor.is_none() {
+        UNIX_PAIRS.lock()[slot] = UnixPair::EMPTY;
+    }
+    descriptor
+}
+
+fn unix_inbox_of(process_fd: &ProcessFd) -> Option<usize> {
+    if !process_fd.open || !process_fd.unix_socket || unix_unbound(process_fd.handle) {
+        return None;
+    }
+    let slot = process_fd.handle as usize;
+    UNIX_PAIRS
+        .lock()
+        .get(slot)
+        .is_some_and(|pair| pair.used && pair.inbox)
+        .then_some(slot)
+}
+
+/// `bind()` for a datagram socket: publishes its inbox under `name`.
+fn unix_datagram_bind(inbox: usize, name: &[u8]) -> u64 {
+    let mut listeners = UNIX_LISTENERS.lock();
+    if listeners
+        .iter()
+        .any(|listener| listener.used && listener.inbox == inbox as u32)
+    {
+        return error(22);
+    }
+    if listeners
+        .iter()
+        .any(|listener| listener.used && listener.name() == name)
+    {
+        return error(98);
+    }
+    let Some(slot) = listeners.iter().position(|listener| !listener.used) else {
+        return error(24);
+    };
+    let mut stored_name = [0u8; UNIX_NAME_CAP];
+    stored_name[..name.len()].copy_from_slice(name);
+    listeners[slot] = UnixListener {
+        used: true,
+        inbox: inbox as u32,
+        name: stored_name,
+        name_len: name.len() as u8,
+        ..UnixListener::EMPTY
+    };
+    0
+}
+
+/// `connect()` for a datagram socket: later writes go to the inbox bound to `name`.
+fn unix_datagram_connect(inbox: usize, name: &[u8]) -> u64 {
+    let Some(target) = unix_datagram_target(name) else {
+        return error(111);
+    };
+    match UNIX_PAIRS.lock().get_mut(inbox) {
+        Some(pair) if pair.used && pair.inbox => {
+            pair.peer = target as u32;
+            0
+        }
+        _ => error(9),
+    }
+}
+
+/// A fresh `socket(AF_UNIX, SOCK_STREAM | SOCK_SEQPACKET, 0)`: not yet bound or connected.
+fn install_unbound_unix_socket_fd(close_on_exec: bool, message: bool) -> Option<u64> {
     install_process_fd_kind(
-        UNIX_UNBOUND,
+        if message {
+            UNIX_UNBOUND_MESSAGE
+        } else {
+            UNIX_UNBOUND
+        },
         close_on_exec,
         false,
         false,
@@ -11710,7 +12493,7 @@ fn release_process_fd(process_fd: ProcessFd) -> u64 {
     }
     if process_fd.unix_socket {
         // Never connected or bound - nothing to release.
-        if process_fd.handle == UNIX_UNBOUND {
+        if unix_unbound(process_fd.handle) {
             return 0;
         }
         let mut pairs = UNIX_PAIRS.lock();
@@ -11725,8 +12508,23 @@ fn release_process_fd(process_fd: ProcessFd) -> u64 {
         } else {
             pair.end_a_open = false;
         }
-        if !pair.end_a_open && !pair.end_b_open {
+        let inbox_closed = pair.inbox && !pair.end_b_open;
+        if inbox_closed || !pair.end_a_open && !pair.end_b_open {
             *pair = UnixPair::EMPTY;
+        }
+        if inbox_closed {
+            let slot = process_fd.handle;
+            for pair in pairs.iter_mut() {
+                if pair.used && pair.inbox && pair.peer == slot {
+                    pair.peer = PEER_GONE;
+                }
+            }
+            drop(pairs);
+            for listener in UNIX_LISTENERS.lock().iter_mut() {
+                if listener.used && listener.inbox == slot {
+                    *listener = UnixListener::EMPTY;
+                }
+            }
         }
         return 0;
     }
@@ -11916,7 +12714,7 @@ pub fn finish_process() {
         *descriptors = initial_process_fds();
     }
     reset_udp_sockets();
-    *PIPES.lock() = [Pipe::EMPTY; PIPE_COUNT];
+    PIPES.lock().fill(Pipe::EMPTY);
     for (handle, memfd) in handles[..count].iter().zip(&memfds[..count]) {
         let _ = close_file_handle(*handle, *memfd);
     }

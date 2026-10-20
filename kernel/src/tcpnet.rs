@@ -171,7 +171,17 @@ pub fn poll() {
                 Some(parsed) => Some(crate::ipv6::Parsed::Tcp(parsed)),
                 None => match crate::net::parse_udp(&packet[..length]) {
                     Some(datagram) => Some(crate::ipv6::Parsed::Udp(datagram)),
-                    None => crate::ipv6::handle_frame(&packet[..length]),
+                    None => match crate::net::parse_echo_reply(&packet[..length]) {
+                        Some((remote, identity, start, size)) => {
+                            let _ = crate::udp::deliver_echo(
+                                identity,
+                                remote,
+                                &packet[start..start + size],
+                            );
+                            None
+                        }
+                        None => crate::ipv6::handle_frame(&packet[..length]),
+                    },
                 },
             };
             match parsed {

@@ -315,7 +315,9 @@ pub fn try_receive(destination: &mut [u8]) -> Option<usize> {
     // Length includes the 4-byte CRC.
     let length = (current.flags & 0x3fff) as usize;
     let payload = length.saturating_sub(4);
-    let usable = current.flags & RX_ERROR == 0 && payload <= destination.len() && payload >= 14;
+    let usable = current.flags & RX_ERROR == 0
+        && payload <= destination.len()
+        && (14..=BUFFER).contains(&payload);
     if usable {
         unsafe {
             core::ptr::copy_nonoverlapping(

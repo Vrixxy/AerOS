@@ -375,6 +375,9 @@ pub fn prepare_linux_stack(
 /// The payload here is small (under 400 bytes), so the one-page stack
 /// these processes get is ample room, unlike the old path's two pages.
 /// Same, with an explicit argv and environment (each string without its NUL).
+/// The most argv (and, separately, envp) strings a new program starts with.
+pub const EXEC_STRINGS_MAX: usize = 64;
+
 pub fn prepare_scheduled_process_stack_with(
     space: &mut crate::arch::paging::ProcessAddressSpace,
     image: &ElfImage<'_>,
@@ -383,7 +386,11 @@ pub fn prepare_scheduled_process_stack_with(
     env: &[&[u8]],
     interpreter_base: u64,
 ) -> bool {
-    if executable.is_empty() || executable.len() >= 256 || args.len() > 24 || env.len() > 24 {
+    if executable.is_empty()
+        || executable.len() >= 256
+        || args.len() > EXEC_STRINGS_MAX
+        || env.len() > EXEC_STRINGS_MAX
+    {
         return false;
     }
     let stack_physical = space.stack_physical;
@@ -413,7 +420,7 @@ pub fn prepare_scheduled_process_stack_with(
         return false;
     };
     random.fill(0);
-    let mut arg_addresses = [0u64; 24];
+    let mut arg_addresses = [0u64; EXEC_STRINGS_MAX];
     for (slot, arg) in args.iter().enumerate() {
         let Some(address) = push_bytes(stack_physical, stack_virtual, &mut cursor, arg, true)
         else {
@@ -421,7 +428,7 @@ pub fn prepare_scheduled_process_stack_with(
         };
         arg_addresses[slot] = address;
     }
-    let mut env_addresses = [0u64; 24];
+    let mut env_addresses = [0u64; EXEC_STRINGS_MAX];
     for (slot, value) in env.iter().enumerate() {
         let Some(address) = push_bytes(stack_physical, stack_virtual, &mut cursor, value, true)
         else {
@@ -430,7 +437,7 @@ pub fn prepare_scheduled_process_stack_with(
         env_addresses[slot] = address;
     }
     cursor &= !15;
-    let mut words = [0u64; 96];
+    let mut words = [0u64; 2 * EXEC_STRINGS_MAX + 64];
     let mut count = 0;
     push_word(&mut words, &mut count, args.len() as u64);
     for address in &arg_addresses[..args.len()] {

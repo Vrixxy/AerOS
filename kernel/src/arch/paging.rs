@@ -750,7 +750,7 @@ pub const PROCESS_STACK_BYTES: u64 = PROCESS_STACK_PAGES as u64 * PAGE_SIZE;
 /// process starts with. This is why the stack sits at the top of the
 /// table with its growth range below it, instead of right after code: there
 /// has to be room to grow into that nothing else already occupies.
-pub const PROCESS_STACK_MAX_GROWTH_PAGES: usize = 96;
+pub const PROCESS_STACK_MAX_GROWTH_PAGES: usize = 192;
 
 const FRAME_REF_SLOTS: usize = 8192;
 /// Software-available PTE bit: the page is shared copy-on-write (mapped
@@ -864,7 +864,7 @@ const PROCESS_MMAP_FIRST_INDEX: usize = PROCESS_STACK_FIRST_INDEX + PROCESS_STAC
 /// Page tables a process's window spans: contiguous, so that a page's entry
 /// is `table[index]` whatever its index, and linked at directory entries
 /// 0.. so the window is that many 2 MiB.
-const PROCESS_TABLE_PAGES: usize = 6;
+const PROCESS_TABLE_PAGES: usize = 8;
 const FIXED_TABLE_PAGES: usize = 4;
 const PROCESS_RESERVED_PAGES: usize = PROCESS_TABLE_PAGES * ENTRY_COUNT;
 const FIXED_RESERVED_PAGES: usize = FIXED_TABLE_PAGES * ENTRY_COUNT;
@@ -1166,8 +1166,24 @@ pub static ASLR_TEST_FAILURE: core::sync::atomic::AtomicU32 = core::sync::atomic
 /// code blob, not a real ELF file), falls back to the original one-page
 /// behavior those tests depend on unchanged.
 pub fn create_process(state: &PagingState, code: &[u8]) -> Option<ProcessAddressSpace> {
+    create_process_with(state, code, None)
+}
+
+/// `create_process`, with the bytes of the program's interpreter when it
+/// has one (a dynamically linked program).
+pub fn create_process_with(
+    state: &PagingState,
+    code: &[u8],
+    interpreter: Option<&[u8]>,
+) -> Option<ProcessAddressSpace> {
     match crate::elf::ElfImage::parse(code) {
-        Ok(image) => create_process_from_elf(state, &image),
+        Ok(image) => match interpreter {
+            None => create_process_from_elf(state, &image, None),
+            Some(bytes) => {
+                let interpreter = crate::elf::ElfImage::parse(bytes).ok()?;
+                create_process_from_elf(state, &image, Some(&interpreter))
+            }
+        },
         Err(_) => create_process_raw(state, code),
     }
 }
@@ -1417,32 +1433,51 @@ fn create_process_raw(state: &PagingState, code: &[u8]) -> Option<ProcessAddress
 fn create_process_from_elf(
     state: &PagingState,
     image: &crate::elf::ElfImage<'_>,
+    interpreter: Option<&crate::elf::ElfImage<'_>>,
 ) -> Option<ProcessAddressSpace> {
-    // A dynamically linked program needs its interpreter loaded with it,
-    // which only `execve` does.
-    if image.interpreter().is_some() {
-        return None;
-    }
+    // A dynamically linked program without its interpreter cannot run; with
+    // one, the interpreter sits after the program and starts first.
+    let bias = match interpreter {
+        Some(interpreter) => {
+            if image.is_fixed() || interpreter.is_fixed() {
+                return None;
+            }
+            interpreter_bias(image)
+        }
+        None if image.interpreter().is_some() => return None,
+        None => 0,
+    };
+    let parts = [(Some(image), 0u64), (interpreter, bias)];
     let mut required = [false; PROCESS_CODE_PAGES];
     let mut writable = [false; PROCESS_CODE_PAGES];
     let mut executable = [false; PROCESS_CODE_PAGES];
-    for segment in image.segments() {
-        let first = usize::try_from(segment.virtual_address / PAGE_SIZE).ok()?;
-        let end = segment.memory_end().checked_add(PAGE_SIZE - 1)? / PAGE_SIZE;
-        let end = usize::try_from(end).ok()?;
-        if first >= end || end > PROCESS_CODE_PAGES {
-            return None;
-        }
-        for page in first..end {
-            required[page] = true;
-            writable[page] |= segment.writable;
-            executable[page] |= segment.executable;
-            if writable[page] && executable[page] {
+    for (part, offset) in parts {
+        let Some(part) = part else {
+            continue;
+        };
+        for segment in part.segments() {
+            let first =
+                usize::try_from(segment.virtual_address.checked_add(offset)? / PAGE_SIZE).ok()?;
+            let end = segment.memory_end().checked_add(offset + PAGE_SIZE - 1)? / PAGE_SIZE;
+            let end = usize::try_from(end).ok()?;
+            if first >= end || end > PROCESS_CODE_PAGES {
                 return None;
+            }
+            for page in first..end {
+                required[page] = true;
+                writable[page] |= segment.writable;
+                executable[page] |= segment.executable;
+                if writable[page] && executable[page] {
+                    return None;
+                }
             }
         }
     }
-    let entry_page = usize::try_from(image.entry() / PAGE_SIZE).ok()?;
+    let start_entry = match interpreter {
+        Some(interpreter) => bias + interpreter.entry(),
+        None => image.entry(),
+    };
+    let entry_page = usize::try_from(start_entry / PAGE_SIZE).ok()?;
     if entry_page >= PROCESS_CODE_PAGES || !executable[entry_page] {
         return None;
     }
@@ -1492,26 +1527,31 @@ fn create_process_from_elf(
             );
         }
     }
-    for segment in image.segments() {
-        let mut source = segment.file_offset;
-        let mut virtual_offset = segment.virtual_address as usize;
-        let mut remaining = segment.file_size;
-        while remaining != 0 {
-            let page = virtual_offset / PAGE_SIZE as usize;
-            let within_page = virtual_offset & (PAGE_SIZE as usize - 1);
-            let count = remaining.min(PAGE_SIZE as usize - within_page);
-            let destination =
-                code_physical[page].checked_add(within_page as u64)? as usize as *mut u8;
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    image.bytes().as_ptr().add(source),
-                    destination,
-                    count,
-                );
+    for (part, offset) in parts {
+        let Some(part) = part else {
+            continue;
+        };
+        for segment in part.segments() {
+            let mut source = segment.file_offset;
+            let mut virtual_offset = segment.virtual_address as usize + offset as usize;
+            let mut remaining = segment.file_size;
+            while remaining != 0 {
+                let page = virtual_offset / PAGE_SIZE as usize;
+                let within_page = virtual_offset & (PAGE_SIZE as usize - 1);
+                let count = remaining.min(PAGE_SIZE as usize - within_page);
+                let destination =
+                    code_physical[page].checked_add(within_page as u64)? as usize as *mut u8;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        part.bytes().as_ptr().add(source),
+                        destination,
+                        count,
+                    );
+                }
+                source = source.checked_add(count)?;
+                virtual_offset = virtual_offset.checked_add(count)?;
+                remaining -= count;
             }
-            source = source.checked_add(count)?;
-            virtual_offset = virtual_offset.checked_add(count)?;
-            remaining -= count;
         }
     }
     if !link_process_root(
@@ -1559,7 +1599,7 @@ fn create_process_from_elf(
     Some(ProcessAddressSpace {
         root_physical: pml4,
         user_slot,
-        entry: virtual_base.checked_add(image.entry())?,
+        entry: virtual_base.checked_add(start_entry)?,
         stack_top: virtual_base
             + (PROCESS_STACK_FIRST_INDEX + PROCESS_STACK_PAGES) as u64 * PAGE_SIZE
             - 16,
@@ -2255,12 +2295,26 @@ pub fn process_mmap_fixed(
         return None;
     }
     let table = process_table_physical(space.root_physical, space.user_slot)?;
+    if space.mmap_used[start..start + pages].contains(&true) {
+        crate::scheduler::stop_siblings(space.root_physical);
+    }
     let flags = translate_protection(protection, space.nx_enabled);
     for index in start..start + pages {
         if space.mmap_used[index] {
+            // The old translation goes before its frame does, so a failed
+            // allocation below never leaves a mapping of a freed frame.
+            unsafe {
+                core::ptr::write_volatile(
+                    (table as usize as *mut u64).add(PROCESS_MMAP_FIRST_INDEX + index),
+                    0,
+                );
+                invalidate(mmap_address(space.user_slot, index));
+            }
             release_entry(space.mmap_physical[index]);
             space.mmap_used[index] = false;
+            space.mmap_protection[index] = 0;
             space.mmap_physical[index] = 0;
+            space.mmap_shared[index] = false;
         }
         let frame = crate::memory::allocate_global()?;
         let page = frame.address();

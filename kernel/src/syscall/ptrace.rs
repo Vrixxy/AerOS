@@ -520,7 +520,11 @@ fn attach(pid: u64) -> u64 {
     if scheduler::group_of_tid(pid) != Some(pid) {
         return error(3);
     }
-    if scheduler::parent_of(pid) != Some(me) && !has_capability(crate::capability::CAP_SYS_PTRACE) {
+    // A kernel task is never traced; without the capability, only a child.
+    if !scheduler::may_signal(pid, has_capability(crate::capability::CAP_SYS_PTRACE))
+        || scheduler::parent_of(pid) != Some(me)
+            && !has_capability(crate::capability::CAP_SYS_PTRACE)
+    {
         return error(1);
     }
     let attached = scheduler::trace_of(pid, |trace| {

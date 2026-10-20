@@ -185,7 +185,7 @@ impl Field {
 
     fn read(&self, report: &[u8]) -> i32 {
         let mut value: u32 = 0;
-        for index in 0..self.size as usize {
+        for index in 0..(self.size as usize).min(32) {
             let bit = self.bit as usize + index;
             if report
                 .get(bit / 8)
@@ -194,8 +194,9 @@ impl Field {
                 value |= 1 << index;
             }
         }
-        if self.signed && self.size > 0 && self.size < 32 && value & (1 << (self.size - 1)) != 0 {
-            value as i32 - (1i32 << self.size)
+        if self.signed && self.size > 0 && self.size < 32 {
+            let unused = 32 - u32::from(self.size);
+            ((value << unused) as i32) >> unused
         } else {
             value as i32
         }
@@ -1247,16 +1248,18 @@ fn parse_pointer(descriptor: u64, length: u16) -> Option<Pointer> {
             }
             (0, 8) => {
                 let id_bits = if report_id != 0 { 8 } else { 0 };
-                for index in 0..report_count {
-                    let field_bit = bit + id_bits;
-                    bit += report_size;
+                // The device writes these numbers: a 64-byte report holds at
+                // most 512 fields, and the arithmetic must not overflow.
+                for index in 0..report_count.min(512) {
+                    let field_bit = bit.saturating_add(id_bits);
+                    bit = bit.saturating_add(report_size);
                     if raw & 1 != 0 {
                         continue;
                     }
                     let usage = if usage_count > 0 {
                         usages[(index as usize).min(usage_count - 1)]
                     } else if usage_max >= usage_min && usage_max != 0 {
-                        usage_min + index
+                        usage_min.saturating_add(index)
                     } else {
                         0
                     };
@@ -1301,6 +1304,23 @@ fn parse_pointer(descriptor: u64, length: u16) -> Option<Pointer> {
         }
     }
     (pointer.x.present && pointer.y.present).then_some(pointer)
+}
+
+/// For the boot fuzzer: a device's configuration and HID report descriptors
+/// (`bytes`, any content) and one input report go through the same parsing a
+/// plugged-in device's do.
+#[cfg_attr(not(feature = "boot-test"), allow(dead_code))]
+pub(crate) fn fuzz_descriptors(bytes: &[u8], report: &[u8; 64]) {
+    let address = bytes.as_ptr() as u64;
+    let length = bytes.len().saturating_sub(16).min(DESCRIPTOR_MAX as usize) as u16;
+    let _ = parse_configuration(address, length);
+    if let Some(pointer) = parse_pointer(address, length) {
+        let _ = (
+            pointer.x.read(report),
+            pointer.y.read(report),
+            pointer.wheel.read(report),
+        );
+    }
 }
 
 fn handle_pointer(pointer: &Pointer, report: &[u8; 64]) {

@@ -140,7 +140,9 @@ pub fn state() -> MouseState {
 
 /// Returns (and clears) the wheel movement accumulated since the last call.
 pub fn take_wheel() -> i32 {
-    WHEEL.swap(0, Ordering::AcqRel)
+    // A device can report any amount; a frame's worth of real scrolling is
+    // far less, and the callers multiply it.
+    WHEEL.swap(0, Ordering::AcqRel).clamp(-64, 64)
 }
 
 fn record_press(x: i32, y: i32) {
@@ -227,7 +229,7 @@ pub fn inject_motion(buttons: u8, delta_x: i32, dy_down: i32, wheel: i32) {
     BUTTONS.store(buttons & 0x07, Ordering::Release);
     PACKETS.fetch_add(1, Ordering::Relaxed);
     if wheel != 0 {
-        WHEEL.fetch_add(-wheel, Ordering::AcqRel);
+        WHEEL.fetch_add(wheel.saturating_neg(), Ordering::AcqRel);
     }
     if delta_x == 0 && dy_down == 0 {
         if pressed {
@@ -238,8 +240,14 @@ pub fn inject_motion(buttons: u8, delta_x: i32, dy_down: i32, wheel: i32) {
     let packed = BOUNDS.load(Ordering::Acquire);
     let max_x = ((packed >> 16) as i32 - 1).max(0);
     let max_y = ((packed & 0xffff) as i32 - 1).max(0);
-    let next_x = (POS_X.load(Ordering::Relaxed) + delta_x).clamp(0, max_x);
-    let next_y = (POS_Y.load(Ordering::Relaxed) + dy_down).clamp(0, max_y);
+    let next_x = POS_X
+        .load(Ordering::Relaxed)
+        .saturating_add(delta_x)
+        .clamp(0, max_x);
+    let next_y = POS_Y
+        .load(Ordering::Relaxed)
+        .saturating_add(dy_down)
+        .clamp(0, max_y);
     POS_X.store(next_x, Ordering::Release);
     POS_Y.store(next_y, Ordering::Release);
     if pressed {
@@ -255,7 +263,7 @@ pub fn inject_absolute(buttons: u8, x: u32, y: u32, wheel: i32) {
     BUTTONS.store(buttons & 0x07, Ordering::Release);
     PACKETS.fetch_add(1, Ordering::Relaxed);
     if wheel != 0 {
-        WHEEL.fetch_add(-wheel, Ordering::AcqRel);
+        WHEEL.fetch_add(wheel.saturating_neg(), Ordering::AcqRel);
     }
     let packed = BOUNDS.load(Ordering::Acquire);
     let max_x = ((packed >> 16) as i32 - 1).max(0);

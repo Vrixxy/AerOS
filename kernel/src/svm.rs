@@ -64,6 +64,9 @@ const INTERCEPT_MSR_PROT: u32 = 1 << 28;
 const INTERCEPT_PAUSE: u32 = 1 << 23;
 const INTERCEPT2_VMRUN: u32 = 1;
 const INTERCEPT2_VMMCALL: u32 = 1 << 1;
+/// VMLOAD, VMSAVE, STGI, CLGI and SKINIT: a guest that turns on EFER.SVME
+/// would otherwise run them on host physical addresses and the host GIF.
+const INTERCEPT2_SVM_INSTRUCTIONS: u32 = 0b11111 << 2;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GuestMode {
@@ -223,7 +226,7 @@ fn run_mode(frames: &mut FrameAllocator, mode: GuestMode, npt_supported: bool) -
         && vm.cpuid_exits >= 1
         && vm.msr_exits >= 1;
 
-    VmReport {
+    let report = VmReport {
         svm_supported: true,
         npt_supported,
         svm_enabled: true,
@@ -240,7 +243,9 @@ fn run_mode(frames: &mut FrameAllocator, mode: GuestMode, npt_supported: bool) -
         guest_marker: marker,
         high_marker,
         verified,
-    }
+    };
+    vm.release(frames);
+    report
 }
 
 pub(crate) const LINUX_LOAD: u64 = 0x10_0000;
@@ -298,6 +303,7 @@ fn run_linux(frames: &mut FrameAllocator) {
             source,
             image.len()
         ));
+        vm.release(frames);
         return;
     };
 
@@ -337,6 +343,7 @@ fn run_linux(frames: &mut FrameAllocator) {
         marker,
         verified,
     ));
+    vm.release(frames);
 }
 
 pub(crate) const GUEST_MESSAGE: &[u8] = b"AER-GUEST\n";
@@ -1433,6 +1440,7 @@ mod linux {
         zero_region(vmcb, PAGE_SIZE);
         fill_region(iopm, 3 * PAGE_SIZE, 0xff);
         zero_region(msrpm, 2 * PAGE_SIZE);
+        protect_host_msrs(msrpm);
         zero_region(ram, 0x20_0000);
         zero_region(scratch, PAGE_2M);
 
@@ -1727,6 +1735,65 @@ mod linux {
         }
     }
 
+    /// MSRs a guest touching directly would reach the host machine through:
+    /// where the processor keeps the host's state across a VM run, SVM and SMM
+    /// control, memory map and caching, microcode, the TSC, machine-check
+    /// banks, power states and the local APIC. Accesses exit instead (reads
+    /// see 0, writes are dropped - see `handle_msr`); the guest still runs
+    /// everything it needs, since every MSR in the VMCB is its own copy.
+    fn protect_host_msrs(msrpm: u64) {
+        let mark = |msr: u32, read: bool| {
+            let (base, index) = match msr {
+                0..=0x1fff => (0u64, msr),
+                0xc000_0000..=0xc000_1fff => (0x800 * 8, msr - 0xc000_0000),
+                0xc001_0000..=0xc001_1fff => (0x1000 * 8, msr - 0xc001_0000),
+                _ => return,
+            };
+            let bit = base + index as u64 * 2;
+            let mask = if read { 3u8 } else { 2u8 } << (bit % 8);
+            let byte = bit / 8;
+            unsafe { write_u8(msrpm, byte, read_u8(msrpm, byte) | mask) };
+        };
+        for msr in [
+            0xc001_0112,
+            0xc001_0113,
+            0xc001_0114,
+            0xc001_0116,
+            0xc001_0117,
+            0xc001_0118,
+        ] {
+            mark(msr, true);
+        }
+        let written_only = [
+            0x10..=0x10,
+            0x1b..=0x1b,
+            0x3a..=0x3b,
+            // SPEC_CTRL and PRED_CMD are the host's: a guest setting them would
+            // stay set once the host runs again.
+            0x48..=0x49,
+            0x79..=0x79,
+            0x17a..=0x17b,
+            0x1a0..=0x1a0,
+            // The MTRRs, but not PAT (0x277), which the VMCB keeps per guest.
+            0x200..=0x276,
+            0x278..=0x2ff,
+            0x400..=0x4ff,
+            0x800..=0x8ff,
+            0xc001_0000..=0xc001_0007,
+            0xc001_0200..=0xc001_020b,
+            0xc001_0010..=0xc001_0020,
+            0xc001_0058..=0xc001_0058,
+            0xc001_0060..=0xc001_0071,
+            0xc001_0140..=0xc001_0141,
+            0xc001_1000..=0xc001_10ff,
+        ];
+        for range in written_only {
+            for msr in range {
+                mark(msr, false);
+            }
+        }
+    }
+
     fn build_vmcb(vmcb: u64, npt: u64, iopm: u64, msrpm: u64) {
         unsafe {
             write_u32(vmcb, 0x008, 1 << 8);
@@ -1740,7 +1807,11 @@ mod linux {
                     | INTERCEPT_PAUSE
                     | INTERCEPT_MSR_PROT,
             );
-            write_u32(vmcb, 0x010, INTERCEPT2_VMRUN | INTERCEPT2_VMMCALL);
+            write_u32(
+                vmcb,
+                0x010,
+                INTERCEPT2_VMRUN | INTERCEPT2_VMMCALL | INTERCEPT2_SVM_INSTRUCTIONS,
+            );
             write_u64(vmcb, 0x040, iopm);
             write_u64(vmcb, 0x048, msrpm);
             write_u32(vmcb, 0x058, 1);
@@ -2573,6 +2644,12 @@ mod linux {
                 }
                 _ => {}
             }
+            // The guest gets no SVM of its own (its instructions are intercepted).
+            if leaf == 0x8000_0001 {
+                c &= !(1 << 2);
+            } else if leaf == 0x8000_000a {
+                (a, b, c, d) = (0, 0, 0, 0);
+            }
             unsafe { write_u64(self.vmcb, 0x5f8, a as u64) };
             self.gpr[0] = b as u64;
             self.gpr[1] = c as u64;
@@ -2616,7 +2693,7 @@ mod linux {
                 return;
             }
             let gpa = value & !0x3;
-            if gpa + 32 > self.ram_bytes {
+            if gpa.checked_add(32).is_none_or(|end| end > self.ram_bytes) {
                 return;
             }
             let base = self.ram + gpa;
@@ -2636,7 +2713,7 @@ mod linux {
 
         fn wallclock_write(&mut self, value: u64) {
             let gpa = value & !0x3;
-            if gpa + 12 > self.ram_bytes {
+            if gpa.checked_add(12).is_none_or(|end| end > self.ram_bytes) {
                 return;
             }
             let base = self.ram + gpa;
@@ -3359,28 +3436,51 @@ mod linux {
             }
         }
 
+        /// Whether `size` bytes at guest address `gpa` are guest RAM. Every
+        /// address here comes from the guest (ring and descriptor contents),
+        /// so anything outside reads as zero and is never written.
+        fn in_ram(&self, gpa: u64, size: u64) -> bool {
+            gpa.checked_add(size)
+                .is_some_and(|end| end <= self.ram_bytes)
+        }
+
         fn gread_u16(&self, gpa: u64) -> u16 {
+            if !self.in_ram(gpa, 2) {
+                return 0;
+            }
             read_u16(self.ram, gpa)
         }
 
         fn gread_u32(&self, gpa: u64) -> u32 {
+            if !self.in_ram(gpa, 4) {
+                return 0;
+            }
             read_u32(self.ram, gpa)
         }
 
         fn gread_u64(&self, gpa: u64) -> u64 {
+            if !self.in_ram(gpa, 8) {
+                return 0;
+            }
             unsafe { read_u64(self.ram, gpa) }
         }
 
         fn gwrite_u8(&mut self, gpa: u64, value: u8) {
-            unsafe { write_u8(self.ram, gpa, value) };
+            if self.in_ram(gpa, 1) {
+                unsafe { write_u8(self.ram, gpa, value) };
+            }
         }
 
         fn gwrite_u16(&mut self, gpa: u64, value: u16) {
-            unsafe { write_u16(self.ram, gpa, value) };
+            if self.in_ram(gpa, 2) {
+                unsafe { write_u16(self.ram, gpa, value) };
+            }
         }
 
         fn gwrite_u32(&mut self, gpa: u64, value: u32) {
-            unsafe { write_u32(self.ram, gpa, value) };
+            if self.in_ram(gpa, 4) {
+                unsafe { write_u32(self.ram, gpa, value) };
+            }
         }
 
         /// Walks the avail ring for however many new requests are pending
@@ -3898,6 +3998,9 @@ struct Vm {
     vmcb: u64,
     host_vmcb: u64,
     hsave: u64,
+    npt: u64,
+    iopm: u64,
+    msrpm: u64,
     guest_ram: u64,
     mode: GuestMode,
     exits: u32,
@@ -3912,6 +4015,22 @@ struct Vm {
 }
 
 impl Vm {
+    /// Gives the guest's memory and control pages back (the boot checks run
+    /// three guests one after another, each needing 32 MiB in one piece).
+    fn release(self, frames: &mut FrameAllocator) {
+        for (start, pages) in [
+            (self.hsave, 1),
+            (self.host_vmcb, 1),
+            (self.vmcb, 1),
+            (self.npt, NPT_PAGES),
+            (self.iopm, IOPM_PAGES),
+            (self.msrpm, MSRPM_PAGES),
+            (self.guest_ram, GUEST_RAM_PAGES),
+        ] {
+            let _ = frames.release_contiguous(start, pages);
+        }
+    }
+
     fn new(frames: &mut FrameAllocator, mode: GuestMode) -> Option<Self> {
         let hsave = frames.allocate_contiguous(1, 1)?.address();
         let host_vmcb = frames.allocate_contiguous(1, 1)?.address();
@@ -3940,6 +4059,9 @@ impl Vm {
             vmcb,
             host_vmcb,
             hsave,
+            npt,
+            iopm,
+            msrpm,
             guest_ram,
             mode,
             exits: 0,
@@ -4315,7 +4437,11 @@ fn build_vmcb(vmcb: u64, npt: u64, iopm: u64, msrpm: u64, mode: GuestMode) {
             0x00c,
             INTERCEPT_HLT | INTERCEPT_IOIO_PROT | INTERCEPT_CPUID | INTERCEPT_MSR_PROT,
         );
-        write_u32(vmcb, 0x010, INTERCEPT2_VMRUN | INTERCEPT2_VMMCALL);
+        write_u32(
+            vmcb,
+            0x010,
+            INTERCEPT2_VMRUN | INTERCEPT2_VMMCALL | INTERCEPT2_SVM_INSTRUCTIONS,
+        );
         write_u64(vmcb, 0x040, iopm);
         write_u64(vmcb, 0x048, msrpm);
         write_u32(vmcb, 0x058, 1);

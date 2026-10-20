@@ -516,7 +516,10 @@ pub fn receive(destination: &mut [u8]) -> Option<usize> {
             core::ptr::read_volatile(descriptor_address as usize as *const ReceiveDescriptor)
         };
         if descriptor.status & 1 != 0 {
-            if descriptor.errors != 0 || descriptor.length as usize > destination.len() {
+            if descriptor.errors != 0
+                || descriptor.length as usize > destination.len()
+                || descriptor.length as usize > BUFFER_SIZE
+            {
                 return None;
             }
             let count = descriptor.length as usize;

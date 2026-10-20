@@ -3,6 +3,7 @@
 //! may shrink the permitted set, and the effective set must stay inside it.
 
 pub const CAP_CHOWN: u32 = 0;
+pub const CAP_DAC_OVERRIDE: u32 = 1;
 pub const CAP_KILL: u32 = 5;
 pub const CAP_NET_BIND_SERVICE: u32 = 10;
 pub const CAP_SYS_PTRACE: u32 = 19;
@@ -23,6 +24,14 @@ impl Capabilities {
     pub const FULL: Self = Self {
         effective: ALL,
         permitted: ALL,
+    };
+
+    /// What a program started by a user who has not elevated with `ear`
+    /// gets: it may not reboot, mount, set the clock, signal or trace what
+    /// it did not start, or touch the system's protected files.
+    pub const UNPRIVILEGED: Self = Self {
+        effective: 1 << CAP_NET_BIND_SERVICE,
+        permitted: 1 << CAP_NET_BIND_SERVICE,
     };
 
     pub fn has(self, capability: u32) -> bool {

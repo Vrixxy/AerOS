@@ -513,6 +513,127 @@ pub fn send_udp(
     crate::nic::transmit(&packet[..packet_bytes])
 }
 
+/// Sends an ICMP echo request for a ping socket: `message` is the ICMP
+/// message the program wrote (type 8, code 0); its identifier becomes the
+/// socket's and the checksum is computed here. An echo to this machine is
+/// answered at once.
+pub fn send_echo(destination: [u8; 4], identity: u16, message: &[u8]) -> bool {
+    if message.len() < 8 || message.len() > MAX_UDP_PAYLOAD || message[0] != 8 || message[1] != 0 {
+        return false;
+    }
+    let mut icmp = [0u8; MAX_UDP_PAYLOAD + 8];
+    let length = message.len();
+    icmp[..length].copy_from_slice(message);
+    icmp[2..4].fill(0);
+    icmp[4..6].copy_from_slice(&identity.to_be_bytes());
+    let sum = checksum(&icmp[..length]);
+    icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+    crate::tcpnet::activate();
+    if crate::tcpnet::is_local(crate::ip::v4(destination)) {
+        icmp[0] = 0;
+        icmp[2..4].fill(0);
+        let sum = checksum(&icmp[..length]);
+        icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+        return crate::udp::deliver_echo(identity, crate::ip::v4(destination), &icmp[..length]);
+    }
+    let config = *CONFIG.lock();
+    if !config.ready {
+        return false;
+    }
+    let packet_bytes = 34 + length;
+    let mut packet = [0u8; 1514];
+    packet[..6].copy_from_slice(&config.gateway_mac);
+    packet[6..12].copy_from_slice(&config.mac);
+    packet[12..14].copy_from_slice(&[0x08, 0x00]);
+    packet[14] = 0x45;
+    packet[16..18].copy_from_slice(&((20 + length) as u16).to_be_bytes());
+    let id = IPV4_ID.fetch_add(1, Ordering::Relaxed) as u16;
+    packet[18..20].copy_from_slice(&id.to_be_bytes());
+    packet[20..22].copy_from_slice(&0x4000u16.to_be_bytes());
+    packet[22] = 64;
+    packet[23] = 1;
+    packet[26..30].copy_from_slice(&config.local_ip);
+    packet[30..34].copy_from_slice(&destination);
+    let ip_checksum = checksum(&packet[14..34]);
+    packet[24..26].copy_from_slice(&ip_checksum.to_be_bytes());
+    packet[34..packet_bytes].copy_from_slice(&icmp[..length]);
+    crate::nic::transmit(&packet[..packet_bytes])
+}
+
+/// An unfragmented IPv4 ICMP echo reply to this host with valid checksums:
+/// the sender, the echo identifier and where the ICMP message is in `packet`.
+pub fn parse_echo_reply(packet: &[u8]) -> Option<(crate::ip::Address, u16, usize, usize)> {
+    let config = *CONFIG.lock();
+    if packet.len() < 42
+        || packet[..6] != config.mac
+        || packet[12..14] != [0x08, 0x00]
+        || packet[14] >> 4 != 4
+        || packet[23] != 1
+        || packet[30..34] != config.local_ip
+    {
+        return None;
+    }
+    let header_bytes = (packet[14] as usize & 0x0f) * 4;
+    let total_bytes = u16::from_be_bytes([packet[16], packet[17]]) as usize;
+    if header_bytes < 20
+        || total_bytes < header_bytes + 8
+        || 14 + total_bytes > packet.len()
+        || u16::from_be_bytes([packet[20], packet[21]]) & 0x3fff != 0
+        || checksum(&packet[14..14 + header_bytes]) != 0
+    {
+        return None;
+    }
+    let start = 14 + header_bytes;
+    let icmp = &packet[start..14 + total_bytes];
+    if icmp[0] != 0 || icmp[1] != 0 || checksum(icmp) != 0 {
+        return None;
+    }
+    let remote: [u8; 4] = packet[26..30].try_into().ok()?;
+    let identity = u16::from_be_bytes([icmp[4], icmp[5]]);
+    Some((crate::ip::v4(remote), identity, start, icmp.len()))
+}
+
+/// A ping socket's echo to this machine and to the gateway comes back
+/// through the socket layer: (loopback, gateway).
+#[cfg(feature = "boot-test")]
+pub fn echo_socket_self_test(gateway: [u8; 4]) -> (bool, bool) {
+    let Ok(slot) = crate::udp::bind_echo() else {
+        return (false, false);
+    };
+    let identity = crate::udp::port_of(slot).unwrap_or(0);
+    let mut request = [0u8; 16];
+    request[0] = 8;
+    request[6..8].copy_from_slice(&1u16.to_be_bytes());
+    request[8..16].copy_from_slice(b"AEROSPNG");
+    let mut reply = [0u8; 64];
+    let local = CONFIG.lock().local_ip;
+    let echoed = |reply: &[u8], length: usize, sequence: u16| {
+        length == 16
+            && reply[0] == 0
+            && reply[4..6] == identity.to_be_bytes()
+            && reply[6..8] == sequence.to_be_bytes()
+            && reply[8..16] == *b"AEROSPNG"
+    };
+    let loopback = send_echo(local, identity, &request)
+        && crate::udp::take(slot, None, &mut reply)
+            .is_some_and(|received| echoed(&reply, received.length, 1));
+    request[6..8].copy_from_slice(&2u16.to_be_bytes());
+    let mut gateway_ok = false;
+    if send_echo(gateway, identity, &request) {
+        let deadline = crate::time::monotonic_nanoseconds().saturating_add(1_000_000_000);
+        while crate::time::monotonic_nanoseconds() < deadline {
+            crate::tcpnet::poll();
+            if let Some(received) = crate::udp::take(slot, None, &mut reply) {
+                gateway_ok = echoed(&reply, received.length, 2);
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    }
+    crate::udp::release(slot);
+    (loopback, gateway_ok)
+}
+
 pub fn receive_udp(
     source: [u8; 4],
     source_port: u16,

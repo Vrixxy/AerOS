@@ -41,6 +41,7 @@ fn run(label: &str, arguments: &[&str], expected: i32) -> bool {
     let program = cstr(match arguments[0] {
         "ldconfig" => "/bin/ldconfig",
         "dynhello" => "/bin/dynhello",
+        "dyntest" => "/bin/dyntest",
         path if path.starts_with('/') => path,
         _ => "/bin/busybox",
     });
@@ -90,6 +91,7 @@ fn link_applets() {
         "tr", "wc", "cat", "head", "sort", "seq", "gzip", "gunzip", "rm", "echo", "ls", "grep",
         "sed", "awk", "uniq", "cut", "sleep", "true", "false", "test", "date", "sh", "du", "tail",
         "base64", "bzip2", "bunzip2", "xz", "unxz", "nl", "tee", "md5sum", "sha1sum", "tar", "cpio", "od",
+        "syslogd", "logger",
     ] {
         let link = cstr(&format!("/tmp/bin/{name}"));
         sys(SYMLINK, [target.as_ptr() as usize, link.as_ptr() as usize, 0, 0, 0, 0]);
@@ -164,6 +166,8 @@ fn main() {
     check_exit("status-background", &["busybox", "sh", "-c", "sleep 0 & wait; echo wait=$?"], 0);
     // A dynamically linked glibc program: the kernel starts ld.so, which maps libc.
     check_exit("dynhello", &["dynhello"], 42);
+    // Threads, sockets, signals, dlopen and more, in one dynamically linked program.
+    check_exit("dyntest", &["dyntest"], 0);
     // A static-PIE glibc program of Debian's, started the same way.
     check_exit("ldconfig-version", &["ldconfig", "--version"], 0);
     check_exit("ldconfig-help", &["ldconfig", "--help"], 0);
@@ -249,6 +253,7 @@ EOF"),
         ("dev-ls", "ls /dev | head -n 3"),
         ("dev-stderr", "echo to-stderr > /dev/stderr"),
         ("ping-localhost", "ping -c 1 127.0.0.1 2>&1 | head -n 2; true"),
+        ("syslogd-logger", "syslogd -n -O /tmp/w/sys.log & sleep 1; logger aeros-syslog-probe; sleep 1; kill $!; grep -c aeros-syslog-probe /tmp/w/sys.log"),
     ];
     for (label, script) in sweeps {
         let arguments = sweep(script);
@@ -294,9 +299,69 @@ b
         ("bash-nested", r#"/bin/env FOO=bar /bin/bash -c 'echo $FOO'"#),
         ("bash-mktemp", r#"d=$(/bin/mktemp -d); /bin/test -d $d && echo temp-ok; /bin/rmdir $d"#),
         ("bash-xargs", r#"echo 1 2 3 | /bin/xargs -n1 /bin/echo n="#),
+        ("tar-roundtrip", r#"cd /tmp && /bin/tar cf t.tar /etc/aeros-release && /bin/tar tf t.tar && /bin/tar xOf t.tar etc/aeros-release && /bin/rm t.tar"#),
+        ("awk", r#"echo 1 2 3 | /bin/awk '{s=0; for(i=1;i<=NF;i++) s+=$i; print s}'"#),
+        ("make", r#"cd /tmp && /bin/printf 'all:\n\t@echo built-by-make\n' > Makefile && /bin/make && /bin/rm Makefile"#),
+        ("meminfo-before", r#"/bin/head -n 3 /proc/meminfo"#),
+        ("xz-only", r#"echo roundtrip | /bin/xz -0 -c | /bin/xz -dc"#),
+        ("bzip2-only", r#"echo roundtrip | /bin/bzip2 -1 -c | /bin/bzip2 -dc"#),
+        ("meminfo-after", r#"/bin/head -n 3 /proc/meminfo"#),
+        ("xz-bzip2", r#"echo roundtrip | /bin/xz -0 -c | /bin/xz -dc; echo roundtrip | /bin/bzip2 -1 -c | /bin/bzip2 -dc"#),
+        ("diff-cmp-patch", r#"cd /tmp && echo one > a && echo two > b && /bin/cmp a b; /bin/diff -u a b > d.patch; /bin/patch a < d.patch && /bin/cmp a b && echo patched; /bin/rm a b d.patch"#),
+        ("less-nano-vi-version", r#"/bin/less --version | /bin/head -n 1; /bin/nano --version | /bin/head -n 1; /bin/vi --version | /bin/head -n 1"#),
+        ("git-version", r#"/bin/git --version"#),
+        ("git-repository", r#"cd /tmp && /bin/rm -rf gr && /bin/mkdir gr && cd gr && /bin/git init -q . && echo hello > f && /bin/git add f && GIT_AUTHOR_NAME=a GIT_AUTHOR_EMAIL=a@b GIT_COMMITTER_NAME=a GIT_COMMITTER_EMAIL=a@b /bin/git commit -q -m first && /bin/git log --oneline | /bin/wc -l && /bin/git status --short | /bin/wc -l && /bin/git cat-file -p HEAD:f"#),
+        ("hostname", r#"/bin/hostname"#),
     ];
     for (label, script) in bash_scripts {
         check_exit(label, &["/bin/bash", "-c", script], 0);
+    }
+    // Debian's Perl and its core modules, loaded through ld.so.
+    let perl: &[(&str, &str)] = &[
+        ("perl-print", "print 2 + 2, qq(\n)"),
+        (
+            "perl-modules",
+            "use strict; use warnings; use List::Util qw(sum max); use POSIX qw(floor); \
+             print sum(1..10), ' ', max(3, 9, 2), ' ', floor(3.7), qq(\n)",
+        ),
+        (
+            "perl-hash-regex",
+            "my %h = (a => 1, b => 2); print join(',', map { qq($_=$h{$_}) } sort keys %h), qq(\n); \
+             'hello world' =~ /(\\w+)\\s+(\\w+)/ and print qq($2 $1\n)",
+        ),
+        (
+            "perl-files",
+            "open(my $f, '>', '/tmp/pl.txt') or die; print $f qq(data\n); close $f; \
+             print -s '/tmp/pl.txt', qq(\n); open($f, '<', '/tmp/pl.txt'); print scalar(<$f>); \
+             unlink '/tmp/pl.txt'; print -e '/tmp/pl.txt' ? qq(still\n) : qq(gone\n)",
+        ),
+        (
+            "perl-subprocess",
+            "my $out = `/bin/echo from-shell`; print $out; system('/bin/echo', 'from-system'); \
+             print $? >> 8, qq(\n)",
+        ),
+        (
+            "perl-core-modules",
+            "use File::Basename; use File::Spec; use Cwd; use Getopt::Long; use Scalar::Util qw(blessed); \
+             print basename('/a/b/c.txt'), ' ', File::Spec->catfile('x', 'y'), ' ', getcwd(), qq(\n)",
+        ),
+        (
+            "perl-unix-sockets",
+            "use Socket; socketpair(my $p, my $q, AF_UNIX, SOCK_STREAM, 0) or die qq(pair $!); \
+             syswrite($p, 'peek'); defined recv($q, my $x, 4, MSG_PEEK) or die qq(peek $!); \
+             sysread($q, my $y, 4); socket(my $s, AF_UNIX, SOCK_DGRAM, 0) or die qq(socket $!); \
+             bind($s, pack_sockaddr_un('aeros-perl-dgram')) or die qq(bind $!); \
+             socket(my $c, AF_UNIX, SOCK_DGRAM, 0) or die; \
+             send($c, 'dgram', 0, pack_sockaddr_un('aeros-perl-dgram')) or die qq(send $!); \
+             recv($s, my $z, 64, 0); print qq($x $y $z\n); exit($x.$y.$z eq 'peekpeekdgram' ? 0 : 1)",
+        ),
+        (
+            "perl-sprintf-sort",
+            "printf(qq(%05.1f %s %x\n), 3.14159, join('', sort { $b <=> $a } (3, 1, 2)), 255)",
+        ),
+    ];
+    for (label, code) in perl {
+        check_exit(label, &["/usr/bin/perl", "-e", code], 0);
     }
     println!("AEROS_APPS done passed={passed} total={total}");
     std::process::exit(if passed == total { 90 } else { 91 });

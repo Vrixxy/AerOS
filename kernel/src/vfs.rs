@@ -1,8 +1,9 @@
 use crate::datafs;
 use crate::fat;
 use crate::sync::TicketLock;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-const MAX_NODES: usize = 384;
+const MAX_NODES: usize = 768;
 const MAX_HANDLES: usize = 24;
 pub const MAX_NAME: usize = 255;
 const MAX_DEPTH: usize = 16;
@@ -16,6 +17,12 @@ const READ_BITS: u16 = 0o444;
 // files come and go), hence 112.
 const MAX_MUTABLE_FILES: usize = 176;
 const MUTABLE_FILE_BYTES: usize = 4096;
+/// The most a file outside `/data` may hold; past `MUTABLE_FILE_BYTES` its
+/// bytes live in the kernel heap.
+const TMP_FILE_BYTES: usize = 4 * 1024 * 1024;
+/// A node whose name was removed while it was open: it goes when its last
+/// handle closes.
+const ORPHAN: u16 = u16::MAX;
 const STATIC_STORAGE: u8 = u8::MAX;
 /// How many symlink hops `resolve_following` will chase before giving up -
 /// generous for any real use, tight enough that a cycle (`ln -s a b; ln -s
@@ -192,11 +199,111 @@ fn is_mutable_mount(node: &Node) -> bool {
     node.parent == ROOT_NODE && (node.name_matches("tmp") || node.name_matches("data"))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Protection {
+    None,
+    /// Readable by anyone, changed only by the system or an elevated user.
+    Changes,
+    /// Not even readable by an unprivileged caller.
+    Secret,
+}
+
+/// The system's own files directly in `/data` (a directory covers what is
+/// inside it).
+const PROTECTED: [(&str, Protection); 6] = [
+    ("ACCOUNT.DAT", Protection::Secret),
+    ("LOCKOUT.DAT", Protection::Changes),
+    ("QUAR", Protection::Secret),
+    ("AVSIG.DAT", Protection::Changes),
+    ("AUDIT.LOG", Protection::Changes),
+    ("MEASURE.REF", Protection::Changes),
+];
+
+/// The task (id + 1) whose file operations are an unelevated shell user's.
+static RESTRICTED_TASK: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_SCOPE: AtomicU32 = AtomicU32::new(0);
+
+/// Runs `body` with this task's file operations counted as those of a user
+/// who has not elevated (`restricted`), or not.
+pub fn as_user<R>(restricted: bool, body: impl FnOnce() -> R) -> R {
+    let marker = if restricted {
+        crate::scheduler::current_task_id() + 1
+    } else {
+        0
+    };
+    let previous = RESTRICTED_TASK.swap(marker, Ordering::AcqRel);
+    let result = body();
+    RESTRICTED_TASK.store(previous, Ordering::Release);
+    result
+}
+
+/// Runs `body` as the system itself: bookkeeping the kernel does on behalf of
+/// whoever set it off (quarantining a file, appending to the audit log).
+pub fn as_system<R>(body: impl FnOnce() -> R) -> R {
+    SYSTEM_SCOPE.fetch_add(1, Ordering::AcqRel);
+    let result = body();
+    SYSTEM_SCOPE.fetch_sub(1, Ordering::AcqRel);
+    result
+}
+
+/// Paths outside `/data` that only the system or an elevated user may
+/// change: the system image (through the union root those writes would
+/// replace its programs), the union root's own store and the package
+/// manager's trust store and installs.
+fn system_path(path: &str) -> bool {
+    let mut components = [""; 2];
+    let mut depth = 0usize;
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => depth = depth.saturating_sub(1),
+            name => {
+                if depth < components.len() {
+                    components[depth] = name;
+                }
+                depth += 1;
+            }
+        }
+    }
+    match components[0] {
+        "" | "tmp" | "data" | "proc" | "sys" | "dev" | "media" => false,
+        "home" => {
+            depth > 1
+                && (components[1].eq_ignore_ascii_case(".root")
+                    || components[1].eq_ignore_ascii_case("pkg"))
+        }
+        _ => true,
+    }
+}
+
+/// Refuses an unprivileged caller a change under a `system_path`.
+fn guard_path(path: &str) -> Result<(), VfsError> {
+    if system_path(path) && caller_restricted() {
+        return Err(VfsError::PermissionDenied);
+    }
+    Ok(())
+}
+
+/// True when the caller may not touch protected files: a program without
+/// `CAP_DAC_OVERRIDE`, or the shell of a user who has not elevated.
+fn caller_restricted() -> bool {
+    if SYSTEM_SCOPE.load(Ordering::Acquire) != 0 {
+        return false;
+    }
+    let marker = RESTRICTED_TASK.load(Ordering::Acquire);
+    (marker != 0 && marker == crate::scheduler::current_task_id() + 1)
+        || !crate::syscall::may_override_file_protection()
+}
+
 #[derive(Clone, Copy)]
 struct MutableFile {
     used: bool,
     length: usize,
     data: [u8; MUTABLE_FILE_BYTES],
+    /// Where the bytes are once the file has outgrown `data` (a kernel heap
+    /// block of `capacity` bytes); 0 while they are in `data`.
+    big: usize,
+    capacity: usize,
 }
 
 impl MutableFile {
@@ -204,7 +311,84 @@ impl MutableFile {
         used: false,
         length: 0,
         data: [0; MUTABLE_FILE_BYTES],
+        big: 0,
+        capacity: 0,
     };
+
+    /// All the backing bytes (`length` of them are the file's).
+    fn slice(&self) -> &[u8] {
+        if self.big == 0 {
+            &self.data
+        } else {
+            // SAFETY: `big` is a live heap block of `capacity` bytes owned by
+            // this slot (see `reserve` and `release`).
+            unsafe { core::slice::from_raw_parts(self.big as *const u8, self.capacity) }
+        }
+    }
+
+    fn slice_mut(&mut self) -> &mut [u8] {
+        if self.big == 0 {
+            &mut self.data
+        } else {
+            // SAFETY: as in `slice`, and the slot is borrowed mutably.
+            unsafe { core::slice::from_raw_parts_mut(self.big as *mut u8, self.capacity) }
+        }
+    }
+
+    /// Makes room for `bytes`, moving the content to the kernel heap when
+    /// `data` is too small. False when that is past `limit` or the heap is
+    /// out of space.
+    fn reserve(&mut self, bytes: usize, limit: usize) -> bool {
+        let current = if self.big == 0 {
+            MUTABLE_FILE_BYTES
+        } else {
+            self.capacity
+        };
+        if bytes <= current {
+            return true;
+        }
+        if bytes > limit {
+            return false;
+        }
+        let mut capacity = current.max(MUTABLE_FILE_BYTES) * 2;
+        while capacity < bytes {
+            capacity *= 2;
+        }
+        capacity = capacity.min(limit).max(bytes);
+        let Ok(layout) = core::alloc::Layout::from_size_align(capacity, 16) else {
+            return false;
+        };
+        let Some(block) = crate::heap::HEAP.allocate(layout) else {
+            return false;
+        };
+        // SAFETY: a fresh block of `capacity` bytes; the old content (at most
+        // `length` bytes of `slice()`) is copied into it before it is freed.
+        unsafe {
+            core::ptr::write_bytes(block.as_ptr(), 0, capacity);
+            core::ptr::copy_nonoverlapping(self.slice().as_ptr(), block.as_ptr(), self.length);
+        }
+        self.release();
+        self.big = block.as_ptr() as usize;
+        self.capacity = capacity;
+        true
+    }
+
+    /// Gives back the heap block, if there is one (the content is gone).
+    fn release(&mut self) {
+        if self.big != 0 {
+            if let Some(block) = core::ptr::NonNull::new(self.big as *mut u8) {
+                crate::heap::HEAP.deallocate(block);
+            }
+            self.big = 0;
+            self.capacity = 0;
+        }
+    }
+
+    /// Frees the slot.
+    fn clear(&mut self) {
+        self.release();
+        *self = Self::EMPTY;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -368,9 +552,9 @@ impl Vfs {
     fn mount(
         &mut self,
         entries: &[InitramfsEntry],
-        more: &[InitramfsEntry],
+        more: &[&[InitramfsEntry]],
     ) -> Result<(), VfsError> {
-        for entry in entries.iter().chain(more) {
+        for entry in entries.iter().chain(more.iter().copied().flatten()) {
             self.mount_file(entry.path, entry.data, entry.mode)?;
         }
         self.mount_directory("/tmp", 0o777)?;
@@ -420,7 +604,7 @@ impl Vfs {
                 }
             };
             let Ok(node) = self.add_node(NodeKind::File, data_node, name, 0o644, &[]) else {
-                MUTABLE_FILES.lock()[slot] = MutableFile::EMPTY;
+                MUTABLE_FILES.lock()[slot].clear();
                 continue;
             };
             self.nodes[node as usize].storage = slot as u8;
@@ -545,6 +729,7 @@ impl Vfs {
         if self.find_child(parent, name).is_some() {
             return Err(VfsError::Exists);
         }
+        Self::guard(self.protection_of(parent, name), true)?;
         if !self.mutable_subtree(parent) || self.nodes[parent as usize].mode & 0o222 == 0 {
             return Err(VfsError::PermissionDenied);
         }
@@ -576,6 +761,7 @@ impl Vfs {
         if !self.mutable_subtree(node) || is_mutable_mount(&stored) {
             return Err(VfsError::PermissionDenied);
         }
+        Self::guard(self.node_protection(node), true)?;
         if directory && stored.kind != NodeKind::Directory {
             return Err(VfsError::NotDirectory);
         }
@@ -589,11 +775,11 @@ impl Vfs {
         {
             return Err(VfsError::NotEmpty);
         }
-        if self
+        let in_use = self
             .handles
             .iter()
-            .any(|handle| handle.open && handle.node == node)
-        {
+            .any(|handle| handle.open && handle.node == node);
+        if in_use && stored.kind == NodeKind::Directory {
             return Err(VfsError::Busy);
         }
         if stored.kind == NodeKind::Directory {
@@ -603,7 +789,13 @@ impl Vfs {
         } else if let Some(short) = self.persisted_short_name(&stored) {
             fat::delete_root_file(&short);
         }
-        self.release_node(node);
+        if in_use {
+            // The name is gone at once; the file stays for whoever has it open.
+            self.nodes[node as usize].parent = ORPHAN;
+            self.nodes[node as usize].name_len = 0;
+        } else {
+            self.release_node(node);
+        }
         Ok(())
     }
 
@@ -636,6 +828,11 @@ impl Vfs {
             return Err(VfsError::PermissionDenied);
         }
         let (destination_parent, destination_name) = self.resolve_parent(&destination_parsed)?;
+        Self::guard(self.node_protection(source_node), true)?;
+        Self::guard(
+            self.protection_of(destination_parent, destination_name),
+            true,
+        )?;
         if !self.mutable_subtree(destination_parent)
             || self.nodes[destination_parent as usize].mode & 0o222 == 0
         {
@@ -677,10 +874,11 @@ impl Vfs {
             {
                 return Err(VfsError::NotEmpty);
             }
-            if self
-                .handles
-                .iter()
-                .any(|handle| handle.open && handle.node == destination_node)
+            if destination_stored.kind == NodeKind::Directory
+                && self
+                    .handles
+                    .iter()
+                    .any(|handle| handle.open && handle.node == destination_node)
             {
                 return Err(VfsError::Busy);
             }
@@ -698,7 +896,16 @@ impl Vfs {
             }
         }
         if let Some(destination_node) = destination_node {
-            self.release_node(destination_node);
+            if self
+                .handles
+                .iter()
+                .any(|handle| handle.open && handle.node == destination_node)
+            {
+                self.nodes[destination_node as usize].parent = ORPHAN;
+                self.nodes[destination_node as usize].name_len = 0;
+            } else {
+                self.release_node(destination_node);
+            }
         }
         let mut name = [0; MAX_NAME];
         name[..destination_name.len()].copy_from_slice(destination_name.as_bytes());
@@ -711,7 +918,7 @@ impl Vfs {
     fn release_node(&mut self, node: u16) {
         let stored = self.nodes[node as usize];
         if stored.storage != STATIC_STORAGE {
-            MUTABLE_FILES.lock()[stored.storage as usize] = MutableFile::EMPTY;
+            MUTABLE_FILES.lock()[stored.storage as usize].clear();
         }
         self.nodes[node as usize] = Node::EMPTY;
     }
@@ -721,6 +928,7 @@ impl Vfs {
         if !self.mutable_subtree(node) || is_mutable_mount(&self.nodes[node as usize]) {
             return Err(VfsError::PermissionDenied);
         }
+        Self::guard(self.node_protection(node), true)?;
         self.nodes[node as usize].mode = mode & 0o777;
         Ok(())
     }
@@ -730,12 +938,13 @@ impl Vfs {
         if !self.mutable_subtree(node) {
             return Err(VfsError::PermissionDenied);
         }
+        Self::guard(self.node_protection(node), true)?;
         self.nodes[node as usize].mode = mode & 0o777;
         Ok(())
     }
 
     fn truncate(&mut self, descriptor: u32, length: usize) -> Result<(), VfsError> {
-        if length > MUTABLE_FILE_BYTES {
+        if length > TMP_FILE_BYTES {
             return Err(VfsError::FileTooLarge);
         }
         let node = self.handle_mut(descriptor)?.node;
@@ -746,6 +955,7 @@ impl Vfs {
         if stored.storage == STATIC_STORAGE {
             return Err(VfsError::PermissionDenied);
         }
+        Self::guard(self.node_protection(node), true)?;
         let persist_name = self.persisted_short_name(&stored);
         {
             let mut files = MUTABLE_FILES.lock();
@@ -753,16 +963,26 @@ impl Vfs {
             if !file.used {
                 return Err(VfsError::BadDescriptor);
             }
-            if length > file.length {
-                file.data[file.length..length].fill(0);
+            let limit = if persist_name.is_some() {
+                MUTABLE_FILE_BYTES
             } else {
-                file.data[length..file.length].fill(0);
+                TMP_FILE_BYTES
+            };
+            if !file.reserve(length, limit) {
+                return Err(VfsError::FileTooLarge);
+            }
+            let old = file.length;
+            let bytes = file.slice_mut();
+            if length > old {
+                bytes[old..length].fill(0);
+            } else {
+                bytes[length..old].fill(0);
             }
             file.length = length;
         }
         if let Some(short) = persist_name {
             let files = MUTABLE_FILES.lock();
-            fat::write_root_file(&short, &files[stored.storage as usize].data[..length]);
+            fat::write_root_file(&short, &files[stored.storage as usize].slice()[..length]);
         }
         Ok(())
     }
@@ -784,6 +1004,11 @@ impl Vfs {
         let mut cursor = node;
         loop {
             let stored = self.nodes[cursor as usize];
+            // A file whose name was removed while it was open came from a
+            // writable place (only those can be removed from).
+            if stored.parent == ORPHAN {
+                return true;
+            }
             if stored.parent == ROOT_NODE {
                 return stored.kind == NodeKind::Directory && is_mutable_mount(&stored);
             }
@@ -792,6 +1017,52 @@ impl Vfs {
             }
             cursor = stored.parent;
         }
+    }
+
+    /// How protected an entry `name` in directory `parent` is (see
+    /// `PROTECTED`), whether it exists yet or not.
+    fn protection_of(&self, parent: u16, name: &str) -> Protection {
+        let Some(data) = self.find_child(ROOT_NODE, "data") else {
+            return Protection::None;
+        };
+        let (mut cursor, mut entry) = (parent, name);
+        for _ in 0..MAX_DEPTH + 1 {
+            if cursor == data {
+                return PROTECTED
+                    .iter()
+                    .find(|(protected, _)| *protected == entry)
+                    .map_or(Protection::None, |(_, protection)| *protection);
+            }
+            let stored = &self.nodes[cursor as usize];
+            if cursor == ROOT_NODE || stored.parent == ORPHAN || stored.kind == NodeKind::Empty {
+                return Protection::None;
+            }
+            entry = stored.name_str();
+            cursor = stored.parent;
+        }
+        Protection::None
+    }
+
+    fn node_protection(&self, node: u16) -> Protection {
+        let stored = &self.nodes[node as usize];
+        if node == ROOT_NODE || stored.parent == ORPHAN {
+            return Protection::None;
+        }
+        self.protection_of(stored.parent, stored.name_str())
+    }
+
+    /// Refuses an unprivileged caller a protected file: any change to one, or
+    /// reading a secret one.
+    fn guard(protection: Protection, change: bool) -> Result<(), VfsError> {
+        let blocked = match protection {
+            Protection::None => false,
+            Protection::Changes => change,
+            Protection::Secret => true,
+        };
+        if blocked && caller_restricted() {
+            return Err(VfsError::PermissionDenied);
+        }
+        Ok(())
     }
 
     fn find_child(&self, parent: u16, name: &str) -> Option<u16> {
@@ -887,6 +1158,7 @@ impl Vfs {
         if stored.kind != NodeKind::File {
             return Err(VfsError::IsDirectory);
         }
+        Self::guard(self.node_protection(node), write || truncate)?;
         if write && stored.storage == STATIC_STORAGE {
             return Err(VfsError::PermissionDenied);
         }
@@ -901,6 +1173,7 @@ impl Vfs {
             {
                 let mut files = MUTABLE_FILES.lock();
                 let file = &mut files[stored.storage as usize];
+                file.release();
                 file.data.fill(0);
                 file.length = 0;
             }
@@ -932,6 +1205,7 @@ impl Vfs {
         if self.find_child(parent, name).is_some() {
             return Err(VfsError::Exists);
         }
+        Self::guard(self.protection_of(parent, name), true)?;
         let persist = self.find_child(ROOT_NODE, "data") == Some(parent);
         let short_name = if persist {
             Some(vfs_name_to_short(name).ok_or(VfsError::PersistNameUnsupported)?)
@@ -952,7 +1226,7 @@ impl Vfs {
         if let Some(short) = short_name
             && !fat::write_root_file(&short, &[])
         {
-            MUTABLE_FILES.lock()[slot] = MutableFile::EMPTY;
+            MUTABLE_FILES.lock()[slot].clear();
             return Err(VfsError::PermissionDenied);
         }
         match self.add_node(NodeKind::File, parent, name, mode & 0o666, &[]) {
@@ -961,7 +1235,7 @@ impl Vfs {
                 Ok(node)
             }
             Err(failure) => {
-                MUTABLE_FILES.lock()[slot] = MutableFile::EMPTY;
+                MUTABLE_FILES.lock()[slot].clear();
                 if let Some(short) = short_name {
                     fat::delete_root_file(&short);
                 }
@@ -995,6 +1269,7 @@ impl Vfs {
         if self.find_child(parent, name).is_some() {
             return Err(VfsError::Exists);
         }
+        Self::guard(self.protection_of(parent, name), true)?;
         let slot = {
             let mut files = MUTABLE_FILES.lock();
             let Some(slot) = files.iter().position(|file| !file.used) else {
@@ -1015,7 +1290,7 @@ impl Vfs {
                 Ok(node)
             }
             Err(failure) => {
-                MUTABLE_FILES.lock()[slot] = MutableFile::EMPTY;
+                MUTABLE_FILES.lock()[slot].clear();
                 Err(failure)
             }
         }
@@ -1103,6 +1378,7 @@ impl Vfs {
         if node.mode & READ_BITS == 0 {
             return Err(VfsError::PermissionDenied);
         }
+        Self::guard(self.node_protection(node_index), false)?;
         self.open_node(node_index)
     }
 
@@ -1186,12 +1462,12 @@ impl Vfs {
             count
         } else {
             let files = MUTABLE_FILES.lock();
-            let file = files[node.storage as usize];
+            let file = &files[node.storage as usize];
             if cursor >= file.length {
                 return Ok(0);
             }
             let count = file.length.saturating_sub(cursor).min(destination.len());
-            destination[..count].copy_from_slice(&file.data[cursor..cursor + count]);
+            destination[..count].copy_from_slice(&file.slice()[cursor..cursor + count]);
             count
         };
         self.handle_mut(descriptor)?.cursor =
@@ -1220,12 +1496,12 @@ impl Vfs {
             Ok(count)
         } else {
             let files = MUTABLE_FILES.lock();
-            let file = files[node.storage as usize];
+            let file = &files[node.storage as usize];
             if offset >= file.length {
                 return Ok(0);
             }
             let count = file.length.saturating_sub(offset).min(destination.len());
-            destination[..count].copy_from_slice(&file.data[offset..offset + count]);
+            destination[..count].copy_from_slice(&file.slice()[offset..offset + count]);
             Ok(count)
         }
     }
@@ -1252,10 +1528,20 @@ impl Vfs {
             end = start
                 .checked_add(source.len())
                 .ok_or(VfsError::OffsetOverflow)?;
-            if end > MUTABLE_FILE_BYTES {
+            let limit = if persist_name.is_some() {
+                MUTABLE_FILE_BYTES
+            } else {
+                TMP_FILE_BYTES
+            };
+            if !file.reserve(end, limit) {
                 return Err(VfsError::FileTooLarge);
             }
-            file.data[start..end].copy_from_slice(source);
+            let old = file.length;
+            let bytes = file.slice_mut();
+            if start > old {
+                bytes[old..start].fill(0);
+            }
+            bytes[start..end].copy_from_slice(source);
             file.length = file.length.max(end);
             persisted_length = file.length;
         }
@@ -1263,7 +1549,7 @@ impl Vfs {
             let files = MUTABLE_FILES.lock();
             fat::write_root_file(
                 &short,
-                &files[stored.storage as usize].data[..persisted_length],
+                &files[stored.storage as usize].slice()[..persisted_length],
             );
         }
         self.handle_mut(descriptor)?.cursor = end;
@@ -1294,13 +1580,20 @@ impl Vfs {
             let end = offset
                 .checked_add(source.len())
                 .ok_or(VfsError::OffsetOverflow)?;
-            if end > MUTABLE_FILE_BYTES {
+            let limit = if persist_name.is_some() {
+                MUTABLE_FILE_BYTES
+            } else {
+                TMP_FILE_BYTES
+            };
+            if !file.reserve(end, limit) {
                 return Err(VfsError::FileTooLarge);
             }
-            if offset > file.length {
-                file.data[file.length..offset].fill(0);
+            let old = file.length;
+            let bytes = file.slice_mut();
+            if offset > old {
+                bytes[old..offset].fill(0);
             }
-            file.data[offset..end].copy_from_slice(source);
+            bytes[offset..end].copy_from_slice(source);
             file.length = file.length.max(end);
             persisted_length = file.length;
         }
@@ -1308,7 +1601,7 @@ impl Vfs {
             let files = MUTABLE_FILES.lock();
             fat::write_root_file(
                 &short,
-                &files[stored.storage as usize].data[..persisted_length],
+                &files[stored.storage as usize].slice()[..persisted_length],
             );
         }
         Ok(source.len())
@@ -1358,6 +1651,9 @@ impl Vfs {
         let mut current = node;
         while current != ROOT_NODE {
             let entry = &self.nodes[current as usize];
+            if entry.parent == ORPHAN {
+                return 0;
+            }
             let name = &entry.name[..entry.name_len as usize];
             if position < name.len() + 1 {
                 return 0;
@@ -1400,11 +1696,20 @@ impl Vfs {
 
     fn close(&mut self, descriptor: u32) -> Result<(), VfsError> {
         let handle = self.handle_mut(descriptor)?;
+        let node = handle.node;
         handle.open = false;
         handle.cursor = 0;
         // Bit 15 stays clear so a descriptor never has its top bit set (that
         // marks the persistent mount's descriptors).
         handle.generation = (handle.generation.wrapping_add(1) & 0x3fff).max(1);
+        if self.nodes[node as usize].parent == ORPHAN
+            && !self
+                .handles
+                .iter()
+                .any(|handle| handle.open && handle.node == node)
+        {
+            self.release_node(node);
+        }
         Ok(())
     }
 
@@ -1516,7 +1821,7 @@ static FILESYSTEM: TicketLock<Vfs> = TicketLock::new(Vfs::new());
 static MUTABLE_FILES: TicketLock<[MutableFile; MAX_MUTABLE_FILES]> =
     TicketLock::new([MutableFile::EMPTY; MAX_MUTABLE_FILES]);
 
-pub fn initialize(entries: &[InitramfsEntry], more: &[InitramfsEntry]) -> VfsStats {
+pub fn initialize(entries: &[InitramfsEntry], more: &[&[InitramfsEntry]]) -> VfsStats {
     *MUTABLE_FILES.lock() = [MutableFile::EMPTY; MAX_MUTABLE_FILES];
     let mut filesystem = FILESYSTEM.lock();
     filesystem.reset();
@@ -1545,6 +1850,19 @@ pub fn file(path: &str) -> Result<FileView, VfsError> {
 
 /// True when a program at `path` has to be read through `with_home_file`
 /// rather than viewed in place: it lives on a volume or in the upper layer.
+/// Whether `path` is a regular file that may be run: it needs an execute bit,
+/// except on a FAT volume, which has no modes (everything there is plain
+/// 0644) and is scanned when it is run instead.
+pub fn may_execute(path: &str) -> bool {
+    let Ok(metadata) = metadata(path) else {
+        return false;
+    };
+    if metadata.mode & 0o170000 != 0o100000 {
+        return false;
+    }
+    metadata.mode & 0o111 != 0 || datafs::route(path).is_some()
+}
+
 pub fn needs_buffer(path: &str) -> bool {
     crate::datafs::route(path).is_some() || crate::overlay::replaced(path)
 }
@@ -1624,6 +1942,9 @@ pub fn open_file(
     }
     if let Some(mapped) = crate::mounts::resolve(path) {
         return open_file(mapped.as_str(), create, exclusive, truncate, mode, write);
+    }
+    if create || truncate || write {
+        guard_path(path)?;
     }
     if let Some((mount, rest)) = home(path) {
         let descriptor = datafs::open_file(mount, rest, create, exclusive, truncate, write, path)?;
@@ -1867,6 +2188,7 @@ pub fn create_directory(path: &str, mode: u16) -> Result<(), VfsError> {
     if let Some(mapped) = crate::mounts::resolve(path) {
         return create_directory(mapped.as_str(), mode);
     }
+    guard_path(path)?;
     if let Some((mount, rest)) = home(path) {
         return datafs::create_directory(mount, rest);
     }
@@ -1906,6 +2228,7 @@ pub fn remove(path: &str, directory: bool) -> Result<(), VfsError> {
     if let Some(mapped) = crate::mounts::resolve(path) {
         return remove(mapped.as_str(), directory);
     }
+    guard_path(path)?;
     if let Some((mount, rest)) = home(path) {
         return datafs::remove(mount, rest, directory);
     }
@@ -1983,6 +2306,8 @@ pub fn rename(source: &str, destination: &str) -> Result<(), VfsError> {
     if let Some((from, to)) = bound_rename_paths(source, destination)? {
         return rename(from.as_str(), to.as_str());
     }
+    guard_path(source)?;
+    guard_path(destination)?;
     if let Some(result) = crate::overlay::rename(source, destination, false) {
         return result;
     }
@@ -1999,6 +2324,8 @@ pub fn rename_noreplace(source: &str, destination: &str) -> Result<(), VfsError>
     if let Some((from, to)) = bound_rename_paths(source, destination)? {
         return rename_noreplace(from.as_str(), to.as_str());
     }
+    guard_path(source)?;
+    guard_path(destination)?;
     if let Some(result) = crate::overlay::rename(source, destination, true) {
         return result;
     }
@@ -2015,6 +2342,7 @@ pub fn chmod(path: &str, mode: u16) -> Result<(), VfsError> {
     if let Some(mapped) = crate::mounts::resolve(path) {
         return chmod(mapped.as_str(), mode);
     }
+    guard_path(path)?;
     if let Some((mount, rest)) = home(path) {
         return datafs::chmod(mount, rest, mode);
     }
@@ -2029,6 +2357,7 @@ pub fn fchmod(descriptor: u32, mode: u16) -> Result<(), VfsError> {
         return Err(VfsError::IsDirectory);
     }
     if is_mounted_descriptor(descriptor) {
+        guard_descriptor(descriptor)?;
         return datafs::fchmod(descriptor, mode);
     }
     FILESYSTEM.lock().fchmod(descriptor, mode)
@@ -2039,6 +2368,7 @@ pub fn truncate(descriptor: u32, length: usize) -> Result<(), VfsError> {
         return Err(VfsError::IsDirectory);
     }
     if is_mounted_descriptor(descriptor) {
+        guard_descriptor(descriptor)?;
         let result = datafs::truncate(descriptor, length);
         if result.is_ok() {
             datafs::mark_dirty(descriptor);
@@ -2050,6 +2380,14 @@ pub fn truncate(descriptor: u32, length: usize) -> Result<(), VfsError> {
         FILESYSTEM.lock().mark_dirty(descriptor);
     }
     result
+}
+
+/// `guard_path` for a file already open on a volume.
+fn guard_descriptor(descriptor: u32) -> Result<(), VfsError> {
+    match datafs::descriptor_path(descriptor) {
+        Some((bytes, length)) => guard_path(core::str::from_utf8(&bytes[..length]).unwrap_or("/x")),
+        None => Ok(()),
+    }
 }
 
 pub fn stats() -> VfsStats {

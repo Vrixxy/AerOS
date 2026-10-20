@@ -54,6 +54,7 @@ mod image;
 mod inflate;
 mod initramfs;
 mod initramfs_gnu;
+mod initramfs_perl;
 mod installer;
 mod ioapic;
 mod iommu;
@@ -493,19 +494,32 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     scheduler::set_default_cr3(paging.root_physical);
     arch::paging::set_boot_state(&paging);
     let demand_paging_ready = arch::paging::demand_init(&paging, &mut frames);
-    const DEMAND_POOL_PAGES: u64 = 4096;
-    let demand_pool_installed = frames
-        .allocate_contiguous(DEMAND_POOL_PAGES, 1)
-        .and_then(|block| FrameAllocator::from_range(block.address(), DEMAND_POOL_PAGES))
-        .map(memory::install_global)
-        .is_some();
+    // Every process's pages (and the shared libraries a dynamically linked
+    // program maps) come from this pool: as much as a third of the usable
+    // memory, from 16 MiB up to 128 MiB.
+    let usable_pages = boot.memory.usable_pages() + boot.memory.reclaimable_pages();
+    let mut demand_pool_pages = 0u64;
+    let demand_pool_installed = [32768u64, 16384, 8192, 4096].into_iter().any(|pages| {
+        if pages > 4096 && pages * 3 > usable_pages {
+            return false;
+        }
+        let installed = frames
+            .allocate_contiguous(pages, 1)
+            .and_then(|block| FrameAllocator::from_range(block.address(), pages))
+            .map(memory::install_global)
+            .is_some();
+        if installed {
+            demand_pool_pages = pages;
+        }
+        installed
+    });
     let demand_paging =
         demand_paging_ready && demand_pool_installed && arch::paging::demand_self_test();
     let demand_stats = arch::paging::demand_stats();
     serial::format(format_args!(
         "AEROS_DEMAND_PAGING ready={} pool_pages={} reserved={} committed={} faults={} verified={}\n",
         demand_paging_ready,
-        DEMAND_POOL_PAGES,
+        demand_pool_pages,
         demand_stats.reserved_pages,
         demand_stats.committed_pages,
         demand_stats.faults_handled,
@@ -800,7 +814,10 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         arch::halt_forever();
     }
     let initramfs_entries = initramfs::entries();
-    let vfs_stats = vfs::initialize(&initramfs_entries, &initramfs_gnu::GNU);
+    let vfs_stats = vfs::initialize(
+        &initramfs_entries,
+        &[&initramfs_gnu::GNU, &initramfs_perl::PERL_FILES],
+    );
     let home = datafs::initialize();
     let assembled_volumes = raid::assemble();
     if assembled_volumes != 0 {
@@ -1100,8 +1117,12 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     let runtime_vfs = vfs::stats();
     let tmpfs_valid = runtime_vfs.verified
         && runtime_vfs.nodes == runtime_vfs.directories + runtime_vfs.files
-        && runtime_vfs.directories == 14
-        && runtime_vfs.files == initramfs::entries().len() + initramfs_gnu::GNU.len() + 1
+        && runtime_vfs.directories == 48
+        && runtime_vfs.files
+            == initramfs::entries().len()
+                + initramfs_gnu::GNU.len()
+                + initramfs_perl::PERL_FILES.len()
+                + 1
         && runtime_vfs.mutable_files == 1
         && runtime_vfs.mutable_bytes == 6
         && runtime_vfs.open_handles == 0;
@@ -2661,6 +2682,14 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         internet.echo_reply,
         internet.verified
     ));
+    #[cfg(feature = "boot-test")]
+    if internet.verified {
+        let (loopback, gateway) = net::echo_socket_self_test(internet.gateway_ip);
+        serial::format(format_args!(
+            "AEROS_PING_SOCKET loopback={loopback} gateway={gateway} verified={}\n",
+            loopback && gateway
+        ));
+    }
     serial::format(format_args!(
         "AEROS_UDP_DNS server={}.{}.{}.{} tx={} rx={} udp_checksum={} response={} answers={} address={}.{}.{}.{} verified={}\n",
         internet.dns_ip[0],

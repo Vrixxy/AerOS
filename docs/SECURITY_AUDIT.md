@@ -8,7 +8,9 @@ This is the project's own review of its security mechanisms, written from the co
 | --- | --- | --- |
 | User code against the kernel | Ring 3 with SMEP, SMAP and NX where the CPU has them; every user pointer goes through `user::copy_*` / `range_accessible`, which check the task's own range and the page tables | `arch/user.rs`, `arch/paging.rs` |
 | One process against another | Separate page tables, per-process ASLR slot, copy-on-write fork with frame reference counts | `arch/paging.rs`, `scheduler.rs` |
-| A process against its own privileges | Linux capability sets that only shrink (`capset`); enforced for CHOWN, KILL, NET_BIND_SERVICE, SYS_PTRACE, SYS_ADMIN, SYS_BOOT, SYS_NICE, SYS_TIME | `capability.rs`, `syscall.rs` |
+| A process against its own privileges | Linux capability sets that only shrink (`capset`); enforced for CHOWN, KILL, NET_BIND_SERVICE, SYS_PTRACE, SYS_ADMIN, SYS_BOOT, SYS_NICE, SYS_TIME, DAC_OVERRIDE. A program started from the shell without `ear` starts with only NET_BIND_SERVICE; with `ear` it has all of them | `capability.rs`, `syscall.rs`, `shell.rs` |
+| Programs against each other | A process may signal, trace (`ptrace`, `process_vm_*`) or re-prioritise only itself and what it started, unless it has the capability; no process may signal a kernel task | `scheduler::may_signal`, `syscall.rs` |
+| Unprivileged callers against the system's files | The account file and quarantine are unreadable, and the antivirus signatures, audit log, measurement reference, lockout state, system image (through the union root), `/home/.root` and `/home/pkg` unchangeable, for a program without DAC_OVERRIDE and for an unelevated shell command; the check is in the VFS below symlinks and bind mounts. An execute bit is needed to run a program (FAT volumes have no modes and are scanned instead) | `vfs.rs` (`PROTECTED`, `caller_restricted`) |
 | A process against the syscall surface | seccomp strict and filter mode (one filter per process, inherited by fork) | `seccomp.rs`, `syscall.rs` |
 | A user against another user | Account database with PBKDF2 hashing, lockout, lock screen with idle timeout, `ear` elevation with re-authentication | `auth.rs`, `shell.rs` |
 | Devices against memory | AMD-Vi IOMMU: devices reach only the DMA memory drivers registered and the buffer lent for one transfer; everything else is blocked and logged | `iommu.rs` |
@@ -16,7 +18,7 @@ This is the project's own review of its security mechanisms, written from the co
 | Installed software | Ed25519-signed packages, hash-checked writes, rollback | `pkg.rs`, `ed25519.rs` |
 | Programs on disk | Scan on exec (`antivirus.rs`), quarantine | `antivirus.rs` |
 | History | Persistent audit log of logins, elevation, seccomp kills and similar events | `audit.rs` |
-| A guest against the host | AMD-V with nested paging; the guest sees only its own RAM and the devices the bridge gives it | `svm.rs` |
+| A guest against the host | AMD-V with nested paging; the guest sees only its own RAM and the devices the bridge gives it. Guest addresses in virtio rings are bounds-checked on every access; MSRs that reach the host (VM_HSAVE_PA, SMM, SYSCFG, MTRRs, microcode, SPEC_CTRL, the local APIC and others) and the SVM instructions are intercepted | `svm.rs` |
 
 ## Debugging interface
 
@@ -35,14 +37,18 @@ Every run exercises ASLR, SMEP/SMAP set-up, seccomp strict and filter modes, cap
 - Fork snapshots lost the thread pointer (FS base) for new threads.
 - Event-log overflow in the IOMMU stopped fault reporting until the status bit was cleared.
 
+- Second-review findings (October 2026): unelevated programs held every capability; any process could signal kernel tasks and read another process's memory with `process_vm_readv`; protected files were writable by any program; `MAP_FIXED` over existing pages could leave a mapping of a freed frame; the Linux guest could reach host memory through unchecked virtio addresses and host state through unintercepted MSRs and SVM instructions; the "forgot password" reset on a locked session let someone into the running session.
+- Overflow on outside input (the kernel keeps overflow checks, so each is a crash): USB HID descriptors and reports, AerFS tree heights, `mremap` sizes, signal frames, timer periods, network-card lengths. The boot fuzzer now covers USB descriptors.
+- `exec` ignored the execute bit; the failed-sign-in count reset at every restart; swap was written in the clear; the guest could set the host's SPEC_CTRL. All fixed.
+
 ## Known weaknesses
 
 - Kernel image randomisation covers the image only: at boot the kernel copies itself to a random 2 MiB-aligned place in free memory and relocates there (about 7 bits of entropy in a 512 MiB machine, 13 or more on a real one). Physical memory is still mapped at its own addresses (the kernel runs on an identity map, with no higher-half or randomised direct map), so the layout of RAM is known and a read primitive that can scan RAM would still find the image. If there is no hardware random generator the move uses the timestamp counter, which is weak. If firmware has no free region large enough (the image is 71 MiB in memory) it stays where it was loaded.
 - The kernel's stack protector (`-Zstack-protector=strong`, a random cookie per boot) catches overwritten return addresses in functions with buffers, but it is a mitigation, not a guarantee, and there is `unsafe` code throughout the drivers. It depends on an unstable compiler flag.
-- Swap writes user pages to the swap partition unencrypted and does not wipe slots when they are freed.
+- Swap pages are encrypted with a key that lives only in memory, so a powered-off machine or a freed slot holds nothing readable; while the machine runs, the key and the ciphertext are both reachable by anything that can read kernel memory or the disk.
 - Nothing verifies the kernel image the firmware loads: updates are signature-checked and a changed image is reported at the next boot (software measurement), but there is no UEFI Secure Boot signing and no TPM driver, so an attacker who can write the boot volume can replace both the image and its sealed digest.
 - `/home` is not encrypted.
-- Every process starts as root with every capability; the capability model can only be used to give privileges away, not to grant them from a lower-privilege start.
+- There is one uid (root). Privilege is the capability set, which only shrinks: a shell user's programs start without capabilities, but a program cannot gain them, and a process started by an elevated (`ear`) command has all of them. System V shared memory, semaphores and queues have no owner or permission bits, so any process that knows a key can use them.
 - TLS 1.3 exists as a client (`https` shell command, `tlsnet.rs`) but nothing else uses it yet: the desktop browser and the package manager still speak plain HTTP, the latter protected by its own signatures. The client has no revocation checking and refuses certificates with name constraints rather than enforcing them; the root table is a snapshot of the Mozilla list and does not update by itself; AES-GCM uses a table-lookup S-box (cache-timing exposure), so ChaCha20-Poly1305 is offered first; the big-number code used for signature checks is variable-time, which is fine for public keys and signatures but must never be reused for secrets. There is no server side.
 - IOMMU coverage is AMD-V only, one shared domain for all devices (a compromised device can reach another driver's DMA buffers), no interrupt remapping, and it has been run only in QEMU.
 - ACPI AML from firmware is executed in the kernel without sandboxing; a malicious table could read mapped physical memory and write device registers (reads and writes outside mapped memory are refused).

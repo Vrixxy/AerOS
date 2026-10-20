@@ -23,9 +23,11 @@ pub static DYNHELLO: &[u8] = include_bytes!("../../assets/userspace/dynhello");
 /// Debian's glibc and its dynamic loader, the libraries such programs need.
 pub static LD_SO: &[u8] = include_bytes!("../../assets/userspace/lib/ld-linux-x86-64.so.2");
 pub static LIBC: &[u8] = include_bytes!("../../assets/userspace/lib/libc.so.6");
+/// A glibc test program using threads, signals, sockets, dlopen and more.
+pub static DYNTEST: &[u8] = include_bytes!("../../assets/userspace/dyntest");
 pub static RELEASE: &[u8] = b"AerOS 0.1.0 x86_64\n";
 
-pub fn entries() -> [InitramfsEntry; 18] {
+pub fn entries() -> [InitramfsEntry; 19] {
     [
         InitramfsEntry {
             path: "/bin/init",
@@ -100,6 +102,11 @@ pub fn entries() -> [InitramfsEntry; 18] {
         InitramfsEntry {
             path: "/bin/ldconfig",
             data: LDCONFIG,
+            mode: 0o555,
+        },
+        InitramfsEntry {
+            path: "/bin/dyntest",
+            data: DYNTEST,
             mode: 0o555,
         },
         InitramfsEntry {

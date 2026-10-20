@@ -38,6 +38,9 @@ enum Owner {
     /// Created by a kernel client's first send; recycled oldest first.
     Kernel,
     Socket,
+    /// An ICMP echo ("ping") socket: its port is the echo identifier, and it
+    /// takes echo replies, never UDP.
+    Echo,
 }
 
 #[derive(Clone, Copy)]
@@ -167,8 +170,43 @@ pub fn port_of(slot: usize) -> Option<u16> {
     table
         .bindings
         .get(slot)
-        .filter(|binding| binding.owner == Owner::Socket)
+        .filter(|binding| matches!(binding.owner, Owner::Socket | Owner::Echo))
         .map(|binding| binding.port)
+}
+
+/// An identifier for a ping socket, from the ephemeral range.
+pub fn bind_echo() -> Result<usize, u64> {
+    let mut table = TABLE.lock();
+    claim(&mut table, 0, Owner::Echo)
+}
+
+/// Queues an echo reply (the whole ICMP message) for the ping socket whose
+/// identifier is `identity`.
+pub fn deliver_echo(identity: u16, source: Address, message: &[u8]) -> bool {
+    if message.len() > MAX_PAYLOAD {
+        return false;
+    }
+    let mut table = TABLE.lock();
+    let Some(index) = table
+        .bindings
+        .iter()
+        .position(|binding| binding.owner == Owner::Echo && binding.port == identity)
+    else {
+        return false;
+    };
+    let binding = &mut table.bindings[index];
+    if binding.count == QUEUE {
+        table.dropped += 1;
+        return true;
+    }
+    let slot = (binding.head + binding.count) % QUEUE;
+    let datagram = &mut binding.queue[slot];
+    datagram.source = source;
+    datagram.source_port = 0;
+    datagram.length = message.len();
+    datagram.data[..message.len()].copy_from_slice(message);
+    binding.count += 1;
+    true
 }
 
 pub fn release(slot: usize) {
@@ -210,11 +248,9 @@ pub fn deliver(port: u16, source: Address, source_port: u16, payload: &[u8]) -> 
         return false;
     }
     let mut table = TABLE.lock();
-    let Some(index) = table
-        .bindings
-        .iter()
-        .position(|binding| binding.owner != Owner::Free && binding.port == port)
-    else {
+    let Some(index) = table.bindings.iter().position(|binding| {
+        !matches!(binding.owner, Owner::Free | Owner::Echo) && binding.port == port
+    }) else {
         return false;
     };
     let binding = &mut table.bindings[index];

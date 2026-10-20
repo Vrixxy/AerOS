@@ -408,7 +408,8 @@ impl<D: Device> AerFs<D> {
             return None;
         }
         let crc = u32::from_le_bytes([sector[508], sector[509], sector[510], sector[511]]);
-        if crc != crc32(&sector[..508]) {
+        // A tree taller than this one writes would overrun the scratch blocks.
+        if crc != crc32(&sector[..508]) || sector[40] > MAX_HEIGHT {
             return None;
         }
         let word = |at: usize| {
@@ -737,7 +738,11 @@ impl<D: Device> AerFs<D> {
         if read < INODE_SIZE {
             return Ok(Inode::FREE);
         }
-        Ok(Inode::decode(&raw))
+        let inode = Inode::decode(&raw);
+        if inode.tree.height > MAX_HEIGHT {
+            return Err(Error::Corrupt);
+        }
+        Ok(inode)
     }
 
     fn put_inode(&mut self, ino: u32, inode: &Inode) -> Result<(), Error> {
@@ -1312,7 +1317,9 @@ impl<D: Device> AerFs<D> {
         if ptr.block == 0 {
             return Ok(());
         }
-        if ptr.block < 2 || ptr.block >= self.working.blocks {
+        // Every block belongs to one tree once; a repeat is a damaged or
+        // looping volume.
+        if ptr.block < 2 || ptr.block >= self.working.blocks || bit(&self.used, ptr.block) {
             return Err(Error::Corrupt);
         }
         set_bit(&mut self.used, ptr.block, true);

@@ -13,7 +13,7 @@ const STACK_ALIGNMENT: usize = 16;
 /// Syscalls and interrupts run on this stack, where `fork`, `execve` and the
 /// process-creation paths build and copy `ProcessAddressSpace` values (about
 /// 33 KiB each, by value), so it is deliberately large.
-const INTERRUPT_STACK_SIZE: usize = 224 * 1024;
+const INTERRUPT_STACK_SIZE: usize = 256 * 1024;
 const RSP0_CPU: usize = 0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -848,11 +848,42 @@ pub fn spawn_process_with(
     path: &str,
     args: &[&[u8]],
 ) -> Option<(u64, usize, arch::paging::ProcessAddressSpace)> {
+    spawn_process_capturing(
+        state,
+        code,
+        path,
+        args,
+        None,
+        crate::capability::Capabilities::FULL,
+    )
+}
+
+/// `spawn_process_with`, with the program's output (descriptors 1 and 2)
+/// going into the capture pipe `capture` (`syscall::capture_create`) and the
+/// capability sets it starts with.
+pub fn spawn_process_capturing(
+    state: &arch::paging::PagingState,
+    code: &[u8],
+    path: &str,
+    args: &[&[u8]],
+    capture: Option<usize>,
+    capabilities: crate::capability::Capabilities,
+) -> Option<(u64, usize, arch::paging::ProcessAddressSpace)> {
     // On-execute protection: a detected image never gets an address space.
     if crate::antivirus::blocks_exec(code) {
         return None;
     }
-    let mut space = arch::paging::create_process(state, code)?;
+    // A dynamically linked program starts through its interpreter.
+    let parsed = crate::elf::ElfImage::parse(code);
+    let interpreter = match &parsed {
+        Ok(image) => match image.interpreter() {
+            Some(interpreter_path) => Some(crate::vfs::file(interpreter_path).ok()?),
+            None => None,
+        },
+        Err(_) => None,
+    };
+    let mut space =
+        arch::paging::create_process_with(state, code, interpreter.as_ref().map(|file| file.data))?;
     if !space.verified {
         arch::paging::destroy_process(&space);
         return None;
@@ -863,18 +894,26 @@ pub fn spawn_process_with(
     // hand, needs the standard argc/argv/envp/auxv contract set up before
     // it runs, or any std-linked binary's runtime init segfaults reading
     // `AT_RANDOM` off what would otherwise be a zeroed stack.
-    if let Ok(image) = crate::elf::ElfImage::parse(code)
-        && !crate::process::prepare_scheduled_process_stack_with(
+    if let Ok(image) = parsed {
+        let interpreter_base = if interpreter.is_some() {
+            arch::paging::process_virtual_base(space.user_slot)
+                + arch::paging::interpreter_bias(&image)
+        } else {
+            0
+        };
+        // A new process gets a minimal environment, as `init` would give it.
+        let environment: [&[u8]; 3] = [b"PATH=/bin:/usr/bin", b"HOME=/tmp", b"TERM=dumb"];
+        if !crate::process::prepare_scheduled_process_stack_with(
             &mut space,
             &image,
             path,
             args,
-            &[],
-            0,
-        )
-    {
-        arch::paging::destroy_process(&space);
-        return None;
+            &environment,
+            interpreter_base,
+        ) {
+            arch::paging::destroy_process(&space);
+            return None;
+        }
     }
     let user_start = arch::paging::process_virtual_base(space.user_slot);
     let user_end = arch::paging::process_reserved_end(user_start);
@@ -884,6 +923,10 @@ pub fn spawn_process_with(
     };
     arch::disable_interrupts();
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    if let Some(pipe) = capture {
+        crate::syscall::attach_capture_pipe(&mut scheduler.tasks[slot].process_state, pipe);
+    }
+    crate::syscall::set_state_capabilities(&mut scheduler.tasks[slot].process_state, capabilities);
     scheduler.tasks[slot].cr3 = space.root_physical;
     scheduler.tasks[slot].process_space = Some(space);
     set_exe(&mut scheduler.tasks[slot], path);
@@ -1175,6 +1218,51 @@ pub fn parent_of(id: u64) -> Option<u64> {
         .iter()
         .position(|task| task.id == id && task.id != 0 && task.state != TaskState::Empty)?;
     Some(scheduler.tasks[scheduler.leader_slot(slot)].parent_id)
+}
+
+/// Whether the running task may send a signal to task `id`. A kernel task
+/// (the desktop, a driver) never takes one; with `any_process` (`CAP_KILL`)
+/// every process may be signalled, otherwise only the caller's own process
+/// and the processes it started, directly or not. An id that is no task is
+/// let through (for the caller to report) only with `any_process`.
+pub fn may_signal(id: u64, any_process: bool) -> bool {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    let Some(slot) = scheduler
+        .tasks
+        .iter()
+        .position(|task| task.id == id && task.id != 0 && task.state != TaskState::Empty)
+    else {
+        return any_process;
+    };
+    let leader = scheduler.leader_slot(slot);
+    let target = &scheduler.tasks[leader];
+    if target.state == TaskState::Exited {
+        return true;
+    }
+    if target.user_entry == 0 && target.process_space.is_none() {
+        return false;
+    }
+    if any_process {
+        return true;
+    }
+    let me = scheduler.group(scheduler.current);
+    let mut cursor = leader;
+    for _ in 0..MAX_TASKS {
+        if scheduler.group(cursor) == me {
+            return true;
+        }
+        let parent = scheduler.tasks[cursor].parent_id;
+        let Some(next) = scheduler
+            .tasks
+            .iter()
+            .position(|task| parent != 0 && task.id == parent && task.state != TaskState::Empty)
+        else {
+            return false;
+        };
+        cursor = scheduler.leader_slot(next);
+    }
+    false
 }
 
 /// A copy of the running task's address-space bookkeeping, `None` for a task
@@ -1745,6 +1833,19 @@ pub fn current_children_cpu_time() -> (u64, u64) {
     let leader = scheduler.leader_slot(scheduler.current);
     let task = &scheduler.tasks[leader];
     (task.children_user_ns, task.children_system_ns)
+}
+
+/// The exit status of a child that has ended (and is then reaped), without
+/// waiting for it.
+pub fn finished_child(child_id: u64) -> Option<u64> {
+    let slot = slot_for_id(child_id)?;
+    let exit_code = USER_TASK_EXIT[slot].load(Ordering::Acquire);
+    if exit_code == u64::MAX {
+        return None;
+    }
+    mark_waited(slot);
+    reap();
+    Some(exit_code)
 }
 
 pub fn wait_for_child(child_id: u64) -> Option<u64> {

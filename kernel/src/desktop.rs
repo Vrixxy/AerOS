@@ -963,6 +963,8 @@ struct DesktopState {
     login_error_until_ns: u64,
     login_typed_ns: u64,
     persist_account: bool,
+    /// Someone reached the desktop since the machine started.
+    session_used: bool,
     terminal_input: [u8; SHELL_LINE_MAX],
     terminal_input_len: usize,
     /// Bytes between the caret and the end of the line (0 = at the end).
@@ -1177,6 +1179,7 @@ impl DesktopState {
             login_error_until_ns: 0,
             login_typed_ns: 0,
             persist_account: false,
+            session_used: false,
             terminal_input: [0; SHELL_LINE_MAX],
             terminal_input_len: 0,
             terminal_back: 0,
@@ -1394,6 +1397,9 @@ impl DesktopState {
     }
 
     fn set_screen(&mut self, target: Screen) {
+        if target == Screen::Desktop {
+            self.session_used = true;
+        }
         if self.screen != target {
             self.reveal_password = false;
             let now = crate::time::monotonic_nanoseconds();
@@ -3123,12 +3129,20 @@ impl DesktopState {
         let removed = self.persist_account && vfs::remove(ACCOUNT_PATH, false).is_ok();
         serial::format(format_args!("AEROS_ACCOUNT reset=true removed={removed}\n"));
         crate::audit::record("ACCOUNT", format_args!("reset removed={removed}"));
+        // What a locked session still holds (its windows, the terminal, what
+        // is in memory) is not the new account's: once someone has signed in,
+        // the reset restarts the machine and setup runs on a fresh boot.
+        if self.persist_account && self.session_used {
+            serial::line("AEROS_REBOOT_REQUESTED source=account_reset");
+            arch::reboot();
+        }
         self.reset_open = false;
         self.credential = None;
         self.username_len = 0;
         self.username_input = [0; MAX_NAME];
         self.account_unsaved = false;
         self.lockout = crate::auth::Lockout::new();
+        self.save_lockout();
         self.setup_error = "";
         self.kb_search_len = 0;
         self.kb_cursor = 0;
@@ -3189,11 +3203,13 @@ impl DesktopState {
         );
         if matches_password {
             self.lockout.record_success();
+            self.save_lockout();
             self.set_screen(Screen::Desktop);
         } else {
             let now = crate::time::monotonic_nanoseconds();
             if had_input {
                 self.lockout.record_failure(now);
+                self.save_lockout();
             }
             self.login_error_until_ns = now.saturating_add(LOGIN_ERROR_NS);
             self.motion_until_ns = self
@@ -3408,8 +3424,14 @@ fn terminal_submit(state: &mut DesktopState, shell: &mut shell::Shell<'_>) -> sh
         "AEROS_SHELL_EXEC sequence={executed} status={status} elevations={elevated} denied={denied} verified=true\n",
     ));
     for line in output.as_str().split('\n') {
-        if !line.is_empty() {
-            state.terminal_push_line(line);
+        let mut rest = line;
+        while !rest.is_empty() {
+            let mut cut = rest.len().min(SHELL_LINE_MAX);
+            while !rest.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            state.terminal_push_line(&rest[..cut]);
+            rest = &rest[cut..];
         }
     }
     control
@@ -3465,11 +3487,13 @@ fn terminal_submit_password(
     if !correct {
         if had_input {
             state.lockout.record_failure(now);
+            state.save_lockout();
         }
         state.terminal_push_line("ear: incorrect password");
         return shell::Control::None;
     }
     state.lockout.record_success();
+    state.save_lockout();
     shell.note_authenticated();
     let mut output: shell::Text<{ shell::MAX_OUTPUT }> = shell::Text::new();
     let control = shell.execute(command.as_str(), &mut output);
@@ -3529,12 +3553,14 @@ fn terminal_submit_passwd_stage(state: &mut DesktopState) -> shell::Control {
             if !correct {
                 if had_input {
                     state.lockout.record_failure(now);
+                    state.save_lockout();
                 }
                 state.terminal_push_line("passwd: incorrect password");
                 state.terminal_passwd_stage = None;
                 return shell::Control::None;
             }
             state.lockout.record_success();
+            state.save_lockout();
             state.terminal_passwd_stage = Some(PasswdStage::New);
             state.terminal_push_line("New password:");
         }
@@ -10993,6 +11019,8 @@ fn draw_eye(painter: &mut Painter<'_>, layout: Layout, bounds: Rect, on: bool) {
 
 const ACCOUNT_PATH: &str = "/data/ACCOUNT.DAT";
 const ACCOUNT_MAGIC: &[u8; 4] = b"AEA1";
+const LOCKOUT_PATH: &str = "/data/LOCKOUT.DAT";
+const LOCKOUT_MAGIC: &[u8; 4] = b"AEL1";
 
 impl DesktopState {
     /// Keeps the account (name + salted password hash, never the password)
@@ -11051,7 +11079,53 @@ impl DesktopState {
         self.username_input[..name_len].copy_from_slice(&data[5..5 + name_len]);
         self.username_len = name_len;
         self.credential = Some(credential);
+        self.load_lockout();
         true
+    }
+
+    /// The failed-sign-in count and any wait outlive a restart, so rebooting is
+    /// not a way past the throttle.
+    fn save_lockout(&self) {
+        if !self.persist_account {
+            return;
+        }
+        let now = crate::time::monotonic_nanoseconds();
+        let mut buffer = [0u8; 16];
+        buffer[..4].copy_from_slice(LOCKOUT_MAGIC);
+        buffer[4..8].copy_from_slice(&self.lockout.failures().to_le_bytes());
+        let unlock = crate::rtc::unix_seconds().saturating_add(self.lockout.seconds_left(now));
+        buffer[8..16].copy_from_slice(&unlock.to_le_bytes());
+        let path = LOCKOUT_PATH;
+        if self.lockout.failures() == 0 {
+            let _ = vfs::remove(path, false);
+            return;
+        }
+        if let Ok(descriptor) = vfs::open_file(path, true, false, true, 0o600, true) {
+            let _ = vfs::write(descriptor, &buffer, false);
+            let _ = vfs::close(descriptor);
+        }
+    }
+
+    #[cfg_attr(feature = "boot-test", allow(dead_code))]
+    fn load_lockout(&mut self) {
+        let Ok(descriptor) = vfs::open_file(LOCKOUT_PATH, false, false, false, 0, false) else {
+            return;
+        };
+        let mut buffer = [0u8; 17];
+        let read = vfs::read(descriptor, &mut buffer);
+        let _ = vfs::close(descriptor);
+        if read != Ok(16) || &buffer[..4] != LOCKOUT_MAGIC {
+            return;
+        }
+        let failures = u32::from_le_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
+        let mut unlock = [0u8; 8];
+        unlock.copy_from_slice(&buffer[8..16]);
+        let remaining = u64::from_le_bytes(unlock).saturating_sub(crate::rtc::unix_seconds());
+        self.lockout = crate::auth::Lockout::restored(
+            failures,
+            remaining,
+            crate::time::monotonic_nanoseconds(),
+        );
     }
 
     fn apply_volume(&self) {

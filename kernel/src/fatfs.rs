@@ -1303,7 +1303,10 @@ impl Fs {
     /// Ends the chain at `first`'s last good cluster, as `fsck_chain` found it.
     fn fsck_cut(&mut self, first: u32, report: &mut FsckReport) -> Result<(), FsError> {
         let (mut cluster, mut previous) = (first, 0u32);
-        while cluster >= 2 && cluster < self.clusters + 2 {
+        // A chain that loops back on itself is cut where it has gone round
+        // once.
+        let mut hops = 0u32;
+        while cluster >= 2 && cluster < self.clusters + 2 && hops <= self.clusters {
             let value = self.fat_get(cluster)?;
             if value == 0 {
                 break;
@@ -1313,6 +1316,7 @@ impl Fs {
                 return Ok(());
             }
             cluster = value;
+            hops += 1;
         }
         if previous >= 2 {
             self.fat_set(previous, self.end_marker())?;
@@ -1499,7 +1503,12 @@ impl Fs {
         if node.is_directory() && new_dir != node.dir {
             // A directory can't move into itself or a descendant.
             let mut check = new_dir;
+            let mut depth = 0u32;
             while check != 0 && check >= 2 {
+                depth += 1;
+                if depth > self.clusters {
+                    return Err(FsError::Corrupt);
+                }
                 if check == node.first_cluster {
                     return Err(FsError::InvalidName);
                 }

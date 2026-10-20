@@ -261,11 +261,47 @@ pub fn run() -> FuzzReport {
         iterations += 1;
     }
 
+    // A USB device writes its own descriptors: a HID mouse report descriptor
+    // and a configuration (interface, HID, endpoint), mutated.
+    const HID_SEEDS: [&[u8]; 2] = [
+        &[
+            0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09, 0x19, 0x01,
+            0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01,
+            0x75, 0x05, 0x81, 0x03, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81,
+            0x25, 0x7f, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, 0xc0, 0xc0,
+        ],
+        &[
+            0x09, 0x02, 0x22, 0x00, 0x01, 0x01, 0x00, 0xa0, 0x32, 0x09, 0x04, 0x00, 0x00, 0x01,
+            0x03, 0x00, 0x00, 0x00, 0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x34, 0x00, 0x07,
+            0x05, 0x81, 0x03, 0x04, 0x00, 0x0a,
+        ],
+    ];
+    let mut report = [0u8; 64];
+    for _ in 0..20_000 {
+        let length = if rng.below(4) == 0 {
+            let length = rng.below(256);
+            for byte in scratch[..length].iter_mut() {
+                *byte = rng.next() as u8;
+            }
+            length
+        } else {
+            let seed = HID_SEEDS[rng.below(2)];
+            mutate(&mut rng, seed, &mut scratch[..])
+        };
+        for byte in report.iter_mut() {
+            *byte = rng.next() as u8;
+        }
+        scratch[length..length + 16].fill(0);
+        crate::xhci::fuzz_descriptors(&scratch[..length + 16], &report);
+        iterations += 1;
+    }
+
     crate::net::fuzz_parse_tcp(|| rng.next(), 8_000);
     iterations += 8_000;
 
     iterations += crate::syscall::fuzz_syscalls(&mut || rng.next(), 30_000);
 
+    iterations += fuzz_aerfs(&mut rng, 120);
     iterations += fuzz_fatfs(&mut rng, 150);
     iterations += fuzz_boot_fat(&mut rng, 150);
     let cyclic_ok = cyclic_directory_terminates();
@@ -337,6 +373,88 @@ fn fuzz_fatfs(rng: &mut Rng, rounds: u32) -> u32 {
             let _ = fs.fsck(false);
             let _ = fs.fsck(true);
             let _ = fs.fsck(false);
+        }
+        done += 1;
+    }
+    done
+}
+
+/// An AerFS volume on the RAM disk with a few blocks damaged, half the time in
+/// a superblock whose checksum is then made valid again (so the fields behind
+/// it are used): mounting, listing, reading, writing, removing and checking
+/// must finish without panicking or hanging.
+fn fuzz_aerfs(rng: &mut Rng, rounds: u32) -> u32 {
+    use crate::fatfs::Disk;
+    use crate::volume::Volume;
+    let mut done = 0;
+    for _ in 0..rounds {
+        let Ok(mut volume) =
+            Volume::format_aerfs(Disk::Ram, 0, crate::blockdev::RAM_DISK_SECTORS, b"FUZZ")
+        else {
+            break;
+        };
+        let data = [0x3cu8; 5000];
+        if let Ok(mut node) = volume.create_file(1, b"a.bin") {
+            let _ = volume.write_at(&mut node, 0, &data);
+        }
+        if let Ok(directory) = volume.create_dir(1, b"sub") {
+            for name in [&b"one"[..], b"two", b"three"] {
+                if let Ok(mut node) = volume.create_file(directory.as_dir(), name) {
+                    let _ = volume.write_at(&mut node, 0, &data[..1200]);
+                }
+            }
+        }
+        drop(volume);
+        for _ in 0..1 + rng.below(6) {
+            let superblock = rng.below(2) == 0;
+            let lba = if superblock {
+                rng.below(2) as u64
+            } else {
+                rng.below(200) as u64
+            };
+            let mut sector = [0u8; 512];
+            if !crate::blockdev::ram_read(lba, &mut sector) {
+                continue;
+            }
+            let at = if superblock {
+                12 + rng.below(56)
+            } else {
+                rng.below(512)
+            };
+            sector[at] = rng.next() as u8;
+            if superblock {
+                let crc = crate::aerfs::crc32(&sector[..508]);
+                sector[508..512].copy_from_slice(&crc.to_le_bytes());
+            }
+            let _ = crate::blockdev::ram_write(lba, &sector);
+        }
+        if let Ok(mut volume) = Volume::mount_aerfs(Disk::Ram, 0, crate::blockdev::RAM_DISK_SECTORS)
+        {
+            let mut cursor = 0;
+            for _ in 0..32 {
+                let Ok(Some(listed)) = volume.list_next(1, &mut cursor) else {
+                    break;
+                };
+                let mut node = listed.node;
+                let mut buffer = [0u8; 700];
+                if node.is_directory() {
+                    let mut inner = 0;
+                    for _ in 0..16 {
+                        let Ok(Some(_)) = volume.list_next(node.as_dir(), &mut inner) else {
+                            break;
+                        };
+                    }
+                } else {
+                    let _ = volume.read_at(&mut node, 0, &mut buffer);
+                    let _ = volume.write_at(&mut node, 4000, &buffer[..300]);
+                    let _ = volume.truncate(&mut node, 900);
+                }
+            }
+            if let Ok(node) = volume.resolve(b"/a.bin") {
+                let _ = volume.remove(&node);
+            }
+            let _ = volume.create_file(1, b"new");
+            let _ = volume.fsck(false);
         }
         done += 1;
     }

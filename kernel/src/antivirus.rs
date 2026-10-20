@@ -1322,7 +1322,13 @@ fn move_file_decrypted(from: &str, to: &str) -> Result<(), ()> {
     write_replacing(from, to, &[&plaintext[..plaintext_len]])
 }
 
+/// Done as the system: the quarantine folder is out of reach of whoever's
+/// program or command found the file.
 pub fn quarantine(path: &str, detection: Detection) -> Result<u32, &'static str> {
+    vfs::as_system(|| quarantine_as_system(path, detection))
+}
+
+fn quarantine_as_system(path: &str, detection: Detection) -> Result<u32, &'static str> {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let mut destination: Text<256> = Text::new();
     quarantine_location(path, id, &mut destination);

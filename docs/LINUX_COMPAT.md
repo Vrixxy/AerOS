@@ -81,32 +81,44 @@ The extended attribute family (188-199) answers EOPNOTSUPP, as a filesystem with
 - **Processes**: `fork`, `clone`/`clone3` threads, `execve`/`execveat` (a path that is absolute or
   relative to the working directory, or `AT_EMPTY_PATH`; no directory descriptors), `wait4`, process
   groups and sessions, `ptrace`, `pidfd_open`/`pidfd_send_signal`, `process_vm_readv`/`writev`.
-  `unshare`/`setns` and namespaces are refused with EPERM. Only uid/gid 0 exists.
+  `execve` takes up to 64 argument and 64 environment strings, 12 KiB in all (Linux allows far more).
+  `unshare`/`setns` and namespaces are refused with EPERM. Only uid/gid 0 exists; what separates
+  privilege is the capability sets: a program the Terminal starts without `ear` has none (only
+  `CAP_NET_BIND_SERVICE`), may signal, trace or `process_vm_*` only what it started, and cannot
+  change the system's protected files (see the CHANGELOG's security review). No process may
+  signal a kernel task.
 - **Programs**: static x86-64 ELF, position-independent or linked at a fixed address (0x400000; the
   image area is 6.25 MiB and needs the first 8 MiB of the machine's memory to be plain RAM, checked
   at boot). Debian's BusyBox runs as-is, and so do dynamically linked programs: `execve` loads the
   interpreter named by `PT_INTERP` (from the initramfs) next to the program and `ld.so` maps the
   libraries (`/lib/x86_64-linux-gnu`, from the initramfs too). Debian's bash and 60 GNU programs are
-  in the boot gate. Only position-independent programs can be dynamic, and only `execve` starts them.
-  A process window is 12 MiB: image area 6.25 MiB, heap 512 KiB, stack up to 400 KiB, then the
-  mapping area (4.8 MiB; a fixed-address program has 8 MiB in all and 872 KiB of mappings).
+  in the boot gate, with Perl, git, make, tar, awk and more (141 command lines). Only position-independent
+  programs can be dynamic; `execve` and the shell's own program launcher (the desktop Terminal runs any
+  `/bin` or `/usr/bin` program for a command it does not know) both start them through the interpreter.
+  A fixed-address program (Debian's Python is one, 11 MiB) does not fit the 8 MiB window.
+  A process window is 16 MiB: image area 6.25 MiB, heap 512 KiB, stack up to 784 KiB, then the
+  mapping area (8.5 MiB; a fixed-address program has 8 MiB in all and 488 KiB of mappings). Process
+  memory comes from a pool of a third of the usable memory (16 to 128 MiB).
   `/dev` has `null`, `zero`, `urandom`, `random`, `tty`, `console`, `stdin`, `stdout` and `stderr`
-  (no other device nodes). The boot gate runs 91 BusyBox command lines (files, archives, text,
+  (no other device nodes). The boot gate runs 92 BusyBox command lines (files, archives, text,
   processes, shell scripting) and `ldconfig`; `bzip2` at its default block size is the known failure
   (it needs more mapping space than the window has).
 - **Memory**: anonymous and read-only file mappings, `MAP_SHARED|MAP_ANONYMOUS` (stays shared across
   `fork`), System V shared memory, `mremap` by copy. A writable `MAP_SHARED` mapping of a file is
-  refused: the writes would have to reach the file. 1242 mapping pages (218 for a fixed-address program) and 128 heap pages per process.
+  refused: the writes would have to reach the file. 2170 mapping pages (122 for a fixed-address program) and 128 heap pages per process.
 - **Signals**: handlers with `SA_RESTORER`, masks, alternate stacks, `signalfd`, `rt_sigtimedwait`,
   `rt_sigsuspend`, queued blocked signals. No realtime queueing: a signal is pending or not, and
   `siginfo` has the code, sender, value and, for faults, the address; faults run the process's own SIGSEGV/SIGFPE/SIGILL/SIGBUS handler.
-- **Timers**: `alarm`, all three `setitimer` timers, `timerfd`, POSIX `timer_*` (8 per process,
-  `sigev_value` not delivered), `nanosleep`, `clock_gettime` with real CPU-time clocks.
+- **Timers**: `alarm`, all three `setitimer` timers, `timerfd`, POSIX `timer_*` (8 per process; the
+  `siginfo` carries `sigev_value` and the overrun), `nanosleep`, `clock_gettime` with real CPU-time clocks.
 - **Files**: the VFS (initramfs, tmpfs, FAT, AerFS, union overlay), `splice`/`tee`/`vmsplice`,
   `sendfile`, `copy_file_range`, `inotify` (events raised by what processes do; consecutive identical
   events are not merged), `flock`, no `fanotify`. Hard links are refused (EPERM): no filesystem has them.
-- **IPC**: pipes, `eventfd`, `socketpair`, AF_UNIX stream, System V message queues, semaphores and
+- **IPC**: pipes, `eventfd`, `socketpair` (stream, and datagram and sequenced-packet pairs that keep message boundaries, up to 4000 bytes a message), named AF_UNIX stream and sequenced-packet sockets (`bind`/`listen`/`accept`/`connect`) and datagram sockets (`bind`, `sendto` a name, `connect` then `send`; BusyBox `syslogd` and `logger` talk over `/dev/log` in the boot gate). Names are matched in a kernel table like Linux's abstract namespace, nothing is created in the filesystem, and a received datagram has no sender address. System V message queues, semaphores and
   shared memory (small fixed tables, kernel-wide so unrelated processes meet by key), `epoll`.
+- **Network sockets**: TCP and UDP over IPv4 and IPv6, and IPv4 ping sockets
+  (`SOCK_DGRAM` + `IPPROTO_ICMP`: echo requests out, replies in, the identifier is the socket's).
+  No raw sockets or `AF_PACKET`.
 - **Accounting**: CPU time is sampled from the timer tick per process (`getrusage`, `times`,
   `/proc/<pid>/stat`, `ps`, `top`).
 - **Not there**: `fanotify`, `userfaultfd`, `bpf`, `perf_event_open`, `io_uring`, `keyctl`, kernel

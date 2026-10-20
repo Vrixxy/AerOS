@@ -1366,8 +1366,10 @@ impl<'a> Shell<'a> {
         let mut path: Text<MAX_PATH> = Text::new();
         let write_result = normalize_path(self.cwd.as_str(), redirect.path.as_str(), &mut path)
             .and_then(|()| {
-                vfs::open_file(path.as_str(), true, false, !redirect.append, 0o644, true)
-                    .map_err(|_| "cannot open file for writing")
+                vfs::as_user(self.effective_uid != 0, || {
+                    vfs::open_file(path.as_str(), true, false, !redirect.append, 0o644, true)
+                })
+                .map_err(|_| "cannot open file for writing")
             })
             .and_then(|descriptor| {
                 let bytes = output.as_str().as_bytes();
@@ -1392,9 +1394,12 @@ impl<'a> Shell<'a> {
             self.last_status = 0;
             return Control::None;
         };
+        let restricted = self.effective_uid != 0;
         let Some(specification) = find_command(name) else {
-            let _ = writeln!(output, "aersh: {name}: command not found");
-            self.last_status = 127;
+            if !vfs::as_user(restricted, || self.run_external(arguments, offset, output)) {
+                let _ = writeln!(output, "aersh: {name}: command not found");
+                self.last_status = 127;
+            }
             return Control::None;
         };
         if specification.handler == Handler::Ear {
@@ -1410,7 +1415,9 @@ impl<'a> Shell<'a> {
             self.last_status = 126;
             return Control::None;
         }
-        let control = self.run_handler(specification, arguments, offset + 1, output);
+        let control = vfs::as_user(restricted, || {
+            self.run_handler(specification, arguments, offset + 1, output)
+        });
         if self.last_status == 0 && output.truncated {
             self.last_status = 1;
         }
@@ -1843,13 +1850,14 @@ fn run_scanned(
     state: &crate::arch::paging::PagingState,
     path: &str,
     argv: &[&[u8]],
+    capabilities: crate::capability::Capabilities,
 ) -> RunOutcome {
     if let Some(found) = crate::antivirus::scan_bytes(data)
         && found.class != crate::antivirus::Class::Info
     {
         return RunOutcome::Blocked(found);
     }
-    match crate::scheduler::spawn_process_with(state, data, path, argv) {
+    match crate::scheduler::spawn_process_capturing(state, data, path, argv, None, capabilities) {
         Some((id, _slot, _space)) => RunOutcome::Ran(id),
         None => RunOutcome::NotExecutable,
     }
@@ -2245,6 +2253,146 @@ impl Shell<'_> {
         }
     }
 
+    /// A command that is not built in runs the program of that name from
+    /// `/bin` or `/usr/bin` (or the path given), with what it prints shown
+    /// here. It has no input (reading reports the end of the file) and is
+    /// stopped after twenty seconds. False when there is no such program.
+    fn run_external(
+        &mut self,
+        arguments: &Arguments,
+        offset: usize,
+        output: &mut Text<MAX_OUTPUT>,
+    ) -> bool {
+        let Some(name) = arguments.get(offset) else {
+            return false;
+        };
+        let mut found: Option<Text<MAX_PATH>> = None;
+        let directories: [&str; 3] = ["", "/bin/", "/usr/bin/"];
+        for directory in directories {
+            if (directory.is_empty()) != name.contains('/') {
+                continue;
+            }
+            let mut candidate = Text::new();
+            let built = if directory.is_empty() {
+                self.make_path(name, &mut candidate).is_ok()
+            } else {
+                candidate.push_str_checked(directory) && candidate.push_str_checked(name)
+            };
+            if built && vfs::may_execute(candidate.as_str()) {
+                found = Some(candidate);
+                break;
+            }
+        }
+        let Some(path) = found else {
+            return false;
+        };
+        let Some(state) = crate::arch::paging::boot_state() else {
+            return false;
+        };
+        let Some(pipe) = crate::syscall::capture_create() else {
+            return false;
+        };
+        let capabilities = self.program_capabilities();
+        let mut argv: [&[u8]; 16] = [&[]; 16];
+        argv[0] = name.as_bytes();
+        let mut argc = 1;
+        while argc < argv.len() && offset + argc < arguments.count {
+            let Some(value) = arguments.get(offset + argc) else {
+                break;
+            };
+            argv[argc] = value.as_bytes();
+            argc += 1;
+        }
+        let spawn = |data: &[u8]| {
+            if crate::antivirus::scan_bytes(data)
+                .is_some_and(|found| found.class != crate::antivirus::Class::Info)
+            {
+                return None;
+            }
+            crate::scheduler::spawn_process_capturing(
+                &state,
+                data,
+                path.as_str(),
+                &argv[..argc],
+                Some(pipe),
+                capabilities,
+            )
+            .map(|(id, _, _)| id)
+        };
+        let launched = if vfs::needs_buffer(path.as_str()) {
+            vfs::with_home_file(path.as_str(), |data, _mode| spawn(data))
+                .ok()
+                .flatten()
+        } else {
+            vfs::file(path.as_str())
+                .ok()
+                .and_then(|file| spawn(file.data))
+        };
+        let Some(id) = launched else {
+            crate::syscall::capture_close(pipe);
+            let _ = writeln!(output, "aersh: {name}: cannot run");
+            self.last_status = 126;
+            return true;
+        };
+        let started = crate::time::monotonic_nanoseconds();
+        let mut chunk = [0u8; 256];
+        let exit = loop {
+            loop {
+                let count = crate::syscall::capture_read(pipe, &mut chunk);
+                if count == 0 {
+                    break;
+                }
+                for byte in &chunk[..count] {
+                    let character = match *byte {
+                        b'\n' | b'\t' | 0x20..=0x7e => *byte as char,
+                        b'\r' => continue,
+                        _ => '?',
+                    };
+                    let _ = output.push_str_checked(character.encode_utf8(&mut [0; 4]));
+                }
+            }
+            if let Some(code) = crate::scheduler::finished_child(id) {
+                // Whatever was written just before it ended.
+                loop {
+                    let count = crate::syscall::capture_read(pipe, &mut chunk);
+                    if count == 0 {
+                        break;
+                    }
+                    for byte in &chunk[..count] {
+                        let character = match *byte {
+                            b'\n' | b'\t' | 0x20..=0x7e => *byte as char,
+                            b'\r' => continue,
+                            _ => '?',
+                        };
+                        let _ = output.push_str_checked(character.encode_utf8(&mut [0; 4]));
+                    }
+                }
+                break code;
+            }
+            if crate::time::monotonic_nanoseconds().saturating_sub(started) > 20_000_000_000 {
+                let _ = crate::scheduler::kill_task(id);
+                let _ = writeln!(output, "aersh: {name}: stopped after 20 seconds");
+                break 124;
+            }
+            if !crate::scheduler::yield_now() {
+                break 255;
+            }
+        };
+        crate::syscall::capture_close(pipe);
+        self.last_status = exit.min(255) as u8;
+        true
+    }
+
+    /// A program started from here runs with every capability only while the
+    /// user has elevated with `ear`.
+    fn program_capabilities(&self) -> crate::capability::Capabilities {
+        if self.effective_uid == 0 {
+            crate::capability::Capabilities::FULL
+        } else {
+            crate::capability::Capabilities::UNPRIVILEGED
+        }
+    }
+
     /// Resolves `arguments[offset]` as a program path, scans it and spawns it
     /// with `arguments[offset + 1..end]` as its argv.
     fn launch_program(
@@ -2261,6 +2409,10 @@ impl Shell<'_> {
         let Some(state) = crate::arch::paging::boot_state() else {
             return Err(LaunchFailure::PagingNotReady);
         };
+        if vfs::metadata(path.as_str()).is_ok() && !vfs::may_execute(path.as_str()) {
+            return Err(LaunchFailure::Vfs(vfs::VfsError::PermissionDenied));
+        }
+        let capabilities = self.program_capabilities();
         let mut argv: [&[u8]; 16] = [&[]; 16];
         argv[0] = path.as_str().as_bytes();
         let mut argc = 1;
@@ -2275,11 +2427,18 @@ impl Shell<'_> {
         // are read into a scratch buffer and spawned from inside the closure.
         let outcome = if vfs::needs_buffer(path.as_str()) {
             vfs::with_home_file(path.as_str(), |data, _mode| {
-                run_scanned(data, &state, path.as_str(), &argv[..argc])
+                run_scanned(data, &state, path.as_str(), &argv[..argc], capabilities)
             })
         } else {
-            vfs::file(path.as_str())
-                .map(|file| run_scanned(file.data, &state, path.as_str(), &argv[..argc]))
+            vfs::file(path.as_str()).map(|file| {
+                run_scanned(
+                    file.data,
+                    &state,
+                    path.as_str(),
+                    &argv[..argc],
+                    capabilities,
+                )
+            })
         }
         .map_err(LaunchFailure::Vfs)?;
         Ok((path, outcome))
@@ -3167,6 +3326,12 @@ impl Shell<'_> {
                 }
             }),
             "eval" | "crs" => {
+                // Firmware methods drive the hardware (ports, memory, PCI).
+                if self.effective_uid != 0 {
+                    self.fail(output, "acpi", "needs elevation: use ear acpi ...");
+                    self.denied_commands = self.denied_commands.saturating_add(1);
+                    return;
+                }
                 let Some((buffer, length)) = path_text(offset + 1) else {
                     self.usage_named(output, "acpi");
                     return;

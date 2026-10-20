@@ -37,6 +37,21 @@ try {
 Get-Process qemu-system-x86_64 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 500
 
+# QEMU turns a directory into a FAT volume of at most 516 MB. The full Debian
+# image (ROOTFS) no longer fits next to the kernel, so a drive without it is
+# used then, and the guest boots from its initrd and the root disk image
+# instead of the graphical image.
+$driveDirectory = $esp
+$espBytes = (Get-ChildItem -Recurse -File -LiteralPath $esp | Measure-Object -Property Length -Sum).Sum
+$fullImage = Join-Path $esp "ROOTFS"
+if ($espBytes -gt 500MB -and (Test-Path -LiteralPath $fullImage)) {
+    Write-Output "build\esp is $([int]($espBytes / 1MB)) MB, too big for QEMU's FAT volume: booting without ROOTFS"
+    $driveDirectory = Join-Path $root "build\esp-linux"
+    if (Test-Path -LiteralPath $driveDirectory) { Remove-Item -Recurse -Force -LiteralPath $driveDirectory }
+    New-Item -ItemType Directory -Force -Path $driveDirectory | Out-Null
+    Get-ChildItem -Force -LiteralPath $esp | Where-Object { $_.Name -ne "ROOTFS" } | Copy-Item -Recurse -Force -Destination $driveDirectory
+}
+
 Copy-Item -Force -LiteralPath $variablesTemplate -Destination $variables
 if (Test-Path -LiteralPath $serial) {
     try { Remove-Item -Force -LiteralPath $serial -ErrorAction Stop } catch { $serial = Join-Path $root ("build\linux-guest-{0}.log" -f (Get-Date -Format HHmmss)) }
@@ -49,7 +64,7 @@ $arguments = @(
     "-cpu", "qemu64,+nx,+smep,+smap,+xsave,+xsaveopt,+rdrand,+rdtscp,+pdpe1gb",
     "-drive", "if=pflash,format=raw,unit=0,readonly=on,file=$firmware",
     "-drive", "if=pflash,format=raw,unit=1,file=$variables",
-    "-drive", "format=raw,file=fat:rw:$esp",
+    "-drive", "format=raw,file=fat:rw:$driveDirectory",
     "-device", "virtio-vga",
     "-serial", "file:$serial",
     "-no-reboot"
@@ -70,7 +85,7 @@ $process = [System.Diagnostics.Process]::Start($start)
 # The full Debian image (tools\build-debian-rootfs.sh) also starts an X
 # session with a window manager, a terminal and a browser; the small busybox
 # image (tools\build-rootfs.sh) doesn't.
-$rootfs = Join-Path $esp "ROOTFS"
+$rootfs = Join-Path $driveDirectory "ROOTFS"
 $graphical = (Test-Path -LiteralPath $rootfs) -and ((Get-Item -LiteralPath $rootfs).Length -gt 200MB)
 $markers = @('Welcome to Linux inside AerOS', 'fb0: VESA VGA frame buffer device', 'AT Translated Set 2 keyboard', 'AEROS_LINUX_NET_OK', 'AEROS_LINUX_PING_OK')
 if ($Smp) { $markers += @('AEROS_LINUX_CPUS 2', 'NMI backtrace for cpu 1') }

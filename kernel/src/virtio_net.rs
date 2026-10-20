@@ -89,7 +89,7 @@ pub fn receive(out: &mut [u8]) -> Option<usize> {
     let length = length as usize;
     let index = id as usize;
     let copied = if length > HEADER && index < RX_BUFFERS {
-        let frame = (length - HEADER).min(out.len());
+        let frame = (length - HEADER).min(out.len()).min(BUFFER - HEADER);
         let source = state.rx_buffers + (index * BUFFER + HEADER) as u64;
         unsafe {
             core::ptr::copy_nonoverlapping(source as usize as *const u8, out.as_mut_ptr(), frame)

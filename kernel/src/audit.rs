@@ -63,10 +63,12 @@ pub fn record(category: &str, detail: core::fmt::Arguments) {
         line,
     };
 
-    if let Ok(descriptor) = vfs::open_file(LOG_PATH, true, false, false, 0o600, true) {
-        let _ = vfs::write(descriptor, line.as_str().as_bytes(), true);
-        let _ = vfs::close(descriptor);
-    }
+    vfs::as_system(|| {
+        if let Ok(descriptor) = vfs::open_file(LOG_PATH, true, false, false, 0o600, true) {
+            let _ = vfs::write(descriptor, line.as_str().as_bytes(), true);
+            let _ = vfs::close(descriptor);
+        }
+    });
 }
 
 /// Visits every currently-held in-memory entry, oldest first.

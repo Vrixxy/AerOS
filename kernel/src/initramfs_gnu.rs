@@ -2,10 +2,12 @@
 //! programs and the shared libraries they need.
 use crate::vfs::InitramfsEntry;
 
-pub static GNU: [InitramfsEntry; 66] = [
+static BASH: &[u8] = include_bytes!("../../assets/userspace/gnu/bash");
+
+pub static GNU: [InitramfsEntry; 86] = [
     InitramfsEntry {
         path: "/bin/bash",
-        data: include_bytes!("../../assets/userspace/gnu/bash"),
+        data: BASH,
         mode: 0o555,
     },
     InitramfsEntry {
@@ -294,6 +296,86 @@ pub static GNU: [InitramfsEntry; 66] = [
         mode: 0o555,
     },
     InitramfsEntry {
+        path: "/bin/tar",
+        data: include_bytes!("../../assets/userspace/gnu/tar"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/bin/less",
+        data: include_bytes!("../../assets/userspace/gnu/less"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/bin/make",
+        data: include_bytes!("../../assets/userspace/gnu/make"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/bin/mawk",
+        data: include_bytes!("../../assets/userspace/gnu/mawk"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/bin/patch",
+        data: include_bytes!("../../assets/userspace/gnu/patch"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/bin/cmp",
+        data: include_bytes!("../../assets/userspace/gnu/cmp"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/bin/xz",
+        data: include_bytes!("../../assets/userspace/gnu/xz"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/bin/bzip2",
+        data: include_bytes!("../../assets/userspace/gnu/bzip2"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/bin/git",
+        data: include_bytes!("../../assets/userspace/gnu/git"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/bin/kill",
+        data: include_bytes!("../../assets/userspace/gnu/kill"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/bin/hostname",
+        data: include_bytes!("../../assets/userspace/gnu/hostname"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/bin/nano",
+        data: include_bytes!("../../assets/userspace/gnu/nano"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/bin/vim.tiny",
+        data: include_bytes!("../../assets/userspace/gnu/vim.tiny"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/bin/awk",
+        data: include_bytes!("../../assets/userspace/gnu/mawk"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/bin/vi",
+        data: include_bytes!("../../assets/userspace/gnu/vim.tiny"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/bin/sh",
+        data: BASH,
+        mode: 0o555,
+    },
+    InitramfsEntry {
         path: "/lib/x86_64-linux-gnu/libtinfo.so.6",
         data: include_bytes!("../../assets/userspace/lib/libtinfo.so.6"),
         mode: 0o555,
@@ -331,6 +413,26 @@ pub static GNU: [InitramfsEntry; 66] = [
     InitramfsEntry {
         path: "/lib/x86_64-linux-gnu/libm.so.6",
         data: include_bytes!("../../assets/userspace/lib/libm.so.6"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/lib/x86_64-linux-gnu/liblzma.so.5",
+        data: include_bytes!("../../assets/userspace/lib/liblzma.so.5"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/lib/x86_64-linux-gnu/libbz2.so.1.0",
+        data: include_bytes!("../../assets/userspace/lib/libbz2.so.1.0"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/lib/x86_64-linux-gnu/libz.so.1",
+        data: include_bytes!("../../assets/userspace/lib/libz.so.1"),
+        mode: 0o555,
+    },
+    InitramfsEntry {
+        path: "/lib/x86_64-linux-gnu/libncursesw.so.6",
+        data: include_bytes!("../../assets/userspace/lib/libncursesw.so.6"),
         mode: 0o555,
     },
 ];
