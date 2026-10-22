@@ -854,6 +854,7 @@ pub fn spawn_process_with(
         path,
         args,
         None,
+        None,
         crate::capability::Capabilities::FULL,
     )
 }
@@ -867,6 +868,7 @@ pub fn spawn_process_capturing(
     path: &str,
     args: &[&[u8]],
     capture: Option<usize>,
+    input: Option<usize>,
     capabilities: crate::capability::Capabilities,
 ) -> Option<(u64, usize, arch::paging::ProcessAddressSpace)> {
     // On-execute protection: a detected image never gets an address space.
@@ -925,6 +927,9 @@ pub fn spawn_process_capturing(
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     if let Some(pipe) = capture {
         crate::syscall::attach_capture_pipe(&mut scheduler.tasks[slot].process_state, pipe);
+    }
+    if let Some(pipe) = input {
+        crate::syscall::attach_input_pipe(&mut scheduler.tasks[slot].process_state, pipe);
     }
     crate::syscall::set_state_capabilities(&mut scheduler.tasks[slot].process_state, capabilities);
     scheduler.tasks[slot].cr3 = space.root_physical;
@@ -1961,6 +1966,19 @@ pub fn linux_mmap_shared_for_current_task(
     Some(arch::paging::process_mmap_shared(
         space, pages, protection, frames,
     ))
+}
+
+/// The physical address of `address` in the running process, when it lies
+/// in a shared mapping.
+pub fn shared_physical_current(address: u64) -> Option<u64> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    if !scheduler.initialized {
+        return None;
+    }
+    let owner = scheduler.leader_slot(scheduler.current);
+    let space = scheduler.tasks[owner].process_space.as_ref()?;
+    arch::paging::process_shared_physical(space, address)
 }
 
 /// The frame of the first page of the mapping at `address`.
@@ -3473,7 +3491,9 @@ pub fn stack_growth_self_test(
     let Some(grown_space) = grown_space else {
         return result;
     };
-    result.grown_pages = grown_space.stack_grown.iter().filter(|p| **p != 0).count();
+    result.grown_pages = (0..64)
+        .filter(|depth| grown_space.stack_grown_frame(*depth) != 0)
+        .count();
     let _ = reap();
     let Some((overflow_exit, _)) = run_stack_growth_probe(
         state,
@@ -3598,11 +3618,11 @@ pub fn fork_self_test(state: &crate::arch::paging::PagingState) -> ForkSelfTestR
             (child_space.stack_physical + STACK_PROBE_OFFSET) as usize as *const u32,
         )
     };
-    let shared_refcount_before_reap =
-        arch::paging::code_page_refcount(parent_space.code_physical[0]);
+    let parent_code = parent_space.code_frame(0);
+    let child_code = child_space.code_frame(0);
+    let shared_refcount_before_reap = arch::paging::code_page_refcount(parent_code);
     let reaped = reap();
-    let shared_refcount_after_reap =
-        arch::paging::code_page_refcount(parent_space.code_physical[0]);
+    let shared_refcount_after_reap = arch::paging::code_page_refcount(parent_code);
     let after = stats();
     ForkSelfTestResult {
         parent_exit,
@@ -3616,7 +3636,7 @@ pub fn fork_self_test(state: &crate::arch::paging::PagingState) -> ForkSelfTestR
             && child_value == 0xbbbb_bbbb
             && parent_space.owns_code
             && !child_space.owns_code
-            && parent_space.code_physical[0] == child_space.code_physical[0]
+            && parent_code == child_code
             && parent_space.root_physical != child_space.root_physical
             // proves the shared code page is genuinely refcounted (2 while
             // both address spaces are still alive, 0 -- actually freed --
@@ -3749,13 +3769,13 @@ pub fn exec_self_test(state: &crate::arch::paging::PagingState) -> ExecSelfTestR
     // originally-shared page before either task was reaped, so the shared
     // page should show only the parent's reference here, and the child's
     // freshly exec'd page should show exactly its own.
-    let shared_refcount_before_reap =
-        arch::paging::code_page_refcount(parent_space.code_physical[0]);
-    let exec_refcount_before_reap = arch::paging::code_page_refcount(child_space.code_physical[0]);
+    let parent_code = parent_space.code_frame(0);
+    let child_code = child_space.code_frame(0);
+    let shared_refcount_before_reap = arch::paging::code_page_refcount(parent_code);
+    let exec_refcount_before_reap = arch::paging::code_page_refcount(child_code);
     let reaped = reap();
-    let shared_refcount_after_reap =
-        arch::paging::code_page_refcount(parent_space.code_physical[0]);
-    let exec_refcount_after_reap = arch::paging::code_page_refcount(child_space.code_physical[0]);
+    let shared_refcount_after_reap = arch::paging::code_page_refcount(parent_code);
+    let exec_refcount_after_reap = arch::paging::code_page_refcount(child_code);
     let after = stats();
     ExecSelfTestResult {
         parent_exit,
@@ -3767,7 +3787,7 @@ pub fn exec_self_test(state: &crate::arch::paging::PagingState) -> ExecSelfTestR
             && child_exit == 33
             && parent_value == 0xaaaa_aaaa
             && child_value == 0xcccc_cccc
-            && child_space.code_physical[0] != parent_space.code_physical[0]
+            && child_code != parent_code
             // the child grew its heap by 1 page before execve(), and the
             // post-exec program grew it by 1 page again -- heap_mapped==1
             // (not 2) proves execve() actually reset the old heap instead
@@ -3896,9 +3916,14 @@ pub fn fork_chain_self_test(state: &crate::arch::paging::PagingState) -> ForkCha
     // them execve()), so the refcount should read 3 while all three are
     // still alive but unreaped -- proving fork()'s refcounting chains
     // correctly through a grandchild, not just a single parent/child pair.
-    let shared_refcount_before_reap = arch::paging::code_page_refcount(a_space.code_physical[0]);
+    let codes = [
+        a_space.code_frame(0),
+        b_space.code_frame(0),
+        c_space.code_frame(0),
+    ];
+    let shared_refcount_before_reap = arch::paging::code_page_refcount(codes[0]);
     let reaped = reap();
-    let shared_refcount_after_reap = arch::paging::code_page_refcount(a_space.code_physical[0]);
+    let shared_refcount_after_reap = arch::paging::code_page_refcount(codes[0]);
     let after = stats();
     ForkChainSelfTestResult {
         exit_a,
@@ -3908,8 +3933,8 @@ pub fn fork_chain_self_test(state: &crate::arch::paging::PagingState) -> ForkCha
         verified: exit_a == 1
             && exit_b == 2
             && exit_c == 3
-            && a_space.code_physical[0] == b_space.code_physical[0]
-            && b_space.code_physical[0] == c_space.code_physical[0]
+            && codes[0] == codes[1]
+            && codes[1] == codes[2]
             && a_space.root_physical != b_space.root_physical
             && b_space.root_physical != c_space.root_physical
             && a_space.root_physical != c_space.root_physical
@@ -4319,14 +4344,15 @@ pub fn heap_self_test(state: &crate::arch::paging::PagingState) -> HeapSelfTestR
     const HEAP_PAGE_OFFSET: u64 = 4096 - 8;
     let parent_heap_value = unsafe {
         core::ptr::read_volatile(
-            (live_parent_space.heap_physical[1] + HEAP_PAGE_OFFSET) as usize as *const u32,
+            (live_parent_space.heap_frame(1) + HEAP_PAGE_OFFSET) as usize as *const u32,
         )
     };
     let child_heap_value = unsafe {
         core::ptr::read_volatile(
-            (child_space.heap_physical[1] + HEAP_PAGE_OFFSET) as usize as *const u32,
+            (child_space.heap_frame(1) + HEAP_PAGE_OFFSET) as usize as *const u32,
         )
     };
+    let distinct_pages = live_parent_space.heap_frame(1) != child_space.heap_frame(1);
     let reaped = reap();
     let after = stats();
     HeapSelfTestResult {
@@ -4339,7 +4365,7 @@ pub fn heap_self_test(state: &crate::arch::paging::PagingState) -> HeapSelfTestR
             && child_exit == 22
             && parent_heap_value == 0xaaaa_aaaa
             && child_heap_value == 0xbbbb_bbbb
-            && live_parent_space.heap_physical[1] != child_space.heap_physical[1]
+            && distinct_pages
             && reaped == 2
             && after.tasks == 1,
     }
@@ -4857,14 +4883,13 @@ pub fn linux_brk_fork_self_test(state: &crate::arch::paging::PagingState) -> Lin
     const MARKER_OFFSET: u64 = 4096 - 8;
     let parent_value = unsafe {
         core::ptr::read_volatile(
-            (live_parent_space.heap_physical[0] + MARKER_OFFSET) as usize as *const u32,
+            (live_parent_space.heap_frame(0) + MARKER_OFFSET) as usize as *const u32,
         )
     };
     let child_value = unsafe {
-        core::ptr::read_volatile(
-            (child_space.heap_physical[0] + MARKER_OFFSET) as usize as *const u32,
-        )
+        core::ptr::read_volatile((child_space.heap_frame(0) + MARKER_OFFSET) as usize as *const u32)
     };
+    let distinct_pages = live_parent_space.heap_frame(0) != child_space.heap_frame(0);
     let reaped = reap();
     let after = stats();
     LinuxBrkForkResult {
@@ -4877,7 +4902,7 @@ pub fn linux_brk_fork_self_test(state: &crate::arch::paging::PagingState) -> Lin
             && child_exit == 22
             && parent_value == 0xaaaa_aaaa
             && child_value == 0xbbbb_bbbb
-            && live_parent_space.heap_physical[0] != child_space.heap_physical[0]
+            && distinct_pages
             && reaped == 2
             && after.tasks == 1,
     }
@@ -5044,14 +5069,12 @@ pub fn linux_mmap_fork_self_test(state: &crate::arch::paging::PagingState) -> Li
     let (Some(live_parent_space), Some(child_space)) = (live_parent_space, child_space) else {
         return failed_linux_mmap_fork_result();
     };
-    let parent_marker_reused = unsafe {
-        core::ptr::read_volatile(live_parent_space.mmap_physical[0] as usize as *const u32)
-    };
-    let parent_marker_second = unsafe {
-        core::ptr::read_volatile(live_parent_space.mmap_physical[1] as usize as *const u32)
-    };
+    let parent_marker_reused =
+        unsafe { core::ptr::read_volatile(live_parent_space.mmap_frame(0) as usize as *const u32) };
+    let parent_marker_second =
+        unsafe { core::ptr::read_volatile(live_parent_space.mmap_frame(1) as usize as *const u32) };
     let child_marker =
-        unsafe { core::ptr::read_volatile(child_space.mmap_physical[0] as usize as *const u32) };
+        unsafe { core::ptr::read_volatile(child_space.mmap_frame(0) as usize as *const u32) };
     let reaped = reap();
     let after = stats();
     LinuxMmapForkResult {
@@ -5335,10 +5358,10 @@ pub fn file_mmap_self_test(state: &crate::arch::paging::PagingState) -> FileMmap
         return failed_file_mmap_result();
     };
     let mut mapped_bytes = [0u8; 4];
-    if live_space.mmap_physical[0] != 0 {
+    if live_space.mmap_frame(0) != 0 {
         unsafe {
             core::ptr::copy_nonoverlapping(
-                live_space.mmap_physical[0] as usize as *const u8,
+                live_space.mmap_frame(0) as usize as *const u8,
                 mapped_bytes.as_mut_ptr(),
                 4,
             );
@@ -5448,6 +5471,27 @@ pub fn threaded_elf_self_test(
 
 /// `threaded_elf_self_test` that also runs `each_tick` every time the kernel
 /// task wakes up while the program runs.
+/// Runs `f` with user programs preempted on the timer, as they are on the
+/// desktop (boot-time code otherwise runs them only from explicit yields).
+#[cfg(feature = "boot-test")]
+pub fn with_preemption<T>(f: impl FnOnce() -> T) -> Option<T> {
+    PREEMPTION_ENABLED.store(1, Ordering::Release);
+    if !arch::apic::start_timer(1000) {
+        PREEMPTION_ENABLED.store(0, Ordering::Release);
+        return None;
+    }
+    let result = f();
+    arch::apic::stop_timer();
+    PREEMPTION_ENABLED.store(0, Ordering::Release);
+    Some(result)
+}
+
+/// Waits for the next interrupt (a timer tick at the latest).
+#[cfg(feature = "boot-test")]
+pub fn wait_tick() {
+    unsafe { asm!("sti; hlt", options(nomem, nostack)) };
+}
+
 pub fn threaded_elf_self_test_with(
     state: &crate::arch::paging::PagingState,
     code: &[u8],

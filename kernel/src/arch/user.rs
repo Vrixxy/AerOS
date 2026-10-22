@@ -295,6 +295,12 @@ pub fn range_accessible(address: u64, length: usize, write: bool) -> bool {
         && super::paging::user_range_accessible(address, length, write)
 }
 
+/// Whether a range lies inside the running process's window, without
+/// touching it (`range_accessible` gives untouched pages their frames).
+pub fn range_in_window(address: u64, length: usize) -> bool {
+    range_within_active(address, length)
+}
+
 fn range_within_active(address: u64, length: usize) -> bool {
     let start = ACTIVE_USER_START.load(Ordering::Acquire);
     let end = ACTIVE_USER_END.load(Ordering::Acquire);

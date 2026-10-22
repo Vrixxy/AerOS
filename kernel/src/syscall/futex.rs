@@ -124,8 +124,8 @@ pub(super) fn wake(group: u64, address: u64, count: usize, bitset: u32) -> usize
     woken
 }
 
-fn requeue(group: u64, from: u64, to: u64, wake_count: usize, move_count: usize) -> usize {
-    let woken = wake(group, from, wake_count, u32::MAX);
+fn requeue(from: (u64, u64), to: (u64, u64), wake_count: usize, move_count: usize) -> usize {
+    let woken = wake(from.0, from.1, wake_count, u32::MAX);
     let mut table = TABLE.lock();
     let mut moved = 0;
     for waiter in table.waiters.iter_mut() {
@@ -135,11 +135,12 @@ fn requeue(group: u64, from: u64, to: u64, wake_count: usize, move_count: usize)
         if waiter.used
             && !waiter.woken
             && waiter.owner == 0
-            && waiter.group == group
-            && waiter.address == from
+            && waiter.group == from.0
+            && waiter.address == from.1
             && crate::scheduler::task_is_live(waiter.task)
         {
-            waiter.address = to;
+            waiter.group = to.0;
+            waiter.address = to.1;
             moved += 1;
         }
     }
@@ -200,6 +201,18 @@ fn count_of(value: u64) -> usize {
     if signed <= 0 { 0 } else { signed as usize }
 }
 
+/// What a futex word is known by: its address in this process, or, for a
+/// shared futex (no `FUTEX_PRIVATE_FLAG`) in a shared mapping, its physical
+/// address, which every process mapping it agrees on (group 0).
+fn key(operation: u64, group: u64, address: u64) -> (u64, u64) {
+    if operation & 0x80 == 0
+        && let Some(physical) = crate::scheduler::shared_physical_current(address)
+    {
+        return (0, physical);
+    }
+    (group, address)
+}
+
 pub(super) fn operate(arguments: [u64; 6]) -> u64 {
     let [address, operation, value, timeout, address2, value3] = arguments;
     FUTEX_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -214,6 +227,7 @@ pub(super) fn operate(arguments: [u64; 6]) -> u64 {
         return error(14);
     }
     let group = crate::scheduler::current_group();
+    let (word_group, word) = key(operation, group, address);
     let realtime = operation & CLOCK_REALTIME_FLAG != 0;
     match operation & 0x7f {
         0 | 9 => {
@@ -235,7 +249,7 @@ pub(super) fn operate(arguments: [u64; 6]) -> u64 {
                 Ok(limit) => limit,
                 Err(failure) => return failure,
             };
-            let Some(slot) = enqueue(group, address, bitset, 0, 0) else {
+            let Some(slot) = enqueue(word_group, word, bitset, 0, 0) else {
                 return error(12);
             };
             block(slot, limit)
@@ -249,7 +263,7 @@ pub(super) fn operate(arguments: [u64; 6]) -> u64 {
             if bitset == 0 {
                 return error(22);
             }
-            wake(group, address, count_of(value), bitset) as u64
+            wake(word_group, word, count_of(value), bitset) as u64
         }
         3 | 4 => {
             if address2 & 3 != 0 || !user::range_accessible(address2, 4, true) {
@@ -262,7 +276,12 @@ pub(super) fn operate(arguments: [u64; 6]) -> u64 {
                     None => return error(14),
                 }
             }
-            requeue(group, address, address2, count_of(value), count_of(timeout)) as u64
+            requeue(
+                (word_group, word),
+                key(operation, group, address2),
+                count_of(value),
+                count_of(timeout),
+            ) as u64
         }
         5 => {
             if address2 & 3 != 0 || !user::range_accessible(address2, 4, true) {
@@ -300,9 +319,10 @@ pub(super) fn operate(arguments: [u64; 6]) -> u64 {
                 5 => old_signed >= comparand,
                 _ => return error(38),
             };
-            let mut woken = wake(group, address, count_of(value), u32::MAX);
+            let mut woken = wake(word_group, word, count_of(value), u32::MAX);
             if holds {
-                woken += wake(group, address2, count_of(timeout), u32::MAX);
+                let (second_group, second) = key(operation, group, address2);
+                woken += wake(second_group, second, count_of(timeout), u32::MAX);
             }
             woken as u64
         }

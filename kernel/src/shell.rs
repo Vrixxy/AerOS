@@ -950,6 +950,69 @@ enum InputFailure {
 /// Splits a command line at `|` characters that are not quoted or escaped.
 /// `None` means the line has no pipe; otherwise the stages and how many there
 /// are (one more than `MAX_PIPELINE_STAGES` means the line has too many).
+/// The interactive terminal's foreground jobs: `/bin/cat` echoes a line it is
+/// given and ends when its input does (status 0), and `/bin/sleep 30` ends at
+/// Ctrl+C. Driven the way the desktop drives them, a poll per tick.
+#[cfg(feature = "boot-test")]
+pub(crate) fn foreground_job_self_test(info: SystemInfo<'_>) -> bool {
+    crate::scheduler::with_preemption(|| {
+        let mut shell = Shell::new(info, true);
+        shell.effective_uid = 0;
+        shell.set_interactive(true);
+        let mut output: Text<MAX_OUTPUT> = Text::new();
+        let run =
+            |shell: &mut Shell<'_>, output: &mut Text<MAX_OUTPUT>, until: &dyn Fn(&str) -> bool| {
+                for _ in 0..20_000 {
+                    let mut written: Text<MAX_OUTPUT> = Text::new();
+                    let ended = shell.job_poll(&mut written);
+                    let _ = output.push_str_checked(written.as_str());
+                    if let Some(status) = ended {
+                        return Some(status);
+                    }
+                    if until(output.as_str()) {
+                        return None;
+                    }
+                    crate::scheduler::wait_tick();
+                }
+                Some(u8::MAX)
+            };
+        shell.execute("/bin/cat", &mut output);
+        let started = shell.job_running();
+        let sent = shell.job_send(b"through the job\n");
+        let echoed = run(&mut shell, &mut output, &|text| {
+            text.contains("through the job\n")
+        })
+        .is_none();
+        shell.job_end_input();
+        let ended = run(&mut shell, &mut output, &|_| false) == Some(0) && !shell.job_running();
+        output.clear();
+        shell.execute("/bin/sleep 30", &mut output);
+        let sleeping = shell.job_running();
+        shell.job_interrupt();
+        let interrupted = run(&mut shell, &mut output, &|_| false)
+            .is_some_and(|status| status != 0)
+            && !shell.job_running();
+        crate::serial::format(format_args!(
+            "AEROS_TERMINAL_JOBS_PARTS started={started} sent={sent} echoed={echoed} ended={ended} sleeping={sleeping} interrupted={interrupted}\n"
+        ));
+        started && sent && echoed && ended && sleeping && interrupted
+    })
+    .unwrap_or(false)
+}
+
+/// A program's output as the terminal shows it: printable ASCII, newlines and
+/// tabs; carriage returns dropped and anything else as `?`.
+fn push_printable(output: &mut Text<MAX_OUTPUT>, bytes: &[u8]) {
+    for byte in bytes {
+        let character = match *byte {
+            b'\n' | b'\t' | 0x20..=0x7e => *byte as char,
+            b'\r' => continue,
+            _ => '?',
+        };
+        let _ = output.push_str_checked(character.encode_utf8(&mut [0; 4]));
+    }
+}
+
 fn split_pipeline(line: &str) -> Option<([&str; MAX_PIPELINE_STAGES + 1], usize)> {
     let mut stages = [""; MAX_PIPELINE_STAGES + 1];
     let (mut count, mut start) = (0usize, 0usize);
@@ -1107,6 +1170,15 @@ const REAUTH_WINDOW_NS: u64 = 5 * 60 * 1_000_000_000;
 
 const MAX_BACKGROUND_JOBS: usize = 8;
 
+/// A program the interactive terminal runs in the foreground: what it writes
+/// is shown as it comes and what the user types goes to its input.
+#[derive(Clone, Copy)]
+struct ForegroundJob {
+    task_id: u64,
+    output: usize,
+    input: usize,
+}
+
 #[derive(Clone, Copy)]
 struct BackgroundJob {
     job_id: u32,
@@ -1136,6 +1208,11 @@ pub(crate) struct Shell<'a> {
     /// Output of the previous pipeline stage, read by commands that are given
     /// no file name.
     pipe_input: Option<Text<MAX_OUTPUT>>,
+    /// Programs started from a plain command line run as a foreground job
+    /// (the desktop's terminal) instead of to completion with no input.
+    interactive: bool,
+    job_allowed: bool,
+    job: Option<ForegroundJob>,
 }
 
 impl<'a> Shell<'a> {
@@ -1160,6 +1237,9 @@ impl<'a> Shell<'a> {
             background_jobs: [None; MAX_BACKGROUND_JOBS],
             next_job_id: 1,
             pipe_input: None,
+            interactive: false,
+            job_allowed: false,
+            job: None,
         };
         shell.cwd.push_str_checked("/");
         shell.hostname.push_str_checked("aeros");
@@ -1229,7 +1309,9 @@ impl<'a> Shell<'a> {
             }
         };
         let redirect = extract_redirection(&mut arguments);
+        self.job_allowed = self.interactive && redirect.is_none();
         let control = self.dispatch(&arguments, 0, output);
+        self.job_allowed = false;
         if let Some(redirect) = redirect {
             self.apply_redirection(redirect, output);
         }
@@ -1237,6 +1319,61 @@ impl<'a> Shell<'a> {
             let _ = output.push_str_checked("\n[output truncated]\n");
         }
         control
+    }
+
+    pub(crate) fn set_interactive(&mut self, interactive: bool) {
+        self.interactive = interactive;
+    }
+
+    pub(crate) fn job_running(&self) -> bool {
+        self.job.is_some()
+    }
+
+    /// Moves what the foreground job has written into `output`; once it has
+    /// ended, returns its exit status (and the job is gone).
+    pub(crate) fn job_poll(&mut self, output: &mut Text<MAX_OUTPUT>) -> Option<u8> {
+        let job = self.job?;
+        let ended = crate::scheduler::finished_child(job.task_id);
+        let mut chunk = [0u8; 256];
+        loop {
+            let count = crate::syscall::capture_read(job.output, &mut chunk);
+            if count == 0 {
+                break;
+            }
+            push_printable(output, &chunk[..count]);
+        }
+        let code = ended?;
+        crate::syscall::capture_close(job.output);
+        crate::syscall::input_close(job.input);
+        self.job = None;
+        self.last_status = code.min(255) as u8;
+        Some(self.last_status)
+    }
+
+    /// Hands a typed line (or anything else) to the foreground job's input.
+    pub(crate) fn job_send(&mut self, bytes: &[u8]) -> bool {
+        self.job
+            .is_some_and(|job| crate::syscall::input_write(job.input, bytes) == bytes.len())
+    }
+
+    /// Ctrl+C: SIGINT to the foreground job (it ends unless it handles it).
+    pub(crate) fn job_interrupt(&mut self) {
+        let Some(job) = self.job else {
+            return;
+        };
+        if matches!(
+            crate::scheduler::signal_other_task(job.task_id, 2),
+            Some(crate::syscall::RemoteSignal::Fatal) | None
+        ) {
+            let _ = crate::scheduler::kill_task(job.task_id);
+        }
+    }
+
+    /// Ctrl+D: the job's input ends.
+    pub(crate) fn job_end_input(&mut self) {
+        if let Some(job) = self.job {
+            crate::syscall::input_close(job.input);
+        }
     }
 
     /// Runs `a | b | c`: each stage's output becomes the next stage's input,
@@ -1857,7 +1994,15 @@ fn run_scanned(
     {
         return RunOutcome::Blocked(found);
     }
-    match crate::scheduler::spawn_process_capturing(state, data, path, argv, None, capabilities) {
+    match crate::scheduler::spawn_process_capturing(
+        state,
+        data,
+        path,
+        argv,
+        None,
+        None,
+        capabilities,
+    ) {
         Some((id, _slot, _space)) => RunOutcome::Ran(id),
         None => RunOutcome::NotExecutable,
     }
@@ -2292,6 +2437,12 @@ impl Shell<'_> {
         let Some(pipe) = crate::syscall::capture_create() else {
             return false;
         };
+        // In the interactive terminal the program runs as a foreground job.
+        let input = if self.job_allowed && self.job.is_none() {
+            crate::syscall::input_create()
+        } else {
+            None
+        };
         let capabilities = self.program_capabilities();
         let mut argv: [&[u8]; 16] = [&[]; 16];
         argv[0] = name.as_bytes();
@@ -2315,6 +2466,7 @@ impl Shell<'_> {
                 path.as_str(),
                 &argv[..argc],
                 Some(pipe),
+                input,
                 capabilities,
             )
             .map(|(id, _, _)| id)
@@ -2330,10 +2482,22 @@ impl Shell<'_> {
         };
         let Some(id) = launched else {
             crate::syscall::capture_close(pipe);
+            if let Some(input) = input {
+                crate::syscall::input_close(input);
+                crate::syscall::capture_close(input);
+            }
             let _ = writeln!(output, "aersh: {name}: cannot run");
             self.last_status = 126;
             return true;
         };
+        if let Some(input) = input {
+            self.job = Some(ForegroundJob {
+                task_id: id,
+                output: pipe,
+                input,
+            });
+            return true;
+        }
         let started = crate::time::monotonic_nanoseconds();
         let mut chunk = [0u8; 256];
         let exit = loop {
@@ -2342,14 +2506,7 @@ impl Shell<'_> {
                 if count == 0 {
                     break;
                 }
-                for byte in &chunk[..count] {
-                    let character = match *byte {
-                        b'\n' | b'\t' | 0x20..=0x7e => *byte as char,
-                        b'\r' => continue,
-                        _ => '?',
-                    };
-                    let _ = output.push_str_checked(character.encode_utf8(&mut [0; 4]));
-                }
+                push_printable(output, &chunk[..count]);
             }
             if let Some(code) = crate::scheduler::finished_child(id) {
                 // Whatever was written just before it ended.
@@ -2358,14 +2515,7 @@ impl Shell<'_> {
                     if count == 0 {
                         break;
                     }
-                    for byte in &chunk[..count] {
-                        let character = match *byte {
-                            b'\n' | b'\t' | 0x20..=0x7e => *byte as char,
-                            b'\r' => continue,
-                            _ => '?',
-                        };
-                        let _ = output.push_str_checked(character.encode_utf8(&mut [0; 4]));
-                    }
+                    push_printable(output, &chunk[..count]);
                 }
                 break code;
             }

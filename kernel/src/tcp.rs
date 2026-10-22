@@ -15,7 +15,7 @@ use crate::sockopt::Options;
 pub const MSS: usize = 1460;
 /// Largest segment payload that fits an Ethernet frame behind an IPv6 header.
 const MSS_V6: usize = 1440;
-pub const BUFFER: usize = 8192;
+pub const BUFFER: usize = 65_536;
 pub const SOCKETS: usize = 8;
 const BACKLOG: usize = 4;
 
@@ -144,7 +144,6 @@ fn seq_le(a: u32, b: u32) -> bool {
     a == b || seq_lt(a, b)
 }
 
-#[derive(Clone, Copy)]
 struct Ring {
     data: [u8; BUFFER],
     head: usize,
@@ -160,6 +159,11 @@ impl Ring {
 
     fn free(&self) -> usize {
         BUFFER - self.len
+    }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
     }
 
     fn push(&mut self, bytes: &[u8]) -> usize {
@@ -204,7 +208,6 @@ impl Ring {
     }
 }
 
-#[derive(Clone, Copy)]
 struct Tcb {
     used: bool,
     state: State,
@@ -317,6 +320,111 @@ impl Tcb {
         rexmit_next: 0,
         sack_retransmits: 0,
     };
+
+    /// Back to `EMPTY` in place, without building a whole `Tcb` (two rings)
+    /// as a temporary; the ring bytes are left as they are, only emptied.
+    fn clear(&mut self) {
+        let &Tcb {
+            used,
+            state,
+            parent,
+            accepted,
+            orphan,
+            local_port,
+            remote,
+            remote_port,
+            snd_una,
+            snd_nxt,
+            snd_max,
+            snd_wnd,
+            rcv_nxt,
+            send: _,
+            recv: _,
+            cwnd,
+            ssthresh,
+            dup_acks,
+            in_recovery,
+            recover,
+            rto,
+            srtt,
+            rttvar,
+            rtt_seq,
+            rtt_start,
+            timer,
+            retries,
+            time_wait_until,
+            fin_queued,
+            fin_sent,
+            fin_seq,
+            peer_closed,
+            error,
+            advertised,
+            mss,
+            own_mss,
+            retransmits,
+            fast_retransmits,
+            timeouts,
+            dual,
+            options,
+            own_sack,
+            sack_ok,
+            ooo,
+            ooo_count,
+            scoreboard,
+            score_count,
+            rexmit_next,
+            sack_retransmits,
+        } = &Tcb::EMPTY;
+        self.used = used;
+        self.state = state;
+        self.parent = parent;
+        self.accepted = accepted;
+        self.orphan = orphan;
+        self.local_port = local_port;
+        self.remote = remote;
+        self.remote_port = remote_port;
+        self.snd_una = snd_una;
+        self.snd_nxt = snd_nxt;
+        self.snd_max = snd_max;
+        self.snd_wnd = snd_wnd;
+        self.rcv_nxt = rcv_nxt;
+        self.send.clear();
+        self.recv.clear();
+        self.cwnd = cwnd;
+        self.ssthresh = ssthresh;
+        self.dup_acks = dup_acks;
+        self.in_recovery = in_recovery;
+        self.recover = recover;
+        self.rto = rto;
+        self.srtt = srtt;
+        self.rttvar = rttvar;
+        self.rtt_seq = rtt_seq;
+        self.rtt_start = rtt_start;
+        self.timer = timer;
+        self.retries = retries;
+        self.time_wait_until = time_wait_until;
+        self.fin_queued = fin_queued;
+        self.fin_sent = fin_sent;
+        self.fin_seq = fin_seq;
+        self.peer_closed = peer_closed;
+        self.error = error;
+        self.advertised = advertised;
+        self.mss = mss;
+        self.own_mss = own_mss;
+        self.retransmits = retransmits;
+        self.fast_retransmits = fast_retransmits;
+        self.timeouts = timeouts;
+        self.dual = dual;
+        self.options = options;
+        self.own_sack = own_sack;
+        self.sack_ok = sack_ok;
+        self.ooo = ooo;
+        self.ooo_count = ooo_count;
+        self.scoreboard = scoreboard;
+        self.score_count = score_count;
+        self.rexmit_next = rexmit_next;
+        self.sack_retransmits = sack_retransmits;
+    }
 
     fn emit(&mut self, sink: &mut dyn Sink, seq: u32, flags: u8, payload: &[u8]) -> bool {
         let window = self.recv.free().min(65_535);
@@ -589,6 +697,10 @@ impl Tcb {
                 }
                 let count = queued.min(self.mss).min(allowed);
                 if count == 0 {
+                    break;
+                }
+                // Nagle: a partial segment waits while earlier data is unacknowledged.
+                if queued < self.mss && sent > 0 && !self.options.nodelay && !self.fin_queued {
                     break;
                 }
                 let copied = self.send.peek(sent, &mut chunk[..count]);
@@ -986,8 +1098,14 @@ impl Tcp {
         }
     }
 
+    /// In place: a whole table is too big to build on a kernel stack.
     pub fn reset(&mut self) {
-        *self = Self::new();
+        for tcb in &mut self.tcbs {
+            tcb.clear();
+        }
+        self.next_port = 49_152;
+        self.local_mss = MSS as u16;
+        self.sack = true;
     }
 
     /// The MSS advertised on connections made from now on.
@@ -1046,19 +1164,20 @@ impl Tcp {
                 .iter()
                 .position(|tcb| tcb.state == State::TimeWait && tcb.orphan)
         })?;
-        self.tcbs[index] = Tcb {
-            used: true,
-            own_mss: self.local_mss,
-            own_sack: self.sack,
-            ..Tcb::EMPTY
-        };
+        let (own_mss, own_sack) = (self.local_mss, self.sack);
+        let tcb = &mut self.tcbs[index];
+        tcb.clear();
+        tcb.used = true;
+        tcb.own_mss = own_mss;
+        tcb.own_sack = own_sack;
         Some(index)
     }
 
+    /// Whether a socket holds `port`: bound, listening or connected.
     fn port_in_use(&self, port: u16) -> bool {
         self.tcbs
             .iter()
-            .any(|tcb| tcb.used && tcb.local_port == port && tcb.state != State::Closed)
+            .any(|tcb| tcb.used && tcb.local_port == port)
     }
 
     pub fn bind(&mut self, index: usize, port: u16) -> Result<(), u64> {
@@ -1077,6 +1196,12 @@ impl Tcp {
         {
             return Err(EADDRINUSE);
         }
+        // Port 0 is an ephemeral port, chosen now so `getsockname` reports it.
+        let port = if port == 0 {
+            self.allocate_port()
+        } else {
+            port
+        };
         self.tcbs[index].local_port = port;
         Ok(())
     }
@@ -1315,22 +1440,27 @@ impl Tcp {
     }
 
     pub fn close(&mut self, index: usize, now: u64, sink: &mut dyn Sink) {
-        let Some(tcb) = self.tcbs.get(index).filter(|tcb| tcb.used).copied() else {
+        let Some(state) = self
+            .tcbs
+            .get(index)
+            .filter(|tcb| tcb.used)
+            .map(|tcb| tcb.state)
+        else {
             return;
         };
-        match tcb.state {
-            State::Closed | State::SynSent => self.tcbs[index] = Tcb::EMPTY,
+        match state {
+            State::Closed | State::SynSent => self.tcbs[index].clear(),
             State::Listen => {
                 for child in self.tcbs.iter_mut() {
                     if child.used && child.parent == Some(index) {
                         if child.accepted {
                             child.parent = None;
                         } else {
-                            *child = Tcb::EMPTY;
+                            child.clear();
                         }
                     }
                 }
-                self.tcbs[index] = Tcb::EMPTY;
+                self.tcbs[index].clear();
             }
             State::SynReceived | State::Established | State::CloseWait => {
                 let tcb = &mut self.tcbs[index];
@@ -1339,7 +1469,7 @@ impl Tcp {
                 tcb.fin_queued = true;
                 tcb.output(now, sink);
             }
-            State::TimeWait => self.tcbs[index] = Tcb::EMPTY,
+            State::TimeWait => self.tcbs[index].clear(),
             _ => {
                 self.tcbs[index].orphan = true;
             }
@@ -1364,7 +1494,7 @@ impl Tcp {
         ) {
             let seq = tcb.snd_nxt;
             tcb.emit(sink, seq, RST | ACK, &[]);
-            self.tcbs[index] = Tcb::EMPTY;
+            self.tcbs[index].clear();
         } else {
             self.close(index, now, sink);
         }
@@ -1442,25 +1572,24 @@ impl Tcp {
                 return;
             };
             let iss = initial_sequence(now, segment.local_port, segment.remote_port);
+            let (local_mss, sack) = (self.local_mss, self.sack);
             let tcb = &mut self.tcbs[child];
-            *tcb = Tcb {
-                used: true,
-                state: State::SynReceived,
-                parent: Some(listener),
-                local_port: segment.local_port,
-                remote: segment.remote,
-                remote_port: segment.remote_port,
-                snd_una: iss,
-                snd_nxt: iss.wrapping_add(1),
-                snd_max: iss.wrapping_add(1),
-                snd_wnd: segment.window as u32,
-                rcv_nxt: segment.seq.wrapping_add(1),
-                mss: negotiated_mss(segment.mss).min(path_limit(&segment.remote)),
-                own_mss: self.local_mss.min(path_limit(&segment.remote) as u16),
-                own_sack: self.sack,
-                sack_ok: self.sack && segment.sack.permitted,
-                ..Tcb::EMPTY
-            };
+            tcb.clear();
+            tcb.used = true;
+            tcb.state = State::SynReceived;
+            tcb.parent = Some(listener);
+            tcb.local_port = segment.local_port;
+            tcb.remote = segment.remote;
+            tcb.remote_port = segment.remote_port;
+            tcb.snd_una = iss;
+            tcb.snd_nxt = iss.wrapping_add(1);
+            tcb.snd_max = iss.wrapping_add(1);
+            tcb.snd_wnd = segment.window as u32;
+            tcb.rcv_nxt = segment.seq.wrapping_add(1);
+            tcb.mss = negotiated_mss(segment.mss).min(path_limit(&segment.remote));
+            tcb.own_mss = local_mss.min(path_limit(&segment.remote) as u16);
+            tcb.own_sack = sack;
+            tcb.sack_ok = sack && segment.sack.permitted;
             tcb.emit(sink, iss, SYN | ACK, &[]);
             tcb.arm(now);
             return;
@@ -2086,6 +2215,58 @@ mod simulation {
             && client.write(socket, b"x", now, to_server) == Err(ENOTCONN)
     }
 
+    /// Ten 100-byte writes in a row: with Nagle the first goes out and the
+    /// rest wait for its acknowledgement and then leave as one segment; with
+    /// `TCP_NODELAY` each goes out at once. Returns the data frames sent
+    /// before any acknowledgement, if all 1000 bytes arrive.
+    fn small_writes(simulation: &mut Simulation, nodelay: bool) -> Option<u32> {
+        simulation.client.reset();
+        simulation.server.reset();
+        simulation.to_server.count = 0;
+        simulation.to_client.count = 0;
+        let Simulation {
+            client,
+            server,
+            to_server,
+            to_client,
+        } = simulation;
+        let (listener, socket) = (server.socket()?, client.socket()?);
+        server.bind(listener, 80).ok()?;
+        server.listen(listener).ok()?;
+        let mut options = client.options(socket);
+        options.nodelay = nodelay;
+        client.set_options(socket, options);
+        let mut now = 1_000_000u64;
+        client.connect(socket, SERVER, 80, now, to_server).ok()?;
+        let mut accepted = None;
+        for _ in 0..10 {
+            now += 1_000_000;
+            deliver(to_server, server, CLIENT, Loss::None, now, to_client);
+            deliver(to_client, client, SERVER, Loss::None, now, to_server);
+            accepted = accepted.or_else(|| server.accept(listener));
+        }
+        let connection = accepted?;
+        let before = to_server.count;
+        for _ in 0..10 {
+            client.write(socket, &[7u8; 100], now, to_server).ok()?;
+        }
+        let burst = to_server.frames[before..to_server.count]
+            .iter()
+            .filter(|frame| frame.length > 0)
+            .count() as u32;
+        let mut received = 0;
+        let mut buffer = [0u8; 1000];
+        for _ in 0..10 {
+            now += 1_000_000;
+            deliver(to_server, server, CLIENT, Loss::None, now, to_client);
+            deliver(to_client, client, SERVER, Loss::None, now, to_server);
+            while let Ok(count @ 1..) = server.read(connection, &mut buffer, to_client) {
+                received += count;
+            }
+        }
+        (received == 1000).then_some(burst)
+    }
+
     fn unreachable_peer(simulation: &mut Simulation) -> bool {
         simulation.client.reset();
         simulation.to_server.count = 0;
@@ -2233,6 +2414,7 @@ mod simulation {
         pub reclaim: bool,
         pub sack_receiver: bool,
         pub sack_recovery: bool,
+        pub nagle: bool,
         pub retransmits: u32,
         pub fast_retransmits: u32,
         pub peak_cwnd: u32,
@@ -2318,6 +2500,8 @@ mod simulation {
             && lossy.upload_frames <= lossy_plain.upload_frames
             && lossy.selective > 0;
         let sack_receiver = out_of_order_receiver(&mut simulation);
+        let nagle = small_writes(&mut simulation, false) == Some(1)
+            && small_writes(&mut simulation, true) == Some(10);
 
         let slow = transfer(&mut simulation, Loss::None, 40_000, 5_000, 300, 0);
         let slow_ok = slow.completed && slow.elapsed_ms > 100;
@@ -2357,6 +2541,19 @@ mod simulation {
             }
             waiting && filler > SOCKETS - 1
         };
+        // Binding port 0 picks a port at once, a different one each time.
+        let ephemeral_ok = {
+            let client = &mut simulation.client;
+            client.reset();
+            match (client.socket(), client.socket()) {
+                (Some(a), Some(b)) => {
+                    let bound = client.bind(a, 0).is_ok() && client.bind(b, 0).is_ok();
+                    let (first, second) = (client.local_port(a), client.local_port(b));
+                    bound && first.is_some_and(|port| port != 0) && first != second
+                }
+                _ => false,
+            }
+        };
         let refused_ok = refused(&mut simulation);
         let unreachable_ok = unreachable_peer(&mut simulation);
         let hostile_ok = hostile_input(&mut simulation);
@@ -2371,6 +2568,7 @@ mod simulation {
             reclaim: reclaim_ok,
             sack_receiver,
             sack_recovery,
+            nagle,
             retransmits: lossy.client_counters.retransmits,
             fast_retransmits: burst.client_counters.fast_retransmits,
             peak_cwnd: clean.peak_cwnd,
@@ -2383,9 +2581,11 @@ mod simulation {
                 && hostile_ok
                 && reclaim_ok
                 && small_ok
+                && ephemeral_ok
                 && chaos_ok
                 && sack_receiver
-                && sack_recovery,
+                && sack_recovery
+                && nagle,
         }
     }
 }

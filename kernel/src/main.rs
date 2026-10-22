@@ -55,6 +55,7 @@ mod inflate;
 mod initramfs;
 mod initramfs_gnu;
 mod initramfs_perl;
+mod initramfs_python;
 mod installer;
 mod ioapic;
 mod iommu;
@@ -495,24 +496,30 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     arch::paging::set_boot_state(&paging);
     let demand_paging_ready = arch::paging::demand_init(&paging, &mut frames);
     // Every process's pages (and the shared libraries a dynamically linked
-    // program maps) come from this pool: as much as a third of the usable
-    // memory, from 16 MiB up to 128 MiB.
+    // program maps) come from this pool: a quarter of the memory, leaving at
+    // least 128 MiB to everything else (the hypervisor's guests among it), at
+    // least 16 MiB and at most 1 GiB, gathered from as few blocks as the
+    // memory map allows.
     let usable_pages = boot.memory.usable_pages() + boot.memory.reclaimable_pages();
+    let target = (usable_pages / 4)
+        .min(boot.memory.usable_pages().saturating_sub(32768))
+        .clamp(4096, memory::POOL_MAX_PAGES as u64);
     let mut demand_pool_pages = 0u64;
-    let demand_pool_installed = [32768u64, 16384, 8192, 4096].into_iter().any(|pages| {
-        if pages > 4096 && pages * 3 > usable_pages {
-            return false;
+    let mut chunk = 65536u64;
+    while demand_pool_pages < target && chunk >= 1024 {
+        let pages = chunk.min(target - demand_pool_pages);
+        match frames.allocate_contiguous(pages, 1) {
+            Some(block) if memory::add_global_block(block.address(), pages) => {
+                demand_pool_pages += pages;
+            }
+            Some(block) => {
+                frames.release_contiguous(block.address(), pages);
+                break;
+            }
+            None => chunk /= 2,
         }
-        let installed = frames
-            .allocate_contiguous(pages, 1)
-            .and_then(|block| FrameAllocator::from_range(block.address(), pages))
-            .map(memory::install_global)
-            .is_some();
-        if installed {
-            demand_pool_pages = pages;
-        }
-        installed
-    });
+    }
+    let demand_pool_installed = demand_pool_pages >= 4096;
     let demand_paging =
         demand_paging_ready && demand_pool_installed && arch::paging::demand_self_test();
     let demand_stats = arch::paging::demand_stats();
@@ -816,7 +823,11 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     let initramfs_entries = initramfs::entries();
     let vfs_stats = vfs::initialize(
         &initramfs_entries,
-        &[&initramfs_gnu::GNU, &initramfs_perl::PERL_FILES],
+        &[
+            &initramfs_gnu::GNU,
+            &initramfs_perl::PERL_FILES,
+            &initramfs_python::PYTHON_FILES,
+        ],
     );
     let home = datafs::initialize();
     let assembled_volumes = raid::assemble();
@@ -1117,11 +1128,12 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     let runtime_vfs = vfs::stats();
     let tmpfs_valid = runtime_vfs.verified
         && runtime_vfs.nodes == runtime_vfs.directories + runtime_vfs.files
-        && runtime_vfs.directories == 48
+        && runtime_vfs.directories == 90
         && runtime_vfs.files
             == initramfs::entries().len()
                 + initramfs_gnu::GNU.len()
                 + initramfs_perl::PERL_FILES.len()
+                + initramfs_python::PYTHON_FILES.len()
                 + 1
         && runtime_vfs.mutable_files == 1
         && runtime_vfs.mutable_bytes == 6
@@ -1349,10 +1361,11 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         #[cfg(feature = "boot-test")]
         arch::halt_forever();
     }
-    // Whether a fixed-address program's window (virtual 0..8 MiB) may shadow
-    // the identity map there: nothing outside plain memory below 8 MiB (the
-    // legacy area under 1 MiB is not used once the kernel runs), and not the
-    // kernel image.
+    // Whether a fixed-address program's window (virtual 0..128 MiB) may shadow
+    // the identity map there: below 128 MiB only plain memory, and firmware
+    // memory the kernel reaches through its own tables (`with_kernel_tables`,
+    // ACPI NVS) or never (reserved); the legacy area under 1 MiB is not used
+    // once the kernel runs, and the kernel image must lie above.
     let low_end = arch::paging::LOW_WINDOW_END;
     let low_clean = boot.memory.regions().iter().all(|region| {
         let start = region.start.max(0x10_0000);
@@ -1363,7 +1376,11 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         start >= end
             || matches!(
                 region.kind,
-                memory::MemoryKind::Usable | memory::MemoryKind::BootReclaimable
+                memory::MemoryKind::Usable
+                    | memory::MemoryKind::BootReclaimable
+                    | memory::MemoryKind::AcpiNvs
+                    | memory::MemoryKind::Reserved
+                    | memory::MemoryKind::Unusable
             )
     }) && arch::paging::kernel_image_range()
         .is_none_or(|(base, size)| base >= low_end || base.saturating_add(size) <= 0x10_0000);
@@ -1378,7 +1395,11 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
             start < end
                 && !matches!(
                     region.kind,
-                    memory::MemoryKind::Usable | memory::MemoryKind::BootReclaimable
+                    memory::MemoryKind::Usable
+                        | memory::MemoryKind::BootReclaimable
+                        | memory::MemoryKind::AcpiNvs
+                        | memory::MemoryKind::Reserved
+                        | memory::MemoryKind::Unusable
                 )
         }) {
             serial::format(format_args!(
@@ -2234,7 +2255,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     {
         let tcp = tcp::self_test();
         serial::format(format_args!(
-            "AEROS_TCP_ENGINE clean={} lossy={} burst_loss={} slow_reader={} refused={} unreachable={} hostile={} sack_receiver={} sack_recovery={} retransmits={} fast_retransmits={} peak_cwnd={} verified={}
+            "AEROS_TCP_ENGINE clean={} lossy={} burst_loss={} slow_reader={} refused={} unreachable={} hostile={} sack_receiver={} sack_recovery={} nagle={} retransmits={} fast_retransmits={} peak_cwnd={} verified={}
 ",
             tcp.clean,
             tcp.lossy,
@@ -2245,6 +2266,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
             tcp.hostile,
             tcp.sack_receiver,
             tcp.sack_recovery,
+            tcp.nagle,
             tcp.retransmits,
             tcp.fast_retransmits,
             tcp.peak_cwnd,
@@ -3142,6 +3164,15 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         serial::line("AEROS_APPS_INVARIANT_FAILURE");
         #[cfg(feature = "boot-test")]
         arch::halt_forever();
+    }
+    #[cfg(feature = "boot-test")]
+    {
+        let jobs = shell::foreground_job_self_test(shell_info);
+        serial::format(format_args!("AEROS_TERMINAL_JOBS verified={jobs}\n"));
+        if !jobs {
+            serial::line("AEROS_TERMINAL_JOBS_FAILURE");
+            arch::halt_forever();
+        }
     }
     #[cfg(feature = "boot-test")]
     {

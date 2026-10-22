@@ -3,7 +3,7 @@ const PROGRAM_HEADER_SIZE: usize = 56;
 const MAX_SEGMENTS: usize = 8;
 /// The most address space an image may span: the code window of a process
 /// (the paging layer checks the exact fit).
-const USER_IMAGE_LIMIT: u64 = 1600 * 4096;
+const USER_IMAGE_LIMIT: u64 = 4096 * 4096;
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
 const PF_EXECUTE: u32 = 1;

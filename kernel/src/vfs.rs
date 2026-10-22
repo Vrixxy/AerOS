@@ -3,7 +3,7 @@ use crate::fat;
 use crate::sync::TicketLock;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-const MAX_NODES: usize = 768;
+const MAX_NODES: usize = 2048;
 const MAX_HANDLES: usize = 24;
 pub const MAX_NAME: usize = 255;
 const MAX_DEPTH: usize = 16;
@@ -545,8 +545,12 @@ impl Vfs {
         }
     }
 
+    /// In place: the node table is too big to build as a temporary.
     fn reset(&mut self) {
-        *self = Self::new();
+        self.nodes.fill(Node::EMPTY);
+        self.nodes[0] = Node::ROOT;
+        self.node_count = 1;
+        self.handles.fill(OpenHandle::EMPTY);
     }
 
     fn mount(

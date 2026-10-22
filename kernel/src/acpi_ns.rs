@@ -78,14 +78,14 @@ fn mem_read(address: u64, bytes: u8) -> Option<u64> {
     }
     let pointer = address as usize;
     // SAFETY: the range is mapped; a device register or firmware table.
-    unsafe {
+    arch::paging::with_kernel_tables(|| unsafe {
         Some(match bytes {
             1 => core::ptr::read_volatile(pointer as *const u8) as u64,
             2 => core::ptr::read_volatile(pointer as *const u16) as u64,
             4 => core::ptr::read_volatile(pointer as *const u32) as u64,
             _ => core::ptr::read_volatile(pointer as *const u64),
         })
-    }
+    })
 }
 
 fn mem_write(address: u64, bytes: u8, value: u64) -> bool {
@@ -94,14 +94,14 @@ fn mem_write(address: u64, bytes: u8, value: u64) -> bool {
     }
     let pointer = address as usize;
     // SAFETY: as above.
-    unsafe {
+    arch::paging::with_kernel_tables(|| unsafe {
         match bytes {
             1 => core::ptr::write_volatile(pointer as *mut u8, value as u8),
             2 => core::ptr::write_volatile(pointer as *mut u16, value as u16),
             4 => core::ptr::write_volatile(pointer as *mut u32, value as u32),
             _ => core::ptr::write_volatile(pointer as *mut u64, value),
         }
-    }
+    });
     true
 }
 

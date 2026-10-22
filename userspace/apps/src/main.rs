@@ -305,6 +305,7 @@ b
         ("meminfo-before", r#"/bin/head -n 3 /proc/meminfo"#),
         ("xz-only", r#"echo roundtrip | /bin/xz -0 -c | /bin/xz -dc"#),
         ("bzip2-only", r#"echo roundtrip | /bin/bzip2 -1 -c | /bin/bzip2 -dc"#),
+        ("bzip2-default", r#"/bin/head -c 1000000 /dev/zero | /bin/bzip2 -c | /bin/bzip2 -dc | /bin/wc -c"#),
         ("meminfo-after", r#"/bin/head -n 3 /proc/meminfo"#),
         ("xz-bzip2", r#"echo roundtrip | /bin/xz -0 -c | /bin/xz -dc; echo roundtrip | /bin/bzip2 -1 -c | /bin/bzip2 -dc"#),
         ("diff-cmp-patch", r#"cd /tmp && echo one > a && echo two > b && /bin/cmp a b; /bin/diff -u a b > d.patch; /bin/patch a < d.patch && /bin/cmp a b && echo patched; /bin/rm a b d.patch"#),
@@ -356,12 +357,83 @@ b
              recv($s, my $z, 64, 0); print qq($x $y $z\n); exit($x.$y.$z eq 'peekpeekdgram' ? 0 : 1)",
         ),
         (
+            "perl-big-string",
+            "my $x = 'a' x 20_000_000; print length($x), qq(\\n); exit(length($x) == 20_000_000 ? 0 : 1)",
+        ),
+        (
             "perl-sprintf-sort",
             "printf(qq(%05.1f %s %x\n), 3.14159, join('', sort { $b <=> $a } (3, 1, 2)), 255)",
         ),
     ];
     for (label, code) in perl {
         check_exit(label, &["/usr/bin/perl", "-e", code], 0);
+    }
+    // Debian's Python 3.13: a fixed-address program with an interpreter.
+    check_exit("python-version", &["/usr/bin/python3", "--version"], 0);
+    let python: &[(&str, &str)] = &[
+        (
+            "python-stdlib",
+            "import json, re, collections, os, sys\n\
+             print(json.dumps(sorted(collections.Counter('hello').items())))\n\
+             print(re.sub(r'l+', 'L', 'hello'), os.getcwd(), sys.version_info[:2])",
+        ),
+        (
+            "python-files",
+            "import pathlib, tempfile\n\
+             p = pathlib.Path(tempfile.mkdtemp()) / 'x.txt'\n\
+             p.write_text('from python')\n\
+             print(p.read_text(), p.stat().st_size)\n\
+             p.unlink()",
+        ),
+        (
+            "python-ssl-sqlite",
+            "import hashlib, ssl, sqlite3, uuid\n\
+             print(hashlib.sha256(b'aeros').hexdigest()[:16], ssl.OPENSSL_VERSION.split()[0])\n\
+             context = ssl.create_default_context()\n\
+             assert context.cert_store_stats()['x509_ca'] > 100\n\
+             db = sqlite3.connect(':memory:')\n\
+             db.execute('create table t (n)'); db.executemany('insert into t values (?)', [(1,), (2,), (3,)])\n\
+             print('sum', db.execute('select sum(n) from t').fetchone()[0], uuid.uuid4().version)",
+        ),
+        (
+            "python-http-thread",
+            "import http.server, threading, urllib.request, json\n\
+             server = http.server.HTTPServer(('127.0.0.1', 0), http.server.SimpleHTTPRequestHandler)\n\
+             threading.Thread(target=server.serve_forever, daemon=True).start()\n\
+             reply = urllib.request.urlopen('http://127.0.0.1:%d/' % server.server_port, timeout=20)\n\
+             print(reply.status, json.dumps({'threads': threading.active_count()}))\n\
+             server.shutdown()",
+        ),
+        (
+            "python-asyncio",
+            "import asyncio\n\
+             async def handle(reader, writer):\n\
+             \x20   writer.write((await reader.readline()).upper()); await writer.drain(); writer.close()\n\
+             async def main():\n\
+             \x20   server = await asyncio.start_server(handle, '127.0.0.1', 0)\n\
+             \x20   port = server.sockets[0].getsockname()[1]\n\
+             \x20   reader, writer = await asyncio.open_connection('127.0.0.1', port)\n\
+             \x20   writer.write(b'hello asyncio\\n'); await writer.drain()\n\
+             \x20   print((await reader.readline()).decode().strip())\n\
+             \x20   writer.close(); server.close(); await server.wait_closed()\n\
+             asyncio.run(main())",
+        ),
+        (
+            "python-multiprocessing",
+            "import multiprocessing\n\
+             def square(value):\n\
+             \x20   return value * value\n\
+             with multiprocessing.Pool(2) as pool:\n\
+             \x20   print(sum(pool.map(square, range(10))))",
+        ),
+        (
+            "python-subprocess",
+            "import subprocess\n\
+             print(subprocess.run(['/bin/echo', 'child'], capture_output=True, text=True).stdout.strip())",
+        ),
+    ];
+    for (label, code) in python {
+        check_exit(label, &["/usr/bin/python3", "-c", code], 0);
     }
     println!("AEROS_APPS done passed={passed} total={total}");
     std::process::exit(if passed == total { 90 } else { 91 });

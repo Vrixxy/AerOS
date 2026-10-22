@@ -8,8 +8,8 @@ use crate::ip::Address;
 use crate::sync::TicketLock;
 
 pub const MAX_PAYLOAD: usize = 1472;
-const BINDINGS: usize = 24;
-const QUEUE: usize = 4;
+const BINDINGS: usize = 40;
+const QUEUE: usize = 16;
 const EPHEMERAL_FIRST: u16 = 49_200;
 
 pub const EADDRINUSE: u64 = 98;
@@ -43,7 +43,6 @@ enum Owner {
     Echo,
 }
 
-#[derive(Clone, Copy)]
 struct Binding {
     owner: Owner,
     port: u16,
@@ -62,6 +61,15 @@ impl Binding {
         last_used: 0,
         queue: [Datagram::EMPTY; QUEUE],
     };
+
+    /// Frees the binding in place (a whole one is too big for a stack temporary).
+    fn release(&mut self) {
+        self.owner = Owner::Free;
+        self.port = 0;
+        self.head = 0;
+        self.count = 0;
+        self.last_used = 0;
+    }
 }
 
 struct Table {
@@ -121,12 +129,11 @@ fn claim(table: &mut Table, port: u16, owner: Owner) -> Result<usize, u64> {
         };
         candidate
     };
-    table.bindings[slot] = Binding {
-        owner,
-        port: chosen,
-        last_used: crate::time::monotonic_nanoseconds(),
-        ..Binding::EMPTY
-    };
+    let binding = &mut table.bindings[slot];
+    binding.release();
+    binding.owner = owner;
+    binding.port = chosen;
+    binding.last_used = crate::time::monotonic_nanoseconds();
     Ok(slot)
 }
 
@@ -212,7 +219,7 @@ pub fn deliver_echo(identity: u16, source: Address, message: &[u8]) -> bool {
 pub fn release(slot: usize) {
     let mut table = TABLE.lock();
     if let Some(binding) = table.bindings.get_mut(slot) {
-        *binding = Binding::EMPTY;
+        binding.release();
     }
 }
 
@@ -220,7 +227,7 @@ pub fn release(slot: usize) {
 pub fn reset() {
     let mut table = TABLE.lock();
     for binding in table.bindings.iter_mut() {
-        *binding = Binding::EMPTY;
+        binding.release();
     }
     table.next_port = EPHEMERAL_FIRST;
     table.dropped = 0;

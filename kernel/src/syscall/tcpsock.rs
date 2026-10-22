@@ -252,7 +252,13 @@ pub(super) fn receive(process_fd: ProcessFd, address: u64, requested: u64, flags
     let Ok(requested) = usize::try_from(requested) else {
         return error(22);
     };
-    if requested > MAX_IO || !user::range_accessible(address, requested, true) {
+    // A bigger buffer gets a short count, as on Linux; it must still lie in
+    // the process.
+    if !user::range_in_window(address, requested) {
+        return error(14);
+    }
+    let requested = requested.min(MAX_IO);
+    if !user::range_accessible(address, requested, true) {
         return error(14);
     }
     let (peek, waitall, dontwait) = (flags & 2 != 0, flags & 0x100 != 0, flags & 0x40 != 0);

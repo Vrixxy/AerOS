@@ -64,7 +64,16 @@ fn current_pid() -> u64 {
 }
 
 /// Paths served by this module: `/proc`, the small `/sys` and `/dev`.
+/// `/dev/shm` holds ordinary (memory) files, see `mounts::resolve`.
+fn shared_memory_path(path: &str) -> bool {
+    path.strip_prefix("/dev/shm")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 pub fn is_virtual_path(path: &str) -> bool {
+    if shared_memory_path(path) {
+        return false;
+    }
     ["/proc", "/sys", "/dev"].iter().any(|root| {
         path.strip_prefix(root)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
@@ -74,6 +83,9 @@ pub fn is_virtual_path(path: &str) -> bool {
 /// The backing path for a `/proc` path, with the files it names refreshed.
 /// `None` for any path outside `/proc`.
 pub fn resolve(path: &str) -> Option<Mapped> {
+    if shared_memory_path(path) {
+        return None;
+    }
     if let Some(rest) = path.strip_prefix("/dev")
         && (rest.is_empty() || rest.starts_with('/'))
     {

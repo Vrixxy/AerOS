@@ -87,25 +87,29 @@ The extended attribute family (188-199) answers EOPNOTSUPP, as a filesystem with
   `CAP_NET_BIND_SERVICE`), may signal, trace or `process_vm_*` only what it started, and cannot
   change the system's protected files (see the CHANGELOG's security review). No process may
   signal a kernel task.
-- **Programs**: static x86-64 ELF, position-independent or linked at a fixed address (0x400000; the
-  image area is 6.25 MiB and needs the first 8 MiB of the machine's memory to be plain RAM, checked
-  at boot). Debian's BusyBox runs as-is, and so do dynamically linked programs: `execve` loads the
-  interpreter named by `PT_INTERP` (from the initramfs) next to the program and `ld.so` maps the
-  libraries (`/lib/x86_64-linux-gnu`, from the initramfs too). Debian's bash and 60 GNU programs are
-  in the boot gate, with Perl, git, make, tar, awk and more (141 command lines). Only position-independent
-  programs can be dynamic; `execve` and the shell's own program launcher (the desktop Terminal runs any
-  `/bin` or `/usr/bin` program for a command it does not know) both start them through the interpreter.
-  A fixed-address program (Debian's Python is one, 11 MiB) does not fit the 8 MiB window.
-  A process window is 16 MiB: image area 6.25 MiB, heap 512 KiB, stack up to 784 KiB, then the
-  mapping area (8.5 MiB; a fixed-address program has 8 MiB in all and 488 KiB of mappings). Process
-  memory comes from a pool of a third of the usable memory (16 to 128 MiB).
+- **Programs**: static x86-64 ELF, position-independent or linked at a fixed address (0x400000; such
+  a program runs in a window at virtual address 0 that covers the first 128 MiB, so that memory must
+  hold nothing the kernel reaches directly: checked at boot, firmware's ACPI NVS is fine because the
+  kernel reads it through its own page tables). Debian's BusyBox runs as-is, and so do dynamically
+  linked programs, position-independent or not: `execve` loads the interpreter named by `PT_INTERP`
+  (from the initramfs) after the program and `ld.so` maps the libraries (`/lib/x86_64-linux-gnu`, from
+  the initramfs too). Debian's bash and 60 GNU programs are in the boot gate, with Perl, Python 3.13
+  (the standard library without tests, Tk and IDLE, with `ssl`, `hashlib`, `sqlite3`, `readline` and `curses`), git, make, tar,
+  awk and more (151 command lines). `execve` and the shell's own program launcher (the desktop
+  Terminal runs any `/bin` or `/usr/bin` program for a command it does not know) both start them
+  through the interpreter.
+  A process window is 256 MiB: image area 16 MiB, heap 32 MiB, stack up to 8 MiB, then about 200 MiB
+  of mappings (a fixed-address program's window is 128 MiB, with about 72 MiB of mappings). Private anonymous
+  mappings are demand-zero (a page gets memory when it is first touched; `PROT_NONE` pages never do);
+  shared ones are allocated when they are mapped. Process memory comes from a pool of a quarter of the memory (16 MiB
+  to 1 GiB, leaving at least 96 MiB for the rest of the system).
   `/dev` has `null`, `zero`, `urandom`, `random`, `tty`, `console`, `stdin`, `stdout` and `stderr`
-  (no other device nodes). The boot gate runs 92 BusyBox command lines (files, archives, text,
-  processes, shell scripting) and `ldconfig`; `bzip2` at its default block size is the known failure
-  (it needs more mapping space than the window has).
+  (no other device nodes). The boot gate runs 93 BusyBox command lines (files, archives, text,
+  processes, shell scripting) and `ldconfig`, `bzip2` at its default block size among them.
 - **Memory**: anonymous and read-only file mappings, `MAP_SHARED|MAP_ANONYMOUS` (stays shared across
-  `fork`), System V shared memory, `mremap` by copy. A writable `MAP_SHARED` mapping of a file is
-  refused: the writes would have to reach the file. 2170 mapping pages (122 for a fixed-address program) and 128 heap pages per process.
+  `fork`), System V shared memory, POSIX shared memory (`/dev/shm`, `shm_open`, `sem_open`;
+  shared futexes), `mremap` by copy. A writable `MAP_SHARED` mapping of any other file is refused:
+  the writes would have to reach the file.
 - **Signals**: handlers with `SA_RESTORER`, masks, alternate stacks, `signalfd`, `rt_sigtimedwait`,
   `rt_sigsuspend`, queued blocked signals. No realtime queueing: a signal is pending or not, and
   `siginfo` has the code, sender, value and, for faults, the address; faults run the process's own SIGSEGV/SIGFPE/SIGILL/SIGBUS handler.
@@ -113,10 +117,11 @@ The extended attribute family (188-199) answers EOPNOTSUPP, as a filesystem with
   `siginfo` carries `sigev_value` and the overrun), `nanosleep`, `clock_gettime` with real CPU-time clocks.
 - **Files**: the VFS (initramfs, tmpfs, FAT, AerFS, union overlay), `splice`/`tee`/`vmsplice`,
   `sendfile`, `copy_file_range`, `inotify` (events raised by what processes do; consecutive identical
-  events are not merged), `flock`, no `fanotify`. Hard links are refused (EPERM): no filesystem has them.
+  events are not merged), `flock`, no `fanotify`. Hard links are refused (EPERM): no filesystem has them (inside
+  `/dev/shm`, `link` renames, which is all `sem_open` needs).
 - **IPC**: pipes, `eventfd`, `socketpair` (stream, and datagram and sequenced-packet pairs that keep message boundaries, up to 4000 bytes a message), named AF_UNIX stream and sequenced-packet sockets (`bind`/`listen`/`accept`/`connect`) and datagram sockets (`bind`, `sendto` a name, `connect` then `send`; BusyBox `syslogd` and `logger` talk over `/dev/log` in the boot gate). Names are matched in a kernel table like Linux's abstract namespace, nothing is created in the filesystem, and a received datagram has no sender address. System V message queues, semaphores and
   shared memory (small fixed tables, kernel-wide so unrelated processes meet by key), `epoll`.
-- **Network sockets**: TCP and UDP over IPv4 and IPv6, and IPv4 ping sockets
+- **Network sockets**: TCP (64 KiB windows without window scaling, SACK, Nagle unless `TCP_NODELAY`; `TCP_CORK` is stored but not acted on) and UDP over IPv4 and IPv6, and IPv4 ping sockets
   (`SOCK_DGRAM` + `IPPROTO_ICMP`: echo requests out, replies in, the identifier is the socket's).
   No raw sockets or `AF_PACKET`.
 - **Accounting**: CPU time is sampled from the timer tick per process (`getrusage`, `times`,

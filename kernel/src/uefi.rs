@@ -564,8 +564,8 @@ pub unsafe fn relocate(system_table: *mut SystemTable, entry: usize) -> Option<u
     if status != SUCCESS || descriptor_size < core::mem::size_of::<MemoryDescriptor>() {
         return fail(7);
     }
-    // Free regions at or above 16 MiB; low memory is left alone.
-    const FLOOR: u64 = 16 * 1024 * 1024;
+    // Free regions above the fixed-address window; low memory is left alone.
+    const FLOOR: u64 = crate::arch::paging::LOW_WINDOW_END;
     let mut regions = [(0u64, 0u64); 192];
     let mut count = 0;
     let map_base = MEMORY_MAP.0.get().cast::<u8>();

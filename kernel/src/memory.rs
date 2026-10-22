@@ -5,7 +5,7 @@ const PAGE_SIZE: u64 = 4096;
 /// part of the identity map a fixed-address (`ET_EXEC`) program's window
 /// replaces in its own page tables (see `paging::LOW_WINDOW_END`), so nothing
 /// the kernel allocates may live there.
-const LOW_MEMORY_LIMIT: u64 = 0x80_0000;
+const LOW_MEMORY_LIMIT: u64 = crate::arch::paging::LOW_WINDOW_END;
 const MAX_MEMORY_REGIONS: usize = 256;
 const MAX_FREE_RANGES: usize = 512;
 
@@ -194,26 +194,6 @@ impl FrameAllocator {
         self.managed[..self.managed_count]
             .iter()
             .map(|range| (range.start, range.end))
-    }
-
-    pub fn from_range(start: u64, pages: u64) -> Option<Self> {
-        if pages == 0 || start & (PAGE_SIZE - 1) != 0 {
-            return None;
-        }
-        let end = start.checked_add(pages.checked_mul(PAGE_SIZE)?)?;
-        let range = Range { start, end };
-        let mut allocator = Self {
-            managed: [Range::EMPTY; MAX_MEMORY_REGIONS],
-            managed_count: 1,
-            free: [Range::EMPTY; MAX_FREE_RANGES],
-            free_count: 1,
-            free_pages: pages,
-            allocated_pages: 0,
-            tracked: false,
-        };
-        allocator.managed[0] = range;
-        allocator.free[0] = range;
-        Some(allocator)
     }
 
     pub fn from_map(map: &BootMemoryMap) -> Self {
@@ -485,34 +465,199 @@ fn align_down(value: u64, alignment: u64) -> u64 {
     value & !(alignment - 1)
 }
 
-static GLOBAL_FRAMES: TicketLock<Option<FrameAllocator>> = TicketLock::new(None);
+/// The most memory the process pool can hold: 1 GiB.
+pub const POOL_MAX_PAGES: usize = 1 << 18;
+const POOL_BLOCKS: usize = 16;
 
-pub fn install_global(allocator: FrameAllocator) {
-    *GLOBAL_FRAMES.lock() = Some(allocator);
+/// The pool every process's pages come from: a few blocks of RAM and one
+/// bit per page, so a page is always given back however fragmented the pool
+/// is (a free list of ranges can run out of entries).
+struct PagePool {
+    /// (first byte, pages, first bit) of each block.
+    blocks: [(u64, usize, usize); POOL_BLOCKS],
+    block_count: usize,
+    used: [u64; POOL_MAX_PAGES / 64],
+    pages: usize,
+    allocated: usize,
+    /// A word to start looking for a free page from.
+    hint: usize,
 }
 
-pub fn with_frames<R>(f: impl FnOnce(&mut FrameAllocator) -> R) -> Option<R> {
-    GLOBAL_FRAMES.lock().as_mut().map(f)
+static POOL: TicketLock<PagePool> = TicketLock::new(PagePool {
+    blocks: [(0, 0, 0); POOL_BLOCKS],
+    block_count: 0,
+    used: [0; POOL_MAX_PAGES / 64],
+    pages: 0,
+    allocated: 0,
+    hint: 0,
+});
+
+impl PagePool {
+    fn is_used(&self, bit: usize) -> bool {
+        self.used[bit / 64] & (1 << (bit % 64)) != 0
+    }
+
+    fn set(&mut self, bit: usize, used: bool) {
+        if used {
+            self.used[bit / 64] |= 1 << (bit % 64);
+        } else {
+            self.used[bit / 64] &= !(1 << (bit % 64));
+        }
+    }
+
+    fn address(&self, bit: usize) -> Option<u64> {
+        self.blocks[..self.block_count]
+            .iter()
+            .find(|(_, pages, first)| (*first..first + pages).contains(&bit))
+            .map(|(start, _, first)| start + (bit - first) as u64 * PAGE_SIZE)
+    }
+
+    fn bit(&self, address: u64) -> Option<usize> {
+        self.blocks[..self.block_count]
+            .iter()
+            .find(|(start, pages, _)| {
+                address >= *start && address < start + *pages as u64 * PAGE_SIZE
+            })
+            .map(|(start, _, first)| first + ((address - start) / PAGE_SIZE) as usize)
+    }
+
+    fn add(&mut self, start: u64, pages: usize) -> bool {
+        let pages = pages.min(POOL_MAX_PAGES - self.pages);
+        if pages == 0 || self.block_count == POOL_BLOCKS || start & (PAGE_SIZE - 1) != 0 {
+            return false;
+        }
+        self.blocks[self.block_count] = (start, pages, self.pages);
+        self.block_count += 1;
+        self.pages += pages;
+        true
+    }
+
+    fn allocate_one(&mut self) -> Option<u64> {
+        let words = self.pages.div_ceil(64);
+        for step in 0..words {
+            let word = (self.hint + step) % words;
+            let free = !self.used[word];
+            if free == 0 {
+                continue;
+            }
+            let bit = word * 64 + free.trailing_zeros() as usize;
+            if bit >= self.pages {
+                continue;
+            }
+            self.set(bit, true);
+            self.allocated += 1;
+            self.hint = word;
+            return self.address(bit);
+        }
+        None
+    }
+
+    /// `pages` pages in a row, inside one block, starting at a multiple of
+    /// `alignment` pages (physically).
+    fn allocate_run(&mut self, pages: usize, alignment: u64) -> Option<u64> {
+        for block in 0..self.block_count {
+            let (start, count, first) = self.blocks[block];
+            let mut page = 0;
+            while page + pages <= count {
+                let address = start + page as u64 * PAGE_SIZE;
+                if !(address / PAGE_SIZE).is_multiple_of(alignment) {
+                    page += 1;
+                    continue;
+                }
+                match (0..pages).find(|offset| self.is_used(first + page + offset)) {
+                    Some(offset) => page += offset + 1,
+                    None => {
+                        for offset in 0..pages {
+                            self.set(first + page + offset, true);
+                        }
+                        self.allocated += pages;
+                        return Some(address);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn release(&mut self, address: u64, pages: usize, wipe: bool) -> bool {
+        let Some(first) = self.bit(address) else {
+            return false;
+        };
+        // The whole run must be in one block and allocated.
+        if self.bit(address + (pages as u64 - 1) * PAGE_SIZE) != Some(first + pages - 1)
+            || (0..pages).any(|offset| !self.is_used(first + offset))
+        {
+            return false;
+        }
+        // A dead process's pages can hold anything it had in memory (file
+        // contents, input, keys): wiped now rather than when they are reused.
+        if wipe {
+            unsafe {
+                core::ptr::write_bytes(address as usize as *mut u8, 0, pages * PAGE_SIZE as usize)
+            };
+        }
+        for offset in 0..pages {
+            self.set(first + offset, false);
+        }
+        self.allocated -= pages;
+        true
+    }
+}
+
+/// Adds a block of RAM to the process pool; false when the pool is full.
+pub fn add_global_block(start: u64, pages: u64) -> bool {
+    POOL.lock().add(start, usize::try_from(pages).unwrap_or(0))
 }
 
 pub fn allocate_global() -> Option<PhysFrame> {
-    with_frames(FrameAllocator::allocate).flatten()
+    POOL.lock().allocate_one().map(PhysFrame)
 }
 
 pub fn release_global_address(address: u64) -> bool {
-    with_frames(|frames| frames.release_contiguous(address, 1)).unwrap_or(false)
+    POOL.lock().release(address, 1, true)
 }
 
 pub fn allocate_global_contiguous(pages: u64, alignment_pages: u64) -> Option<PhysFrame> {
-    with_frames(|frames| frames.allocate_contiguous(pages, alignment_pages)).flatten()
+    if pages == 0 || !alignment_pages.is_power_of_two() {
+        return None;
+    }
+    let pages = usize::try_from(pages).ok()?;
+    if pages == 1 && alignment_pages == 1 {
+        return allocate_global();
+    }
+    POOL.lock()
+        .allocate_run(pages, alignment_pages)
+        .map(PhysFrame)
 }
 
 pub fn release_global_contiguous(address: u64, pages: u64) -> bool {
-    with_frames(|frames| frames.release_contiguous(address, pages)).unwrap_or(false)
+    match usize::try_from(pages) {
+        Ok(pages) if pages != 0 && address & (PAGE_SIZE - 1) == 0 => {
+            POOL.lock().release(address, pages, true)
+        }
+        _ => false,
+    }
+}
+
+/// `release_global_contiguous` for memory that holds nothing of a process's
+/// (its page tables), which is not wiped first.
+pub fn release_global_contiguous_unwiped(address: u64, pages: u64) -> bool {
+    match usize::try_from(pages) {
+        Ok(pages) if pages != 0 && address & (PAGE_SIZE - 1) == 0 => {
+            POOL.lock().release(address, pages, false)
+        }
+        _ => false,
+    }
 }
 
 pub fn global_stats() -> Option<AllocatorStats> {
-    with_frames(|frames| frames.stats())
+    let pool = POOL.lock();
+    (pool.pages != 0).then(|| AllocatorStats {
+        free_pages: (pool.pages - pool.allocated) as u64,
+        allocated_pages: pool.allocated as u64,
+        free_ranges: 0,
+        managed_regions: pool.block_count,
+    })
 }
 
 /// The main allocator, installed once boot setup is done, for big buffers

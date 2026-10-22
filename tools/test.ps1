@@ -1,7 +1,7 @@
 param(
     [ValidateRange(1, 8)]
     [int]$CpuCount = 2,
-    [int]$MemoryMiB = 512
+    [int]$MemoryMiB = 1024
 )
 
 $ErrorActionPreference = "Stop"
@@ -352,7 +352,7 @@ function Send-AerosMonitor {
 
 function Send-AerosPowerButton { return (Send-AerosMonitor "system_powerdown") }
 
-$deadline = [DateTime]::UtcNow.AddSeconds(480)
+$deadline = [DateTime]::UtcNow.AddSeconds(720)
 $output = ""
 $powerButtonSent = $false
 
@@ -475,7 +475,7 @@ if ($output -notmatch "AEROS_HEAP .* active=0 verified=true") {
 if ($output -notmatch "AEROS_USER .* exit=42 smep=true smap=true mapped=true verified=true") {
     throw "AerOS ring-3 transition failed`n$output"
 }
-if ($output -notmatch "AEROS_VFS nodes=[0-9]+ directories=48 files=[0-9]+ bytes=[0-9]+ handles=0 mutable_files=0 mutable_bytes=0 readonly_root=true verified=true") {
+if ($output -notmatch "AEROS_VFS nodes=[0-9]+ directories=90 files=[0-9]+ bytes=[0-9]+ handles=0 mutable_files=0 mutable_bytes=0 readonly_root=true verified=true") {
     throw "AerOS VFS validation failed`n$output"
 }
 if ($output -notmatch "AEROS_ELF type=pie machine=x86_64 segments=3 .* wx=false verified=true") {
@@ -502,7 +502,7 @@ if ($output -notmatch "AEROS_REAP mappings=5 released_pages=[1-9][0-9]* free_bef
 if ($output -notmatch "AEROS_PROCESSES spawned=4 reaped=4 highest_pid=4 ready=0 running=0 zombies=0 generations=true init_exit=73 compiled_exit=74 std_exit=75 fault_exit=132 verified=true") {
     throw "AerOS process table validation failed`n$output"
 }
-if ($output -notmatch "AEROS_TMPFS path=/tmp nodes=[0-9]+ directories=48 files=[0-9]+ mutable_files=1 mutable_bytes=6 handles=0 verified=true") {
+if ($output -notmatch "AEROS_TMPFS path=/tmp nodes=[0-9]+ directories=90 files=[0-9]+ mutable_files=1 mutable_bytes=6 handles=0 verified=true") {
     throw "AerOS writable tmpfs validation failed`n$output"
 }
 if ($output -notmatch "AEROS_SYSCALL .* calls=161 bootstrap=2 linux=159 exits=4 unknown=0 opens=13 reads=12 writes=10 closes=17 io_bytes=264 clocks=1 random_calls=1 random_bytes=32 compat_calls=73 memory_calls=16 mmaps=6 file_mmaps=1 mprotects=2 munmaps=4 metadata=9 seeks=2 paths=12 resources=1 rseq=1 futex=1 fd_calls=10 dup_calls=4 last_fd=3 signals=12 runtime=8 directories=1 sockets=4 datagrams=2 network_bytes=[3-9][0-9]+ vectored=2 positional=1 access=1 statx=1 wall_clock=2 sleeps=2 chdir=1 relative_paths=5 polls=1 creates=2 renames=2 removes=5 syncs=2 truncates=1 chmods=1 verified=true") {
@@ -549,6 +549,9 @@ if ($output -notmatch "AEROS_RAID linear=true stripe=true mirror=true degraded=t
 }
 if ($output -notmatch "AEROS_SYSX exit=89 reaped=1 verified=true") {
     throw "AerOS extra syscall validation failed`n$output"
+}
+if ($output -notmatch "AEROS_TERMINAL_JOBS verified=true") {
+    throw "AerOS terminal foreground jobs (input, output, Ctrl+C) failed`n$output"
 }
 if ($output -notmatch "AEROS_APPS done passed=(\d+) total=\1\b" -or $output -notmatch "AEROS_APPS exit=90 reaped=1 verified=true") {
     throw "AerOS third-party program (BusyBox) validation failed`n$output"
@@ -715,7 +718,7 @@ if ($output -notmatch "AEROS_PWRITE created=true verified=true") {
 if ($output -notmatch "AEROS_PIPE verified=true") {
     throw "AerOS pipe validation failed`n$output"
 }
-if ($output -notmatch "AEROS_TCP_ENGINE clean=true lossy=true burst_loss=true slow_reader=true refused=true unreachable=true hostile=true sack_receiver=true sack_recovery=true retransmits=[1-9][0-9]* fast_retransmits=[1-9][0-9]* peak_cwnd=[0-9]+ verified=true") {
+if ($output -notmatch "AEROS_TCP_ENGINE clean=true lossy=true burst_loss=true slow_reader=true refused=true unreachable=true hostile=true sack_receiver=true sack_recovery=true nagle=true retransmits=[1-9][0-9]* fast_retransmits=[1-9][0-9]* peak_cwnd=[0-9]+ verified=true") {
     throw "AerOS TCP engine validation failed`n$output"
 }
 if ($output -notmatch "AEROS_SYSCALL_FUZZ exit=0 reaped=1 elapsed_ms=[0-9]+ verified=true") {

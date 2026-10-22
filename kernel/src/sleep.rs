@@ -152,10 +152,10 @@ fn facs_valid(acpi: &AcpiInfo) -> bool {
     }
     let facs = address as usize as *const u8;
     // SAFETY: the FADT names this table; it is only read.
-    unsafe {
+    arch::paging::with_kernel_tables(|| unsafe {
         core::ptr::read_volatile(facs.cast::<[u8; 4]>()) == *b"FACS"
             && core::ptr::read_volatile(facs.add(4).cast::<u32>()) >= 32
-    }
+    })
 }
 
 fn paging_root() -> u64 {
@@ -553,7 +553,8 @@ pub fn suspend() -> Result<Resumed, Error> {
     // interrupts are off.
     unsafe { *SAVED.0.get() = saved };
     RESUMED.store(false, Ordering::Release);
-    let woke = tables_for_wake(&acpi, trampoline, root, nx) && sleep_here(&acpi, types);
+    let woke = arch::paging::with_kernel_tables(|| tables_for_wake(&acpi, trampoline, root, nx))
+        && sleep_here(&acpi, types);
     if !woke {
         if flags & (1 << 9) != 0 {
             arch::enable_interrupts();

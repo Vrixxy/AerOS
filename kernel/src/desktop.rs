@@ -967,6 +967,11 @@ struct DesktopState {
     session_used: bool,
     terminal_input: [u8; SHELL_LINE_MAX],
     terminal_input_len: usize,
+    /// What a running program has written since its last newline (a prompt
+    /// such as Python's `>>> `), shown as the last line until it is complete.
+    terminal_partial: [u8; SHELL_LINE_MAX],
+    terminal_partial_len: usize,
+    terminal_partial_shown: bool,
     /// Bytes between the caret and the end of the line (0 = at the end).
     terminal_back: usize,
     terminal_lines: [[u8; SHELL_LINE_MAX]; SHELL_HISTORY_LINES],
@@ -1182,6 +1187,9 @@ impl DesktopState {
             session_used: false,
             terminal_input: [0; SHELL_LINE_MAX],
             terminal_input_len: 0,
+            terminal_partial: [0; SHELL_LINE_MAX],
+            terminal_partial_len: 0,
+            terminal_partial_shown: false,
             terminal_back: 0,
             terminal_lines: [[0; SHELL_LINE_MAX]; SHELL_HISTORY_LINES],
             terminal_line_lens: [0; SHELL_HISTORY_LINES],
@@ -3362,6 +3370,40 @@ impl DesktopState {
         self.terminal_line_count += 1;
     }
 
+    /// Output of the terminal's foreground program: complete lines are added,
+    /// and an unfinished one stays the last line until more of it comes.
+    fn terminal_job_output(&mut self, text: &str) {
+        for byte in text.bytes() {
+            if byte == b'\n' || self.terminal_partial_len == SHELL_LINE_MAX {
+                self.terminal_finish_partial();
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            self.terminal_partial[self.terminal_partial_len] = byte;
+            self.terminal_partial_len += 1;
+        }
+        if self.terminal_partial_len > 0 {
+            self.terminal_show_partial();
+        }
+    }
+
+    fn terminal_show_partial(&mut self) {
+        if self.terminal_partial_shown && self.terminal_line_count > 0 {
+            self.terminal_line_count -= 1;
+        }
+        let partial = self.terminal_partial;
+        let length = self.terminal_partial_len;
+        self.terminal_push_line(core::str::from_utf8(&partial[..length]).unwrap_or(""));
+        self.terminal_partial_shown = true;
+    }
+
+    fn terminal_finish_partial(&mut self) {
+        self.terminal_show_partial();
+        self.terminal_partial_len = 0;
+        self.terminal_partial_shown = false;
+    }
+
     fn terminal_line_str(&self, index: usize) -> &str {
         core::str::from_utf8(&self.terminal_lines[index][..self.terminal_line_lens[index]])
             .unwrap_or("")
@@ -4049,6 +4091,7 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
     // account password for `ear` - every other `Shell::new` caller
     // (self-tests, the boot sequence's own internal use) is unaffected.
     shell.require_reauth();
+    shell.set_interactive(true);
     {
         let mut startup_output: shell::Text<{ shell::MAX_OUTPUT }> = shell::Text::new();
         shell.run_startup_script(&mut startup_output);
@@ -4386,6 +4429,24 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 redraw = true;
                 continue;
             }
+            // Ctrl+C / Ctrl+D for the program the terminal is running.
+            if ctrl_down
+                && !was_extended
+                && !released
+                && (code == 0x2e || code == 0x20)
+                && state.screen == Screen::Desktop
+                && state.app == DesktopApp::Terminal
+                && shell.job_running()
+            {
+                if code == 0x2e {
+                    state.terminal_job_output("^C\n");
+                    shell.job_interrupt();
+                } else {
+                    shell.job_end_input();
+                }
+                redraw = true;
+                continue;
+            }
             // Ctrl+C / Ctrl+X / Ctrl+V in AerOS's own text fields (a focused
             // Linux window got the keys above and handles them itself).
             if ctrl_down
@@ -4538,6 +4599,25 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                         }
                         redraw = true;
                     }
+                    DesktopKey::Activate if shell.job_running() => {
+                        // A line for the running program: shown after its
+                        // prompt and handed to its input.
+                        let mut line = [0u8; SHELL_LINE_MAX + 1];
+                        let length = state.terminal_input_len;
+                        line[..length].copy_from_slice(&state.terminal_input[..length]);
+                        line[length] = b'\n';
+                        state.terminal_job_output(
+                            core::str::from_utf8(&line[..length]).unwrap_or(""),
+                        );
+                        state.terminal_finish_partial();
+                        state.terminal_input = [0; SHELL_LINE_MAX];
+                        state.terminal_input_len = 0;
+                        state.terminal_back = 0;
+                        if !shell.job_send(&line[..=length]) {
+                            state.terminal_push_line("(the program is not reading its input)");
+                        }
+                        redraw = true;
+                    }
                     DesktopKey::Activate => {
                         match terminal_submit(&mut state, &mut shell) {
                             shell::Control::Reboot => {
@@ -4576,6 +4656,25 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
             match state.handle(key) {
                 DesktopAction::Redraw => redraw = true,
                 DesktopAction::Idle => {}
+            }
+        }
+        if shell.job_running() {
+            let mut written: shell::Text<{ shell::MAX_OUTPUT }> = shell::Text::new();
+            let ended = shell.job_poll(&mut written);
+            if !written.as_str().is_empty() {
+                state.terminal_job_output(written.as_str());
+                redraw = true;
+            }
+            if let Some(status) = ended {
+                if state.terminal_partial_len > 0 {
+                    state.terminal_finish_partial();
+                }
+                if status != 0 {
+                    let mut line: shell::Text<32> = shell::Text::new();
+                    let _ = write!(line, "[exit {status}]");
+                    state.terminal_push_line(line.as_str());
+                }
+                redraw = true;
             }
         }
         if let Some(at) = guest_paste_at

@@ -98,6 +98,9 @@ pub enum MountError {
     Full,
 }
 
+const SHM_BACKING: &str = "/tmp/.dev/shm";
+static SHM_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 fn below(path: &str, prefix: &str) -> Option<usize> {
     let rest = path.strip_prefix(prefix)?;
     (rest.is_empty() || rest.starts_with('/')).then_some(prefix.len())
@@ -106,6 +109,14 @@ fn below(path: &str, prefix: &str) -> Option<usize> {
 /// The path on the volume a bound path stands for, or `None` when the path is
 /// not under any bind.
 pub fn resolve(path: &str) -> Option<Mapped> {
+    // `/dev/shm` is a directory of memory files in the tmpfs (`posixshm`).
+    if let Some(at) = below(path, "/dev/shm") {
+        if !SHM_READY.swap(true, core::sync::atomic::Ordering::AcqRel) {
+            let _ = crate::vfs::create_directory("/tmp/.dev", 0o755);
+            let _ = crate::vfs::create_directory(SHM_BACKING, 0o1777);
+        }
+        return Some(Mapped::join(SHM_BACKING, &path[at..]));
+    }
     let binds = BINDS.lock();
     for bind in binds.iter().filter(|bind| bind.used) {
         if let Some(at) = below(path, bind.target()) {

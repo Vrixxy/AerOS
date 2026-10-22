@@ -312,6 +312,7 @@ const MAP_FIXED_NOREPLACE: u64 = 0x100000;
 const MAX_PATH: usize = 256;
 mod futex;
 mod inotify;
+mod posixshm;
 mod ptrace;
 mod sysv;
 
@@ -321,7 +322,7 @@ mod tcpsock;
 const IO_CHUNK: usize = 256;
 const MAX_IO: usize = 64 * 1024;
 const PROCESS_FD_COUNT: usize = 64;
-const SOCKET_COUNT: usize = 8;
+const SOCKET_COUNT: usize = 16;
 const MAX_DATAGRAM: usize = 1472;
 
 #[derive(Clone, Copy)]
@@ -659,6 +660,10 @@ const EPOLL_MAX_WATCHES: usize = 32;
 /// `linux_poll`'s identical `readable`/`writable` -> bitmask mapping).
 const EPOLLIN: u32 = 0x001;
 const EPOLLOUT: u32 = 0x004;
+/// Reported whether asked for or not, as on Linux.
+const EPOLLERR: u32 = 0x008;
+const EPOLLHUP: u32 = 0x010;
+const EPOLLRDHUP: u32 = 0x2000;
 
 #[derive(Clone, Copy)]
 struct EpollWatch {
@@ -1783,6 +1788,51 @@ pub fn attach_capture_pipe(state: &mut ProcessState, slot: usize) {
     };
     state.fds[1] = descriptor;
     state.fds[2] = descriptor;
+}
+
+/// A pipe the shell feeds a program's input through (descriptor 0 of the
+/// program is its read end, see `attach_input_pipe`).
+pub fn input_create() -> Option<usize> {
+    capture_create()
+}
+
+pub fn attach_input_pipe(state: &mut ProcessState, slot: usize) {
+    state.fds[0] = ProcessFd {
+        handle: slot as u32,
+        open: true,
+        pipe: true,
+        readable: true,
+        ..ProcessFd::EMPTY
+    };
+}
+
+/// Puts what the user typed into the program's input; returns how much fit.
+pub fn input_write(slot: usize, source: &[u8]) -> usize {
+    let mut pipes = PIPES.lock();
+    let Some(pipe) = pipes
+        .get_mut(slot)
+        .filter(|pipe| pipe.used && pipe.read_open)
+    else {
+        return 0;
+    };
+    let count = source.len().min(PIPE_BUFFER_BYTES - pipe.length);
+    for (index, byte) in source.iter().enumerate().take(count) {
+        pipe.data[(pipe.head + pipe.length + index) % PIPE_BUFFER_BYTES] = *byte;
+    }
+    pipe.length += count;
+    count
+}
+
+/// No more input: the program reads the end of the file once it has taken
+/// what is left; the pipe is freed when it lets go too.
+pub fn input_close(slot: usize) {
+    let mut pipes = PIPES.lock();
+    if let Some(pipe) = pipes.get_mut(slot) {
+        pipe.write_open = false;
+        if !pipe.read_open {
+            *pipe = Pipe::EMPTY;
+        }
+    }
 }
 
 /// Takes what the program has written so far, without waiting.
@@ -3011,7 +3061,20 @@ fn dispatch_linux(number: u64, arguments: [u64; 6]) -> SyscallResult {
         LINUX_GETDENTS => {
             SyscallResult::Return(linux_getdents(arguments[0], arguments[1], arguments[2]))
         }
-        LINUX_LINK | LINUX_LINKAT => SyscallResult::Return(error(1)),
+        LINUX_LINK => SyscallResult::Return(linux_linkat(
+            AT_FDCWD as u64,
+            arguments[0],
+            AT_FDCWD as u64,
+            arguments[1],
+            0,
+        )),
+        LINUX_LINKAT => SyscallResult::Return(linux_linkat(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+            arguments[4],
+        )),
         LINUX_SYSLOG => {
             SyscallResult::Return(linux_syslog(arguments[0], arguments[1], arguments[2]))
         }
@@ -5602,7 +5665,12 @@ fn linux_recvfrom(arguments: [u64; 6]) -> u64 {
     let Ok(capacity) = usize::try_from(capacity) else {
         return error(22);
     };
-    if capacity > MAX_DATAGRAM || !user::range_accessible(address, capacity, true) {
+    // A bigger buffer than a datagram can fill is fine; only what is used must be.
+    if !user::range_in_window(address, capacity) {
+        return error(14);
+    }
+    let capacity = capacity.min(MAX_DATAGRAM);
+    if !user::range_accessible(address, capacity, true) {
         return error(14);
     }
     let socket = {
@@ -5877,11 +5945,12 @@ fn linux_pread64(descriptor: u64, address: u64, requested: u64, offset: u64) -> 
     };
     // A buffer that really is that big may be asked for more than one call
     // moves: it gets a short count, as on Linux.
-    let requested = if requested > MAX_IO && user::range_accessible(address, requested, true) {
-        MAX_IO
-    } else {
-        requested
-    };
+    // The whole buffer must lie in the process (Linux's access_ok); only the
+    // part one call moves has to be mapped.
+    if !user::range_in_window(address, requested) {
+        return error(14);
+    }
+    let requested = requested.min(MAX_IO);
     if requested > MAX_IO || !user::range_accessible(address, requested, true) {
         return error(14);
     }
@@ -5931,11 +6000,12 @@ fn linux_pwrite64(descriptor: u64, address: u64, requested: u64, offset: u64) ->
     };
     // A buffer that really is that big may be asked for more than one call
     // moves: it gets a short count, as on Linux.
-    let requested = if requested > MAX_IO && user::range_accessible(address, requested, false) {
-        MAX_IO
-    } else {
-        requested
-    };
+    // The whole buffer must lie in the process (Linux's access_ok); only the
+    // part one call moves has to be mapped.
+    if !user::range_in_window(address, requested) {
+        return error(14);
+    }
+    let requested = requested.min(MAX_IO);
     if requested > MAX_IO || !user::range_accessible(address, requested, false) {
         return error(14);
     }
@@ -6270,8 +6340,16 @@ fn fd_ready_events(descriptor: u64) -> u32 {
         if process_fd.readable && pipe.length > 0 {
             available |= EPOLLIN;
         }
+        // With every writer gone a read returns end of file: a hang-up, as on
+        // Linux (and with every reader gone a write fails: an error).
+        if process_fd.readable && !pipe.write_open {
+            available |= EPOLLHUP;
+        }
         if process_fd.writable && pipe.length < PIPE_BUFFER_BYTES {
             available |= EPOLLOUT;
+        }
+        if process_fd.writable && !pipe.read_open {
+            available |= EPOLLERR;
         }
         return available;
     }
@@ -6291,6 +6369,14 @@ fn fd_ready_events(descriptor: u64) -> u32 {
         }
         if outgoing.length < PIPE_BUFFER_BYTES {
             available |= EPOLLOUT;
+        }
+        let peer_open = if process_fd.unix_end_b {
+            pair.end_a_open
+        } else {
+            pair.end_b_open
+        };
+        if pair.used && !peer_open {
+            available |= EPOLLIN | EPOLLHUP | EPOLLRDHUP;
         }
         return available;
     }
@@ -6333,7 +6419,7 @@ fn poll_scan(address: u64, count: usize) -> Result<u64, u64> {
         let returned = if descriptor < 0 {
             0
         } else if lookup_process_fd(descriptor as u64).is_some() {
-            events & fd_ready_events(descriptor as u64) as u16
+            (events | (EPOLLERR | EPOLLHUP) as u16) & fd_ready_events(descriptor as u64) as u16
         } else {
             0x20
         };
@@ -6808,7 +6894,7 @@ fn epoll_scan(epoll_handle: u32, output: &mut [(u32, u64)]) -> Option<usize> {
         if watch.fd < 0 || count >= output.len() {
             continue;
         }
-        let ready = fd_ready_events(watch.fd as u64) & watch.events;
+        let ready = fd_ready_events(watch.fd as u64) & (watch.events | EPOLLERR | EPOLLHUP);
         if ready == 0 {
             continue;
         }
@@ -7677,7 +7763,6 @@ fn linux_mmap(arguments: [u64; 6]) -> u64 {
                 | MAP_POPULATE)
             != 0
         || protection > u8::MAX as u64
-        || (shared_file && protection & 2 != 0)
         || (fixed && (address & 0xfff != 0 || (kind == MAP_SHARED && anonymous)))
     {
         return error(22);
@@ -7704,6 +7789,27 @@ fn linux_mmap(arguments: [u64; 6]) -> u64 {
         return error(12);
     };
     let pages = length.div_ceil(4096).max(1);
+    if let Some(process_fd) = file
+        && shared_file
+    {
+        // A file in /dev/shm is memory several processes share; any other
+        // shared file mapping is usable only read-only (writes would have
+        // to reach the file), and then it is the same as a private one.
+        if posixshm::is_shared_file(process_fd.handle) {
+            if fixed {
+                return error(22);
+            }
+            return posixshm::map(
+                process_fd.handle,
+                (offset / 4096) as usize,
+                pages,
+                protection as u8,
+            );
+        }
+        if protection & 2 != 0 {
+            return error(22);
+        }
+    }
 
     // Tasks with their own `process_space` (real forked/exec'd processes)
     // get file-backed mmap mapped into their own dedicated region, not the
@@ -8009,7 +8115,7 @@ fn linux_msync(address: u64, length: u64, flags: u64) -> u64 {
     if address & 0xfff != 0
         || flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
         || flags & MS_ASYNC != 0 && flags & MS_SYNC != 0
-        || !user::range_accessible(address, length, false)
+        || !user::range_in_window(address, length)
     {
         return error(22);
     }
@@ -8022,10 +8128,7 @@ fn linux_madvise(address: u64, length: u64, advice: u64) -> u64 {
     let Ok(length) = usize::try_from(length) else {
         return error(22);
     };
-    if address & 0xfff != 0
-        || length == 0
-        || advice > 4
-        || !user::range_accessible(address, length, false)
+    if address & 0xfff != 0 || length == 0 || advice > 4 || !user::range_in_window(address, length)
     {
         return error(22);
     }
@@ -8339,6 +8442,36 @@ fn linux_renameat(
     }
 }
 
+/// Hard links exist only as far as `sem_open` needs them, inside
+/// `/dev/shm` (see `posixshm::link`); anywhere else they are refused, as no
+/// filesystem here has them.
+fn linux_linkat(
+    source_directory: u64,
+    source_address: u64,
+    destination_directory: u64,
+    destination_address: u64,
+    flags: u64,
+) -> u64 {
+    if flags != 0 || source_address == 0 || destination_address == 0 {
+        return error(1);
+    }
+    let mut source = [0u8; MAX_PATH];
+    let mut destination = [0u8; MAX_PATH];
+    let (Ok((source_length, _)), Ok((destination_length, _))) = (
+        resolve_user_path(source_directory, source_address, &mut source),
+        resolve_user_path(destination_directory, destination_address, &mut destination),
+    ) else {
+        return error(1);
+    };
+    let (Ok(source), Ok(destination)) = (
+        core::str::from_utf8(&source[..source_length]),
+        core::str::from_utf8(&destination[..destination_length]),
+    ) else {
+        return error(1);
+    };
+    posixshm::link(source, destination).unwrap_or(error(1))
+}
+
 fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
     if flags & !AT_REMOVEDIR != 0 {
         return error(22);
@@ -8358,8 +8491,12 @@ fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
     } else {
         0
     };
+    let shared_inode = posixshm::inode_before_removal(path);
     match vfs::remove(path, flags & AT_REMOVEDIR != 0) {
         Ok(()) => {
+            if let Some(inode) = shared_inode {
+                posixshm::forget(inode);
+            }
             inotify::notify(path, inotify::IN_DELETE | directory_flag, 0);
             REMOVE_CALLS.fetch_add(1, Ordering::Relaxed);
             PATH_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -9324,9 +9461,7 @@ fn linux_mincore(address: u64, length: u64, vector: u64) -> u64 {
         return error(12);
     };
     let pages = length.div_ceil(4096);
-    if !user::range_accessible(address, length, false)
-        || !user::range_accessible(vector, pages, true)
-    {
+    if !user::range_in_window(address, length) || !user::range_accessible(vector, pages, true) {
         return error(12);
     }
     let resident = [1u8; 64];
@@ -10393,11 +10528,12 @@ fn linux_getrandom(address: u64, requested: u64, flags: u64) -> u64 {
     };
     // A buffer that really is that big may be asked for more than one call
     // moves: it gets a short count, as on Linux.
-    let requested = if requested > MAX_IO && user::range_accessible(address, requested, true) {
-        MAX_IO
-    } else {
-        requested
-    };
+    // The whole buffer must lie in the process (Linux's access_ok); only the
+    // part one call moves has to be mapped.
+    if !user::range_in_window(address, requested) {
+        return error(14);
+    }
+    let requested = requested.min(MAX_IO);
     if requested > MAX_IO || !user::range_accessible(address, requested, true) {
         return error(14);
     }
@@ -11584,11 +11720,12 @@ fn read_device(kind: u8, address: u64, requested: u64) -> u64 {
     };
     // A buffer that really is that big may be asked for more than one call
     // moves: it gets a short count, as on Linux.
-    let requested = if requested > MAX_IO && user::range_accessible(address, requested, true) {
-        MAX_IO
-    } else {
-        requested
-    };
+    // The whole buffer must lie in the process (Linux's access_ok); only the
+    // part one call moves has to be mapped.
+    if !user::range_in_window(address, requested) {
+        return error(14);
+    }
+    let requested = requested.min(MAX_IO);
     if requested > MAX_IO || !user::range_accessible(address, requested, true) {
         return error(14);
     }
@@ -11712,11 +11849,12 @@ fn linux_read(descriptor: u64, address: u64, requested: u64) -> u64 {
     };
     // A buffer that really is that big may be asked for more than one call
     // moves: it gets a short count, as on Linux.
-    let requested = if requested > MAX_IO && user::range_accessible(address, requested, true) {
-        MAX_IO
-    } else {
-        requested
-    };
+    // The whole buffer must lie in the process (Linux's access_ok); only the
+    // part one call moves has to be mapped.
+    if !user::range_in_window(address, requested) {
+        return error(14);
+    }
+    let requested = requested.min(MAX_IO);
     if requested > MAX_IO || !user::range_accessible(address, requested, true) {
         return error(14);
     }
@@ -11815,11 +11953,12 @@ fn linux_write(descriptor: u64, address: u64, requested: u64) -> u64 {
     };
     // A buffer that really is that big may be asked for more than one call
     // moves: it gets a short count, as on Linux.
-    let requested = if requested > MAX_IO && user::range_accessible(address, requested, false) {
-        MAX_IO
-    } else {
-        requested
-    };
+    // The whole buffer must lie in the process (Linux's access_ok); only the
+    // part one call moves has to be mapped.
+    if !user::range_in_window(address, requested) {
+        return error(14);
+    }
+    let requested = requested.min(MAX_IO);
     if requested > MAX_IO || !user::range_accessible(address, requested, false) {
         return error(14);
     }
