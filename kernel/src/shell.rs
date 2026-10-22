@@ -6078,7 +6078,8 @@ pub(crate) fn vfs_error(failure: vfs::VfsError) -> &'static str {
         vfs::VfsError::HandleLimit => "open-handle limit reached",
         vfs::VfsError::BadDescriptor => "bad descriptor",
         vfs::VfsError::OffsetOverflow => "file offset overflow",
-        vfs::VfsError::FileTooLarge => "file exceeds the 4096-byte tmpfs limit",
+        vfs::VfsError::FileTooLarge => "file too large",
+        vfs::VfsError::NoSpace => "out of memory for files",
         vfs::VfsError::NotEmpty => "directory not empty",
         vfs::VfsError::Busy => "resource busy",
         vfs::VfsError::PersistNameUnsupported => {

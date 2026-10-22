@@ -18,8 +18,9 @@ const READ_BITS: u16 = 0o444;
 const MAX_MUTABLE_FILES: usize = 176;
 const MUTABLE_FILE_BYTES: usize = 4096;
 /// The most a file outside `/data` may hold; past `MUTABLE_FILE_BYTES` its
-/// bytes live in the kernel heap.
-const TMP_FILE_BYTES: usize = 4 * 1024 * 1024;
+/// bytes live in the kernel heap, so in practice the heap (an eighth of the
+/// memory) is the limit.
+const TMP_FILE_BYTES: usize = 1 << 30;
 /// A node whose name was removed while it was open: it goes when its last
 /// handle closes.
 const ORPHAN: u16 = u16::MAX;
@@ -338,28 +339,30 @@ impl MutableFile {
     /// Makes room for `bytes`, moving the content to the kernel heap when
     /// `data` is too small. False when that is past `limit` or the heap is
     /// out of space.
-    fn reserve(&mut self, bytes: usize, limit: usize) -> bool {
+    fn reserve(&mut self, bytes: usize, limit: usize) -> Result<(), VfsError> {
         let current = if self.big == 0 {
             MUTABLE_FILE_BYTES
         } else {
             self.capacity
         };
         if bytes <= current {
-            return true;
+            return Ok(());
         }
         if bytes > limit {
-            return false;
+            return Err(VfsError::FileTooLarge);
         }
         let mut capacity = current.max(MUTABLE_FILE_BYTES) * 2;
         while capacity < bytes {
             capacity *= 2;
         }
         capacity = capacity.min(limit).max(bytes);
-        let Ok(layout) = core::alloc::Layout::from_size_align(capacity, 16) else {
-            return false;
-        };
-        let Some(block) = crate::heap::HEAP.allocate(layout) else {
-            return false;
+        // When doubling does not fit, the exact size still might.
+        let exact = bytes.next_multiple_of(4096).min(capacity);
+        let Some((block, capacity)) = [capacity, exact].into_iter().find_map(|size| {
+            let layout = core::alloc::Layout::from_size_align(size, 16).ok()?;
+            Some((crate::heap::HEAP.allocate(layout)?, size))
+        }) else {
+            return Err(VfsError::NoSpace);
         };
         // SAFETY: a fresh block of `capacity` bytes; the old content (at most
         // `length` bytes of `slice()`) is copied into it before it is freed.
@@ -370,7 +373,7 @@ impl MutableFile {
         self.release();
         self.big = block.as_ptr() as usize;
         self.capacity = capacity;
-        true
+        Ok(())
     }
 
     /// Gives back the heap block, if there is one (the content is gone).
@@ -427,6 +430,8 @@ pub enum VfsError {
     BadDescriptor,
     OffsetOverflow,
     FileTooLarge,
+    /// The memory a tmpfs file grows into ran out (`ENOSPC`).
+    NoSpace,
     NotEmpty,
     Busy,
     /// A name under `/data` couldn't be mapped to a FAT 8.3 short name for
@@ -972,9 +977,7 @@ impl Vfs {
             } else {
                 TMP_FILE_BYTES
             };
-            if !file.reserve(length, limit) {
-                return Err(VfsError::FileTooLarge);
-            }
+            file.reserve(length, limit)?;
             let old = file.length;
             let bytes = file.slice_mut();
             if length > old {
@@ -1537,9 +1540,7 @@ impl Vfs {
             } else {
                 TMP_FILE_BYTES
             };
-            if !file.reserve(end, limit) {
-                return Err(VfsError::FileTooLarge);
-            }
+            file.reserve(end, limit)?;
             let old = file.length;
             let bytes = file.slice_mut();
             if start > old {
@@ -1589,9 +1590,7 @@ impl Vfs {
             } else {
                 TMP_FILE_BYTES
             };
-            if !file.reserve(end, limit) {
-                return Err(VfsError::FileTooLarge);
-            }
+            file.reserve(end, limit)?;
             let old = file.length;
             let bytes = file.slice_mut();
             if offset > old {

@@ -319,7 +319,7 @@ mod sysv;
 pub use ptrace::Trap;
 mod tcpsock;
 
-const IO_CHUNK: usize = 256;
+const IO_CHUNK: usize = 4096;
 const MAX_IO: usize = 64 * 1024;
 const PROCESS_FD_COUNT: usize = 64;
 const SOCKET_COUNT: usize = 16;
@@ -477,7 +477,38 @@ static SOCKETS: TicketLock<[UdpSocket; SOCKET_COUNT]> =
     TicketLock::new([UdpSocket::EMPTY; SOCKET_COUNT]);
 
 const PIPE_COUNT: usize = 32;
-const PIPE_BUFFER_BYTES: usize = 4096;
+const PIPE_BUFFER_BYTES: usize = 64 * 1024;
+/// Writes up to this size reach a pipe whole or not at all (POSIX `PIPE_BUF`).
+const PIPE_ATOMIC_BYTES: usize = 4096;
+
+/// Copies `source` behind the `length` bytes queued at `head`; returns how
+/// much fit.
+fn ring_put(data: &mut [u8], head: usize, length: &mut usize, source: &[u8]) -> usize {
+    let count = source.len().min(data.len() - *length);
+    let tail = (head + *length) % data.len();
+    let first = count.min(data.len() - tail);
+    data[tail..tail + first].copy_from_slice(&source[..first]);
+    data[..count - first].copy_from_slice(&source[first..count]);
+    *length += count;
+    count
+}
+
+/// Copies queued bytes from `offset` past `head` without taking them.
+fn ring_peek(data: &[u8], head: usize, length: usize, offset: usize, destination: &mut [u8]) -> usize {
+    let count = destination.len().min(length.saturating_sub(offset));
+    let start = (head + offset) % data.len();
+    let first = count.min(data.len() - start);
+    destination[..first].copy_from_slice(&data[start..start + first]);
+    destination[first..count].copy_from_slice(&data[..count - first]);
+    count
+}
+
+fn ring_take(data: &[u8], head: &mut usize, length: &mut usize, destination: &mut [u8]) -> usize {
+    let count = ring_peek(data, *head, *length, 0, destination);
+    *head = (*head + count) % data.len();
+    *length -= count;
+    count
+}
 
 /// A minimal, deliberately non-blocking pipe: `pipe_read`/`pipe_write`
 /// return EAGAIN immediately rather than parking the caller when the
@@ -493,7 +524,6 @@ const PIPE_BUFFER_BYTES: usize = 4096;
 #[derive(Clone, Copy)]
 struct Pipe {
     used: bool,
-    data: [u8; PIPE_BUFFER_BYTES],
     head: usize,
     length: usize,
     read_open: bool,
@@ -520,7 +550,6 @@ struct Pipe {
 impl Pipe {
     const EMPTY: Self = Self {
         used: false,
-        data: [0; PIPE_BUFFER_BYTES],
         head: 0,
         length: 0,
         read_open: false,
@@ -537,23 +566,41 @@ impl Pipe {
     };
 }
 
-static PIPES: TicketLock<[Pipe; PIPE_COUNT]> = TicketLock::new([Pipe::EMPTY; PIPE_COUNT]);
+/// The pipes, with their byte rings kept apart so a `Pipe` stays small.
+struct PipeTable {
+    pipes: [Pipe; PIPE_COUNT],
+    data: [[u8; PIPE_BUFFER_BYTES]; PIPE_COUNT],
+}
+
+impl core::ops::Deref for PipeTable {
+    type Target = [Pipe; PIPE_COUNT];
+
+    fn deref(&self) -> &Self::Target {
+        &self.pipes
+    }
+}
+
+impl core::ops::DerefMut for PipeTable {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.pipes
+    }
+}
+
+static PIPES: TicketLock<PipeTable> = TicketLock::new(PipeTable {
+    pipes: [Pipe::EMPTY; PIPE_COUNT],
+    data: [[0; PIPE_BUFFER_BYTES]; PIPE_COUNT],
+});
 
 const UNIX_PAIR_COUNT: usize = 32;
 
 #[derive(Clone, Copy)]
 struct UnixBuffer {
-    data: [u8; PIPE_BUFFER_BYTES],
     head: usize,
     length: usize,
 }
 
 impl UnixBuffer {
-    const EMPTY: Self = Self {
-        data: [0; PIPE_BUFFER_BYTES],
-        head: 0,
-        length: 0,
-    };
+    const EMPTY: Self = Self { head: 0, length: 0 };
 }
 
 /// A connected `AF_UNIX`/`SOCK_STREAM` pair from `socketpair()`: two
@@ -599,8 +646,30 @@ impl UnixPair {
 const PEER_NONE: u32 = u32::MAX;
 const PEER_GONE: u32 = u32::MAX - 1;
 
-static UNIX_PAIRS: TicketLock<[UnixPair; UNIX_PAIR_COUNT]> =
-    TicketLock::new([UnixPair::EMPTY; UNIX_PAIR_COUNT]);
+/// The pairs and their rings: `data[slot][0]` backs `a_to_b`, `[1]` `b_to_a`.
+struct UnixTable {
+    pairs: [UnixPair; UNIX_PAIR_COUNT],
+    data: [[[u8; PIPE_BUFFER_BYTES]; 2]; UNIX_PAIR_COUNT],
+}
+
+impl core::ops::Deref for UnixTable {
+    type Target = [UnixPair; UNIX_PAIR_COUNT];
+
+    fn deref(&self) -> &Self::Target {
+        &self.pairs
+    }
+}
+
+impl core::ops::DerefMut for UnixTable {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.pairs
+    }
+}
+
+static UNIX_PAIRS: TicketLock<UnixTable> = TicketLock::new(UnixTable {
+    pairs: [UnixPair::EMPTY; UNIX_PAIR_COUNT],
+    data: [[[0; PIPE_BUFFER_BYTES]; 2]; UNIX_PAIR_COUNT],
+});
 
 /// A `unix_socket` fd not yet connected to a pair, nor bound to a listener -
 /// the state `socket(AF_UNIX, SOCK_STREAM, 0)` returns.
@@ -1052,21 +1121,16 @@ fn pipe_read(slot: usize, destination: &mut [u8]) -> Result<usize, u64> {
     }
     for attempt in 0..PIPE_WAIT_ITERATIONS {
         {
-            let mut pipes = PIPES.lock();
-            let Some(pipe) = pipes.get_mut(slot) else {
+            let mut guard = PIPES.lock();
+            let table = &mut *guard;
+            let Some(pipe) = table.pipes.get_mut(slot) else {
                 return Err(9);
             };
             if !pipe.used {
                 return Err(9);
             }
             if pipe.length > 0 {
-                let count = pipe.length.min(destination.len());
-                for (index, slot) in destination.iter_mut().enumerate().take(count) {
-                    *slot = pipe.data[(pipe.head + index) % PIPE_BUFFER_BYTES];
-                }
-                pipe.head = (pipe.head + count) % PIPE_BUFFER_BYTES;
-                pipe.length -= count;
-                return Ok(count);
+                return Ok(ring_take(&table.data[slot], &mut pipe.head, &mut pipe.length, destination));
             }
             if !pipe.write_open {
                 return Ok(0);
@@ -1187,22 +1251,17 @@ fn pipe_write(slot: usize, source: &[u8]) -> Result<usize, u64> {
     }
     for attempt in 0..PIPE_WAIT_ITERATIONS {
         {
-            let mut pipes = PIPES.lock();
-            let Some(pipe) = pipes.get_mut(slot) else {
+            let mut guard = PIPES.lock();
+            let table = &mut *guard;
+            let Some(pipe) = table.pipes.get_mut(slot) else {
                 return Err(9);
             };
             if !pipe.used || !pipe.read_open {
                 return Err(32);
             }
             let space = PIPE_BUFFER_BYTES - pipe.length;
-            if space > 0 {
-                let count = source.len().min(space);
-                let tail = (pipe.head + pipe.length) % PIPE_BUFFER_BYTES;
-                for (index, byte) in source[..count].iter().enumerate() {
-                    pipe.data[(tail + index) % PIPE_BUFFER_BYTES] = *byte;
-                }
-                pipe.length += count;
-                return Ok(count);
+            if space > 0 && (source.len() > PIPE_ATOMIC_BYTES || space >= source.len()) {
+                return Ok(ring_put(&mut table.data[slot], pipe.head, &mut pipe.length, source));
             }
         }
         if attempt + 1 < PIPE_WAIT_ITERATIONS {
@@ -1231,27 +1290,27 @@ fn unix_socket_take(
 ) -> Result<usize, u64> {
     for attempt in 0..PIPE_WAIT_ITERATIONS {
         {
-            let mut pairs = UNIX_PAIRS.lock();
-            let Some(pair) = pairs.get_mut(slot) else {
+            let mut guard = UNIX_PAIRS.lock();
+            let table = &mut *guard;
+            let Some(pair) = table.pairs.get_mut(slot) else {
                 return Err(9);
             };
             if !pair.used {
                 return Err(9);
             }
             let message = pair.message;
-            let (buffer, peer_open) = if end_b {
-                (&mut pair.a_to_b, pair.end_a_open)
+            let (buffer, data, peer_open) = if end_b {
+                (&mut pair.a_to_b, &table.data[slot][0], pair.end_a_open)
             } else {
-                (&mut pair.b_to_a, pair.end_b_open)
+                (&mut pair.b_to_a, &table.data[slot][1], pair.end_b_open)
             };
             if buffer.length > 0 && message {
                 // One message: what does not fit the caller's buffer is dropped.
-                let size = usize::from(buffer.data[buffer.head % PIPE_BUFFER_BYTES])
-                    | usize::from(buffer.data[(buffer.head + 1) % PIPE_BUFFER_BYTES]) << 8;
+                let mut header = [0u8; 2];
+                ring_peek(data, buffer.head, buffer.length, 0, &mut header);
+                let size = usize::from(u16::from_le_bytes(header));
                 let count = size.min(destination.len());
-                for (index, slot) in destination.iter_mut().enumerate().take(count) {
-                    *slot = buffer.data[(buffer.head + 2 + index) % PIPE_BUFFER_BYTES];
-                }
+                ring_peek(data, buffer.head, buffer.length, 2, &mut destination[..count]);
                 if !peek {
                     let taken = (2 + size).min(buffer.length);
                     buffer.head = (buffer.head + taken) % PIPE_BUFFER_BYTES;
@@ -1260,15 +1319,10 @@ fn unix_socket_take(
                 return Ok(count);
             }
             if buffer.length > 0 {
-                let count = buffer.length.min(destination.len());
-                for (index, slot) in destination.iter_mut().enumerate().take(count) {
-                    *slot = buffer.data[(buffer.head + index) % PIPE_BUFFER_BYTES];
+                if peek {
+                    return Ok(ring_peek(data, buffer.head, buffer.length, 0, destination));
                 }
-                if !peek {
-                    buffer.head = (buffer.head + count) % PIPE_BUFFER_BYTES;
-                    buffer.length -= count;
-                }
-                return Ok(count);
+                return Ok(ring_take(data, &mut buffer.head, &mut buffer.length, destination));
             }
             if !peer_open {
                 return Ok(0);
@@ -1345,8 +1399,9 @@ fn unix_socket_write(slot: usize, end_b: bool, source: &[u8]) -> Result<usize, u
     }
     for attempt in 0..PIPE_WAIT_ITERATIONS {
         {
-            let mut pairs = UNIX_PAIRS.lock();
-            let Some(pair) = pairs.get_mut(slot) else {
+            let mut guard = UNIX_PAIRS.lock();
+            let table = &mut *guard;
+            let Some(pair) = table.pairs.get_mut(slot) else {
                 return Err(9);
             };
             let peer_open = if end_b {
@@ -1358,10 +1413,10 @@ fn unix_socket_write(slot: usize, end_b: bool, source: &[u8]) -> Result<usize, u
                 return Err(32);
             }
             let message = pair.message;
-            let buffer = if end_b {
-                &mut pair.b_to_a
+            let (buffer, data) = if end_b {
+                (&mut pair.b_to_a, &mut table.data[slot][1])
             } else {
-                &mut pair.a_to_b
+                (&mut pair.a_to_b, &mut table.data[slot][0])
             };
             let space = PIPE_BUFFER_BYTES - buffer.length;
             if message {
@@ -1370,22 +1425,13 @@ fn unix_socket_write(slot: usize, end_b: bool, source: &[u8]) -> Result<usize, u
                     return Err(90);
                 }
                 if space >= 2 + source.len() {
-                    let tail = (buffer.head + buffer.length) % PIPE_BUFFER_BYTES;
                     let header = (source.len() as u16).to_le_bytes();
-                    for (index, byte) in header.iter().chain(source.iter()).enumerate() {
-                        buffer.data[(tail + index) % PIPE_BUFFER_BYTES] = *byte;
-                    }
-                    buffer.length += 2 + source.len();
+                    ring_put(data, buffer.head, &mut buffer.length, &header);
+                    ring_put(data, buffer.head, &mut buffer.length, source);
                     return Ok(source.len());
                 }
-            } else if space > 0 {
-                let count = source.len().min(space);
-                let tail = (buffer.head + buffer.length) % PIPE_BUFFER_BYTES;
-                for (index, byte) in source[..count].iter().enumerate() {
-                    buffer.data[(tail + index) % PIPE_BUFFER_BYTES] = *byte;
-                }
-                buffer.length += count;
-                return Ok(count);
+            } else if space > 0 && (source.len() > PIPE_ATOMIC_BYTES || space >= source.len()) {
+                return Ok(ring_put(data, buffer.head, &mut buffer.length, source));
             }
         }
         if attempt + 1 < PIPE_WAIT_ITERATIONS {
@@ -1808,19 +1854,16 @@ pub fn attach_input_pipe(state: &mut ProcessState, slot: usize) {
 
 /// Puts what the user typed into the program's input; returns how much fit.
 pub fn input_write(slot: usize, source: &[u8]) -> usize {
-    let mut pipes = PIPES.lock();
-    let Some(pipe) = pipes
+    let mut guard = PIPES.lock();
+    let table = &mut *guard;
+    let Some(pipe) = table
+        .pipes
         .get_mut(slot)
         .filter(|pipe| pipe.used && pipe.read_open)
     else {
         return 0;
     };
-    let count = source.len().min(PIPE_BUFFER_BYTES - pipe.length);
-    for (index, byte) in source.iter().enumerate().take(count) {
-        pipe.data[(pipe.head + pipe.length + index) % PIPE_BUFFER_BYTES] = *byte;
-    }
-    pipe.length += count;
-    count
+    ring_put(&mut table.data[slot], pipe.head, &mut pipe.length, source)
 }
 
 /// No more input: the program reads the end of the file once it has taken
@@ -1837,17 +1880,12 @@ pub fn input_close(slot: usize) {
 
 /// Takes what the program has written so far, without waiting.
 pub fn capture_read(slot: usize, destination: &mut [u8]) -> usize {
-    let mut pipes = PIPES.lock();
-    let Some(pipe) = pipes.get_mut(slot) else {
+    let mut guard = PIPES.lock();
+    let table = &mut *guard;
+    let Some(pipe) = table.pipes.get_mut(slot) else {
         return 0;
     };
-    let count = pipe.length.min(destination.len());
-    for (index, byte) in destination.iter_mut().enumerate().take(count) {
-        *byte = pipe.data[(pipe.head + index) % PIPE_BUFFER_BYTES];
-    }
-    pipe.head = (pipe.head + count) % PIPE_BUFFER_BYTES;
-    pipe.length -= count;
-    count
+    ring_take(&table.data[slot], &mut pipe.head, &mut pipe.length, destination)
 }
 
 /// The reader is done: the pipe is freed once the program has let go of it.
@@ -3806,7 +3844,24 @@ pub(crate) fn pipe_self_test() -> bool {
     let wrap_read_ok = pipe_read(wrap_slot, &mut wrap_buffer) == Ok(4) && wrap_buffer == *b"WRAP";
     PIPES.lock()[wrap_slot] = Pipe::EMPTY;
 
+    let Some(big_slot) = allocate_test_pipe(PIPE_BUFFER_BYTES / 2) else {
+        return false;
+    };
+    let block = [0x5au8; 1024];
+    let filled_ok =
+        (0..PIPE_BUFFER_BYTES / 1024 - 1).all(|_| pipe_write(big_slot, &block) == Ok(1024));
+    let atomic_ok = pipe_write(big_slot, &[1u8; 2000]) == Err(11);
+    let partial_ok = pipe_write(big_slot, &[2u8; 5000]) == Ok(1024);
+    let mut tail = [0u8; 1024];
+    let drained = (0..PIPE_BUFFER_BYTES / 1024 - 1).all(|_| pipe_read(big_slot, &mut tail) == Ok(1024));
+    let order_ok = drained && pipe_read(big_slot, &mut tail) == Ok(1024) && tail == [2u8; 1024];
+    PIPES.lock()[big_slot] = Pipe::EMPTY;
+
     write_ok
+        && filled_ok
+        && atomic_ok
+        && partial_ok
+        && order_ok
         && eventfd_self_test()
         && timerfd_self_test()
         && first_half_ok
@@ -6345,7 +6400,7 @@ fn fd_ready_events(descriptor: u64) -> u32 {
         if process_fd.readable && !pipe.write_open {
             available |= EPOLLHUP;
         }
-        if process_fd.writable && pipe.length < PIPE_BUFFER_BYTES {
+        if process_fd.writable && PIPE_BUFFER_BYTES - pipe.length >= PIPE_ATOMIC_BYTES {
             available |= EPOLLOUT;
         }
         if process_fd.writable && !pipe.read_open {
@@ -6367,7 +6422,7 @@ fn fd_ready_events(descriptor: u64) -> u32 {
         if incoming.length > 0 {
             available |= EPOLLIN;
         }
-        if outgoing.length < PIPE_BUFFER_BYTES {
+        if PIPE_BUFFER_BYTES - outgoing.length >= PIPE_ATOMIC_BYTES {
             available |= EPOLLOUT;
         }
         let peer_open = if process_fd.unix_end_b {
@@ -8041,6 +8096,33 @@ fn linux_ioctl(descriptor: u64, request: u64, address: u64) -> u64 {
     };
     if is_socket_fd(&process_fd) && matches!(request, 0x541b | 0x5421) {
         return socket_ioctl(descriptor, &process_fd, request, address);
+    }
+    // FIONBIO, FIOCLEX and FIONCLEX work on any descriptor, FIONREAD on a pipe.
+    if matches!(request, 0x5421 | 0x5451 | 0x5450) {
+        let mut flag = [0u8; 4];
+        if request == 0x5421 && !user::copy_from_user(address, &mut flag) {
+            return error(14);
+        }
+        if let Some(index) = process_fd_index(descriptor) {
+            let mut fds = PROCESS_FDS.lock();
+            match request {
+                0x5421 => fds[index].nonblocking = u32::from_le_bytes(flag) != 0,
+                0x5451 => fds[index].close_on_exec = true,
+                _ => fds[index].close_on_exec = false,
+            }
+        }
+        return 0;
+    }
+    if request == 0x541b && process_fd.pipe {
+        let queued = PIPES
+            .lock()
+            .get(process_fd.handle as usize)
+            .filter(|pipe| pipe.used && !pipe.event && !pipe.timer && !pipe.signal && !pipe.pidfd)
+            .map_or(0, |pipe| pipe.length);
+        if !user::copy_to_user(address, &(queued as u32).to_le_bytes()) {
+            return error(14);
+        }
+        return 0;
     }
     if process_fd.standard == 0 || process_fd.standard >= DEVICE_NULL {
         return error(25);
@@ -11465,11 +11547,15 @@ fn linux_tee(fd_in: u64, fd_out: u64, length: u64, flags: u64) -> u64 {
     if take == 0 {
         return error(11);
     }
-    for index in 0..take {
-        let byte = pipes[source].data[(pipes[source].head + index) % PIPE_BUFFER_BYTES];
-        let tail = (pipes[destination].head + pipes[destination].length) % PIPE_BUFFER_BYTES;
-        pipes[destination].data[tail] = byte;
-        pipes[destination].length += 1;
+    let table = &mut *pipes;
+    let (from, to) = (table.pipes[source], &mut table.pipes[destination]);
+    let mut moved = 0;
+    let mut chunk = [0u8; 512];
+    while moved < take {
+        let part = (take - moved).min(chunk.len());
+        ring_peek(&table.data[source], from.head, from.length, moved, &mut chunk[..part]);
+        ring_put(&mut table.data[destination], to.head, &mut to.length, &chunk[..part]);
+        moved += part;
     }
     take as u64
 }
@@ -11935,6 +12021,28 @@ fn linux_read(descriptor: u64, address: u64, requested: u64) -> u64 {
     total as u64
 }
 
+/// Writes `source` through `write`; on a blocking descriptor it keeps going
+/// until all of it is in, as Linux does for pipes and stream sockets.
+/// Returns how much went in and the error that stopped it.
+fn write_all_waiting(
+    source: &[u8],
+    nonblocking: bool,
+    mut write: impl FnMut(&[u8]) -> Result<usize, u64>,
+) -> (usize, Option<u64>) {
+    let mut done = 0;
+    while done < source.len() {
+        match write(&source[done..]) {
+            Ok(0) => break,
+            Ok(written) => done += written,
+            Err(failure) => return (done, Some(failure)),
+        }
+        if nonblocking {
+            break;
+        }
+    }
+    (done, None)
+}
+
 fn linux_write(descriptor: u64, address: u64, requested: u64) -> u64 {
     let Some(process_fd) = lookup_process_fd(descriptor) else {
         return error(9);
@@ -11975,51 +12083,34 @@ fn linux_write(descriptor: u64, address: u64, requested: u64) -> u64 {
             for byte in &chunk[..amount] {
                 crate::serial::byte(*byte);
             }
-        } else if process_fd.pipe {
-            match pipe_write_waiting(
-                process_fd.handle as usize,
-                &chunk[..amount],
-                process_fd.nonblocking || total > 0,
-            ) {
-                Ok(written) => {
-                    total += written;
-                    if written < amount {
-                        break;
-                    }
-                    continue;
-                }
-                Err(failure) => {
-                    return if total == 0 {
-                        error(failure)
+        } else if process_fd.pipe || (process_fd.unix_socket && !process_fd.tcp) {
+            let (written, failure) =
+                write_all_waiting(&chunk[..amount], process_fd.nonblocking, |part| {
+                    if process_fd.pipe {
+                        pipe_write_waiting(process_fd.handle as usize, part, process_fd.nonblocking)
                     } else {
-                        total as u64
-                    };
-                }
+                        unix_write_waiting(
+                            process_fd.handle as usize,
+                            process_fd.unix_end_b,
+                            part,
+                            process_fd.nonblocking,
+                        )
+                    }
+                });
+            total += written;
+            if let Some(failure) = failure {
+                return if total == 0 {
+                    error(failure)
+                } else {
+                    total as u64
+                };
             }
+            if written < amount {
+                break;
+            }
+            continue;
         } else if process_fd.tcp {
             match tcpsock::write_bytes(process_fd, &chunk[..amount]) {
-                Ok(written) => {
-                    total += written;
-                    if written < amount {
-                        break;
-                    }
-                    continue;
-                }
-                Err(failure) => {
-                    return if total == 0 {
-                        error(failure)
-                    } else {
-                        total as u64
-                    };
-                }
-            }
-        } else if process_fd.unix_socket {
-            match unix_write_waiting(
-                process_fd.handle as usize,
-                process_fd.unix_end_b,
-                &chunk[..amount],
-                process_fd.nonblocking || total > 0,
-            ) {
                 Ok(written) => {
                     total += written;
                     if written < amount {
@@ -12874,6 +12965,7 @@ fn vfs_error(failure: VfsError) -> u64 {
         VfsError::BadDescriptor => 9,
         VfsError::OffsetOverflow => 22,
         VfsError::FileTooLarge => 27,
+        VfsError::NoSpace => 28,
         VfsError::NotEmpty => 39,
         VfsError::Busy => 16,
         VfsError::TooManyLinks => 40,

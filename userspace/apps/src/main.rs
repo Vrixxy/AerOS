@@ -405,6 +405,30 @@ b
              server.shutdown()",
         ),
         (
+            "python-sqlite-file",
+            "import sqlite3, os\n\
+             path = '/tmp/aeros-probe.db'\n\
+             db = sqlite3.connect(path)\n\
+             db.execute('create table if not exists t (n integer, s text)')\n\
+             with db:\n\
+             \x20   db.executemany('insert into t values (?, ?)', [(i, str(i) * 20) for i in range(500)])\n\
+             db.close()\n\
+             again = sqlite3.connect(path)\n\
+             print(again.execute('select count(*), sum(n) from t').fetchone(), os.path.getsize(path) > 0)\n\
+             again.close(); os.remove(path)",
+        ),
+        (
+            "python-big-tmp-file",
+            "import os, hashlib\n\
+             data = os.urandom(1 << 20) * 20\n\
+             with open('/tmp/aeros-big', 'wb') as f:\n\
+             \x20   f.write(data)\n\
+             with open('/tmp/aeros-big', 'rb') as f:\n\
+             \x20   back = f.read()\n\
+             print(len(back), hashlib.sha256(back).digest() == hashlib.sha256(data).digest())\n\
+             os.remove('/tmp/aeros-big')",
+        ),
+        (
             "python-asyncio",
             "import asyncio\n\
              async def handle(reader, writer):\n\
@@ -430,6 +454,22 @@ b
             "python-subprocess",
             "import subprocess\n\
              print(subprocess.run(['/bin/echo', 'child'], capture_output=True, text=True).stdout.strip())",
+        ),
+        (
+            "python-pipe-capacity",
+            "import os, subprocess\n\
+             r, w = os.pipe()\n\
+             assert os.write(w, b'x' * 65536) == 65536\n\
+             os.set_blocking(w, False)\n\
+             try:\n\
+             \x20   os.write(w, b'y'); raise SystemExit('pipe should be full')\n\
+             except BlockingIOError:\n\
+             \x20   pass\n\
+             os.close(w); os.close(r)\n\
+             data = os.urandom(1 << 20)\n\
+             out = subprocess.run(['/bin/cat'], input=data, capture_output=True).stdout\n\
+             assert out == data, len(out)\n\
+             print('pipe ok')",
         ),
     ];
     for (label, code) in python {

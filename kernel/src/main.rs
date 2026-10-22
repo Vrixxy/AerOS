@@ -585,7 +585,10 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     // its doc comment). Concretely unblocks `spawn()`'s 64 KB-per-task
     // kernel-stack allocations (`heap::HEAP`) well past the ~9-task ceiling
     // the old 1 MiB heap hit in `AEROS_TASK_EXHAUSTION` earlier this session.
-    let heap_mapping = match arch::paging::map_heap(&paging, &mut frames, 4096) {
+    // An eighth of the usable memory, 16 to 256 MiB: the tmpfs keeps files
+    // bigger than a page here, so this is what all of `/tmp` can hold.
+    let heap_pages = (boot.memory.usable_pages() / 8).clamp(4096, 65536) as usize;
+    let heap_mapping = match arch::paging::map_heap(&paging, &mut frames, heap_pages) {
         Some(mapping) => mapping,
         None => {
             serial::line("AEROS_HEAP_MAPPING_FAILURE");

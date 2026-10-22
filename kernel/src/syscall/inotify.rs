@@ -171,18 +171,15 @@ fn queue_event(slot: usize, wd: i32, mask: u32, cookie: u32, name: &[u8]) {
     record[8..12].copy_from_slice(&cookie.to_le_bytes());
     record[12..16].copy_from_slice(&(padded as u32).to_le_bytes());
     record[RECORD_HEADER..RECORD_HEADER + name.len()].copy_from_slice(name);
-    let mut pipes = PIPES.lock();
-    let Some(pipe) = pipes.get_mut(slot) else {
+    let mut guard = PIPES.lock();
+    let table = &mut *guard;
+    let Some(pipe) = table.pipes.get_mut(slot) else {
         return;
     };
     if !pipe.used || !pipe.inotify || PIPE_BUFFER_BYTES - pipe.length < total {
         return;
     }
-    let tail = (pipe.head + pipe.length) % PIPE_BUFFER_BYTES;
-    for (index, byte) in record[..total].iter().enumerate() {
-        pipe.data[(tail + index) % PIPE_BUFFER_BYTES] = *byte;
-    }
-    pipe.length += total;
+    ring_put(&mut table.data[slot], pipe.head, &mut pipe.length, &record[..total]);
 }
 
 /// Reports `mask` events about `path` (an absolute path; add `IN_ISDIR` for a
