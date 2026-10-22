@@ -35,7 +35,7 @@ try {
     # 2: some symbolic links could not be made (sitecustomize.py, the
     # sysconfig data); everything else is there.
     if ($LASTEXITCODE -gt 2) { throw "7-Zip failed ($LASTEXITCODE)" }
-    $skip = '[\\/](__pycache__|test|tests|idle_test|pydoc_data|idlelib|tkinter|turtledemo|ensurepip|lib2to3|_pyrepl|venv|config-3\.13[^\\/]*)[\\/]|turtle\.py$|\.exe$|lib-dynload[\\/](_test|xx|_ctypes_test|_codecs_(cn|hk|jp|kr|tw|iso2022)|_dbm)'
+    $skip = '[\\/](__pycache__|test|tests|idle_test|pydoc_data|idlelib|tkinter|turtledemo|ensurepip|lib2to3|_pyrepl|venv|config-3\.13[^\\/]*)[\\/]|turtle\.py$|\.exe$|^LICENSE\.txt$|lib-dynload[\\/](_test|xx|_ctypes_test|_codecs_(cn|hk|jp|kr|tw|iso2022)|_dbm)'
     if (Test-Path $assets) { Remove-Item -Recurse -Force $assets }
     New-Item -ItemType Directory -Force $assets | Out-Null
     $entries = New-Object System.Collections.Generic.List[string]

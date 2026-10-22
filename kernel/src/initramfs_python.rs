@@ -3,7 +3,7 @@ use crate::vfs::InitramfsEntry;
 
 static PYTHON: &[u8] = include_bytes!("../../assets/userspace/python/usr/bin/python3.13");
 
-pub static PYTHON_FILES: [InitramfsEntry; 546] = [
+pub static PYTHON_FILES: [InitramfsEntry; 545] = [
     InitramfsEntry {
         path: "/usr/bin/python3",
         data: PYTHON,
@@ -81,9 +81,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/__phello__/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/__phello__/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/__phello__/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -98,9 +96,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/_android_support.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/_android_support.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_android_support.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -110,9 +106,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/_collections_abc.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/_collections_abc.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_collections_abc.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -132,9 +126,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/_distutils_system_mod.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/_distutils_system_mod.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_distutils_system_mod.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -149,9 +141,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/_opcode_metadata.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/_opcode_metadata.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_opcode_metadata.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -196,23 +186,17 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/_sysconfigdata__linux_x86_64-linux-gnu.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/_sysconfigdata__linux_x86_64-linux-gnu.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_sysconfigdata__linux_x86_64-linux-gnu.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/_sysconfigdata__x86_64-linux-gnu.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/_sysconfigdata__x86_64-linux-gnu.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_sysconfigdata__x86_64-linux-gnu.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/_threading_local.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/_threading_local.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_threading_local.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -242,58 +226,42 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/__main__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/__main__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/__main__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/base_events.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/base_events.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/base_events.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/base_futures.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/base_futures.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/base_futures.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/base_subprocess.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/base_subprocess.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/base_subprocess.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/base_tasks.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/base_tasks.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/base_tasks.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/constants.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/constants.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/constants.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/coroutines.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/coroutines.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/coroutines.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -303,16 +271,12 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/exceptions.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/exceptions.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/exceptions.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/format_helpers.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/format_helpers.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/format_helpers.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -337,16 +301,12 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/proactor_events.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/proactor_events.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/proactor_events.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/protocols.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/protocols.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/protocols.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -361,23 +321,17 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/selector_events.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/selector_events.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/selector_events.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/sslproto.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/sslproto.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/sslproto.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/staggered.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/staggered.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/staggered.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -387,16 +341,12 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/subprocess.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/subprocess.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/subprocess.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/taskgroups.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/taskgroups.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/taskgroups.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -411,16 +361,12 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/timeouts.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/timeouts.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/timeouts.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/transports.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/transports.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/transports.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -430,23 +376,17 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/unix_events.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/unix_events.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/unix_events.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/windows_events.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/windows_events.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/windows_events.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/asyncio/windows_utils.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/asyncio/windows_utils.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/asyncio/windows_utils.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -496,9 +436,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/collections/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/collections/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/collections/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -513,37 +451,27 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/concurrent/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/concurrent/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/concurrent/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/concurrent/futures/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/concurrent/futures/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/concurrent/futures/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/concurrent/futures/_base.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/concurrent/futures/_base.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/concurrent/futures/_base.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/concurrent/futures/process.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/concurrent/futures/process.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/concurrent/futures/process.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/concurrent/futures/thread.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/concurrent/futures/thread.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/concurrent/futures/thread.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -693,44 +621,32 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/email/_encoded_words.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/email/_encoded_words.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/email/_encoded_words.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/email/_header_value_parser.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/email/_header_value_parser.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/email/_header_value_parser.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/email/_parseaddr.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/email/_parseaddr.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/email/_parseaddr.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/email/_policybase.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/email/_policybase.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/email/_policybase.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/email/architecture.rst",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/email/architecture.rst"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/email/architecture.rst"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/email/base64mime.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/email/base64mime.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/email/base64mime.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -740,9 +656,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/email/contentmanager.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/email/contentmanager.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/email/contentmanager.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -757,9 +671,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/email/feedparser.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/email/feedparser.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/email/feedparser.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -774,9 +686,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/email/headerregistry.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/email/headerregistry.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/email/headerregistry.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -791,23 +701,17 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/email/mime/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/email/mime/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/email/mime/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/email/mime/application.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/email/mime/application.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/email/mime/application.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/email/mime/audio.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/email/mime/audio.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/email/mime/audio.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -817,30 +721,22 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/email/mime/image.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/email/mime/image.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/email/mime/image.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/email/mime/message.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/email/mime/message.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/email/mime/message.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/email/mime/multipart.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/email/mime/multipart.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/email/mime/multipart.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/email/mime/nonmultipart.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/email/mime/nonmultipart.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/email/mime/nonmultipart.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -860,9 +756,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/email/quoprimime.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/email/quoprimime.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/email/quoprimime.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -872,16 +766,12 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/aliases.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/aliases.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/aliases.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -891,9 +781,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/base64_codec.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/base64_codec.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/base64_codec.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -903,23 +791,17 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/big5hkscs.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/big5hkscs.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/big5hkscs.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/bz2_codec.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/bz2_codec.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/bz2_codec.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/charmap.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/charmap.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/charmap.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -929,93 +811,67 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/cp1006.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/cp1006.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/cp1006.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/cp1026.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/cp1026.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/cp1026.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/cp1125.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/cp1125.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/cp1125.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/cp1140.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/cp1140.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/cp1140.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/cp1250.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/cp1250.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/cp1250.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/cp1251.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/cp1251.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/cp1251.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/cp1252.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/cp1252.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/cp1252.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/cp1253.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/cp1253.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/cp1253.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/cp1254.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/cp1254.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/cp1254.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/cp1255.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/cp1255.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/cp1255.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/cp1256.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/cp1256.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/cp1256.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/cp1257.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/cp1257.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/cp1257.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/cp1258.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/cp1258.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/cp1258.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -1150,44 +1006,32 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/euc_jis_2004.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/euc_jis_2004.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/euc_jis_2004.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/euc_jisx0213.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/euc_jisx0213.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/euc_jisx0213.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/euc_jp.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/euc_jp.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/euc_jp.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/euc_kr.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/euc_kr.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/euc_kr.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/gb18030.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/gb18030.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/gb18030.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/gb2312.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/gb2312.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/gb2312.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -1197,16 +1041,12 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/hex_codec.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/hex_codec.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/hex_codec.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/hp_roman8.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/hp_roman8.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/hp_roman8.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -1221,156 +1061,112 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso2022_jp.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso2022_jp.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso2022_jp.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso2022_jp_1.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso2022_jp_1.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso2022_jp_1.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso2022_jp_2.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso2022_jp_2.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso2022_jp_2.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso2022_jp_2004.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso2022_jp_2004.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso2022_jp_2004.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso2022_jp_3.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso2022_jp_3.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso2022_jp_3.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso2022_jp_ext.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso2022_jp_ext.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso2022_jp_ext.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso2022_kr.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso2022_kr.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso2022_kr.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso8859_1.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_1.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_1.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso8859_10.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_10.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_10.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso8859_11.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_11.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_11.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso8859_13.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_13.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_13.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso8859_14.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_14.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_14.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso8859_15.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_15.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_15.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso8859_16.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_16.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_16.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso8859_2.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_2.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_2.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso8859_3.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_3.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_3.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso8859_4.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_4.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_4.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso8859_5.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_5.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_5.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso8859_6.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_6.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_6.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso8859_7.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_7.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_7.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso8859_8.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_8.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_8.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/iso8859_9.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_9.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/iso8859_9.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -1380,107 +1176,77 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/koi8_r.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/koi8_r.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/koi8_r.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/koi8_t.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/koi8_t.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/koi8_t.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/koi8_u.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/koi8_u.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/koi8_u.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/kz1048.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/kz1048.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/kz1048.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/latin_1.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/latin_1.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/latin_1.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/mac_arabic.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/mac_arabic.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/mac_arabic.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/mac_croatian.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/mac_croatian.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/mac_croatian.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/mac_cyrillic.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/mac_cyrillic.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/mac_cyrillic.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/mac_farsi.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/mac_farsi.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/mac_farsi.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/mac_greek.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/mac_greek.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/mac_greek.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/mac_iceland.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/mac_iceland.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/mac_iceland.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/mac_latin2.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/mac_latin2.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/mac_latin2.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/mac_roman.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/mac_roman.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/mac_roman.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/mac_romanian.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/mac_romanian.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/mac_romanian.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/mac_turkish.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/mac_turkish.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/mac_turkish.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -1495,128 +1261,92 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/palmos.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/palmos.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/palmos.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/ptcp154.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/ptcp154.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/ptcp154.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/punycode.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/punycode.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/punycode.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/quopri_codec.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/quopri_codec.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/quopri_codec.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/raw_unicode_escape.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/raw_unicode_escape.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/raw_unicode_escape.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/rot_13.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/rot_13.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/rot_13.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/shift_jis.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/shift_jis.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/shift_jis.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/shift_jis_2004.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/shift_jis_2004.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/shift_jis_2004.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/shift_jisx0213.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/shift_jisx0213.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/shift_jisx0213.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/tis_620.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/tis_620.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/tis_620.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/undefined.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/undefined.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/undefined.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/unicode_escape.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/unicode_escape.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/unicode_escape.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/utf_16.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/utf_16.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/utf_16.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/utf_16_be.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/utf_16_be.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/utf_16_be.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/utf_16_le.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/utf_16_le.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/utf_16_le.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/utf_32.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/utf_32.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/utf_32.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/utf_32_be.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/utf_32_be.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/utf_32_be.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/utf_32_le.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/utf_32_le.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/utf_32_le.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -1631,23 +1361,17 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/utf_8_sig.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/utf_8_sig.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/utf_8_sig.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/uu_codec.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/uu_codec.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/uu_codec.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/encodings/zlib_codec.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/encodings/zlib_codec.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/encodings/zlib_codec.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -1787,9 +1511,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -1799,16 +1521,12 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/_bootstrap.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/_bootstrap.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/_bootstrap.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/_bootstrap_external.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/_bootstrap_external.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/_bootstrap_external.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -1818,135 +1536,97 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/machinery.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/machinery.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/machinery.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/metadata/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/metadata/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/metadata/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/metadata/_adapters.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/metadata/_adapters.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/metadata/_adapters.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/metadata/_collections.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/metadata/_collections.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/metadata/_collections.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/metadata/_functools.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/metadata/_functools.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/metadata/_functools.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/metadata/_itertools.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/metadata/_itertools.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/metadata/_itertools.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/metadata/_meta.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/metadata/_meta.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/metadata/_meta.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/metadata/_text.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/metadata/_text.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/metadata/_text.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/metadata/diagnose.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/metadata/diagnose.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/metadata/diagnose.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/readers.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/readers.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/readers.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/resources/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/resources/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/resources/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/resources/_adapters.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/resources/_adapters.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/resources/_adapters.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/resources/_common.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/resources/_common.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/resources/_common.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/resources/_functional.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/resources/_functional.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/resources/_functional.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/resources/_itertools.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/resources/_itertools.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/resources/_itertools.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/resources/abc.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/resources/abc.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/resources/abc.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/resources/readers.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/resources/readers.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/resources/readers.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/resources/simple.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/resources/simple.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/resources/simple.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/importlib/simple.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/importlib/simple.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/importlib/simple.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -2001,189 +1681,132 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_asyncio.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_asyncio.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_asyncio.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_bz2.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_bz2.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_bz2.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_contextvars.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_contextvars.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_contextvars.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_ctypes.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_ctypes.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_ctypes.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_curses.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_curses.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_curses.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_curses_panel.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_curses_panel.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_curses_panel.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_decimal.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_decimal.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_decimal.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_hashlib.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_hashlib.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_hashlib.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_interpchannels.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_interpchannels.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_interpchannels.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_interpqueues.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_interpqueues.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_interpqueues.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_interpreters.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_interpreters.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_interpreters.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_lsprof.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_lsprof.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_lsprof.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_lzma.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_lzma.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_lzma.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_multibytecodec.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_multibytecodec.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_multibytecodec.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_multiprocessing.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_multiprocessing.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_multiprocessing.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_posixshmem.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_posixshmem.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_posixshmem.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_queue.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_queue.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_queue.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_sqlite3.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_sqlite3.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_sqlite3.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_ssl.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_ssl.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_ssl.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_uuid.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_uuid.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_uuid.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_xxtestfuzz.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_xxtestfuzz.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_xxtestfuzz.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/_zoneinfo.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_zoneinfo.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/_zoneinfo.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/mmap.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/mmap.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/mmap.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/readline.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/readline.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/readline.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/resource.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/resource.cpython-313-x86_64-linux-gnu.so"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/resource.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/lib-dynload/termios.cpython-313-x86_64-linux-gnu.so",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/lib-dynload/termios.cpython-313-x86_64-linux-gnu.so"
-        ),
-        mode: 0o444,
-    },
-    InitramfsEntry {
-        path: "/usr/lib/python3.13/LICENSE.txt",
-        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/LICENSE.txt"),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/lib-dynload/termios.cpython-313-x86_64-linux-gnu.so"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -2198,9 +1821,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/logging/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/logging/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/logging/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -2210,9 +1831,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/logging/handlers.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/logging/handlers.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/logging/handlers.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -2237,163 +1856,117 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/connection.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/connection.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/connection.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/context.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/context.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/context.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/dummy/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/dummy/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/dummy/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/dummy/connection.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/dummy/connection.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/dummy/connection.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/forkserver.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/forkserver.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/forkserver.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/heap.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/heap.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/heap.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/managers.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/managers.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/managers.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/pool.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/pool.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/pool.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/popen_fork.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/popen_fork.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/popen_fork.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/popen_forkserver.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/popen_forkserver.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/popen_forkserver.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/popen_spawn_posix.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/popen_spawn_posix.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/popen_spawn_posix.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/popen_spawn_win32.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/popen_spawn_win32.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/popen_spawn_win32.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/process.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/process.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/process.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/queues.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/queues.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/queues.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/reduction.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/reduction.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/reduction.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/resource_sharer.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/resource_sharer.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/resource_sharer.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/resource_tracker.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/resource_tracker.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/resource_tracker.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/shared_memory.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/shared_memory.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/shared_memory.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/sharedctypes.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/sharedctypes.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/sharedctypes.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/spawn.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/spawn.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/spawn.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/synchronize.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/synchronize.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/synchronize.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/multiprocessing/util.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/multiprocessing/util.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/multiprocessing/util.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -2438,9 +2011,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/pathlib/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/pathlib/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/pathlib/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -2645,16 +2216,12 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/sqlite3/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/sqlite3/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/sqlite3/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/sqlite3/__main__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/sqlite3/__main__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/sqlite3/__main__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -2724,16 +2291,12 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/sysconfig/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/sysconfig/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/sysconfig/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/sysconfig/__main__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/sysconfig/__main__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/sysconfig/__main__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -2783,9 +2346,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/tomllib/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/tomllib/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/tomllib/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -2840,16 +2401,12 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/unittest/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/unittest/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/unittest/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/unittest/__main__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/unittest/__main__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/unittest/__main__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -2859,9 +2416,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/unittest/async_case.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/unittest/async_case.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/unittest/async_case.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -2896,9 +2451,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/unittest/signals.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/unittest/signals.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/unittest/signals.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -2938,9 +2491,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/urllib/robotparser.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/urllib/robotparser.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/urllib/robotparser.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -2970,16 +2521,12 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/wsgiref/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/wsgiref/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/wsgiref/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/wsgiref/handlers.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/wsgiref/handlers.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/wsgiref/handlers.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -2989,9 +2536,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/wsgiref/simple_server.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/wsgiref/simple_server.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/wsgiref/simple_server.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -3006,9 +2551,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/wsgiref/validate.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/wsgiref/validate.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/wsgiref/validate.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -3018,9 +2561,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/xml/dom/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/xml/dom/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/xml/dom/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -3030,16 +2571,12 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/xml/dom/expatbuilder.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/xml/dom/expatbuilder.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/xml/dom/expatbuilder.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/xml/dom/minicompat.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/xml/dom/minicompat.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/xml/dom/minicompat.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -3049,9 +2586,7 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/xml/dom/NodeFilter.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/xml/dom/NodeFilter.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/xml/dom/NodeFilter.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -3061,79 +2596,57 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/xml/dom/xmlbuilder.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/xml/dom/xmlbuilder.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/xml/dom/xmlbuilder.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/xml/etree/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/xml/etree/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/xml/etree/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/xml/etree/cElementTree.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/xml/etree/cElementTree.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/xml/etree/cElementTree.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/xml/etree/ElementInclude.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/xml/etree/ElementInclude.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/xml/etree/ElementInclude.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/xml/etree/ElementPath.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/xml/etree/ElementPath.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/xml/etree/ElementPath.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/xml/etree/ElementTree.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/xml/etree/ElementTree.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/xml/etree/ElementTree.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/xml/parsers/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/xml/parsers/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/xml/parsers/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/xml/parsers/expat.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/xml/parsers/expat.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/xml/parsers/expat.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/xml/sax/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/xml/sax/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/xml/sax/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/xml/sax/_exceptions.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/xml/sax/_exceptions.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/xml/sax/_exceptions.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/xml/sax/expatreader.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/xml/sax/expatreader.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/xml/sax/expatreader.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -3143,16 +2656,12 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/xml/sax/saxutils.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/xml/sax/saxutils.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/xml/sax/saxutils.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/xml/sax/xmlreader.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/xml/sax/xmlreader.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/xml/sax/xmlreader.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -3177,30 +2686,22 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/zipfile/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/zipfile/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/zipfile/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/zipfile/__main__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/zipfile/__main__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/zipfile/__main__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/zipfile/_path/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/zipfile/_path/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/zipfile/_path/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/zipfile/_path/glob.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/zipfile/_path/glob.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/zipfile/_path/glob.py"),
         mode: 0o444,
     },
     InitramfsEntry {
@@ -3210,30 +2711,22 @@ pub static PYTHON_FILES: [InitramfsEntry; 546] = [
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/zoneinfo/__init__.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/zoneinfo/__init__.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/zoneinfo/__init__.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/zoneinfo/_common.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/zoneinfo/_common.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/zoneinfo/_common.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/zoneinfo/_tzpath.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/zoneinfo/_tzpath.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/zoneinfo/_tzpath.py"),
         mode: 0o444,
     },
     InitramfsEntry {
         path: "/usr/lib/python3.13/zoneinfo/_zoneinfo.py",
-        data: include_bytes!(
-            "../../assets/userspace/python/usr/lib/python3.13/zoneinfo/_zoneinfo.py"
-        ),
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/zoneinfo/_zoneinfo.py"),
         mode: 0o444,
     },
 ];
