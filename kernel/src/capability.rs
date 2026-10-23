@@ -10,6 +10,7 @@ pub const CAP_SYS_PTRACE: u32 = 19;
 pub const CAP_SYS_ADMIN: u32 = 21;
 pub const CAP_SYS_BOOT: u32 = 22;
 pub const CAP_SYS_NICE: u32 = 23;
+pub const CAP_SYS_RESOURCE: u32 = 24;
 pub const CAP_SYS_TIME: u32 = 25;
 const LAST_CAP: u32 = 40;
 pub const ALL: u64 = (1 << (LAST_CAP + 1)) - 1;

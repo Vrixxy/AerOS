@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$esp = & (Join-Path $PSScriptRoot "build.ps1")
+$esp = [string]@(& (Join-Path $PSScriptRoot "build.ps1"))[-1]
+$esp = & (Join-Path $PSScriptRoot "esp-drive.ps1") -Esp $esp -Name esp-install
 $qemu = Join-Path $env:ProgramFiles "qemu\qemu-system-x86_64.exe"
 $firmware = Join-Path $env:ProgramFiles "qemu\share\edk2-x86_64-code.fd"
 $variablesTemplate = Join-Path $env:ProgramFiles "qemu\share\edk2-i386-vars.fd"

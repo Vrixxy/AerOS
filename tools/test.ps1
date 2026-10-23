@@ -550,6 +550,9 @@ if ($output -notmatch "AEROS_RAID linear=true stripe=true mirror=true degraded=t
 if ($output -notmatch "AEROS_SYSX exit=89 reaped=1 verified=true") {
     throw "AerOS extra syscall validation failed`n$output"
 }
+if ($output -notmatch "AEROS_TTY verified=true") {
+    throw "AerOS terminal line discipline (echo, erase, lines, end of file, raw mode) failed`n$output"
+}
 if ($output -notmatch "AEROS_TERMINAL_JOBS verified=true") {
     throw "AerOS terminal foreground jobs (input, output, Ctrl+C) failed`n$output"
 }

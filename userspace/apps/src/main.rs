@@ -471,6 +471,42 @@ b
              assert out == data, len(out)\n\
              print('pipe ok')",
         ),
+        (
+            "python-many-threads",
+            "import threading, resource\n\
+             barrier = threading.Barrier(41, timeout=60)\n\
+             results = []\n\
+             def work(n):\n\
+             \x20   barrier.wait(); results.append(n * n)\n\
+             threads = [threading.Thread(target=work, args=(n,)) for n in range(40)]\n\
+             for started, t in enumerate(threads):\n\
+             \x20   try:\n\
+             \x20       t.start()\n\
+             \x20   except RuntimeError:\n\
+             \x20       barrier.abort(); raise SystemExit('started %d threads' % started)\n\
+             barrier.wait()\n\
+             [t.join() for t in threads]\n\
+             assert sorted(results) == [n * n for n in range(40)]\n\
+             print(len(results), resource.getrlimit(resource.RLIMIT_STACK)[0] >> 20)",
+        ),
+        (
+            "python-rlimits",
+            "import os, resource\n\
+             resource.setrlimit(resource.RLIMIT_CORE, (0, resource.RLIM_INFINITY))\n\
+             assert resource.getrlimit(resource.RLIMIT_CORE)[0] == 0\n\
+             soft, hard = resource.getrlimit(resource.RLIMIT_STACK)\n\
+             resource.setrlimit(resource.RLIMIT_STACK, (hard, hard))\n\
+             resource.setrlimit(resource.RLIMIT_STACK, (soft, hard))\n\
+             resource.setrlimit(resource.RLIMIT_NOFILE, (32, 48))\n\
+             assert resource.prlimit(0, resource.RLIMIT_NOFILE, (8, 48)) == (32, 48)\n\
+             fds = []\n\
+             try:\n\
+             \x20   while True:\n\
+             \x20       fds.append(os.open('/dev/null', os.O_RDONLY))\n\
+             except OSError as error:\n\
+             \x20   assert error.errno == 24 and len(fds) < 8, (error, len(fds))\n\
+             \x20   print('emfile', len(fds))",
+        ),
     ];
     for (label, code) in python {
         check_exit(label, &["/usr/bin/python3", "-c", code], 0);

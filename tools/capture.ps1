@@ -1,12 +1,15 @@
 param(
     [string]$Command = "",
     [ValidateSet("desktop", "apps", "quick", "browser", "settings", "setup", "lock", "login")]
-    [string]$View = "desktop"
+    [string]$View = "desktop",
+    [string]$Then = "",
+    [int]$SettleMs = 250
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$esp = & (Join-Path $PSScriptRoot "build.ps1")
+$esp = [string]@(& (Join-Path $PSScriptRoot "build.ps1"))[-1]
+$esp = & (Join-Path $PSScriptRoot "esp-drive.ps1") -Esp $esp -Name esp-capture
 $qemu = Join-Path $env:ProgramFiles "qemu\qemu-system-x86_64.exe"
 $firmware = Join-Path $env:ProgramFiles "qemu\share\edk2-x86_64-code.fd"
 $variablesTemplate = Join-Path $env:ProgramFiles "qemu\share\edk2-i386-vars.fd"
@@ -127,11 +130,17 @@ elseif ($View -in @("lock", "login", "desktop")) {
         Send-Monitor "sendkey $key" 0
         $stepDeadline = [DateTime]::UtcNow.AddSeconds(12)
         $stepReady = $false
+
         while ([DateTime]::UtcNow -lt $stepDeadline) {
             $serialText = [string](Get-Content -Raw -LiteralPath $serial)
             if ($serialText -match "AEROS_DESKTOP_REDRAW .* screen=$waypoint") {
                 $stepReady = $true
                 break
+            }
+            # A key sent before the desktop reads input is lost: send it again.
+            if ([DateTime]::UtcNow -gt $resendAt) {
+                Send-Monitor "sendkey $key" 0
+        
             }
             Start-Sleep -Milliseconds 50
         }
@@ -215,7 +224,23 @@ if ($Command.Length -gt 0) {
         throw "AerOS did not execute the injected shell command"
     }
 }
-Start-Sleep -Milliseconds 250
+if ($Then.Length -gt 0) {
+    # Typed into the program the command started (a REPL, say) once it is up.
+    Start-Sleep -Milliseconds $SettleMs
+    foreach ($character in $Then.ToCharArray()) {
+        $key = switch ($character) {
+            " " { "spc" }
+            "-" { "minus" }
+            "/" { "slash" }
+            "." { "dot" }
+            "=" { "equal" }
+            default { [string]$character }
+        }
+        Send-Monitor "sendkey $key" 90
+    }
+    Send-Monitor "sendkey ret" 120
+}
+Start-Sleep -Milliseconds $SettleMs
 Send-Monitor "screendump build/aeros-boot.ppm" 0
 $captureDeadline = [DateTime]::UtcNow.AddSeconds(5)
 while (-not (Test-Path -LiteralPath $ppm) -and [DateTime]::UtcNow -lt $captureDeadline) {

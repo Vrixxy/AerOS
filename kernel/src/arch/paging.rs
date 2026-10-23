@@ -1355,6 +1355,7 @@ pub fn kernel_image_range() -> Option<(u64, u64)> {
 /// never hands out memory below this limit (`memory::LOW_MEMORY_LIMIT`) and
 /// the boot code checks the firmware map and the kernel image (`set_low_window_clean`).
 pub const LOW_WINDOW_END: u64 = FIXED_TABLE_PAGES as u64 * ENTRY_COUNT as u64 * PAGE_SIZE;
+pub const PROCESS_WINDOW_BYTES: u64 = PROCESS_TABLE_PAGES as u64 * ENTRY_COUNT as u64 * PAGE_SIZE;
 
 /// Runs `f` on the kernel's own page tables. A fixed-address process's
 /// tables replace the identity map below `LOW_WINDOW_END` with its window,

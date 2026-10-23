@@ -979,12 +979,38 @@ pub(crate) fn foreground_job_self_test(info: SystemInfo<'_>) -> bool {
         shell.execute("/bin/cat", &mut output);
         let started = shell.job_running();
         let sent = shell.job_send(b"through the job\n");
+        // The terminal echoes the line, then `cat` writes it back.
         let echoed = run(&mut shell, &mut output, &|text| {
-            text.contains("through the job\n")
+            text.matches("through the job\n").count() == 2
         })
         .is_none();
         shell.job_end_input();
         let ended = run(&mut shell, &mut output, &|_| false) == Some(0) && !shell.job_running();
+        output.clear();
+        shell.execute("/bin/sh -c \"[ -t 0 ] && [ -t 1 ] && echo on-a-terminal\"", &mut output);
+        let terminal = run(&mut shell, &mut output, &|_| false) == Some(0)
+            && output.as_str().contains("on-a-terminal");
+        output.clear();
+        shell.execute(
+            "/usr/bin/python3 -c \"import sys, tty; tty.setraw(0); print('raw', sys.stdin.read(3))\"",
+            &mut output,
+        );
+        // `tty.setraw` flushes what was typed ahead, so type once it is raw.
+        for _ in 0..20_000 {
+            if shell.job_mode().is_none_or(|(canonical, _)| !canonical) {
+                break;
+            }
+            let mut written: Text<MAX_OUTPUT> = Text::new();
+            let _ = shell.job_poll(&mut written);
+            let _ = output.push_str_checked(written.as_str());
+            crate::scheduler::wait_tick();
+        }
+        let _ = shell.job_send(b"xyz");
+        let raw = run(&mut shell, &mut output, &|_| false) == Some(0)
+            && output.as_str().contains("raw xyz");
+        if !raw {
+            crate::serial::format(format_args!("AEROS_TERMINAL_JOBS_RAW {:?}\n", output.as_str()));
+        }
         output.clear();
         shell.execute("/bin/sleep 30", &mut output);
         let sleeping = shell.job_running();
@@ -993,9 +1019,9 @@ pub(crate) fn foreground_job_self_test(info: SystemInfo<'_>) -> bool {
             .is_some_and(|status| status != 0)
             && !shell.job_running();
         crate::serial::format(format_args!(
-            "AEROS_TERMINAL_JOBS_PARTS started={started} sent={sent} echoed={echoed} ended={ended} sleeping={sleeping} interrupted={interrupted}\n"
+            "AEROS_TERMINAL_JOBS_PARTS started={started} sent={sent} echoed={echoed} ended={ended} terminal={terminal} raw={raw} sleeping={sleeping} interrupted={interrupted}\n"
         ));
-        started && sent && echoed && ended && sleeping && interrupted
+        started && sent && echoed && ended && terminal && raw && sleeping && interrupted
     })
     .unwrap_or(false)
 }
@@ -1007,6 +1033,18 @@ fn push_printable(output: &mut Text<MAX_OUTPUT>, bytes: &[u8]) {
         let character = match *byte {
             b'\n' | b'\t' | 0x20..=0x7e => *byte as char,
             b'\r' => continue,
+            _ => '?',
+        };
+        let _ = output.push_str_checked(character.encode_utf8(&mut [0; 4]));
+    }
+}
+
+/// A foreground job's output for the Terminal, which follows carriage
+/// returns, backspaces and the common escape sequences itself.
+fn push_terminal(output: &mut Text<MAX_OUTPUT>, bytes: &[u8]) {
+    for byte in bytes {
+        let character = match *byte {
+            b'\n' | b'\t' | b'\r' | 0x08 | 0x07 | 0x1b | 0x20..=0x7e => *byte as char,
             _ => '?',
         };
         let _ = output.push_str_checked(character.encode_utf8(&mut [0; 4]));
@@ -1177,6 +1215,8 @@ struct ForegroundJob {
     task_id: u64,
     output: usize,
     input: usize,
+    /// The terminal its input and output pipes make (`syscall::tty`).
+    tty: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -1213,6 +1253,8 @@ pub(crate) struct Shell<'a> {
     interactive: bool,
     job_allowed: bool,
     job: Option<ForegroundJob>,
+    /// Rows and columns a foreground job's terminal reports.
+    terminal_size: (u16, u16),
 }
 
 impl<'a> Shell<'a> {
@@ -1240,6 +1282,7 @@ impl<'a> Shell<'a> {
             interactive: false,
             job_allowed: false,
             job: None,
+            terminal_size: (25, 80),
         };
         shell.cwd.push_str_checked("/");
         shell.hostname.push_str_checked("aeros");
@@ -1325,6 +1368,10 @@ impl<'a> Shell<'a> {
         self.interactive = interactive;
     }
 
+    pub(crate) fn set_terminal_size(&mut self, rows: u16, columns: u16) {
+        self.terminal_size = (rows, columns);
+    }
+
     pub(crate) fn job_running(&self) -> bool {
         self.job.is_some()
     }
@@ -1340,9 +1387,12 @@ impl<'a> Shell<'a> {
             if count == 0 {
                 break;
             }
-            push_printable(output, &chunk[..count]);
+            push_terminal(output, &chunk[..count]);
         }
         let code = ended?;
+        if let Some(tty) = job.tty {
+            crate::syscall::tty::release(tty);
+        }
         crate::syscall::capture_close(job.output);
         crate::syscall::input_close(job.input);
         self.job = None;
@@ -1350,10 +1400,25 @@ impl<'a> Shell<'a> {
         Some(self.last_status)
     }
 
-    /// Hands a typed line (or anything else) to the foreground job's input.
+    /// Hands what was typed to the foreground job: through its terminal's
+    /// line discipline, or straight into its input when it has none.
     pub(crate) fn job_send(&mut self, bytes: &[u8]) -> bool {
+        let Some(job) = self.job else {
+            return false;
+        };
+        if let Some(tty) = job.tty {
+            crate::syscall::tty::input(tty, bytes);
+            return true;
+        }
+        crate::syscall::input_write(job.input, bytes) == bytes.len()
+    }
+
+    /// The job's terminal mode: whether it reads whole lines (the Terminal
+    /// edits them) and whether typed text is shown; `None` without a terminal.
+    pub(crate) fn job_mode(&self) -> Option<(bool, bool)> {
         self.job
-            .is_some_and(|job| crate::syscall::input_write(job.input, bytes) == bytes.len())
+            .and_then(|job| job.tty)
+            .map(crate::syscall::tty::mode)
     }
 
     /// Ctrl+C: SIGINT to the foreground job (it ends unless it handles it).
@@ -1361,6 +1426,10 @@ impl<'a> Shell<'a> {
         let Some(job) = self.job else {
             return;
         };
+        if let Some(tty) = job.tty {
+            crate::syscall::tty::input(tty, &[0x03]);
+            return;
+        }
         if matches!(
             crate::scheduler::signal_other_task(job.task_id, 2),
             Some(crate::syscall::RemoteSignal::Fatal) | None
@@ -1369,10 +1438,13 @@ impl<'a> Shell<'a> {
         }
     }
 
-    /// Ctrl+D: the job's input ends.
+    /// Ctrl+D: the job's input ends (on a terminal: one end of file).
     pub(crate) fn job_end_input(&mut self) {
         if let Some(job) = self.job {
-            crate::syscall::input_close(job.input);
+            match job.tty {
+                Some(tty) => crate::syscall::tty::input(tty, &[0x04]),
+                None => crate::syscall::input_close(job.input),
+            }
         }
     }
 
@@ -2443,6 +2515,10 @@ impl Shell<'_> {
         } else {
             None
         };
+        let tty = input.and_then(|input| crate::syscall::tty::create(input, pipe));
+        if let Some(tty) = tty {
+            crate::syscall::tty::set_size(tty, self.terminal_size.0, self.terminal_size.1);
+        }
         let capabilities = self.program_capabilities();
         let mut argv: [&[u8]; 16] = [&[]; 16];
         argv[0] = name.as_bytes();
@@ -2481,6 +2557,9 @@ impl Shell<'_> {
                 .and_then(|file| spawn(file.data))
         };
         let Some(id) = launched else {
+            if let Some(tty) = tty {
+                crate::syscall::tty::release(tty);
+            }
             crate::syscall::capture_close(pipe);
             if let Some(input) = input {
                 crate::syscall::input_close(input);
@@ -2491,10 +2570,14 @@ impl Shell<'_> {
             return true;
         };
         if let Some(input) = input {
+            if let Some(tty) = tty {
+                crate::syscall::tty::set_foreground(tty, id);
+            }
             self.job = Some(ForegroundJob {
                 task_id: id,
                 output: pipe,
                 input,
+                tty,
             });
             return true;
         }
@@ -3180,7 +3263,7 @@ impl Shell<'_> {
     }
 
     fn command_top(&mut self, output: &mut Text<MAX_OUTPUT>) {
-        let mut rows = [None; 32];
+        let mut rows = [None; scheduler::MAX_TASKS];
         let mut count = 0;
         let mut total_ms = 0u64;
         scheduler::list_tasks(|task| {

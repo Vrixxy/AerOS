@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use crate::acpi::MAX_PROCESSORS;
 use crate::{arch, heap, slab};
 
-const MAX_TASKS: usize = 32;
+pub const MAX_TASKS: usize = 64;
 const STACK_SIZE: usize = 64 * 1024;
 const STACK_ALIGNMENT: usize = 16;
 /// Syscalls and interrupts run on this stack, where `fork`, `execve` and the
@@ -221,8 +221,20 @@ impl Scheduler {
         }
     }
 
+    /// `empty()` in place: the task table is too big for a temporary.
+    fn reset(&mut self) {
+        self.tasks.fill(Task::EMPTY);
+        self.current = 0;
+        self.next_id = 1;
+        self.initialized = false;
+        self.context_switches = 0;
+        self.fpu_template_base = 0;
+        self.fpu_state_bytes = 0;
+        self.fpu_switches = 0;
+    }
+
     fn initialize(&mut self, main_fpu: usize, template_fpu: usize, fpu_state_bytes: usize) {
-        self.tasks = [Task::EMPTY; MAX_TASKS];
+        self.tasks.fill(Task::EMPTY);
         self.tasks[0] = Task {
             id: 0,
             state: TaskState::Running,
@@ -653,7 +665,7 @@ pub fn initialize() {
     crate::syscall::reset_scheduled_process_state();
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     release_scheduler_memory(scheduler);
-    *scheduler = Scheduler::empty();
+    scheduler.reset();
     let fpu_state_bytes = arch::fpu::context_state_bytes();
     let Ok(fpu_layout) = Layout::from_size_align(fpu_state_bytes, arch::fpu::context_alignment())
     else {
@@ -1334,6 +1346,25 @@ pub fn pgid_of(pid: u64) -> Option<u64> {
         .map(|task| task.pgid)
 }
 
+/// Ids of the live processes in process group `pgid` (up to `out.len()`).
+pub fn group_members(pgid: u64, out: &mut [u64]) -> usize {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    let mut count = 0;
+    for task in &scheduler.tasks {
+        if count < out.len()
+            && pgid != 0
+            && task.pgid == pgid
+            && task.tgid == 0
+            && task.process_space.is_some()
+            && !matches!(task.state, TaskState::Empty | TaskState::Exited)
+        {
+            out[count] = task.id;
+            count += 1;
+        }
+    }
+    count
+}
 pub fn sid_of(pid: u64) -> Option<u64> {
     arch::disable_interrupts();
     let scheduler = unsafe { &*SCHEDULER.0.get() };

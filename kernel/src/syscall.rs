@@ -315,6 +315,7 @@ mod inotify;
 mod posixshm;
 mod ptrace;
 mod sysv;
+pub(crate) mod tty;
 
 pub use ptrace::Trap;
 mod tcpsock;
@@ -545,6 +546,14 @@ struct Pipe {
     inotify: bool,
     /// A pidfd: `counter` holds the process id.
     pidfd: bool,
+    /// One of a terminal's two pipes (`tty::TTYS` index + 1, 0 for none).
+    tty: u8,
+    /// The terminal's input pipe in canonical mode: a read takes one line.
+    canonical: bool,
+    /// Non-canonical with `VMIN` 0: a read of nothing returns 0 at once.
+    nowait: bool,
+    /// End-of-file marks typed (Ctrl+D on an empty line): each ends one read.
+    eof_pending: u8,
 }
 
 impl Pipe {
@@ -563,6 +572,10 @@ impl Pipe {
         pidfd: false,
         timer_next: 0,
         timer_interval: 0,
+        tty: 0,
+        canonical: false,
+        nowait: false,
+        eof_pending: 0,
     };
 }
 
@@ -1130,9 +1143,29 @@ fn pipe_read(slot: usize, destination: &mut [u8]) -> Result<usize, u64> {
                 return Err(9);
             }
             if pipe.length > 0 {
-                return Ok(ring_take(&table.data[slot], &mut pipe.head, &mut pipe.length, destination));
+                let mut wanted = destination.len();
+                if pipe.canonical {
+                    let mut byte = [0u8; 1];
+                    let line = (0..pipe.length.min(wanted)).find(|&offset| {
+                        ring_peek(&table.data[slot], pipe.head, pipe.length, offset, &mut byte);
+                        byte[0] == b'\n'
+                    });
+                    if let Some(end) = line {
+                        wanted = end + 1;
+                    }
+                }
+                return Ok(ring_take(
+                    &table.data[slot],
+                    &mut pipe.head,
+                    &mut pipe.length,
+                    &mut destination[..wanted],
+                ));
             }
-            if !pipe.write_open {
+            if pipe.eof_pending > 0 {
+                pipe.eof_pending -= 1;
+                return Ok(0);
+            }
+            if !pipe.write_open || pipe.nowait {
                 return Ok(0);
             }
         }
@@ -1613,12 +1646,30 @@ static SECCOMP_FILTERED: AtomicBool = AtomicBool::new(false);
 /// capability.rs); inherited across fork and exec.
 static CAP_EFFECTIVE: AtomicU64 = AtomicU64::new(crate::capability::ALL);
 static CAP_PERMITTED: AtomicU64 = AtomicU64::new(crate::capability::ALL);
-/// `RLIMIT_NOFILE`'s current (soft) value: `prlimit64` can only ever lower
-/// this (there's no privileged override here, so the hard limit is always
-/// `PROCESS_FD_COUNT`) - enforced in `install_process_fd_kind`, the one
-/// choke point every fd allocation (pipe, socket, epoll, unix pair/listener,
-/// real file) already goes through.
-static NOFILE_LIMIT: AtomicU64 = AtomicU64::new(PROCESS_FD_COUNT as u64);
+const RLIMIT_COUNT: usize = 16;
+const RLIMIT_STACK: usize = 3;
+const RLIMIT_NOFILE: usize = 7;
+const RLIMIT_AS: usize = 9;
+
+/// Each resource's soft and hard limit, as a process starts with them; a
+/// hard limit is also the most it can ever be raised to.
+const fn default_limits() -> [[u64; 2]; RLIMIT_COUNT] {
+    let mut limits = [[u64::MAX; 2]; RLIMIT_COUNT];
+    // glibc gives each thread a stack the soft size: dozens of them have to
+    // fit a fixed-address program's 72 MiB of mappings.
+    limits[RLIMIT_STACK] = [1 << 20, 8 << 20];
+    limits[RLIMIT_NOFILE] = [PROCESS_FD_COUNT as u64; 2];
+    limits[RLIMIT_AS] = [crate::arch::paging::PROCESS_WINDOW_BYTES; 2];
+    limits
+}
+
+/// The running process's resource limits. Only `RLIMIT_NOFILE` is enforced
+/// (in `install_process_fd_kind`); the rest are kept and reported.
+static LIMITS: TicketLock<[[u64; 2]; RLIMIT_COUNT]> = TicketLock::new(default_limits());
+
+fn nofile_limit() -> u64 {
+    LIMITS.lock()[RLIMIT_NOFILE][0]
+}
 
 #[derive(Clone, Copy)]
 pub struct ProcessState {
@@ -1637,7 +1688,7 @@ pub struct ProcessState {
     seccomp_strict: bool,
     seccomp_filter: Option<crate::seccomp::Filter>,
     capabilities: crate::capability::Capabilities,
-    nofile_limit: u64,
+    limits: [[u64; 2]; RLIMIT_COUNT],
 }
 
 impl ProcessState {
@@ -1681,7 +1732,7 @@ impl ProcessState {
         seccomp_strict: false,
         seccomp_filter: None,
         capabilities: crate::capability::Capabilities::FULL,
-        nofile_limit: PROCESS_FD_COUNT as u64,
+        limits: default_limits(),
     };
 }
 
@@ -1718,7 +1769,7 @@ pub fn save_process_state() -> ProcessState {
         seccomp_strict: SECCOMP_STRICT.load(Ordering::Acquire),
         seccomp_filter: *SECCOMP_FILTER.lock(),
         capabilities: current_capabilities(),
-        nofile_limit: NOFILE_LIMIT.load(Ordering::Acquire),
+        limits: *LIMITS.lock(),
     }
 }
 
@@ -1765,7 +1816,7 @@ pub fn restore_process_state(state: &ProcessState) {
     SECCOMP_FILTERED.store(state.seccomp_filter.is_some(), Ordering::Release);
     *SECCOMP_FILTER.lock() = state.seccomp_filter;
     set_capabilities(state.capabilities);
-    NOFILE_LIMIT.store(state.nofile_limit, Ordering::Release);
+    *LIMITS.lock() = state.limits;
 }
 
 /// A scheduler task's exit-time cleanup for Linux-ABI process state. This is
@@ -1917,7 +1968,7 @@ pub fn reset_scheduled_process_state() {
     SECCOMP_FILTERED.store(false, Ordering::Release);
     *SECCOMP_FILTER.lock() = None;
     set_capabilities(crate::capability::Capabilities::FULL);
-    NOFILE_LIMIT.store(PROCESS_FD_COUNT as u64, Ordering::Release);
+    *LIMITS.lock() = default_limits();
 }
 
 /// execve() semantics for the process state that survives across an exec:
@@ -6392,7 +6443,7 @@ fn fd_ready_events(descriptor: u64) -> u32 {
             }
             return available;
         }
-        if process_fd.readable && pipe.length > 0 {
+        if process_fd.readable && (pipe.length > 0 || pipe.eof_pending > 0) {
             available |= EPOLLIN;
         }
         // With every writer gone a read returns end of file: a hang-up, as on
@@ -8123,6 +8174,9 @@ fn linux_ioctl(descriptor: u64, request: u64, address: u64) -> u64 {
             return error(14);
         }
         return 0;
+    }
+    if let Some(result) = tty::ioctl(&process_fd, request, address) {
+        return result;
     }
     if process_fd.standard == 0 || process_fd.standard >= DEVICE_NULL {
         return error(25);
@@ -10175,50 +10229,43 @@ fn linux_futex(arguments: [u64; 6]) -> u64 {
     futex::operate(arguments)
 }
 
-/// `RLIMIT_NOFILE` (resource 7) is the only limit actually enforced anywhere
-/// (`install_process_fd_kind`) - `setrlimit`-ing any other resource is
-/// rejected the same way it always was (EPERM), since nothing would honor
-/// it. There's no privileged override, so the hard limit is always
-/// `PROCESS_FD_COUNT`: a process can only ever lower its own soft limit,
-/// never raise the ceiling.
+/// `getrlimit`/`setrlimit`/`prlimit64` on the calling process. A soft limit
+/// may move up to the hard one; a hard limit may be lowered, and raised again
+/// (up to its starting value) only with `CAP_SYS_RESOURCE`.
 fn linux_prlimit64(pid: u64, resource: u64, new_limit: u64, old_limit: u64) -> u64 {
     if pid != 0 && pid != current_process_id() {
         return error(3);
     }
-    if new_limit != 0 {
-        if resource != 7 {
-            return error(1);
-        }
-        let mut requested = [0u8; 16];
-        if !user::copy_from_user(new_limit, &mut requested) {
-            return error(14);
-        }
-        let mut soft_bytes = [0u8; 8];
-        soft_bytes.copy_from_slice(&requested[..8]);
-        let soft = u64::from_le_bytes(soft_bytes);
-        let mut hard_bytes = [0u8; 8];
-        hard_bytes.copy_from_slice(&requested[8..]);
-        let hard = u64::from_le_bytes(hard_bytes);
-        if soft > hard || hard > PROCESS_FD_COUNT as u64 {
-            return error(22);
-        }
-        NOFILE_LIMIT.store(soft, Ordering::Release);
+    let Some(resource) = usize::try_from(resource).ok().filter(|&r| r < RLIMIT_COUNT) else {
+        return error(22);
+    };
+    let mut requested = [0u8; 16];
+    if new_limit != 0 && !user::copy_from_user(new_limit, &mut requested) {
+        return error(14);
     }
-    let (current, maximum) = match resource {
-        // The stack a process (and glibc: the stack of each thread it creates) can use.
-        3 => (512 * 1024u64, 512 * 1024u64),
-        7 => (
-            NOFILE_LIMIT.load(Ordering::Acquire),
-            PROCESS_FD_COUNT as u64,
-        ),
-        9 => (12 * 1024 * 1024u64, 12 * 1024 * 1024u64),
-        0..=15 => (u64::MAX, u64::MAX),
-        _ => return error(22),
+    let old = {
+        let mut limits = LIMITS.lock();
+        let old = limits[resource];
+        if new_limit != 0 {
+            let soft = u64::from_le_bytes(requested[..8].try_into().unwrap_or_default());
+            let hard = u64::from_le_bytes(requested[8..].try_into().unwrap_or_default());
+            if soft > hard {
+                return error(22);
+            }
+            let ceiling = default_limits()[resource][1];
+            if hard > ceiling
+                || (hard > old[1] && !has_capability(crate::capability::CAP_SYS_RESOURCE))
+            {
+                return error(1);
+            }
+            limits[resource] = [soft, hard];
+        }
+        old
     };
     if old_limit != 0 {
         let mut limit = [0u8; 16];
-        limit[..8].copy_from_slice(&current.to_le_bytes());
-        limit[8..].copy_from_slice(&maximum.to_le_bytes());
+        limit[..8].copy_from_slice(&old[0].to_le_bytes());
+        limit[8..].copy_from_slice(&old[1].to_le_bytes());
         if !user::copy_to_user(old_limit, &limit) {
             return error(14);
         }
@@ -10235,10 +10282,10 @@ fn linux_prlimit64(pid: u64, resource: u64, new_limit: u64, old_limit: u64) -> u
 /// now succeeds - proving this isn't a one-way ratchet that breaks fd
 /// allocation for the rest of boot.
 pub(crate) fn rlimit_nofile_self_test() -> bool {
-    let original = NOFILE_LIMIT.load(Ordering::Acquire);
-    NOFILE_LIMIT.store(3, Ordering::Release);
+    let original = LIMITS.lock()[RLIMIT_NOFILE];
+    LIMITS.lock()[RLIMIT_NOFILE][0] = 3;
     let blocked = linux_epoll_create1(0) == error(24);
-    NOFILE_LIMIT.store(original, Ordering::Release);
+    LIMITS.lock()[RLIMIT_NOFILE] = original;
     let allowed = linux_epoll_create1(0);
     let allowed_ok = allowed < 1_000_000;
     if allowed_ok {
@@ -12452,7 +12499,7 @@ fn install_process_fd_kind(
     // current limit, not just "some slot is free" - `position` always finds
     // the lowest free slot, so if that one is already at/past the limit,
     // every slot at or above it is too.
-    let limit = NOFILE_LIMIT.load(Ordering::Acquire);
+    let limit = nofile_limit();
     if index as u64 >= limit {
         // Dropped before logging: `audit::record` can do real file I/O
         // (writing `/data/AUDIT.LOG`), which must never happen while still
@@ -12503,7 +12550,7 @@ pub(crate) fn proc_working_directory() -> ([u8; MAX_PATH], usize) {
 }
 
 pub(crate) fn proc_descriptor_limit() -> u64 {
-    NOFILE_LIMIT.load(Ordering::Acquire)
+    nofile_limit()
 }
 
 struct LabelBuffer {

@@ -21,6 +21,7 @@ try {
     Pop-Location
 }
 Copy-Item -Force -LiteralPath $binary -Destination (Join-Path $esp "EFI\BOOT\BOOTX64.EFI")
+$drive = & (Join-Path $PSScriptRoot "esp-drive.ps1") -Esp $esp -Name esp-live-linux
 
 $qemu = Join-Path $env:ProgramFiles "qemu\qemu-system-x86_64.exe"
 $firmware = Join-Path $env:ProgramFiles "qemu\share\edk2-x86_64-code.fd"
@@ -46,7 +47,7 @@ Copy-Item -Force -LiteralPath $variablesTemplate -Destination $variables
     -cpu "qemu64,+nx,+smep,+smap,+xsave,+xsaveopt,+rdrand,+rdtscp,+pdpe1gb" `
     -drive "if=pflash,format=raw,unit=0,readonly=on,file=$firmware" `
     -drive "if=pflash,format=raw,unit=1,file=$variables" `
-    -drive "format=raw,file=fat:rw:$esp" `
+    -drive "format=raw,file=fat:rw:$drive" `
     -device virtio-vga `
     -display $Display `
     -serial "file:$root\build\live.log" `

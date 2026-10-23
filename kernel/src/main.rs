@@ -497,12 +497,12 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     let demand_paging_ready = arch::paging::demand_init(&paging, &mut frames);
     // Every process's pages (and the shared libraries a dynamically linked
     // program maps) come from this pool: a quarter of the memory, leaving at
-    // least 128 MiB to everything else (the hypervisor's guests among it), at
-    // least 16 MiB and at most 1 GiB, gathered from as few blocks as the
-    // memory map allows.
+    // least 128 MiB of what the frame allocator has to everything else (the
+    // kernel heap, the hypervisor's guests), at least 16 MiB and at most
+    // 1 GiB, gathered from as few blocks as the memory map allows.
     let usable_pages = boot.memory.usable_pages() + boot.memory.reclaimable_pages();
     let target = (usable_pages / 4)
-        .min(boot.memory.usable_pages().saturating_sub(32768))
+        .min(frames.stats().free_pages.saturating_sub(32768))
         .clamp(4096, memory::POOL_MAX_PAGES as u64);
     let mut demand_pool_pages = 0u64;
     let mut chunk = 65536u64;
@@ -586,12 +586,18 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     // kernel-stack allocations (`heap::HEAP`) well past the ~9-task ceiling
     // the old 1 MiB heap hit in `AEROS_TASK_EXHAUSTION` earlier this session.
     // An eighth of the usable memory, 16 to 256 MiB: the tmpfs keeps files
-    // bigger than a page here, so this is what all of `/tmp` can hold.
-    let heap_pages = (boot.memory.usable_pages() / 8).clamp(4096, 65536) as usize;
+    // bigger than a page here, so this is what all of `/tmp` can hold. On a
+    // small machine it is held to half of what the frame allocator still has.
+    let heap_pages = (boot.memory.usable_pages() / 8)
+        .min(frames.stats().free_pages / 2)
+        .clamp(4096, 65536) as usize;
     let heap_mapping = match arch::paging::map_heap(&paging, &mut frames, heap_pages) {
         Some(mapping) => mapping,
         None => {
-            serial::line("AEROS_HEAP_MAPPING_FAILURE");
+            serial::format(format_args!(
+                "AEROS_HEAP_MAPPING_FAILURE pages={heap_pages} free={}\n",
+                frames.stats().free_pages
+            ));
             arch::halt_forever();
         }
     };
@@ -3152,24 +3158,32 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         #[cfg(feature = "boot-test")]
         arch::halt_forever();
     }
-    // Real third-party programs (BusyBox, a static non-PIE Debian build) run
-    // as processes; the lines say which applets ran and how each ended.
-    let apps_result = match vfs::file("/bin/aeros-apps") {
-        Ok(file) => scheduler::threaded_elf_self_test(&paging, file.data, 90),
-        Err(_) => scheduler::threaded_elf_self_test(&paging, &[], 90),
-    };
-    serial::format(format_args!(
-        "AEROS_APPS exit={} reaped={} verified={}
-",
-        apps_result.exit_code, apps_result.reaped, apps_result.verified
-    ));
-    if !apps_result.verified {
-        serial::line("AEROS_APPS_INVARIANT_FAILURE");
-        #[cfg(feature = "boot-test")]
-        arch::halt_forever();
+    // Real third-party programs (BusyBox, Debian's bash, Perl, Python, git...)
+    // run as processes; the lines say which ran and how each ended. They take
+    // minutes, so an ordinary boot leaves them to the boot test.
+    #[cfg(feature = "boot-test")]
+    {
+        let apps_result = match vfs::file("/bin/aeros-apps") {
+            Ok(file) => scheduler::threaded_elf_self_test(&paging, file.data, 90),
+            Err(_) => scheduler::threaded_elf_self_test(&paging, &[], 90),
+        };
+        serial::format(format_args!(
+            "AEROS_APPS exit={} reaped={} verified={}\n",
+            apps_result.exit_code, apps_result.reaped, apps_result.verified
+        ));
+        if !apps_result.verified {
+            serial::line("AEROS_APPS_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
     }
     #[cfg(feature = "boot-test")]
     {
+        let tty = syscall::tty::self_test();
+        serial::format(format_args!("AEROS_TTY verified={tty}\n"));
+        if !tty {
+            serial::line("AEROS_TTY_FAILURE");
+            arch::halt_forever();
+        }
         let jobs = shell::foreground_job_self_test(shell_info);
         serial::format(format_args!("AEROS_TERMINAL_JOBS verified={jobs}\n"));
         if !jobs {

@@ -972,6 +972,16 @@ struct DesktopState {
     terminal_partial: [u8; SHELL_LINE_MAX],
     terminal_partial_len: usize,
     terminal_partial_shown: bool,
+    /// Where the foreground program's next character lands in the partial line.
+    terminal_cursor: usize,
+    /// Escape-sequence state of the program's output: 0 none, 1 after ESC,
+    /// 2 in a CSI sequence, 3 in an OSC string.
+    terminal_escape: u8,
+    terminal_csi: u16,
+    /// A foreground program is running, and its terminal's mode.
+    terminal_job: bool,
+    terminal_job_raw: bool,
+    terminal_job_echo: bool,
     /// Bytes between the caret and the end of the line (0 = at the end).
     terminal_back: usize,
     terminal_lines: [[u8; SHELL_LINE_MAX]; SHELL_HISTORY_LINES],
@@ -1190,6 +1200,12 @@ impl DesktopState {
             terminal_partial: [0; SHELL_LINE_MAX],
             terminal_partial_len: 0,
             terminal_partial_shown: false,
+            terminal_cursor: 0,
+            terminal_escape: 0,
+            terminal_csi: 0,
+            terminal_job: false,
+            terminal_job_raw: false,
+            terminal_job_echo: true,
             terminal_back: 0,
             terminal_lines: [[0; SHELL_LINE_MAX]; SHELL_HISTORY_LINES],
             terminal_line_lens: [0; SHELL_HISTORY_LINES],
@@ -3371,20 +3387,116 @@ impl DesktopState {
     }
 
     /// Output of the terminal's foreground program: complete lines are added,
-    /// and an unfinished one stays the last line until more of it comes.
+    /// and an unfinished one stays the last line until more of it comes. A
+    /// carriage return, a backspace and the cursor and erase sequences of
+    /// line editors move within that last line; other escapes are dropped.
     fn terminal_job_output(&mut self, text: &str) {
         for byte in text.bytes() {
-            if byte == b'\n' || self.terminal_partial_len == SHELL_LINE_MAX {
-                self.terminal_finish_partial();
-                if byte == b'\n' {
+            match self.terminal_escape {
+                1 => {
+                    self.terminal_escape = match byte {
+                        b'[' => 2,
+                        b']' => 3,
+                        _ => 0,
+                    };
+                    self.terminal_csi = 0;
                     continue;
                 }
+                2 => {
+                    match byte {
+                        b'0'..=b'9' => {
+                            self.terminal_csi = self
+                                .terminal_csi
+                                .saturating_mul(10)
+                                .saturating_add(u16::from(byte - b'0'));
+                        }
+                        0x40..=0x7e => {
+                            self.terminal_escape = 0;
+                            self.terminal_csi_apply(byte);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                3 => {
+                    if byte == 0x07 {
+                        self.terminal_escape = 0;
+                    } else if byte == 0x1b {
+                        self.terminal_escape = 1;
+                    }
+                    continue;
+                }
+                _ => {}
             }
-            self.terminal_partial[self.terminal_partial_len] = byte;
+            match byte {
+                0x1b => self.terminal_escape = 1,
+                b'\n' => {
+                    self.terminal_finish_partial();
+                    self.terminal_cursor = 0;
+                }
+                b'\r' => self.terminal_cursor = 0,
+                0x08 => self.terminal_cursor = self.terminal_cursor.saturating_sub(1),
+                b'\t' => {
+                    let stop = (self.terminal_cursor / 8 + 1) * 8;
+                    while self.terminal_cursor < stop.min(SHELL_LINE_MAX) {
+                        self.terminal_put(b' ');
+                    }
+                }
+                0x20..=0x7e => self.terminal_put(byte),
+                _ => {}
+            }
+        }
+        if self.terminal_partial_len > 0 || self.terminal_partial_shown {
+            self.terminal_show_partial();
+        }
+    }
+
+    fn terminal_put(&mut self, byte: u8) {
+        if self.terminal_cursor >= SHELL_LINE_MAX {
+            self.terminal_finish_partial();
+            self.terminal_cursor = 0;
+        }
+        while self.terminal_partial_len < self.terminal_cursor {
+            self.terminal_partial[self.terminal_partial_len] = b' ';
             self.terminal_partial_len += 1;
         }
-        if self.terminal_partial_len > 0 {
-            self.terminal_show_partial();
+        self.terminal_partial[self.terminal_cursor] = byte;
+        self.terminal_cursor += 1;
+        self.terminal_partial_len = self.terminal_partial_len.max(self.terminal_cursor);
+    }
+
+    fn terminal_csi_apply(&mut self, last: u8) {
+        let count = usize::from(self.terminal_csi.max(1));
+        let length = self.terminal_partial_len;
+        match last {
+            b'K' => match self.terminal_csi {
+                0 => self.terminal_partial_len = self.terminal_cursor.min(length),
+                1 => self.terminal_partial[..self.terminal_cursor.min(length)].fill(b' '),
+                _ => self.terminal_partial_len = 0,
+            },
+            b'C' => self.terminal_cursor = (self.terminal_cursor + count).min(SHELL_LINE_MAX - 1),
+            b'D' => self.terminal_cursor = self.terminal_cursor.saturating_sub(count),
+            b'G' => self.terminal_cursor = (count - 1).min(SHELL_LINE_MAX - 1),
+            b'P' => {
+                let at = self.terminal_cursor.min(length);
+                let removed = count.min(length - at);
+                self.terminal_partial.copy_within(at + removed..length, at);
+                self.terminal_partial_len -= removed;
+            }
+            b'@' => {
+                let at = self.terminal_cursor.min(length);
+                let added = count.min(SHELL_LINE_MAX - length);
+                self.terminal_partial.copy_within(at..length, at + added);
+                self.terminal_partial[at..at + added].fill(b' ');
+                self.terminal_partial_len += added;
+            }
+            b'J' if self.terminal_csi == 2 => {
+                self.terminal_line_count = 0;
+                self.terminal_partial_len = 0;
+                self.terminal_partial_shown = false;
+                self.terminal_cursor = 0;
+            }
+            _ => {}
         }
     }
 
@@ -3402,6 +3514,8 @@ impl DesktopState {
         self.terminal_show_partial();
         self.terminal_partial_len = 0;
         self.terminal_partial_shown = false;
+        self.terminal_cursor = 0;
+        self.terminal_escape = 0;
     }
 
     fn terminal_line_str(&self, index: usize) -> &str {
@@ -4092,6 +4206,7 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
     // (self-tests, the boot sequence's own internal use) is unaffected.
     shell.require_reauth();
     shell.set_interactive(true);
+    shell.set_terminal_size(SHELL_HISTORY_LINES as u16, SHELL_LINE_MAX as u16);
     {
         let mut startup_output: shell::Text<{ shell::MAX_OUTPUT }> = shell::Text::new();
         shell.run_startup_script(&mut startup_output);
@@ -4438,10 +4553,25 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 && state.app == DesktopApp::Terminal
                 && shell.job_running()
             {
+                let tty = shell.job_mode().is_some();
                 if code == 0x2e {
-                    state.terminal_job_output("^C\n");
+                    if !tty {
+                        state.terminal_job_output("^C\n");
+                    }
+                    state.terminal_input = [0; SHELL_LINE_MAX];
+                    state.terminal_input_len = 0;
+                    state.terminal_back = 0;
                     shell.job_interrupt();
                 } else {
+                    // What is typed so far goes first, as on a terminal.
+                    let length = state.terminal_input_len;
+                    if tty && length > 0 {
+                        let typed = state.terminal_input;
+                        let _ = shell.job_send(&typed[..length]);
+                        state.terminal_input = [0; SHELL_LINE_MAX];
+                        state.terminal_input_len = 0;
+                        state.terminal_back = 0;
+                    }
                     shell.job_end_input();
                 }
                 redraw = true;
@@ -4509,6 +4639,27 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                         | DesktopKey::End
                 )
             {
+                // A program that put its terminal in raw mode gets every key.
+                if shell.job_mode().is_some_and(|(canonical, _)| !canonical) {
+                    let mut encoded = [0u8; 4];
+                    let bytes: &[u8] = match key {
+                        DesktopKey::Character(ch) => ch.encode_utf8(&mut encoded).as_bytes(),
+                        DesktopKey::Backspace => b"\x7f",
+                        DesktopKey::Activate => b"\r",
+                        DesktopKey::Tab => b"\t",
+                        DesktopKey::Up => b"\x1b[A",
+                        DesktopKey::Down => b"\x1b[B",
+                        DesktopKey::Right => b"\x1b[C",
+                        DesktopKey::Left => b"\x1b[D",
+                        DesktopKey::Home => b"\x1b[H",
+                        DesktopKey::End => b"\x1b[F",
+                        DesktopKey::Delete => b"\x1b[3~",
+                        _ => b"",
+                    };
+                    let _ = shell.job_send(bytes);
+                    redraw = true;
+                    continue;
+                }
                 match key {
                     DesktopKey::Character(ch) => {
                         redraw |= state.push_terminal_input_char(ch);
@@ -4600,16 +4751,18 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                         redraw = true;
                     }
                     DesktopKey::Activate if shell.job_running() => {
-                        // A line for the running program: shown after its
-                        // prompt and handed to its input.
+                        // A line for the running program: its terminal echoes
+                        // it after the prompt (without one, it is shown here).
                         let mut line = [0u8; SHELL_LINE_MAX + 1];
                         let length = state.terminal_input_len;
                         line[..length].copy_from_slice(&state.terminal_input[..length]);
                         line[length] = b'\n';
-                        state.terminal_job_output(
-                            core::str::from_utf8(&line[..length]).unwrap_or(""),
-                        );
-                        state.terminal_finish_partial();
+                        if shell.job_mode().is_none() {
+                            state.terminal_job_output(
+                                core::str::from_utf8(&line[..length]).unwrap_or(""),
+                            );
+                            state.terminal_finish_partial();
+                        }
                         state.terminal_input = [0; SHELL_LINE_MAX];
                         state.terminal_input_len = 0;
                         state.terminal_back = 0;
@@ -4657,6 +4810,16 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 DesktopAction::Redraw => redraw = true,
                 DesktopAction::Idle => {}
             }
+        }
+        let mode = shell.job_mode();
+        let job_state = (
+            shell.job_running(),
+            mode.is_some_and(|(canonical, _)| !canonical),
+            mode.is_none_or(|(_, echo)| echo),
+        );
+        if job_state != (state.terminal_job, state.terminal_job_raw, state.terminal_job_echo) {
+            (state.terminal_job, state.terminal_job_raw, state.terminal_job_echo) = job_state;
+            redraw = true;
         }
         if shell.job_running() {
             let mut written: shell::Text<{ shell::MAX_OUTPUT }> = shell::Text::new();
@@ -7667,9 +7830,15 @@ fn draw_shell_window(
     painter.set_clip(previous_clip);
 
     let masking = state.terminal_awaiting_password || state.terminal_passwd_stage.is_some();
-    let prompt_y = scrollback_top + visible as i32 * 16;
+    // A running program's own prompt is the last line of its output: what is
+    // typed goes on that line.
+    let job = state.terminal_job;
+    let inline = job && state.terminal_partial_shown && visible > 0;
+    let prompt_row = if inline { visible - 1 } else { visible };
+    let prompt_y = scrollback_top + prompt_row as i32 * 16;
     let mut prompt: shell::Text<48> = shell::Text::new();
-    if state.terminal_awaiting_password {
+    if job {
+    } else if state.terminal_awaiting_password {
         let _ = write!(prompt, "Password:");
     } else if let Some(stage) = state.terminal_passwd_stage {
         let _ = write!(
@@ -7705,14 +7874,32 @@ fn draw_shell_window(
     // the measured prompt prefix.
     let physical_size = layout.scale.logical(11);
     let prompt_origin = layout.point(Point::new(card.x + 12, prompt_y));
-    let prefix_width = mono_font.text_width(prompt.as_str(), physical_size);
-    let typed_x = prompt_origin.x + prefix_width + layout.scale.logical(6);
+    let partial = if inline {
+        state.terminal_line_str(first + prompt_row)
+    } else {
+        ""
+    };
+    let typed_x = if job {
+        // In raw mode the program draws the line, so the caret is its cursor.
+        let upto = if state.terminal_job_raw {
+            state.terminal_cursor.min(partial.len())
+        } else {
+            partial.len()
+        };
+        prompt_origin.x + mono_font.text_width(&partial[..upto], physical_size)
+    } else {
+        prompt_origin.x
+            + mono_font.text_width(prompt.as_str(), physical_size)
+            + layout.scale.logical(6)
+    };
     // While a password is being captured, show bullets instead of the real
     // characters - same byte count as what was typed, which is accurate
     // for the ASCII-only passwords `check_password` requires and only
     // cosmetically approximate for a hypothetical multi-byte one.
     let masked = [b'*'; SHELL_LINE_MAX];
-    let displayed = if masking {
+    let displayed = if job && (state.terminal_job_raw || !state.terminal_job_echo) {
+        ""
+    } else if masking {
         core::str::from_utf8(&masked[..state.terminal_input_len]).unwrap_or("")
     } else {
         state.terminal_input_str()

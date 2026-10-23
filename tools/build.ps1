@@ -34,9 +34,10 @@ if ($BootTest) {
 
 Push-Location $root
 try {
-    & $fontBuilder
-    & $userspaceBuilder
-    & (Join-Path $PSScriptRoot "build-store-icons.ps1")
+    # Only the ESP path below is this script's output; callers take it as the image.
+    & $fontBuilder | Out-Host
+    & $userspaceBuilder | Out-Host
+    & (Join-Path $PSScriptRoot "build-store-icons.ps1") | Out-Host
     if ($BootTest) {
         cargo build --release --target x86_64-unknown-uefi --features boot-test
     } else {

@@ -2,7 +2,8 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 # QEMU's GL needs ANGLE (libEGL.dll, libGLESv2.dll); a copy sits in build\angle.
 $env:PATH = (Join-Path $root "build\angle") + ";" + $env:PATH
-$esp = & (Join-Path $PSScriptRoot "build.ps1")
+$esp = [string]@(& (Join-Path $PSScriptRoot "build.ps1"))[-1]
+$esp = & (Join-Path $PSScriptRoot "esp-drive.ps1") -Esp $esp -Name esp-run
 $qemu = Join-Path $env:ProgramFiles "qemu\qemu-system-x86_64.exe"
 $firmware = Join-Path $env:ProgramFiles "qemu\share\edk2-x86_64-code.fd"
 $variablesTemplate = Join-Path $env:ProgramFiles "qemu\share\edk2-i386-vars.fd"
