@@ -65,7 +65,9 @@ impl Termios {
     }
 
     fn decode(bytes: &[u8; 36]) -> Self {
-        let word = |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+        let word = |at: usize| {
+            u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+        };
         let mut cc = [0u8; CC_COUNT];
         cc.copy_from_slice(&bytes[17..]);
         Self {
@@ -145,7 +147,11 @@ pub fn set_foreground(index: usize, pgid: u64) {
 }
 
 pub fn release(index: usize) {
-    let Some(tty) = TTYS.lock().get_mut(index).map(|tty| core::mem::replace(tty, Tty::EMPTY)) else {
+    let Some(tty) = TTYS
+        .lock()
+        .get_mut(index)
+        .map(|tty| core::mem::replace(tty, Tty::EMPTY))
+    else {
         return;
     };
     let mut pipes = PIPES.lock();
@@ -165,7 +171,10 @@ pub fn release(index: usize) {
 /// whether what is typed is shown.
 pub fn mode(index: usize) -> (bool, bool) {
     TTYS.lock().get(index).map_or((true, true), |tty| {
-        (tty.termios.lflag & ICANON != 0, tty.termios.lflag & ECHO != 0)
+        (
+            tty.termios.lflag & ICANON != 0,
+            tty.termios.lflag & ECHO != 0,
+        )
     })
 }
 
@@ -238,13 +247,18 @@ pub fn input(index: usize, bytes: &[u8]) {
                         push(tty.output, b"\x08 \x08");
                     }
                 }
-            } else if byte == termios.cc[VKILL] || (lflag & IEXTEN != 0 && byte == termios.cc[VWERASE]) {
+            } else if byte == termios.cc[VKILL]
+                || (lflag & IEXTEN != 0 && byte == termios.cc[VWERASE])
+            {
                 let keep = if byte == termios.cc[VKILL] {
                     0
                 } else {
                     let line = &tty.line[..tty.line_len];
                     let end = line.iter().rposition(|&c| c != b' ').map_or(0, |at| at + 1);
-                    line[..end].iter().rposition(|&c| c == b' ').map_or(0, |at| at + 1)
+                    line[..end]
+                        .iter()
+                        .rposition(|&c| c == b' ')
+                        .map_or(0, |at| at + 1)
                 };
                 if lflag & ECHO != 0 {
                     for _ in keep..tty.line_len {
@@ -322,7 +336,12 @@ fn set_termios(index: usize, termios: Termios, flush: bool) {
         if flush {
             pipe.length = 0;
         }
-        ring_put(&mut table.data[input], pipe.head, &mut pipe.length, &line[..length]);
+        ring_put(
+            &mut table.data[input],
+            pipe.head,
+            &mut pipe.length,
+            &line[..length],
+        );
     }
 }
 
@@ -333,7 +352,6 @@ fn tty_of(process_fd: &ProcessFd) -> Option<usize> {
     let index = PIPES.lock().get(process_fd.handle as usize)?.tty;
     index.checked_sub(1).map(usize::from)
 }
-
 
 /// The terminal ioctls on a terminal's pipe; `None` for any other descriptor.
 pub(super) fn ioctl(process_fd: &ProcessFd, request: u64, address: u64) -> Option<u64> {
@@ -455,7 +473,10 @@ pub(crate) fn self_test() -> bool {
         && capture_read(output, &mut buffer) == 0;
     let (canonical, echo) = mode(index);
     release(index);
-    let released = PIPES.lock().get(keys).is_some_and(|pipe| pipe.tty == 0 && !pipe.canonical);
+    let released = PIPES
+        .lock()
+        .get(keys)
+        .is_some_and(|pipe| pipe.tty == 0 && !pipe.canonical);
     capture_close(keys);
     input_close(keys);
     capture_close(output);

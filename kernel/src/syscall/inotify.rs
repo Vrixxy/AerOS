@@ -179,7 +179,12 @@ fn queue_event(slot: usize, wd: i32, mask: u32, cookie: u32, name: &[u8]) {
     if !pipe.used || !pipe.inotify || PIPE_BUFFER_BYTES - pipe.length < total {
         return;
     }
-    ring_put(&mut table.data[slot], pipe.head, &mut pipe.length, &record[..total]);
+    ring_put(
+        &mut table.data[slot],
+        pipe.head,
+        &mut pipe.length,
+        &record[..total],
+    );
 }
 
 /// Reports `mask` events about `path` (an absolute path; add `IN_ISDIR` for a

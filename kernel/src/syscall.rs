@@ -495,7 +495,13 @@ fn ring_put(data: &mut [u8], head: usize, length: &mut usize, source: &[u8]) -> 
 }
 
 /// Copies queued bytes from `offset` past `head` without taking them.
-fn ring_peek(data: &[u8], head: usize, length: usize, offset: usize, destination: &mut [u8]) -> usize {
+fn ring_peek(
+    data: &[u8],
+    head: usize,
+    length: usize,
+    offset: usize,
+    destination: &mut [u8],
+) -> usize {
     let count = destination.len().min(length.saturating_sub(offset));
     let start = (head + offset) % data.len();
     let first = count.min(data.len() - start);
@@ -1294,7 +1300,12 @@ fn pipe_write(slot: usize, source: &[u8]) -> Result<usize, u64> {
             }
             let space = PIPE_BUFFER_BYTES - pipe.length;
             if space > 0 && (source.len() > PIPE_ATOMIC_BYTES || space >= source.len()) {
-                return Ok(ring_put(&mut table.data[slot], pipe.head, &mut pipe.length, source));
+                return Ok(ring_put(
+                    &mut table.data[slot],
+                    pipe.head,
+                    &mut pipe.length,
+                    source,
+                ));
             }
         }
         if attempt + 1 < PIPE_WAIT_ITERATIONS {
@@ -1343,7 +1354,13 @@ fn unix_socket_take(
                 ring_peek(data, buffer.head, buffer.length, 0, &mut header);
                 let size = usize::from(u16::from_le_bytes(header));
                 let count = size.min(destination.len());
-                ring_peek(data, buffer.head, buffer.length, 2, &mut destination[..count]);
+                ring_peek(
+                    data,
+                    buffer.head,
+                    buffer.length,
+                    2,
+                    &mut destination[..count],
+                );
                 if !peek {
                     let taken = (2 + size).min(buffer.length);
                     buffer.head = (buffer.head + taken) % PIPE_BUFFER_BYTES;
@@ -1355,7 +1372,12 @@ fn unix_socket_take(
                 if peek {
                     return Ok(ring_peek(data, buffer.head, buffer.length, 0, destination));
                 }
-                return Ok(ring_take(data, &mut buffer.head, &mut buffer.length, destination));
+                return Ok(ring_take(
+                    data,
+                    &mut buffer.head,
+                    &mut buffer.length,
+                    destination,
+                ));
             }
             if !peer_open {
                 return Ok(0);
@@ -1936,7 +1958,12 @@ pub fn capture_read(slot: usize, destination: &mut [u8]) -> usize {
     let Some(pipe) = table.pipes.get_mut(slot) else {
         return 0;
     };
-    ring_take(&table.data[slot], &mut pipe.head, &mut pipe.length, destination)
+    ring_take(
+        &table.data[slot],
+        &mut pipe.head,
+        &mut pipe.length,
+        destination,
+    )
 }
 
 /// The reader is done: the pipe is freed once the program has let go of it.
@@ -3904,7 +3931,8 @@ pub(crate) fn pipe_self_test() -> bool {
     let atomic_ok = pipe_write(big_slot, &[1u8; 2000]) == Err(11);
     let partial_ok = pipe_write(big_slot, &[2u8; 5000]) == Ok(1024);
     let mut tail = [0u8; 1024];
-    let drained = (0..PIPE_BUFFER_BYTES / 1024 - 1).all(|_| pipe_read(big_slot, &mut tail) == Ok(1024));
+    let drained =
+        (0..PIPE_BUFFER_BYTES / 1024 - 1).all(|_| pipe_read(big_slot, &mut tail) == Ok(1024));
     let order_ok = drained && pipe_read(big_slot, &mut tail) == Ok(1024) && tail == [2u8; 1024];
     PIPES.lock()[big_slot] = Pipe::EMPTY;
 
@@ -11600,8 +11628,19 @@ fn linux_tee(fd_in: u64, fd_out: u64, length: u64, flags: u64) -> u64 {
     let mut chunk = [0u8; 512];
     while moved < take {
         let part = (take - moved).min(chunk.len());
-        ring_peek(&table.data[source], from.head, from.length, moved, &mut chunk[..part]);
-        ring_put(&mut table.data[destination], to.head, &mut to.length, &chunk[..part]);
+        ring_peek(
+            &table.data[source],
+            from.head,
+            from.length,
+            moved,
+            &mut chunk[..part],
+        );
+        ring_put(
+            &mut table.data[destination],
+            to.head,
+            &mut to.length,
+            &chunk[..part],
+        );
         moved += part;
     }
     take as u64

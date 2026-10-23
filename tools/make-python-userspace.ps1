@@ -74,6 +74,8 @@ try {
         "    InitramfsEntry {`n        path: `"/usr/bin/python3`",`n        data: PYTHON,`n        mode: 0o555,`n    },"
     ) + ($entries | ForEach-Object { $_ -replace 'include_bytes!\("\.\./\.\./assets/userspace/python/usr/bin/python3\.13"\)', 'PYTHON' }) + @("];", "")
     [IO.File]::WriteAllText((Join-Path $root "kernel\src\initramfs_python.rs"), ($source -join "`n"))
+    # CI checks formatting, and long paths wrap differently than written here.
+    & rustfmt --edition 2024 (Join-Path $root "kernel\src\initramfs_python.rs")
     $bytes = (Get-ChildItem -LiteralPath $assets -Recurse -File | Measure-Object Length -Sum).Sum
     "python files=$count bytes=$bytes"
 } finally {

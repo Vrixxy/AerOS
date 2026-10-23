@@ -4817,8 +4817,18 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
             mode.is_some_and(|(canonical, _)| !canonical),
             mode.is_none_or(|(_, echo)| echo),
         );
-        if job_state != (state.terminal_job, state.terminal_job_raw, state.terminal_job_echo) {
-            (state.terminal_job, state.terminal_job_raw, state.terminal_job_echo) = job_state;
+        if job_state
+            != (
+                state.terminal_job,
+                state.terminal_job_raw,
+                state.terminal_job_echo,
+            )
+        {
+            (
+                state.terminal_job,
+                state.terminal_job_raw,
+                state.terminal_job_echo,
+            ) = job_state;
             redraw = true;
         }
         if shell.job_running() {
