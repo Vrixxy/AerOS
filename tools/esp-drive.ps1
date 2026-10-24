@@ -1,4 +1,4 @@
-param([Parameter(Mandatory = $true)][string]$Esp, [string]$Name = "esp-run")
+param([Parameter(Mandatory = $true)][string]$Esp, [string]$Name = "esp-run", [switch]$Fresh)
 
 # QEMU turns a directory into a FAT volume of at most 516 MB. With the Linux
 # guest's 420 MB ROOTFS next to the kernel image, build\esp no longer fits, so
@@ -6,15 +6,20 @@ param([Parameter(Mandatory = $true)][string]$Esp, [string]$Name = "esp-run")
 # build\rootfs-disk.img, the disk labelled aeros-root). What the last session
 # wrote to that copy (the account, settings, /data files) is brought back to
 # build\esp first, so it survives the next build.
+# -Fresh (the capture tool): always a new copy, without the saved account,
+# and nothing is brought back, so a session that sets one up leaves no trace.
 $ErrorActionPreference = "Stop"
 $limit = 500MB
 $total = (Get-ChildItem -Recurse -File -Force -LiteralPath $Esp | Measure-Object -Property Length -Sum).Sum
-if ($total -le $limit) {
+if ($total -le $limit -and -not $Fresh) {
     return $Esp
 }
 
 $root = Split-Path -Parent $PSScriptRoot
 $stage = Join-Path $root "build\$Name"
+if ($Fresh -and (Test-Path -LiteralPath $stage)) {
+    Remove-Item -Recurse -Force -LiteralPath $stage
+}
 if (Test-Path -LiteralPath $stage) {
     Get-ChildItem -Recurse -File -Force -LiteralPath $stage | ForEach-Object {
         $target = Join-Path $Esp $_.FullName.Substring($stage.Length + 1)
@@ -29,7 +34,8 @@ if (Test-Path -LiteralPath $stage) {
     }
     Remove-Item -Recurse -Force -LiteralPath $stage
 }
-robocopy $Esp $stage /E /XF ROOTFS /NFL /NDL /NJH /NJS /NP | Out-Null
+$skip = if ($Fresh) { @("ROOTFS", "account.dat", "LOCKOUT.DAT") } else { @("ROOTFS") }
+robocopy $Esp $stage /E /XF @skip /NFL /NDL /NJH /NJS /NP | Out-Null
 if ($LASTEXITCODE -ge 8) {
     throw "could not copy $Esp to $stage (robocopy $LASTEXITCODE)"
 }

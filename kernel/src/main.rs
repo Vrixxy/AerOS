@@ -56,6 +56,7 @@ mod initramfs;
 mod initramfs_gnu;
 mod initramfs_perl;
 mod initramfs_python;
+mod initramfs_terminfo;
 mod installer;
 mod ioapic;
 mod iommu;
@@ -836,6 +837,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
             &initramfs_gnu::GNU,
             &initramfs_perl::PERL_FILES,
             &initramfs_python::PYTHON_FILES,
+            &initramfs_terminfo::TERMINFO_FILES,
         ],
     );
     let home = datafs::initialize();
@@ -1137,12 +1139,13 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     let runtime_vfs = vfs::stats();
     let tmpfs_valid = runtime_vfs.verified
         && runtime_vfs.nodes == runtime_vfs.directories + runtime_vfs.files
-        && runtime_vfs.directories == 90
+        && runtime_vfs.directories == 98
         && runtime_vfs.files
             == initramfs::entries().len()
                 + initramfs_gnu::GNU.len()
                 + initramfs_perl::PERL_FILES.len()
                 + initramfs_python::PYTHON_FILES.len()
+                + initramfs_terminfo::TERMINFO_FILES.len()
                 + 1
         && runtime_vfs.mutable_files == 1
         && runtime_vfs.mutable_bytes == 6
@@ -3182,6 +3185,12 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         serial::format(format_args!("AEROS_TTY verified={tty}\n"));
         if !tty {
             serial::line("AEROS_TTY_FAILURE");
+            arch::halt_forever();
+        }
+        let screen = desktop::screen_self_test();
+        serial::format(format_args!("AEROS_TERMINAL_SCREEN verified={screen}\n"));
+        if !screen {
+            serial::line("AEROS_TERMINAL_SCREEN_FAILURE");
             arch::halt_forever();
         }
         let jobs = shell::foreground_job_self_test(shell_info);

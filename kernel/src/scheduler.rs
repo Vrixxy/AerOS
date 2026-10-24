@@ -131,7 +131,14 @@ struct Task {
     last_cpu: u8,
     /// A kill that reached the task while it was running on another processor;
     /// it ends itself at its next entry into the kernel.
-    kill_pending: bool,
+    /// The signal that ended it there (0: none).
+    kill_pending: u8,
+    /// Stopped by a stop signal (job control): not run again until SIGCONT.
+    job_stopped: bool,
+    /// The leader's slot: a stop (its signal) and a continue the parent's
+    /// `wait4` has not reported yet.
+    stop_report: u8,
+    continue_report: bool,
     /// When the task first ran and when it ended (monotonic nanoseconds; SMP test).
     started_ns: u64,
     ended_ns: u64,
@@ -183,7 +190,10 @@ impl Task {
         group_code: u64::MAX,
         trace: Trace::NONE,
         last_cpu: 0,
-        kill_pending: false,
+        kill_pending: 0,
+        job_stopped: false,
+        stop_report: 0,
+        continue_report: false,
         started_ns: 0,
         ended_ns: 0,
         cpu_user_ns: 0,
@@ -267,7 +277,10 @@ impl Scheduler {
             group_code: u64::MAX,
             trace: Trace::NONE,
             last_cpu: 0,
-            kill_pending: false,
+            kill_pending: 0,
+            job_stopped: false,
+            stop_report: 0,
+            continue_report: false,
             started_ns: 0,
             ended_ns: 0,
             cpu_user_ns: 0,
@@ -345,7 +358,7 @@ impl Scheduler {
             match member.state {
                 TaskState::Ready => member.state = TaskState::Exited,
                 TaskState::Running if crate::kernel_lock::active() => {
-                    member.kill_pending = true;
+                    member.kill_pending = 9;
                     pending = true;
                     kick_task(index);
                 }
@@ -425,7 +438,7 @@ impl Scheduler {
                 continue;
             }
             let task = &self.tasks[index];
-            if task.state == TaskState::Ready {
+            if task.state == TaskState::Ready && !task.job_stopped {
                 candidates[count] = (index, task.nice, task.skipped);
                 count += 1;
             }
@@ -818,7 +831,10 @@ pub fn spawn(entry: extern "C" fn() -> !) -> Option<u64> {
         group_code: u64::MAX,
         trace: Trace::NONE,
         last_cpu: 0,
-        kill_pending: false,
+        kill_pending: 0,
+        job_stopped: false,
+        stop_report: 0,
+        continue_report: false,
         started_ns: 0,
         ended_ns: 0,
         cpu_user_ns: 0,
@@ -916,7 +932,13 @@ pub fn spawn_process_capturing(
             0
         };
         // A new process gets a minimal environment, as `init` would give it.
-        let environment: [&[u8]; 3] = [b"PATH=/bin:/usr/bin", b"HOME=/tmp", b"TERM=dumb"];
+        // A Terminal job draws on the Terminal's VT100 screen.
+        let terminal: &[u8] = if input.is_some() {
+            b"TERM=vt100"
+        } else {
+            b"TERM=dumb"
+        };
+        let environment: [&[u8]; 3] = [b"PATH=/bin:/usr/bin", b"HOME=/tmp", terminal];
         if !crate::process::prepare_scheduled_process_stack_with(
             &mut space,
             &image,
@@ -1175,15 +1197,116 @@ pub fn signal_other_task(id: u64, signal: u64) -> Option<crate::syscall::RemoteS
         return None;
     }
     let traced = scheduler.tasks[slot].trace.tracer != 0;
+    let target = scheduler.tasks[slot].id;
+    if signal == 18 {
+        continue_process(target);
+    }
     let delivered = crate::syscall::signal_stored_state(
         &mut scheduler.tasks[slot].process_state,
         signal,
         traced,
     );
-    if scheduler.tasks[slot].state == TaskState::Running {
+    if matches!(delivered, crate::syscall::RemoteSignal::Stopped) {
+        stop_process(target, signal as u8);
+    } else if scheduler.tasks[slot].state == TaskState::Running {
         kick_task(slot);
     }
     Some(delivered)
+}
+
+/// Stops every thread of process `id` (a stop signal's default action): none
+/// of them is picked to run again until SIGCONT, wherever it was. Returns
+/// whether it was running.
+pub fn stop_process(id: u64, signal: u8) -> bool {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let Some(slot) = scheduler.tasks.iter().position(|task| {
+        task.id == id && !matches!(task.state, TaskState::Empty | TaskState::Exited)
+    }) else {
+        return false;
+    };
+    let group = scheduler.group(slot);
+    let current = scheduler.current;
+    let mut stopped = false;
+    for index in 0..MAX_TASKS {
+        let task = &mut scheduler.tasks[index];
+        if matches!(task.state, TaskState::Empty | TaskState::Exited)
+            || (if task.tgid == 0 { task.id } else { task.tgid }) != group
+            || task.job_stopped
+        {
+            continue;
+        }
+        task.job_stopped = true;
+        stopped = true;
+        if task.state == TaskState::Running && index != current {
+            kick_task(index);
+        }
+    }
+    if stopped && let Some(leader) = scheduler.tasks.iter_mut().find(|task| task.id == group) {
+        leader.stop_report = signal;
+        leader.continue_report = false;
+    }
+    stopped
+}
+
+/// SIGCONT for process `id`: its stopped threads run again. Returns whether
+/// it was stopped.
+pub fn continue_process(id: u64) -> bool {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let Some(slot) = scheduler.tasks.iter().position(|task| {
+        task.id == id && !matches!(task.state, TaskState::Empty | TaskState::Exited)
+    }) else {
+        return false;
+    };
+    let group = scheduler.group(slot);
+    let mut resumed = false;
+    for task in scheduler.tasks.iter_mut() {
+        if task.job_stopped && (if task.tgid == 0 { task.id } else { task.tgid }) == group {
+            task.job_stopped = false;
+            resumed = true;
+        }
+    }
+    if resumed && let Some(leader) = scheduler.tasks.iter_mut().find(|task| task.id == group) {
+        leader.stop_report = 0;
+        leader.continue_report = true;
+    }
+    if resumed {
+        wake_idle_processors();
+    }
+    resumed
+}
+
+/// Whether process `id` is stopped.
+pub fn process_stopped(id: u64) -> bool {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    scheduler
+        .tasks
+        .iter()
+        .any(|task| task.id == id && task.job_stopped && task.state != TaskState::Exited)
+}
+
+/// A stop (`untraced`, `WUNTRACED`) or continue (`continued`, `WCONTINUED`)
+/// of the running process's child `child` not reported yet, as a `wait4`
+/// status; taking it clears it.
+pub fn take_job_report(child: u64, untraced: bool, continued: bool) -> Option<u32> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let parent = scheduler.group(scheduler.current);
+    let task = scheduler.tasks.iter_mut().find(|task| {
+        task.id == child
+            && task.parent_id == parent
+            && !matches!(task.state, TaskState::Empty | TaskState::Exited)
+    })?;
+    if untraced && task.stop_report != 0 {
+        let signal = core::mem::take(&mut task.stop_report);
+        return Some(u32::from(signal) << 8 | 0x7f);
+    }
+    if continued && core::mem::take(&mut task.continue_report) {
+        return Some(0xffff);
+    }
+    None
 }
 
 /// True once the process `id` has ended (or was never there): it is gone
@@ -1346,15 +1469,15 @@ pub fn pgid_of(pid: u64) -> Option<u64> {
         .map(|task| task.pgid)
 }
 
-/// Ids of the live processes in process group `pgid` (up to `out.len()`).
-pub fn group_members(pgid: u64, out: &mut [u64]) -> usize {
+/// Ids of the live processes in process group `pgid`, or of every live
+/// process for `None` (up to `out.len()`).
+pub fn group_members(pgid: Option<u64>, out: &mut [u64]) -> usize {
     arch::disable_interrupts();
     let scheduler = unsafe { &*SCHEDULER.0.get() };
     let mut count = 0;
     for task in &scheduler.tasks {
         if count < out.len()
-            && pgid != 0
-            && task.pgid == pgid
+            && pgid.is_none_or(|pgid| pgid != 0 && task.pgid == pgid)
             && task.tgid == 0
             && task.process_space.is_some()
             && !matches!(task.state, TaskState::Empty | TaskState::Exited)
@@ -1469,6 +1592,12 @@ pub fn set_new_session() -> Result<u64, u64> {
 }
 
 pub fn kill_task(target_id: u64) -> Result<(), ()> {
+    kill_task_with(target_id, 9)
+}
+
+/// Ends process `target_id` as `signal` does by default: its wait status
+/// says so (128 + `signal` as the task's exit code).
+pub fn kill_task_with(target_id: u64, signal: u8) -> Result<(), ()> {
     if target_id == 0 {
         return Err(());
     }
@@ -1504,7 +1633,7 @@ pub fn kill_task(target_id: u64) -> Result<(), ()> {
         match member.state {
             TaskState::Ready => member.state = TaskState::Exited,
             TaskState::Running if crate::kernel_lock::active() => {
-                member.kill_pending = true;
+                member.kill_pending = signal;
                 pending = true;
                 kick_task(index);
             }
@@ -1512,7 +1641,7 @@ pub fn kill_task(target_id: u64) -> Result<(), ()> {
         }
     }
     if !pending {
-        USER_TASK_EXIT[slot].store(137, Ordering::Release);
+        USER_TASK_EXIT[slot].store(128 + u64::from(signal), Ordering::Release);
     }
     Ok(())
 }
@@ -2464,9 +2593,9 @@ impl Scheduler {
 
 /// Whether a kill reached the running task while it ran or waited on another
 /// processor; clears the mark.
-pub fn take_kill_pending() -> bool {
+pub fn take_kill_pending() -> u8 {
     if !crate::kernel_lock::active() {
-        return false;
+        return 0;
     }
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     let current = scheduler.current;
@@ -2724,15 +2853,16 @@ fn kick_task(slot: usize) {
 
 /// What entering the kernel from user mode found.
 pub struct Entry {
-    /// The task was killed while it ran elsewhere and must end now.
-    pub kill: bool,
+    /// The signal that killed the task while it ran elsewhere (0: none);
+    /// it must end now.
+    pub kill: u8,
 }
 
 /// Takes the kernel lock for a processor that trapped out of user mode and
 /// makes the task it was running the live one.
 pub fn enter_from_user() -> Entry {
     if !crate::kernel_lock::active() {
-        return Entry { kill: false };
+        return Entry { kill: 0 };
     }
     // Before waiting for the lock: a processor stopping the others for a
     // page-table change must see this one is no longer running user code.
@@ -2747,7 +2877,7 @@ pub fn enter_from_user() -> Entry {
     }
     let current = scheduler.current;
     let kill = scheduler.tasks[current].kill_pending;
-    scheduler.tasks[current].kill_pending = false;
+    scheduler.tasks[current].kill_pending = 0;
     Entry { kill }
 }
 

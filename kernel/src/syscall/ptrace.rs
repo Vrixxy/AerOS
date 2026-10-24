@@ -233,7 +233,7 @@ fn stop(
     });
     scheduler::save_fpu_here();
     loop {
-        if scheduler::take_kill_pending() {
+        if scheduler::take_kill_pending() != 0 {
             scheduler::trace_current(|trace| {
                 trace.resume = Resume::Kill;
                 trace.stopped = false;

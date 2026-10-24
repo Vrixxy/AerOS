@@ -3,7 +3,7 @@ use crate::vfs::InitramfsEntry;
 
 static PYTHON: &[u8] = include_bytes!("../../assets/userspace/python/usr/bin/python3.13");
 
-pub static PYTHON_FILES: [InitramfsEntry; 545] = [
+pub static PYTHON_FILES: [InitramfsEntry; 571] = [
     InitramfsEntry {
         path: "/usr/bin/python3",
         data: PYTHON,
@@ -182,6 +182,166 @@ pub static PYTHON_FILES: [InitramfsEntry; 545] = [
     InitramfsEntry {
         path: "/usr/lib/python3.13/_pylong.py",
         data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_pylong.py"),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/__init__.py",
+        data: include_bytes!(
+            "../../assets/userspace/python/usr/lib/python3.13/_pyrepl/__init__.py"
+        ),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/__main__.py",
+        data: include_bytes!(
+            "../../assets/userspace/python/usr/lib/python3.13/_pyrepl/__main__.py"
+        ),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/_minimal_curses.py",
+        data: include_bytes!(
+            "../../assets/userspace/python/usr/lib/python3.13/_pyrepl/_minimal_curses.py"
+        ),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/_threading_handler.py",
+        data: include_bytes!(
+            "../../assets/userspace/python/usr/lib/python3.13/_pyrepl/_threading_handler.py"
+        ),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/base_eventqueue.py",
+        data: include_bytes!(
+            "../../assets/userspace/python/usr/lib/python3.13/_pyrepl/base_eventqueue.py"
+        ),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/commands.py",
+        data: include_bytes!(
+            "../../assets/userspace/python/usr/lib/python3.13/_pyrepl/commands.py"
+        ),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/completing_reader.py",
+        data: include_bytes!(
+            "../../assets/userspace/python/usr/lib/python3.13/_pyrepl/completing_reader.py"
+        ),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/console.py",
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_pyrepl/console.py"),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/curses.py",
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_pyrepl/curses.py"),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/fancy_termios.py",
+        data: include_bytes!(
+            "../../assets/userspace/python/usr/lib/python3.13/_pyrepl/fancy_termios.py"
+        ),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/historical_reader.py",
+        data: include_bytes!(
+            "../../assets/userspace/python/usr/lib/python3.13/_pyrepl/historical_reader.py"
+        ),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/input.py",
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_pyrepl/input.py"),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/keymap.py",
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_pyrepl/keymap.py"),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/main.py",
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_pyrepl/main.py"),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/mypy.ini",
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_pyrepl/mypy.ini"),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/pager.py",
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_pyrepl/pager.py"),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/reader.py",
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_pyrepl/reader.py"),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/readline.py",
+        data: include_bytes!(
+            "../../assets/userspace/python/usr/lib/python3.13/_pyrepl/readline.py"
+        ),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/simple_interact.py",
+        data: include_bytes!(
+            "../../assets/userspace/python/usr/lib/python3.13/_pyrepl/simple_interact.py"
+        ),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/trace.py",
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_pyrepl/trace.py"),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/types.py",
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_pyrepl/types.py"),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/unix_console.py",
+        data: include_bytes!(
+            "../../assets/userspace/python/usr/lib/python3.13/_pyrepl/unix_console.py"
+        ),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/unix_eventqueue.py",
+        data: include_bytes!(
+            "../../assets/userspace/python/usr/lib/python3.13/_pyrepl/unix_eventqueue.py"
+        ),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/utils.py",
+        data: include_bytes!("../../assets/userspace/python/usr/lib/python3.13/_pyrepl/utils.py"),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/windows_console.py",
+        data: include_bytes!(
+            "../../assets/userspace/python/usr/lib/python3.13/_pyrepl/windows_console.py"
+        ),
+        mode: 0o444,
+    },
+    InitramfsEntry {
+        path: "/usr/lib/python3.13/_pyrepl/windows_eventqueue.py",
+        data: include_bytes!(
+            "../../assets/userspace/python/usr/lib/python3.13/_pyrepl/windows_eventqueue.py"
+        ),
         mode: 0o444,
     },
     InitramfsEntry {

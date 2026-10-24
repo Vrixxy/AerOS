@@ -53,7 +53,7 @@ $monitorArgs = if ($Monitor) { @("-monitor", "tcp:127.0.0.1:45511,server,nowait"
 
 $qemuArgs = @(
     "-machine", "q35,accel=whpx:tcg",
-    "-m", "512M",
+    "-m", "1024M",
     "-smp", "$Cpus",
     "-cpu", "qemu64,+nx,+smep,+smap,+xsave,+xsaveopt,+rdrand,+rdtscp,+pdpe1gb",
     "-drive", $codeFlash,

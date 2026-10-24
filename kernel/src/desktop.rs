@@ -30,6 +30,14 @@ mod settings_ui;
 mod shellui;
 #[path = "desktop_switcher.rs"]
 mod switcher;
+#[path = "desktop_vt.rs"]
+mod vt;
+
+/// The Terminal's screen emulator on its own (`desktop_vt.rs`).
+#[cfg(feature = "boot-test")]
+pub(crate) fn screen_self_test() -> bool {
+    vt::self_test()
+}
 
 const DESIGN_WIDTH: i32 = 752;
 const DESIGN_HEIGHT: i32 = 458;
@@ -108,7 +116,45 @@ const LOGIN_ERROR_NS: u64 = 1_500_000_000;
 /// Idle time on the desktop before the session locks itself.
 const AUTO_LOCK_NS: u64 = 300_000_000_000;
 const SHELL_LINE_MAX: usize = 56;
+/// What one command line typed into the Terminal can hold (it scrolls sideways
+/// past the window's width).
+const TERMINAL_INPUT_MAX: usize = shell::MAX_INPUT;
 const SHELL_HISTORY_LINES: usize = 14;
+
+/// The Terminal's older lines, scrolled off its top: kept outside
+/// `DesktopState` (which lives on a stack) for scrolling back.
+const TERMINAL_HISTORY: usize = 500;
+
+struct TerminalHistory {
+    lines: [[u8; SHELL_LINE_MAX]; TERMINAL_HISTORY],
+    lens: [u8; TERMINAL_HISTORY],
+    next: usize,
+    count: usize,
+}
+
+impl TerminalHistory {
+    fn push(&mut self, line: &[u8]) {
+        let length = line.len().min(SHELL_LINE_MAX);
+        self.lines[self.next][..length].copy_from_slice(&line[..length]);
+        self.lens[self.next] = length as u8;
+        self.next = (self.next + 1) % TERMINAL_HISTORY;
+        self.count = (self.count + 1).min(TERMINAL_HISTORY);
+    }
+
+    /// Line `index`, counting from the oldest kept.
+    fn line(&self, index: usize) -> &[u8] {
+        let slot = (self.next + TERMINAL_HISTORY - self.count + index) % TERMINAL_HISTORY;
+        &self.lines[slot][..usize::from(self.lens[slot])]
+    }
+}
+
+static TERMINAL_OLDER: crate::sync::TicketLock<TerminalHistory> =
+    crate::sync::TicketLock::new(TerminalHistory {
+        lines: [[0; SHELL_LINE_MAX]; TERMINAL_HISTORY],
+        lens: [0; TERMINAL_HISTORY],
+        next: 0,
+        count: 0,
+    });
 const FILES_MAX_ENTRIES: usize = 12;
 const FILES_GRID_COLUMNS: i32 = 3;
 const FILES_GRID_ROWS: i32 = 4;
@@ -965,19 +1011,15 @@ struct DesktopState {
     persist_account: bool,
     /// Someone reached the desktop since the machine started.
     session_used: bool,
-    terminal_input: [u8; SHELL_LINE_MAX],
+    terminal_input: [u8; TERMINAL_INPUT_MAX],
     terminal_input_len: usize,
     /// What a running program has written since its last newline (a prompt
     /// such as Python's `>>> `), shown as the last line until it is complete.
-    terminal_partial: [u8; SHELL_LINE_MAX],
-    terminal_partial_len: usize,
-    terminal_partial_shown: bool,
-    /// Where the foreground program's next character lands in the partial line.
-    terminal_cursor: usize,
-    /// Escape-sequence state of the program's output: 0 none, 1 after ESC,
-    /// 2 in a CSI sequence, 3 in an OSC string.
-    terminal_escape: u8,
-    terminal_csi: u16,
+    /// The screen of the program running in the terminal, and whether it is
+    /// on show (from the job's first poll until it ends or stops).
+    terminal_screen: vt::Screen,
+    terminal_screen_live: bool,
+
     /// A foreground program is running, and its terminal's mode.
     terminal_job: bool,
     terminal_job_raw: bool,
@@ -987,13 +1029,15 @@ struct DesktopState {
     terminal_lines: [[u8; SHELL_LINE_MAX]; SHELL_HISTORY_LINES],
     terminal_line_lens: [usize; SHELL_HISTORY_LINES],
     terminal_line_count: usize,
+    /// How many lines the Terminal is scrolled back (0: at the bottom).
+    terminal_scroll: usize,
     terminal_elevated: bool,
     /// Set by `terminal_submit` when `ear <command>` comes back needing the
     /// account password (`shell::Control::NeedsPassword`): the terminal's
     /// next Enter completes that password instead of running a new command,
     /// and the typed line renders masked in the meantime.
     terminal_awaiting_password: bool,
-    terminal_pending_command: [u8; SHELL_LINE_MAX],
+    terminal_pending_command: [u8; TERMINAL_INPUT_MAX],
     terminal_pending_command_len: usize,
     /// Set by `terminal_submit` when `passwd` runs
     /// (`shell::Control::NeedsPasswordChange`): walks current/new/confirm
@@ -1006,7 +1050,7 @@ struct DesktopState {
     /// decrements back to 0, which restores whatever was being typed
     /// before history browsing started).
     terminal_history_index: usize,
-    terminal_draft: [u8; SHELL_LINE_MAX],
+    terminal_draft: [u8; TERMINAL_INPUT_MAX],
     terminal_draft_len: usize,
     seamless: Seamless,
     clip_open: bool,
@@ -1195,14 +1239,10 @@ impl DesktopState {
             login_typed_ns: 0,
             persist_account: false,
             session_used: false,
-            terminal_input: [0; SHELL_LINE_MAX],
+            terminal_input: [0; TERMINAL_INPUT_MAX],
             terminal_input_len: 0,
-            terminal_partial: [0; SHELL_LINE_MAX],
-            terminal_partial_len: 0,
-            terminal_partial_shown: false,
-            terminal_cursor: 0,
-            terminal_escape: 0,
-            terminal_csi: 0,
+            terminal_screen: vt::Screen::EMPTY,
+            terminal_screen_live: false,
             terminal_job: false,
             terminal_job_raw: false,
             terminal_job_echo: true,
@@ -1210,15 +1250,16 @@ impl DesktopState {
             terminal_lines: [[0; SHELL_LINE_MAX]; SHELL_HISTORY_LINES],
             terminal_line_lens: [0; SHELL_HISTORY_LINES],
             terminal_line_count: 0,
+            terminal_scroll: 0,
             terminal_elevated: false,
             terminal_awaiting_password: false,
-            terminal_pending_command: [0; SHELL_LINE_MAX],
+            terminal_pending_command: [0; TERMINAL_INPUT_MAX],
             terminal_pending_command_len: 0,
             terminal_passwd_stage: None,
             terminal_passwd_new: [0; MAX_NAME],
             terminal_passwd_new_len: 0,
             terminal_history_index: 0,
-            terminal_draft: [0; SHELL_LINE_MAX],
+            terminal_draft: [0; TERMINAL_INPUT_MAX],
             terminal_draft_len: 0,
             seamless: Seamless::new(),
             clip_open: false,
@@ -3313,7 +3354,7 @@ impl DesktopState {
         }
         let mut buffer = [0u8; 4];
         let encoded = ch.encode_utf8(&mut buffer).as_bytes();
-        if self.terminal_input_len + encoded.len() > SHELL_LINE_MAX {
+        if self.terminal_input_len + encoded.len() > TERMINAL_INPUT_MAX {
             return false;
         }
         let at = self.terminal_input_len - self.terminal_back.min(self.terminal_input_len);
@@ -3375,6 +3416,9 @@ impl DesktopState {
         let bytes = text.as_bytes();
         let take = bytes.len().min(SHELL_LINE_MAX);
         if self.terminal_line_count == SHELL_HISTORY_LINES {
+            TERMINAL_OLDER
+                .lock()
+                .push(&self.terminal_lines[0][..self.terminal_line_lens[0]]);
             self.terminal_lines.copy_within(1.., 0);
             self.terminal_line_lens.copy_within(1.., 0);
             self.terminal_line_count -= 1;
@@ -3386,138 +3430,53 @@ impl DesktopState {
         self.terminal_line_count += 1;
     }
 
-    /// Output of the terminal's foreground program: complete lines are added,
-    /// and an unfinished one stays the last line until more of it comes. A
-    /// carriage return, a backspace and the cursor and erase sequences of
-    /// line editors move within that last line; other escapes are dropped.
+    /// Scrolls the Terminal back (positive) or forward through its older lines.
+    fn terminal_scroll_by(&mut self, lines: i32) {
+        let older = TERMINAL_OLDER.lock().count as i32;
+        self.terminal_scroll = (self.terminal_scroll as i32 + lines).clamp(0, older) as usize;
+    }
+
+    /// `text` as as many scrollback lines as the window's width needs (none
+    /// for an empty one).
+    fn terminal_push_wrapped(&mut self, text: &str) {
+        let mut rest = text;
+        while !rest.is_empty() {
+            let mut cut = rest.len().min(SHELL_LINE_MAX);
+            while !rest.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            self.terminal_push_line(&rest[..cut]);
+            rest = &rest[cut..];
+        }
+    }
+
+    /// Output of the terminal's foreground program, drawn on its screen.
     fn terminal_job_output(&mut self, text: &str) {
-        for byte in text.bytes() {
-            match self.terminal_escape {
-                1 => {
-                    self.terminal_escape = match byte {
-                        b'[' => 2,
-                        b']' => 3,
-                        _ => 0,
-                    };
-                    self.terminal_csi = 0;
-                    continue;
-                }
-                2 => {
-                    match byte {
-                        b'0'..=b'9' => {
-                            self.terminal_csi = self
-                                .terminal_csi
-                                .saturating_mul(10)
-                                .saturating_add(u16::from(byte - b'0'));
-                        }
-                        0x40..=0x7e => {
-                            self.terminal_escape = 0;
-                            self.terminal_csi_apply(byte);
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-                3 => {
-                    if byte == 0x07 {
-                        self.terminal_escape = 0;
-                    } else if byte == 0x1b {
-                        self.terminal_escape = 1;
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-            match byte {
-                0x1b => self.terminal_escape = 1,
-                b'\n' => {
-                    self.terminal_finish_partial();
-                    self.terminal_cursor = 0;
-                }
-                b'\r' => self.terminal_cursor = 0,
-                0x08 => self.terminal_cursor = self.terminal_cursor.saturating_sub(1),
-                b'\t' => {
-                    let stop = (self.terminal_cursor / 8 + 1) * 8;
-                    while self.terminal_cursor < stop.min(SHELL_LINE_MAX) {
-                        self.terminal_put(b' ');
-                    }
-                }
-                0x20..=0x7e => self.terminal_put(byte),
-                _ => {}
-            }
-        }
-        if self.terminal_partial_len > 0 || self.terminal_partial_shown {
-            self.terminal_show_partial();
-        }
+        self.terminal_screen.feed(text.as_bytes());
     }
 
-    fn terminal_put(&mut self, byte: u8) {
-        if self.terminal_cursor >= SHELL_LINE_MAX {
-            self.terminal_finish_partial();
-            self.terminal_cursor = 0;
+    /// A program starts: its screen begins as what the terminal shows.
+    fn terminal_screen_open(&mut self) {
+        let mut lines: [&[u8]; SHELL_HISTORY_LINES] = [&[]; SHELL_HISTORY_LINES];
+        let count = self.terminal_line_count.min(SHELL_HISTORY_LINES);
+        for (index, slot) in lines.iter_mut().enumerate().take(count) {
+            *slot = &self.terminal_lines[index][..self.terminal_line_lens[index]];
         }
-        while self.terminal_partial_len < self.terminal_cursor {
-            self.terminal_partial[self.terminal_partial_len] = b' ';
-            self.terminal_partial_len += 1;
-        }
-        self.terminal_partial[self.terminal_cursor] = byte;
-        self.terminal_cursor += 1;
-        self.terminal_partial_len = self.terminal_partial_len.max(self.terminal_cursor);
+        let mut screen = vt::Screen::EMPTY;
+        screen.load(&lines[..count]);
+        self.terminal_screen = screen;
     }
 
-    fn terminal_csi_apply(&mut self, last: u8) {
-        let count = usize::from(self.terminal_csi.max(1));
-        let length = self.terminal_partial_len;
-        match last {
-            b'K' => match self.terminal_csi {
-                0 => self.terminal_partial_len = self.terminal_cursor.min(length),
-                1 => self.terminal_partial[..self.terminal_cursor.min(length)].fill(b' '),
-                _ => self.terminal_partial_len = 0,
-            },
-            b'C' => self.terminal_cursor = (self.terminal_cursor + count).min(SHELL_LINE_MAX - 1),
-            b'D' => self.terminal_cursor = self.terminal_cursor.saturating_sub(count),
-            b'G' => self.terminal_cursor = (count - 1).min(SHELL_LINE_MAX - 1),
-            b'P' => {
-                let at = self.terminal_cursor.min(length);
-                let removed = count.min(length - at);
-                self.terminal_partial.copy_within(at + removed..length, at);
-                self.terminal_partial_len -= removed;
-            }
-            b'@' => {
-                let at = self.terminal_cursor.min(length);
-                let added = count.min(SHELL_LINE_MAX - length);
-                self.terminal_partial.copy_within(at..length, at + added);
-                self.terminal_partial[at..at + added].fill(b' ');
-                self.terminal_partial_len += added;
-            }
-            b'J' if self.terminal_csi == 2 => {
-                self.terminal_line_count = 0;
-                self.terminal_partial_len = 0;
-                self.terminal_partial_shown = false;
-                self.terminal_cursor = 0;
-            }
-            _ => {}
+    /// It ends or stops: what its screen shows stays in the scrollback.
+    fn terminal_screen_close(&mut self) {
+        self.terminal_screen.finish();
+        let screen = self.terminal_screen;
+        self.terminal_line_lens = [0; SHELL_HISTORY_LINES];
+        self.terminal_line_count = 0;
+        for row in 0..screen.used_rows() {
+            self.terminal_push_line(core::str::from_utf8(screen.line(row)).unwrap_or(""));
         }
     }
-
-    fn terminal_show_partial(&mut self) {
-        if self.terminal_partial_shown && self.terminal_line_count > 0 {
-            self.terminal_line_count -= 1;
-        }
-        let partial = self.terminal_partial;
-        let length = self.terminal_partial_len;
-        self.terminal_push_line(core::str::from_utf8(&partial[..length]).unwrap_or(""));
-        self.terminal_partial_shown = true;
-    }
-
-    fn terminal_finish_partial(&mut self) {
-        self.terminal_show_partial();
-        self.terminal_partial_len = 0;
-        self.terminal_partial_shown = false;
-        self.terminal_cursor = 0;
-        self.terminal_escape = 0;
-    }
-
     fn terminal_line_str(&self, index: usize) -> &str {
         core::str::from_utf8(&self.terminal_lines[index][..self.terminal_line_lens[index]])
             .unwrap_or("")
@@ -3541,9 +3500,9 @@ fn terminal_submit(state: &mut DesktopState, shell: &mut shell::Shell<'_>) -> sh
     if state.terminal_passwd_stage.is_some() {
         return terminal_submit_passwd_stage(state);
     }
-    let mut command: shell::Text<SHELL_LINE_MAX> = shell::Text::new();
+    let mut command: shell::Text<TERMINAL_INPUT_MAX> = shell::Text::new();
     let _ = command.push_str_checked(state.terminal_input_str());
-    state.terminal_input = [0; SHELL_LINE_MAX];
+    state.terminal_input = [0; TERMINAL_INPUT_MAX];
     state.terminal_input_len = 0;
     state.terminal_back = 0;
     state.terminal_history_index = 0;
@@ -3553,16 +3512,16 @@ fn terminal_submit(state: &mut DesktopState, shell: &mut shell::Shell<'_>) -> sh
     } else {
         state.display_name()
     };
-    let mut prompt_line: shell::Text<128> = shell::Text::new();
+    let mut prompt_line: shell::Text<{ TERMINAL_INPUT_MAX + 64 }> = shell::Text::new();
     let _ = write!(prompt_line, "{}> {}", prefix, command.as_str());
-    state.terminal_push_line(prompt_line.as_str());
+    state.terminal_push_wrapped(prompt_line.as_str());
 
     let mut output: shell::Text<{ shell::MAX_OUTPUT }> = shell::Text::new();
     let control = shell.execute(command.as_str(), &mut output);
     if control == shell::Control::NeedsPassword {
-        state.terminal_pending_command = [0; SHELL_LINE_MAX];
+        state.terminal_pending_command = [0; TERMINAL_INPUT_MAX];
         let bytes = command.as_str().as_bytes();
-        let count = bytes.len().min(SHELL_LINE_MAX);
+        let count = bytes.len().min(TERMINAL_INPUT_MAX);
         state.terminal_pending_command[..count].copy_from_slice(&bytes[..count]);
         state.terminal_pending_command_len = count;
         state.terminal_awaiting_password = true;
@@ -3580,15 +3539,7 @@ fn terminal_submit(state: &mut DesktopState, shell: &mut shell::Shell<'_>) -> sh
         "AEROS_SHELL_EXEC sequence={executed} status={status} elevations={elevated} denied={denied} verified=true\n",
     ));
     for line in output.as_str().split('\n') {
-        let mut rest = line;
-        while !rest.is_empty() {
-            let mut cut = rest.len().min(SHELL_LINE_MAX);
-            while !rest.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            state.terminal_push_line(&rest[..cut]);
-            rest = &rest[cut..];
-        }
+        state.terminal_push_wrapped(line);
     }
     control
 }
@@ -3612,7 +3563,7 @@ fn terminal_submit_password(
 ) -> shell::Control {
     let mut attempt = state.terminal_input;
     let attempt_len = state.terminal_input_len;
-    state.terminal_input = [0; SHELL_LINE_MAX];
+    state.terminal_input = [0; TERMINAL_INPUT_MAX];
     state.terminal_input_len = 0;
     state.terminal_back = 0;
     state.terminal_history_index = 0;
@@ -3633,12 +3584,12 @@ fn terminal_submit_password(
             .is_some_and(|credential| credential.verify(&attempt[..attempt_len]));
     crate::auth::wipe(&mut attempt[..attempt_len]);
 
-    let mut command: shell::Text<SHELL_LINE_MAX> = shell::Text::new();
+    let mut command: shell::Text<TERMINAL_INPUT_MAX> = shell::Text::new();
     let pending_len = state.terminal_pending_command_len;
     let _ = command.push_str_checked(
         core::str::from_utf8(&state.terminal_pending_command[..pending_len]).unwrap_or(""),
     );
-    state.terminal_pending_command = [0; SHELL_LINE_MAX];
+    state.terminal_pending_command = [0; TERMINAL_INPUT_MAX];
     state.terminal_pending_command_len = 0;
     if !correct {
         if had_input {
@@ -3685,7 +3636,7 @@ fn terminal_submit_passwd_stage(state: &mut DesktopState) -> shell::Control {
     };
     let mut attempt = state.terminal_input;
     let attempt_len = state.terminal_input_len;
-    state.terminal_input = [0; SHELL_LINE_MAX];
+    state.terminal_input = [0; TERMINAL_INPUT_MAX];
     state.terminal_input_len = 0;
     state.terminal_back = 0;
     match stage {
@@ -4544,21 +4495,43 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 redraw = true;
                 continue;
             }
-            // Ctrl+C / Ctrl+D for the program the terminal is running.
+            // Page Up / Page Down scroll the Terminal back and forward (a
+            // program in raw mode gets them as keys).
+            if was_extended
+                && !released
+                && (code == 0x49 || code == 0x51)
+                && state.screen == Screen::Desktop
+                && state.app == DesktopApp::Terminal
+            {
+                let _ = decoder.feed(scancode);
+                if shell.job_mode().is_some_and(|(canonical, _)| !canonical) {
+                    let _ = shell.job_send(if code == 0x49 { b"\x1b[5~" } else { b"\x1b[6~" });
+                } else if !state.terminal_screen_live {
+                    let page = SHELL_HISTORY_LINES as i32 - 1;
+                    state.terminal_scroll_by(if code == 0x49 { page } else { -page });
+                }
+                redraw = true;
+                continue;
+            }
+            // Ctrl+C / Ctrl+D / Ctrl+Z for the program the terminal is running.
             if ctrl_down
                 && !was_extended
                 && !released
-                && (code == 0x2e || code == 0x20)
+                && (code == 0x2e || code == 0x20 || code == 0x2c)
                 && state.screen == Screen::Desktop
                 && state.app == DesktopApp::Terminal
                 && shell.job_running()
             {
                 let tty = shell.job_mode().is_some();
-                if code == 0x2e {
+                if code == 0x2c {
+                    if tty {
+                        let _ = shell.job_send(&[0x1a]);
+                    }
+                } else if code == 0x2e {
                     if !tty {
                         state.terminal_job_output("^C\n");
                     }
-                    state.terminal_input = [0; SHELL_LINE_MAX];
+                    state.terminal_input = [0; TERMINAL_INPUT_MAX];
                     state.terminal_input_len = 0;
                     state.terminal_back = 0;
                     shell.job_interrupt();
@@ -4568,7 +4541,7 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                     if tty && length > 0 {
                         let typed = state.terminal_input;
                         let _ = shell.job_send(&typed[..length]);
-                        state.terminal_input = [0; SHELL_LINE_MAX];
+                        state.terminal_input = [0; TERMINAL_INPUT_MAX];
                         state.terminal_input_len = 0;
                         state.terminal_back = 0;
                     }
@@ -4639,6 +4612,8 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                         | DesktopKey::End
                 )
             {
+                // Typing goes back to the bottom of the scrollback.
+                state.terminal_scroll = 0;
                 // A program that put its terminal in raw mode gets every key.
                 if shell.job_mode().is_some_and(|(canonical, _)| !canonical) {
                     let mut encoded = [0u8; 4];
@@ -4647,6 +4622,11 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                         DesktopKey::Backspace => b"\x7f",
                         DesktopKey::Activate => b"\r",
                         DesktopKey::Tab => b"\t",
+                        // In application cursor mode (DECCKM) arrows are `ESC O x`.
+                        DesktopKey::Up if state.terminal_screen.app_cursor => b"\x1bOA",
+                        DesktopKey::Down if state.terminal_screen.app_cursor => b"\x1bOB",
+                        DesktopKey::Right if state.terminal_screen.app_cursor => b"\x1bOC",
+                        DesktopKey::Left if state.terminal_screen.app_cursor => b"\x1bOD",
                         DesktopKey::Up => b"\x1b[A",
                         DesktopKey::Down => b"\x1b[B",
                         DesktopKey::Right => b"\x1b[C",
@@ -4682,9 +4662,9 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                             state.terminal_draft_len = state.terminal_input_len;
                         }
                         if let Some(entry) = shell.history_entry(state.terminal_history_index) {
-                            state.terminal_input = [0; SHELL_LINE_MAX];
+                            state.terminal_input = [0; TERMINAL_INPUT_MAX];
                             let bytes = entry.as_bytes();
-                            let count = bytes.len().min(SHELL_LINE_MAX);
+                            let count = bytes.len().min(TERMINAL_INPUT_MAX);
                             state.terminal_input[..count].copy_from_slice(&bytes[..count]);
                             state.terminal_input_len = count;
                             state.terminal_back = 0;
@@ -4700,8 +4680,8 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                         let before = state.terminal_input_len;
                         let (line, count) = shell.complete(state.terminal_input_str(), &mut names);
                         let bytes = line.as_str().as_bytes();
-                        if count > 0 && bytes.len() <= SHELL_LINE_MAX && bytes.len() >= before {
-                            state.terminal_input = [0; SHELL_LINE_MAX];
+                        if count > 0 && bytes.len() <= TERMINAL_INPUT_MAX && bytes.len() >= before {
+                            state.terminal_input = [0; TERMINAL_INPUT_MAX];
                             state.terminal_input[..bytes.len()].copy_from_slice(bytes);
                             state.terminal_input_len = bytes.len();
                             state.terminal_back = 0;
@@ -4712,9 +4692,10 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                             } else {
                                 state.display_name()
                             };
-                            let mut echoed: shell::Text<128> = shell::Text::new();
+                            let mut echoed: shell::Text<{ TERMINAL_INPUT_MAX + 64 }> =
+                                shell::Text::new();
                             let _ = write!(echoed, "{}> {}", prefix, state.terminal_input_str());
-                            state.terminal_push_line(echoed.as_str());
+                            state.terminal_push_wrapped(echoed.as_str());
                             let mut rest = names.as_str().trim_end();
                             while !rest.is_empty() {
                                 let mut take = rest.len().min(SHELL_LINE_MAX);
@@ -4741,9 +4722,9 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                         } else if let Some(entry) =
                             shell.history_entry(state.terminal_history_index - 1)
                         {
-                            state.terminal_input = [0; SHELL_LINE_MAX];
+                            state.terminal_input = [0; TERMINAL_INPUT_MAX];
                             let bytes = entry.as_bytes();
-                            let count = bytes.len().min(SHELL_LINE_MAX);
+                            let count = bytes.len().min(TERMINAL_INPUT_MAX);
                             state.terminal_input[..count].copy_from_slice(&bytes[..count]);
                             state.terminal_input_len = count;
                             state.terminal_back = 0;
@@ -4753,17 +4734,16 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                     DesktopKey::Activate if shell.job_running() => {
                         // A line for the running program: its terminal echoes
                         // it after the prompt (without one, it is shown here).
-                        let mut line = [0u8; SHELL_LINE_MAX + 1];
+                        let mut line = [0u8; TERMINAL_INPUT_MAX + 1];
                         let length = state.terminal_input_len;
                         line[..length].copy_from_slice(&state.terminal_input[..length]);
                         line[length] = b'\n';
                         if shell.job_mode().is_none() {
                             state.terminal_job_output(
-                                core::str::from_utf8(&line[..length]).unwrap_or(""),
+                                core::str::from_utf8(&line[..=length]).unwrap_or(""),
                             );
-                            state.terminal_finish_partial();
                         }
-                        state.terminal_input = [0; SHELL_LINE_MAX];
+                        state.terminal_input = [0; TERMINAL_INPUT_MAX];
                         state.terminal_input_len = 0;
                         state.terminal_back = 0;
                         if !shell.job_send(&line[..=length]) {
@@ -4795,6 +4775,8 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                                 state.terminal_lines = [[0; SHELL_LINE_MAX]; SHELL_HISTORY_LINES];
                                 state.terminal_line_lens = [0; SHELL_HISTORY_LINES];
                                 state.terminal_line_count = 0;
+                                state.terminal_scroll = 0;
+                                TERMINAL_OLDER.lock().count = 0;
                             }
                             shell::Control::None
                             | shell::Control::NeedsPassword
@@ -4832,17 +4814,29 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
             redraw = true;
         }
         if shell.job_running() {
+            if !state.terminal_screen_live {
+                state.terminal_screen_open();
+                state.terminal_screen_live = true;
+            }
             let mut written: shell::Text<{ shell::MAX_OUTPUT }> = shell::Text::new();
             let ended = shell.job_poll(&mut written);
             if !written.as_str().is_empty() {
+                // A terminal does ONLCR itself; bare pipes need it here.
+                state.terminal_screen.crlf = shell.job_mode().is_none();
                 state.terminal_job_output(written.as_str());
                 redraw = true;
             }
+            // What the program asked the terminal (where its cursor is).
+            let mut replies = [0u8; 32];
+            let count = state.terminal_screen.take_replies(&mut replies);
+            if count > 0 {
+                let _ = shell.job_send(&replies[..count]);
+            }
             if let Some(status) = ended {
-                if state.terminal_partial_len > 0 {
-                    state.terminal_finish_partial();
-                }
-                if status != 0 {
+                state.terminal_screen_close();
+                state.terminal_screen_live = false;
+                // 148 is a job Ctrl+Z stopped, which says so itself.
+                if status != 0 && status != 148 {
                     let mut line: shell::Text<32> = shell::Text::new();
                     let _ = write!(line, "[exit {status}]");
                     state.terminal_push_line(line.as_str());
@@ -5026,6 +5020,13 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
         let wheel = crate::mouse::take_wheel();
         if wheel != 0 && over_linux {
             crate::svm::linux_mouse_wheel(pointer_buttons(&pointer), wheel);
+        } else if wheel != 0
+            && state.app == DesktopApp::Terminal
+            && state.overlay == Overlay::None
+            && !state.terminal_screen_live
+        {
+            state.terminal_scroll_by(-wheel * 3);
+            redraw = true;
         } else if wheel != 0 && state.app == DesktopApp::Store && state.overlay == Overlay::None {
             crate::store::get().scroll_rows(wheel);
         } else if wheel != 0 && state.app == DesktopApp::Browser && state.overlay == Overlay::None {
@@ -7824,30 +7825,60 @@ fn draw_shell_window(
     ));
     let previous_clip = painter.clip();
     painter.set_clip(clip);
-    let visible = state.terminal_line_count.min(SHELL_HISTORY_LINES);
-    let first = state.terminal_line_count - visible;
+    // While a program runs, the terminal shows its screen.
+    let job = state.terminal_screen_live;
+    // The lines on show: the newest, or older ones while scrolled back.
+    let older = TERMINAL_OLDER.lock();
+    let scroll = if job {
+        0
+    } else {
+        state.terminal_scroll.min(older.count)
+    };
+    let total = older.count + state.terminal_line_count;
+    let visible = if job {
+        vt::ROWS
+    } else {
+        (total - scroll).min(SHELL_HISTORY_LINES)
+    };
+    let first = (total - scroll).saturating_sub(visible);
     for row in 0..visible {
+        let at = Point::new(card.x + 12, scrollback_top + row as i32 * 16);
+        if job {
+            draw_screen_row(painter, layout, mono_font, at, &state.terminal_screen, row);
+            continue;
+        }
+        let index = first + row;
+        let line = if index < older.count {
+            core::str::from_utf8(older.line(index)).unwrap_or("")
+        } else {
+            state.terminal_line_str(index - older.count)
+        };
         text(
             painter,
             layout,
             mono_font,
-            Point::new(card.x + 12, scrollback_top + row as i32 * 16),
-            state.terminal_line_str(first + row),
+            at,
+            line,
             11,
             Color::rgb(206, 212, 218),
         );
     }
+    drop(older);
     painter.set_clip(previous_clip);
 
     let masking = state.terminal_awaiting_password || state.terminal_passwd_stage.is_some();
-    // A running program's own prompt is the last line of its output: what is
-    // typed goes on that line.
-    let job = state.terminal_job;
-    let inline = job && state.terminal_partial_shown && visible > 0;
-    let prompt_row = if inline { visible - 1 } else { visible };
+    // A running program's cursor is where what is typed goes (its prompt is
+    // before it on that row).
+    let prompt_row = if job {
+        state.terminal_screen.row
+    } else {
+        visible
+    };
     let prompt_y = scrollback_top + prompt_row as i32 * 16;
     let mut prompt: shell::Text<48> = shell::Text::new();
     if job {
+    } else if scroll > 0 {
+        let _ = write!(prompt, "-- {scroll} lines back, PgDn returns --");
     } else if state.terminal_awaiting_password {
         let _ = write!(prompt, "Password:");
     } else if let Some(stage) = state.terminal_passwd_stage {
@@ -7884,19 +7915,14 @@ fn draw_shell_window(
     // the measured prompt prefix.
     let physical_size = layout.scale.logical(11);
     let prompt_origin = layout.point(Point::new(card.x + 12, prompt_y));
-    let partial = if inline {
-        state.terminal_line_str(first + prompt_row)
+    let partial = if job {
+        let screen = &state.terminal_screen;
+        core::str::from_utf8(&screen.cells[screen.row][..screen.col]).unwrap_or("")
     } else {
         ""
     };
     let typed_x = if job {
-        // In raw mode the program draws the line, so the caret is its cursor.
-        let upto = if state.terminal_job_raw {
-            state.terminal_cursor.min(partial.len())
-        } else {
-            partial.len()
-        };
-        prompt_origin.x + mono_font.text_width(&partial[..upto], physical_size)
+        prompt_origin.x + mono_font.text_width(partial, physical_size)
     } else {
         prompt_origin.x
             + mono_font.text_width(prompt.as_str(), physical_size)
@@ -7906,24 +7932,45 @@ fn draw_shell_window(
     // characters - same byte count as what was typed, which is accurate
     // for the ASCII-only passwords `check_password` requires and only
     // cosmetically approximate for a hypothetical multi-byte one.
-    let masked = [b'*'; SHELL_LINE_MAX];
-    let displayed = if job && (state.terminal_job_raw || !state.terminal_job_echo) {
+    let masked = [b'*'; TERMINAL_INPUT_MAX];
+    let displayed = if scroll > 0 || job && (state.terminal_job_raw || !state.terminal_job_echo) {
         ""
     } else if masking {
         core::str::from_utf8(&masked[..state.terminal_input_len]).unwrap_or("")
     } else {
         state.terminal_input_str()
     };
+    // A line longer than the room after the prompt scrolls to keep the caret
+    // in view.
+    let taken = if job {
+        partial.len()
+    } else {
+        prompt.as_str().len() + 1
+    };
+    let columns = SHELL_LINE_MAX.saturating_sub(taken).max(8);
+    let full_caret = state.terminal_caret().min(displayed.len());
+    let mut start = full_caret.saturating_sub(columns - 1);
+    while !displayed.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end = (start + columns).min(displayed.len());
+    while !displayed.is_char_boundary(end) {
+        end -= 1;
+    }
+    let shown = &displayed[start..end];
     painter.text(
         mono_font,
         Point::new(typed_x, prompt_origin.y),
-        displayed,
+        shown,
         physical_size,
         Color::rgb(230, 233, 236),
     );
-    if (now_ns / 530_000_000).is_multiple_of(2) {
-        let caret = state.terminal_caret().min(displayed.len());
-        let typed_width = mono_font.text_width(&displayed[..caret], physical_size);
+    if (now_ns / 530_000_000).is_multiple_of(2)
+        && scroll == 0
+        && (!job || state.terminal_screen.cursor_visible)
+    {
+        let caret = full_caret.saturating_sub(start).min(shown.len());
+        let typed_width = mono_font.text_width(&shown[..caret], physical_size);
         let cursor_width = mono_font
             .text_width(">", physical_size)
             .max(layout.scale.logical(6));
@@ -10327,6 +10374,74 @@ fn chip_centered_text(
         Rgba::new(10, 30, 42, 96),
     );
     centered_text(painter, layout, font, bounds, value, height, color);
+}
+
+/// One row of a program's screen in the Terminal: runs of cells that share
+/// attributes, reverse video as a light bar, the eight ANSI colours.
+fn draw_screen_row(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    font: RasterFont,
+    origin: Point,
+    screen: &vt::Screen,
+    row: usize,
+) {
+    const PALETTE: [(u8, u8, u8); 8] = [
+        (120, 128, 136),
+        (240, 110, 100),
+        (120, 210, 140),
+        (230, 200, 100),
+        (110, 160, 240),
+        (200, 130, 230),
+        (100, 210, 220),
+        (230, 233, 236),
+    ];
+    let size = layout.scale.logical(11);
+    let origin = layout.point(origin);
+    let (cells, attrs) = (&screen.cells[row], &screen.attrs[row]);
+    // A reverse-video bar runs on past the text (a status line of blanks).
+    let end = attrs
+        .iter()
+        .rposition(|&attribute| attribute & vt::REVERSE != 0)
+        .map_or(0, |at| at + 1)
+        .max(screen.line(row).len());
+    let mut start = 0;
+    while start < end {
+        let attribute = attrs[start];
+        let mut stop = start + 1;
+        while stop < end && attrs[stop] == attribute {
+            stop += 1;
+        }
+        let run = core::str::from_utf8(&cells[start..stop]).unwrap_or("");
+        let before = core::str::from_utf8(&cells[..start]).unwrap_or("");
+        let x = origin.x + font.text_width(before, size);
+        let (red, green, blue) =
+            vt::colour(attribute).map_or((206, 212, 218), |index| PALETTE[usize::from(index)]);
+        let mut colour = if attribute & vt::BOLD != 0 {
+            Color::rgb(
+                red.saturating_add(30),
+                green.saturating_add(30),
+                blue.saturating_add(30),
+            )
+        } else {
+            Color::rgb(red, green, blue)
+        };
+        if attribute & vt::REVERSE != 0 {
+            painter.fill_rounded_rect(
+                Rect::new(
+                    x,
+                    origin.y,
+                    font.text_width(run, size),
+                    layout.scale.logical(14),
+                ),
+                CornerRadii::all(0),
+                Rgba::new(colour.red, colour.green, colour.blue, 235),
+            );
+            colour = Color::rgb(16, 19, 24);
+        }
+        painter.text(font, Point::new(x, origin.y), run, size, colour);
+        start = stop;
+    }
 }
 
 fn text(

@@ -510,6 +510,23 @@ fn ring_peek(
     count
 }
 
+/// `ring_put` that writes each `\n` as `\r\n` (a terminal's ONLCR); returns
+/// how much of `source` went in.
+fn ring_put_crlf(data: &mut [u8], head: usize, length: &mut usize, source: &[u8]) -> usize {
+    for (index, &byte) in source.iter().enumerate() {
+        let bytes: &[u8] = if byte == b'\n' {
+            b"\r\n"
+        } else {
+            &source[index..=index]
+        };
+        if data.len() - *length < bytes.len() {
+            return index;
+        }
+        ring_put(data, head, length, bytes);
+    }
+    source.len()
+}
+
 fn ring_take(data: &[u8], head: &mut usize, length: &mut usize, destination: &mut [u8]) -> usize {
     let count = ring_peek(data, *head, *length, 0, destination);
     *head = (*head + count) % data.len();
@@ -560,6 +577,8 @@ struct Pipe {
     nowait: bool,
     /// End-of-file marks typed (Ctrl+D on an empty line): each ends one read.
     eof_pending: u8,
+    /// A terminal's output pipe with OPOST|ONLCR: `\n` is written as `\r\n`.
+    onlcr: bool,
 }
 
 impl Pipe {
@@ -582,6 +601,7 @@ impl Pipe {
         canonical: false,
         nowait: false,
         eof_pending: 0,
+        onlcr: false,
     };
 }
 
@@ -1299,13 +1319,18 @@ fn pipe_write(slot: usize, source: &[u8]) -> Result<usize, u64> {
                 return Err(32);
             }
             let space = PIPE_BUFFER_BYTES - pipe.length;
-            if space > 0 && (source.len() > PIPE_ATOMIC_BYTES || space >= source.len()) {
-                return Ok(ring_put(
-                    &mut table.data[slot],
-                    pipe.head,
-                    &mut pipe.length,
-                    source,
-                ));
+            let needed = if pipe.onlcr {
+                source.len() + source.iter().filter(|&&byte| byte == b'\n').count()
+            } else {
+                source.len()
+            };
+            if space > 1 && (source.len() > PIPE_ATOMIC_BYTES || space >= needed) {
+                let data = &mut table.data[slot];
+                return Ok(if pipe.onlcr {
+                    ring_put_crlf(data, pipe.head, &mut pipe.length, source)
+                } else {
+                    ring_put(data, pipe.head, &mut pipe.length, source)
+                });
             }
         }
         if attempt + 1 < PIPE_WAIT_ITERATIONS {
@@ -2430,20 +2455,48 @@ fn wait_status(exit_code: u64) -> u32 {
 /// Waits for a child to end, or for a task this process traces to stop.
 fn linux_wait4(pid: u64, status_address: u64, options: u64) -> u64 {
     const WNOHANG: u64 = 1;
+    const WUNTRACED: u64 = 2;
+    const WCONTINUED: u64 = 8;
     let group = crate::scheduler::current_group();
     loop {
+        // -1: any child, 0: one in the caller's process group, below that:
+        // one in the group -pid, above: that child.
+        let target = pid as u32 as i32;
         let mut candidates = [0u64; 16];
-        let count = if pid as i64 == -1 {
+        let mut count = if target <= 0 {
             ptrace::candidates(group, &mut candidates)
         } else {
-            candidates[0] = pid;
+            candidates[0] = u64::from(target.unsigned_abs());
             1
         };
+        if target == 0 || target < -1 {
+            let wanted = if target == 0 {
+                crate::scheduler::pgid_of(group).unwrap_or(group)
+            } else {
+                u64::from(target.unsigned_abs())
+            };
+            let mut kept = 0;
+            for index in 0..count {
+                if crate::scheduler::pgid_of(candidates[index]) == Some(wanted) {
+                    candidates[kept] = candidates[index];
+                    kept += 1;
+                }
+            }
+            count = kept;
+        }
         let mut alive = false;
         for &child in &candidates[..count] {
             let status = match ptrace::poll(group, child) {
                 Some(ptrace::Event::Stopped(status)) => Some(status),
                 Some(ptrace::Event::Exited(code)) => Some(wait_status(code)),
+                None if let Some(status) = crate::scheduler::take_job_report(
+                    child,
+                    options & WUNTRACED != 0,
+                    options & WCONTINUED != 0,
+                ) =>
+                {
+                    Some(status)
+                }
                 None => match crate::scheduler::poll_child(child) {
                     Some(Some(code)) => Some(wait_status(code)),
                     Some(None) => {
@@ -2653,16 +2706,17 @@ pub extern "C" fn aeros_linux_syscall_dispatch(frame: *mut LinuxSyscallFrame) ->
         return syscall_inner(frame);
     }
     let entry = crate::scheduler::enter_from_user();
-    if entry.kill {
-        user::set_exit_code(128 + 9);
+    if entry.kill != 0 {
+        user::set_exit_code(128 + u64::from(entry.kill));
         return 1;
     }
     let result = syscall_inner(frame);
     // 0 returns with `sysretq` and 2 with `iretq`; anything else ends the
     // process in the kernel, which keeps the lock.
     if result == 0 || result == 2 {
-        if crate::scheduler::take_kill_pending() {
-            user::set_exit_code(128 + 9);
+        let killed = crate::scheduler::take_kill_pending();
+        if killed != 0 {
+            user::set_exit_code(128 + u64::from(killed));
             return 1;
         }
         crate::scheduler::leave_to_user();
@@ -2795,6 +2849,55 @@ fn linux_syscall(frame: &mut LinuxSyscallFrame) -> u64 {
                     error(3)
                 }
             };
+            let target = pid as u32 as i32;
+            if frame.number == LINUX_KILL && target <= 0 && signal <= 64 {
+                // 0: the caller's process group, -1: every process it may
+                // signal but `init`, below that: the group -pid.
+                let pgid = match target {
+                    0 => Some(crate::scheduler::pgid_of(own).unwrap_or(own)),
+                    -1 => None,
+                    group => Some(u64::from(group.unsigned_abs())),
+                };
+                let mut members = [0u64; 64];
+                let count = crate::scheduler::group_members(pgid, &mut members);
+                let privileged = has_capability(crate::capability::CAP_KILL);
+                let (mut reached, mut denied, mut itself) = (0, 0, false);
+                for &member in &members[..count] {
+                    if member == own {
+                        itself = target != -1;
+                    } else if target == -1 && member == 1 {
+                    } else if !crate::scheduler::may_signal(member, privileged) {
+                        denied += 1;
+                    } else {
+                        reached += 1;
+                        if signal != 0
+                            && matches!(
+                                crate::scheduler::signal_other_task(member, signal),
+                                Some(RemoteSignal::Fatal)
+                            )
+                        {
+                            let _ = crate::scheduler::kill_task_with(member, signal as u8);
+                        }
+                    }
+                }
+                SIGNAL_CALLS.fetch_add(1, Ordering::Relaxed);
+                frame.number = match (reached > 0 || itself, denied > 0) {
+                    (true, _) => 0,
+                    (false, true) => error(1),
+                    (false, false) => error(3),
+                };
+                if itself
+                    && signal != 0
+                    && let SyscallResult::Exit(code) = raise_signal(signal)
+                {
+                    *NEXT_SIGNAL_INFO.lock() = None;
+                    EXITS.fetch_add(1, Ordering::Relaxed);
+                    user::set_exit_code(code);
+                    return 1;
+                }
+                *NEXT_SIGNAL_INFO.lock() = None;
+                return finish_syscall(frame);
+            }
             if signal > 64 {
                 frame.number = error(22);
             } else if pid != own
@@ -2819,11 +2922,13 @@ fn linux_syscall(frame: &mut LinuxSyscallFrame) -> u64 {
                 frame.number = exists();
             } else {
                 frame.number = match crate::scheduler::signal_other_task(pid, signal) {
-                    Some(RemoteSignal::Ignored | RemoteSignal::Queued) => 0,
-                    Some(RemoteSignal::Fatal) => match crate::scheduler::kill_task(pid) {
-                        Ok(()) => 0,
-                        Err(()) => error(3),
-                    },
+                    Some(RemoteSignal::Ignored | RemoteSignal::Queued | RemoteSignal::Stopped) => 0,
+                    Some(RemoteSignal::Fatal) => {
+                        match crate::scheduler::kill_task_with(pid, signal as u8) {
+                            Ok(()) => 0,
+                            Err(()) => error(3),
+                        }
+                    }
                     None => error(3),
                 };
             }
@@ -6354,6 +6459,9 @@ fn linux_vmsplice(descriptor: u64, vectors: u64, count: u64, flags: u64) -> u64 
 }
 
 fn linux_readv(descriptor: u64, vectors: u64, count: u64) -> u64 {
+    if lookup_process_fd(descriptor).is_some_and(|process_fd| streams(&process_fd)) {
+        return vectored_stream(descriptor, vectors, count, false);
+    }
     let Some(process_fd) = lookup_process_fd(descriptor) else {
         return error(9);
     };
@@ -6438,6 +6546,9 @@ fn fd_ready_events(descriptor: u64) -> u32 {
     let Some(process_fd) = lookup_process_fd(descriptor) else {
         return 0;
     };
+    if matches!(process_fd.standard, DEVICE_TTY | DEVICE_PTMX) {
+        return tty::ready_events(&process_fd);
+    }
     if process_fd.tcp {
         return tcpsock::ready_events(&process_fd);
     }
@@ -7117,13 +7228,15 @@ fn linux_tkill(thread: u64, signal: u64) -> SyscallResult {
         return SyscallResult::Return(0);
     }
     match crate::scheduler::signal_other_task(thread, signal) {
-        Some(RemoteSignal::Ignored | RemoteSignal::Queued) => SyscallResult::Return(0),
+        Some(RemoteSignal::Ignored | RemoteSignal::Queued | RemoteSignal::Stopped) => {
+            SyscallResult::Return(0)
+        }
         Some(RemoteSignal::Fatal) | None => {
             if group == crate::scheduler::current_group() {
                 crate::scheduler::exit_group(128 + signal);
                 SyscallResult::Exit(128 + signal)
             } else {
-                match crate::scheduler::kill_task(group) {
+                match crate::scheduler::kill_task_with(group, signal as u8) {
                     Ok(()) => SyscallResult::Return(0),
                     Err(()) => SyscallResult::Return(error(1)),
                 }
@@ -7137,6 +7250,8 @@ pub enum RemoteSignal {
     Ignored,
     Queued,
     Fatal,
+    /// A stop signal with its default action: the process is to be stopped.
+    Stopped,
 }
 
 /// Applies a signal to a stored (not currently running) process: a handler
@@ -7149,6 +7264,9 @@ pub fn signal_stored_state(state: &mut ProcessState, signal: u64, traced: bool) 
         return RemoteSignal::Queued;
     }
     let action = state.signal_actions[signal as usize - 1];
+    if signal == 19 || (matches!(signal, 20..=22) && action.handler == 0) {
+        return RemoteSignal::Stopped;
+    }
     let catchable = signal != 9 && signal != 19;
     if catchable && (action.handler == 1 || (action.handler == 0 && default_ignored(signal))) {
         RemoteSignal::Ignored
@@ -7430,7 +7548,14 @@ fn take_signal(context: &mut ptrace::Context) -> Result<Option<(u64, SignalActio
         }
         return Ok(Some((signal, action)));
     }
-    if action.handler == 0 && !default_ignored(signal) && !matches!(signal, 19..=22) {
+    if action.handler == 0 && matches!(signal, 19..=22) {
+        // The process stops; the scheduler gives the processor up for it.
+        if let Some(own) = crate::scheduler::current_task_pid_for_linux() {
+            crate::scheduler::stop_process(own, signal as u8);
+        }
+        return Ok(None);
+    }
+    if action.handler == 0 && !default_ignored(signal) {
         return Err(128 + signal);
     }
     Ok(None)
@@ -7656,10 +7781,51 @@ fn linux_tgkill(group: u64, thread: u64, signal: u64) -> SyscallResult {
     linux_tkill(thread, signal)
 }
 
+/// `readv`/`writev` on a byte stream (a pipe, a stream socket, a terminal):
+/// each vector in turn through `read`/`write`, stopping at a short one.
+fn vectored_stream(descriptor: u64, vectors: u64, count: u64, writing: bool) -> u64 {
+    if count > 1024 {
+        return error(22);
+    }
+    let mut total = 0u64;
+    for index in 0..count as usize {
+        let Some((base, length)) = read_iovec(vectors, index) else {
+            return if total == 0 { error(14) } else { total };
+        };
+        if length == 0 {
+            continue;
+        }
+        let moved = if writing {
+            linux_write(descriptor, base, length)
+        } else {
+            linux_read(descriptor, base, length)
+        };
+        if (moved as i64) < 0 {
+            return if total == 0 { moved } else { total };
+        }
+        total += moved;
+        if moved < length {
+            break;
+        }
+    }
+    total
+}
+
+/// Whether `readv`/`writev` on `process_fd` go vector by vector.
+fn streams(process_fd: &ProcessFd) -> bool {
+    process_fd.pipe
+        || process_fd.tcp
+        || (process_fd.unix_socket && !unix_keeps_messages(process_fd.handle))
+        || matches!(process_fd.standard, DEVICE_TTY | DEVICE_PTMX)
+}
+
 fn linux_writev(descriptor: u64, vectors: u64, count: u64) -> u64 {
     let Some(process_fd) = lookup_process_fd(descriptor) else {
         return error(9);
     };
+    if streams(&process_fd) {
+        return vectored_stream(descriptor, vectors, count, true);
+    }
     if !process_fd.writable
         || process_fd.socket
         || process_fd.pipe
@@ -7781,6 +7947,7 @@ fn linux_statx(arguments: [u64; 6]) -> u64 {
         return error(14);
     };
     let mut relative = false;
+    let mut device = None;
     let metadata = if length == 0 && flags & AT_EMPTY_PATH != 0 {
         let Some(process_fd) = lookup_file_fd(directory) else {
             return error(9);
@@ -7800,17 +7967,34 @@ fn linux_statx(arguments: [u64; 6]) -> u64 {
         let Ok(path) = core::str::from_utf8(&resolved[..length]) else {
             return error(84);
         };
-        let found = if flags & AT_SYMLINK_NOFOLLOW != 0 {
-            vfs::symlink_metadata(path)
+        // A terminal device path reports its device number (`stx_rdev`).
+        device = tty::device_number(path);
+        if let Some(number) = device {
+            vfs::Metadata {
+                inode: number,
+                mode: 0o020620,
+                size: 0,
+                modified: 0,
+            }
         } else {
-            vfs::metadata(path)
-        };
-        match found {
-            Ok(metadata) => metadata,
-            Err(failure) => return vfs_error(failure),
+            let found = if flags & AT_SYMLINK_NOFOLLOW != 0 {
+                vfs::symlink_metadata(path)
+            } else {
+                vfs::metadata(path)
+            };
+            match found {
+                Ok(metadata) => metadata,
+                Err(failure) => return vfs_error(failure),
+            }
         }
     };
     let mut statx = [0u8; 256];
+    if let Some(number) = device {
+        let major = (number >> 8 & 0xfff) as u32 | (number >> 32) as u32 & !0xfff;
+        let minor = (number & 0xff) as u32 | (number >> 12) as u32 & !0xff;
+        statx[128..132].copy_from_slice(&major.to_le_bytes());
+        statx[132..136].copy_from_slice(&minor.to_le_bytes());
+    }
     statx[..4].copy_from_slice(&0x7ffu32.to_le_bytes());
     statx[4..8].copy_from_slice(&4096u32.to_le_bytes());
     statx[16..20].copy_from_slice(&1u32.to_le_bytes());
@@ -10348,6 +10532,11 @@ fn linux_fstat(descriptor: u64, address: u64) -> u64 {
     let Some(process_fd) = lookup_process_fd(descriptor) else {
         return error(9);
     };
+    match process_fd.standard {
+        DEVICE_TTY => return write_device_stat(address, tty::slave_number(process_fd.handle)),
+        DEVICE_PTMX => return write_device_stat(address, 0x502),
+        _ => {}
+    }
     let metadata = if process_fd.standard != 0 {
         vfs::Metadata {
             inode: process_fd.standard as u64,
@@ -10427,6 +10616,10 @@ fn linux_newfstatat(directory: u64, path_address: u64, address: u64, flags: u64)
         let Ok(path) = core::str::from_utf8(&resolved[..length]) else {
             return error(84);
         };
+        // glibc's `ptsname` and `grantpt` check the slave is a pty device.
+        if let Some(number) = tty::device_number(path) {
+            return write_device_stat(address, number);
+        }
         let found = if flags & AT_SYMLINK_NOFOLLOW != 0 {
             vfs::symlink_metadata(path)
         } else {
@@ -10440,6 +10633,21 @@ fn linux_newfstatat(directory: u64, path_address: u64, address: u64, flags: u64)
     let result = write_linux_stat(address, metadata);
     if result == 0 && relative {
         RELATIVE_PATH_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    result
+}
+
+/// The `stat` of a character device with device number `number`.
+fn write_device_stat(address: u64, number: u64) -> u64 {
+    let metadata = vfs::Metadata {
+        inode: number,
+        mode: 0o020620,
+        size: 0,
+        modified: 0,
+    };
+    let result = write_linux_stat(address, metadata);
+    if result == 0 && !user::copy_to_user(address + 40, &number.to_le_bytes()) {
+        return error(14);
     }
     result
 }
@@ -11763,6 +11971,26 @@ fn linux_openat(directory: u64, path_address: u64, flags: u64, mode: u64) -> u64
     };
     let readable = access != 1;
     let writable = access != 0;
+    // `/dev/tty` is the caller's terminal when it has one (the console when
+    // it has none); `/dev/ptmx` makes a pseudo-terminal.
+    let cloexec = flags & O_CLOEXEC != 0;
+    if path == "/dev/tty"
+        && let Some(terminal) = tty::controlling()
+    {
+        return install_device(DEVICE_TTY, terminal as u32, cloexec);
+    }
+    if path == "/dev/ptmx" {
+        return match tty::open_master() {
+            Some(terminal) => install_device(DEVICE_PTMX, terminal as u32, cloexec),
+            None => error(28),
+        };
+    }
+    if let Some(number) = path.strip_prefix("/dev/pts/") {
+        return match number.parse::<usize>().ok().filter(|&n| tty::open_slave(n)) {
+            Some(terminal) => install_device(DEVICE_TTY, terminal as u32, cloexec),
+            None => error(2),
+        };
+    }
     if flags & O_DIRECTORY == 0
         && let Some(kind) = device_kind(path)
     {
@@ -11873,6 +12101,25 @@ fn linux_getdents64(descriptor: u64, address: u64, capacity: u64) -> u64 {
 const DEVICE_NULL: u8 = 4;
 const DEVICE_ZERO: u8 = 5;
 const DEVICE_RANDOM: u8 = 6;
+/// A terminal (`handle` is its `tty::TTYS` index): what `/dev/tty` and
+/// `/dev/pts/N` open, reading the terminal's input and writing its output.
+const DEVICE_TTY: u8 = 7;
+/// The master side of a pseudo-terminal from `/dev/ptmx`: what it writes is
+/// typed into the terminal, what it reads is the terminal's output.
+const DEVICE_PTMX: u8 = 8;
+
+/// Installs a descriptor for device `kind` (`handle` says which one).
+fn install_device(kind: u8, handle: u32, close_on_exec: bool) -> u64 {
+    let Some(descriptor) = install_process_fd(handle, close_on_exec, false, true, true, false)
+    else {
+        return error(24);
+    };
+    if let Some(index) = process_fd_index(descriptor) {
+        PROCESS_FDS.lock()[index].standard = kind;
+    }
+    OPENS.fetch_add(1, Ordering::Relaxed);
+    descriptor
+}
 
 /// The descriptor kind a `/dev` path opens as, if it is one of the devices
 /// handled here (`tty` and `console` act as the console).
@@ -12003,6 +12250,14 @@ fn linux_read(descriptor: u64, address: u64, requested: u64) -> u64 {
     let Some(process_fd) = lookup_process_fd(descriptor) else {
         return error(9);
     };
+    if matches!(process_fd.standard, DEVICE_TTY | DEVICE_PTMX) {
+        return tty::read(&process_fd, address, requested);
+    }
+    read_from(process_fd, address, requested)
+}
+
+/// `read` on an open descriptor (a terminal's arrive as its pipe's).
+fn read_from(process_fd: ProcessFd, address: u64, requested: u64) -> u64 {
     if !process_fd.readable {
         return error(9);
     }
@@ -12133,6 +12388,14 @@ fn linux_write(descriptor: u64, address: u64, requested: u64) -> u64 {
     let Some(process_fd) = lookup_process_fd(descriptor) else {
         return error(9);
     };
+    if matches!(process_fd.standard, DEVICE_TTY | DEVICE_PTMX) {
+        return tty::write(&process_fd, address, requested);
+    }
+    write_to(process_fd, address, requested)
+}
+
+/// `write` on an open descriptor (a terminal's arrive as its pipe's).
+fn write_to(process_fd: ProcessFd, address: u64, requested: u64) -> u64 {
     if !process_fd.writable
         || (process_fd.socket && !process_fd.unix_socket)
         || process_fd.standard == 1
@@ -12620,7 +12883,9 @@ pub(crate) fn proc_open_descriptors(visit: &mut dyn FnMut(usize, &str)) {
             bytes: [0; 128],
             length: 0,
         };
-        if process_fd.standard != 0 {
+        if process_fd.standard == DEVICE_TTY {
+            let _ = write!(label, "/dev/pts/{}", process_fd.handle);
+        } else if process_fd.standard != 0 {
             let _ = write!(
                 label,
                 "{}",
@@ -12628,6 +12893,7 @@ pub(crate) fn proc_open_descriptors(visit: &mut dyn FnMut(usize, &str)) {
                     DEVICE_NULL => "/dev/null",
                     DEVICE_ZERO => "/dev/zero",
                     DEVICE_RANDOM => "/dev/urandom",
+                    DEVICE_PTMX => "/dev/ptmx",
                     _ => "/dev/console",
                 }
             );
@@ -12731,15 +12997,17 @@ fn remove_process_fd(descriptor: u64) -> Option<(ProcessFd, bool)> {
     let shared_elsewhere = crate::scheduler::any_other_task_shares_fd(|candidate| {
         same_open_description(*candidate, process_fd)
     });
-    let last_reference = process_fd.standard == 0 && !shared_in_this_process && !shared_elsewhere;
+    let last_reference = matches!(process_fd.standard, 0 | DEVICE_PTMX)
+        && !shared_in_this_process
+        && !shared_elsewhere;
     Some((process_fd, last_reference))
 }
 
 fn same_open_description(left: ProcessFd, right: ProcessFd) -> bool {
     left.open
         && right.open
-        && left.standard == 0
-        && right.standard == 0
+        && left.standard == right.standard
+        && matches!(left.standard, 0 | DEVICE_PTMX)
         && left.socket == right.socket
         && left.pipe == right.pipe
         && left.epoll == right.epoll
@@ -12767,6 +13035,10 @@ fn same_open_description(left: ProcessFd, right: ProcessFd) -> bool {
 }
 
 fn release_process_fd(process_fd: ProcessFd) -> u64 {
+    if process_fd.standard == DEVICE_PTMX {
+        tty::close_master(process_fd.handle as usize);
+        return 0;
+    }
     if process_fd.standard != 0 {
         return 0;
     }
@@ -12943,12 +13215,20 @@ fn duplicate_process_fd_exact(descriptor: u64, target: u64, close_on_exec: bool)
             close_on_exec,
             ..source
         };
-        let last_reference = previous.standard == 0
+        let last_reference = matches!(previous.standard, 0 | DEVICE_PTMX)
             && !descriptors
                 .iter()
                 .any(|candidate| same_open_description(*candidate, previous));
         previous.open.then_some((previous, last_reference))
     };
+    // A forked relative may still have it open (as `remove_process_fd` checks).
+    let replaced = replaced.map(|(previous, last)| {
+        let shared = last
+            && crate::scheduler::any_other_task_shares_fd(|candidate| {
+                same_open_description(*candidate, previous)
+            });
+        (previous, last && !shared)
+    });
     if let Some((previous, true)) = replaced {
         let result = release_process_fd(previous);
         if result != 0 {

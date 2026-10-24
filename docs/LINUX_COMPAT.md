@@ -79,8 +79,10 @@ The extended attribute family (188-199) answers EOPNOTSUPP, as a filesystem with
 ## What is deliberately partial
 
 - **Processes**: `fork`, `clone`/`clone3` threads, `execve`/`execveat` (a path that is absolute or
-  relative to the working directory, or `AT_EMPTY_PATH`; no directory descriptors), `wait4`, process
-  groups and sessions, `ptrace`, `pidfd_open`/`pidfd_send_signal`, `process_vm_readv`/`writev`.
+  relative to the working directory, or `AT_EMPTY_PATH`; no directory descriptors), `wait4` (a pid, -1, 0 or -pgid), process
+  groups and sessions (`kill` with 0, -1 or -pgid signals a group), job control (SIGSTOP, SIGTSTP,
+  SIGTTIN and SIGTTOU stop every thread of a process until SIGCONT; `wait4` reports both with
+  `WUNTRACED` and `WCONTINUED`), `ptrace`, `pidfd_open`/`pidfd_send_signal`, `process_vm_readv`/`writev`.
   `execve` takes up to 64 argument and 64 environment strings, 12 KiB in all (Linux allows far more).
   At most 64 tasks (processes and threads, kernel tasks included) exist at once. Each process has its own
   resource limits, inherited across `fork`: the stack's soft limit is 1 MiB (glibc's thread stack size;
@@ -99,25 +101,33 @@ The extended attribute family (188-199) answers EOPNOTSUPP, as a filesystem with
   (from the initramfs) after the program and `ld.so` maps the libraries (`/lib/x86_64-linux-gnu`, from
   the initramfs too). Debian's bash and 60 GNU programs are in the boot gate, with Perl, Python 3.13
   (the standard library without tests, Tk and IDLE, with `ssl`, `hashlib`, `sqlite3`, `readline` and `curses`), git, make, tar,
-  awk and more (156 command lines). `execve` and the shell's own program launcher (the desktop
+  awk and more (159 command lines). `execve` and the shell's own program launcher (the desktop
   Terminal runs any `/bin` or `/usr/bin` program for a command it does not know) both start them
   through the interpreter.
-- **Terminal**: a program the Terminal runs in the foreground has a terminal on descriptors 0, 1 and 2
-  (`isatty` is true): `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF`, `TIOCGWINSZ`/`TIOCSWINSZ` (14 rows
-  of 56 columns, the Terminal's size), `TIOCGPGRP`/`TIOCSPGRP`, `TIOCGSID`, `TCFLSH`, and a line
-  discipline: canonical lines with echo, erase, kill and word erase, `VINTR`/`VQUIT` as SIGINT/SIGQUIT
-  to the foreground process group, `VEOF` as one end of file, `ICRNL`, and raw mode (`VMIN` 0 or more;
-  `VTIME` is ignored). There is no job control (`VSUSP` is an ordinary character), no output processing
-  (`OPOST` is reported but the Terminal handles `\r`, `\b` and the cursor and erase sequences itself),
-  and `/dev/tty` is still the serial console, not the job's terminal; `TERM` is `dumb`.
   A process window is 256 MiB: image area 16 MiB, heap 32 MiB, stack up to 8 MiB, then about 200 MiB
   of mappings (a fixed-address program's window is 128 MiB, with about 72 MiB of mappings). Private anonymous
   mappings are demand-zero (a page gets memory when it is first touched; `PROT_NONE` pages never do);
   shared ones are allocated when they are mapped. Process memory comes from a pool of a quarter of the memory (16 MiB
   to 1 GiB, leaving at least 96 MiB for the rest of the system).
-  `/dev` has `null`, `zero`, `urandom`, `random`, `tty`, `console`, `stdin`, `stdout` and `stderr`
-  (no other device nodes). The boot gate runs 93 BusyBox command lines (files, archives, text,
+  `/dev` has `null`, `zero`, `urandom`, `random`, `tty`, `console`, `ptmx`, `pts/N`, `stdin`,
+  `stdout` and `stderr` (no other device nodes). The boot gate runs 93 BusyBox command lines (files, archives, text,
   processes, shell scripting) and `ldconfig`, `bzip2` at its default block size among them.
+- **Terminal**: a program the Terminal runs in the foreground has a terminal on descriptors 0, 1 and 2
+  (`isatty` is true): `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF`, `TIOCGWINSZ`/`TIOCSWINSZ` (14 rows
+  of 56 columns, the Terminal's size), `TIOCGPGRP`/`TIOCSPGRP`, `TIOCGSID`, `TCFLSH`, and a line
+  discipline: canonical lines with echo, erase, kill and word erase, `VINTR`/`VQUIT` as SIGINT/SIGQUIT
+  to the foreground process group, `VEOF` as one end of file, `ICRNL`, raw mode (`VMIN` 0 or more;
+  `VTIME` is ignored), and `VSUSP` (Ctrl+Z) as SIGTSTP (the Terminal's `fg` resumes the job). Output
+  processing is `OPOST|ONLCR` (`\n` written as `\r\n`, as on Linux; raw mode turns it off). The Terminal is a VT100 screen (`TERM=vt100`; terminfo for `vt100`,
+  `vt102`, `vt220`, `ansi`, `linux`, `xterm` and `dumb` is in `/usr/share/terminfo`): cursor
+  addressing, erase, scroll regions, insert and delete of lines and characters, the alternate screen,
+  application cursor keys, and answers to cursor-position and device queries; no colours or
+  attributes beyond bold, reverse video and the eight colours. `/dev/tty` is the caller's terminal (the
+  console for a process without one). Pseudo-terminals: `/dev/ptmx` makes one (`TIOCGPTN`,
+  `TIOCSPTLCK`, `TIOCGPTPEER`), `/dev/pts/N` is its slave (a character device of major 136, as
+  glibc's `ptsname` and `grantpt` check), what the master writes goes through the line discipline,
+  and once every slave has closed the master reads EIO (Python's `pty.fork` is in the boot gate).
+  Other programs get `TERM=dumb`.
 - **Memory**: anonymous and read-only file mappings, `MAP_SHARED|MAP_ANONYMOUS` (stays shared across
   `fork`), System V shared memory, POSIX shared memory (`/dev/shm`, `shm_open`, `sem_open`;
   shared futexes), `mremap` by copy. A writable `MAP_SHARED` mapping of any other file is refused:

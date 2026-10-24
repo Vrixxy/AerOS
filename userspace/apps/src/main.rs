@@ -490,6 +490,67 @@ b
              print(len(results), resource.getrlimit(resource.RLIMIT_STACK)[0] >> 20)",
         ),
         (
+            "python-killpg",
+            "import os, signal, subprocess\n\
+             first = subprocess.Popen(['/bin/sleep', '30'], process_group=0)\n\
+             second = subprocess.Popen(['/bin/sleep', '30'], process_group=first.pid)\n\
+             assert os.getpgid(second.pid) == first.pid\n\
+             os.kill(0, 0)\n\
+             assert os.waitpid(-first.pid, os.WNOHANG) == (0, 0)\n\
+             try:\n\
+             \x20   os.waitpid(0, os.WNOHANG); raise SystemExit('no child shares our group')\n\
+             except ChildProcessError:\n\
+             \x20   pass\n\
+             os.killpg(first.pid, signal.SIGTERM)\n\
+             ended = sorted(os.waitpid(-first.pid, 0) for _ in range(2))\n\
+             assert [pid for pid, _ in ended] == sorted([first.pid, second.pid]), ended\n\
+             codes = tuple(-os.WTERMSIG(status) for _, status in ended)\n\
+             assert codes == (-15, -15), codes\n\
+             first.returncode = second.returncode = -15\n\
+             try:\n\
+             \x20   os.killpg(first.pid, 0); raise SystemExit('group still there')\n\
+             except ProcessLookupError:\n\
+             \x20   pass\n\
+             print('killpg', codes)",
+        ),        (
+            "python-job-control",
+            "import os, signal, time\n\
+             pid = os.fork()\n\
+             if pid == 0:\n\
+             \x20   time.sleep(30); os._exit(0)\n\
+             os.kill(pid, signal.SIGSTOP)\n\
+             _, status = os.waitpid(pid, os.WUNTRACED)\n\
+             assert os.WIFSTOPPED(status) and os.WSTOPSIG(status) == signal.SIGSTOP, status\n\
+             os.kill(pid, signal.SIGCONT)\n\
+             _, status = os.waitpid(pid, os.WCONTINUED)\n\
+             assert os.WIFCONTINUED(status), status\n\
+             os.kill(pid, signal.SIGTERM)\n\
+             _, status = os.waitpid(pid, 0)\n\
+             assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGTERM, status\n\
+             print('job control ok')",
+        ),        (
+            "python-pty",
+            "import os, pty\n\
+             pid, fd = pty.fork()\n\
+             if pid == 0:\n\
+             \x20   print('child tty', os.isatty(0), os.ttyname(0), flush=True)\n\
+             \x20   print('got', input(), flush=True)\n\
+             \x20   os._exit(3)\n\
+             os.write(fd, b'hello pty\\n')\n\
+             out = b''\n\
+             while True:\n\
+             \x20   try:\n\
+             \x20       chunk = os.read(fd, 1024)\n\
+             \x20   except OSError:\n\
+             \x20       break\n\
+             \x20   if not chunk:\n\
+             \x20       break\n\
+             \x20   out += chunk\n\
+             _, status = os.waitpid(pid, 0)\n\
+             assert b'child tty True /dev/pts/' in out and b'got hello pty' in out, out\n\
+             assert os.WEXITSTATUS(status) == 3, status\n\
+             print('pty ok')",
+        ),        (
             "python-rlimits",
             "import os, resource\n\
              resource.setrlimit(resource.RLIMIT_CORE, (0, resource.RLIM_INFINITY))\n\

@@ -9,7 +9,7 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $esp = [string]@(& (Join-Path $PSScriptRoot "build.ps1"))[-1]
-$esp = & (Join-Path $PSScriptRoot "esp-drive.ps1") -Esp $esp -Name esp-capture
+$esp = & (Join-Path $PSScriptRoot "esp-drive.ps1") -Esp $esp -Name esp-capture -Fresh
 $qemu = Join-Path $env:ProgramFiles "qemu\qemu-system-x86_64.exe"
 $firmware = Join-Path $env:ProgramFiles "qemu\share\edk2-x86_64-code.fd"
 $variablesTemplate = Join-Path $env:ProgramFiles "qemu\share\edk2-i386-vars.fd"
@@ -28,7 +28,7 @@ foreach ($path in @($serial, $ppm, $png)) {
 
 $arguments = @(
     "-machine", "q35,accel=whpx:tcg",
-    "-m", "512M",
+    "-m", "1024M",
     "-smp", "2",
     "-cpu", "qemu64,+nx,+smep,+smap,+xsave,+xsaveopt,+rdrand,+rdtscp,+pdpe1gb",
     "-drive", "if=pflash,format=raw,unit=0,readonly=on,file=$firmware",
@@ -50,7 +50,7 @@ $start.WorkingDirectory = $root
 $start.UseShellExecute = $false
 $start.CreateNoWindow = $true
 $process = [System.Diagnostics.Process]::Start($start)
-$deadline = [DateTime]::UtcNow.AddSeconds(25)
+$deadline = [DateTime]::UtcNow.AddSeconds(60)
 $ready = $false
 
 while ([DateTime]::UtcNow -lt $deadline) {
@@ -96,25 +96,64 @@ if (-not $runtimeReady) {
 
 $monitorHost = "127.0.0.1"
 
+# One monitor connection for the whole session: commands sent on a
+# connection that is closed straight away can be lost.
+$script:monitor = $null
 function Send-Monitor {
     param([string]$Line, [int]$SettleMs = 120)
-    $c = [System.Net.Sockets.TcpClient]::new($monitorHost, $monitorPort)
-    try {
-        $s = $c.GetStream()
-        $w = [System.IO.StreamWriter]::new($s)
-        $w.NewLine = "`n"
-        Start-Sleep -Milliseconds 60
-        $w.WriteLine($Line)
-        $w.Flush()
-        Start-Sleep -Milliseconds 60
+    if ($null -eq $script:monitor) {
+        $client = [System.Net.Sockets.TcpClient]::new($monitorHost, $monitorPort)
+        $writer = [System.IO.StreamWriter]::new($client.GetStream())
+        $writer.NewLine = "`r`n"
+        $script:monitor = @{ Client = $client; Writer = $writer }
+        Start-Sleep -Milliseconds 300
     }
-    finally {
-        $c.Close()
-    }
+    $script:monitor.Writer.WriteLine($Line)
+    $script:monitor.Writer.Flush()
+    Start-Sleep -Milliseconds 60
     if ($SettleMs -gt 0) {
         Start-Sleep -Milliseconds $SettleMs
     }
 }
+# Types `Text` (capitals and the symbols below too).
+function Send-Text {
+    param([string]$Text)
+    foreach ($character in $Text.ToCharArray()) {
+        $key = switch -CaseSensitive ([string]$character) {
+            " " { "spc" }
+            "-" { "minus" }
+            "/" { "slash" }
+            "." { "dot" }
+            "=" { "equal" }
+            "*" { "shift-8" }
+            "(" { "shift-9" }
+            ")" { "shift-0" }
+            "+" { "shift-equal" }
+            "_" { "shift-minus" }
+            ":" { "shift-semicolon" }
+            "'" { "apostrophe" }
+            '"' { "shift-apostrophe" }
+            "," { "comma" }
+            { $_ -cmatch '^[A-Z]$' } { "shift-" + $_.ToLower() }
+            default { $_ }
+        }
+        Send-Monitor "sendkey $key" 90
+    }
+}
+
+function Wait-Screen {
+    param([string]$Name, [int]$Seconds = 12)
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $serialText = [string](Get-Content -Raw -LiteralPath $serial)
+        if ($serialText -match "AEROS_DESKTOP_REDRAW .* screen=$Name") {
+            return $true
+        }
+        Start-Sleep -Milliseconds 50
+    }
+    return $false
+}
+
 if ($View -eq "setup") {
     Start-Sleep -Milliseconds 250
 }
@@ -123,7 +162,26 @@ elseif ($View -in @("lock", "login", "desktop")) {
     $waypoints = switch ($View) {
         "login" { @("username", "password", "lock", "login") }
         "lock" { @("username", "password", "lock") }
-        default { @("desktop") }
+        default { @() }
+    }
+    if ($View -eq "desktop") {
+        # The drive has no account: set one up (it lives in this copy only).
+        # The first screen takes keys once it has faded in.
+        Start-Sleep -Seconds 3
+        $password = "Capture-2026"
+        $steps = @(
+            @("", "keyboard"), @("", "username"), @("capture", "password"),
+            @($password, "confirm"), @($password, "welcome"), @("", "lock"),
+            @("", "login"), @($password, "desktop")
+        )
+        foreach ($step in $steps) {
+            Send-Text $step[0]
+            Send-Monitor "sendkey ret" 0
+            if (-not (Wait-Screen $step[1])) {
+                Send-Monitor "quit" 0
+                throw "AerOS setup did not reach the $($step[1]) screen"
+            }
+        }
     }
     foreach ($waypoint in $waypoints) {
         $key = if ($waypoint -eq "desktop") { "esc" } else { "ret" }
@@ -227,17 +285,7 @@ if ($Command.Length -gt 0) {
 if ($Then.Length -gt 0) {
     # Typed into the program the command started (a REPL, say) once it is up.
     Start-Sleep -Milliseconds $SettleMs
-    foreach ($character in $Then.ToCharArray()) {
-        $key = switch ($character) {
-            " " { "spc" }
-            "-" { "minus" }
-            "/" { "slash" }
-            "." { "dot" }
-            "=" { "equal" }
-            default { [string]$character }
-        }
-        Send-Monitor "sendkey $key" 90
-    }
+    Send-Text $Then
     Send-Monitor "sendkey ret" 120
 }
 Start-Sleep -Milliseconds $SettleMs

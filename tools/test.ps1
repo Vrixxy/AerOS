@@ -475,7 +475,7 @@ if ($output -notmatch "AEROS_HEAP .* active=0 verified=true") {
 if ($output -notmatch "AEROS_USER .* exit=42 smep=true smap=true mapped=true verified=true") {
     throw "AerOS ring-3 transition failed`n$output"
 }
-if ($output -notmatch "AEROS_VFS nodes=[0-9]+ directories=90 files=[0-9]+ bytes=[0-9]+ handles=0 mutable_files=0 mutable_bytes=0 readonly_root=true verified=true") {
+if ($output -notmatch "AEROS_VFS nodes=[0-9]+ directories=98 files=[0-9]+ bytes=[0-9]+ handles=0 mutable_files=0 mutable_bytes=0 readonly_root=true verified=true") {
     throw "AerOS VFS validation failed`n$output"
 }
 if ($output -notmatch "AEROS_ELF type=pie machine=x86_64 segments=3 .* wx=false verified=true") {
@@ -502,7 +502,7 @@ if ($output -notmatch "AEROS_REAP mappings=5 released_pages=[1-9][0-9]* free_bef
 if ($output -notmatch "AEROS_PROCESSES spawned=4 reaped=4 highest_pid=4 ready=0 running=0 zombies=0 generations=true init_exit=73 compiled_exit=74 std_exit=75 fault_exit=132 verified=true") {
     throw "AerOS process table validation failed`n$output"
 }
-if ($output -notmatch "AEROS_TMPFS path=/tmp nodes=[0-9]+ directories=90 files=[0-9]+ mutable_files=1 mutable_bytes=6 handles=0 verified=true") {
+if ($output -notmatch "AEROS_TMPFS path=/tmp nodes=[0-9]+ directories=98 files=[0-9]+ mutable_files=1 mutable_bytes=6 handles=0 verified=true") {
     throw "AerOS writable tmpfs validation failed`n$output"
 }
 if ($output -notmatch "AEROS_SYSCALL .* calls=161 bootstrap=2 linux=159 exits=4 unknown=0 opens=13 reads=12 writes=10 closes=17 io_bytes=264 clocks=1 random_calls=1 random_bytes=32 compat_calls=73 memory_calls=16 mmaps=6 file_mmaps=1 mprotects=2 munmaps=4 metadata=9 seeks=2 paths=12 resources=1 rseq=1 futex=1 fd_calls=10 dup_calls=4 last_fd=3 signals=12 runtime=8 directories=1 sockets=4 datagrams=2 network_bytes=[3-9][0-9]+ vectored=2 positional=1 access=1 statx=1 wall_clock=2 sleeps=2 chdir=1 relative_paths=5 polls=1 creates=2 renames=2 removes=5 syncs=2 truncates=1 chmods=1 verified=true") {
@@ -549,6 +549,9 @@ if ($output -notmatch "AEROS_RAID linear=true stripe=true mirror=true degraded=t
 }
 if ($output -notmatch "AEROS_SYSX exit=89 reaped=1 verified=true") {
     throw "AerOS extra syscall validation failed`n$output"
+}
+if ($output -notmatch "AEROS_TERMINAL_SCREEN verified=true") {
+    throw "AerOS Terminal screen emulator (cursor addressing, scrolling, alternate screen, replies) failed`n$output"
 }
 if ($output -notmatch "AEROS_TTY verified=true") {
     throw "AerOS terminal line discipline (echo, erase, lines, end of file, raw mode) failed`n$output"
@@ -1088,7 +1091,7 @@ if ($output -notmatch "AEROS_AV signatures=[1-9][0-9]* self_test=true quarantine
 if ($output -notmatch "AEROS_AUDIT verified=true") {
     throw "AerOS audit log validation failed`n$output"
 }
-if ($output -notmatch "AEROS_COMMANDS count=94 shell=aersh elevation=ear unique=true parser=true privilege=true filesystem=true reauth=true redirection=true startup=true symlinks=true background_jobs=true firewall_command=true dmesg_command=true service_command=true text_tools=true priority_command=true crashes_command=true bench_command=true sigcheck_command=true pipelines=true strace_command=true fsck_command=true verified=true") {
+if ($output -notmatch "AEROS_COMMANDS count=95 shell=aersh elevation=ear unique=true parser=true privilege=true filesystem=true reauth=true redirection=true startup=true symlinks=true background_jobs=true firewall_command=true dmesg_command=true service_command=true text_tools=true priority_command=true crashes_command=true bench_command=true sigcheck_command=true pipelines=true strace_command=true fsck_command=true verified=true") {
     throw "AerOS command registry validation failed`n$output"
 }
 if ($output -notmatch "AEROS_UI_CORE geometry=true scaling=true interaction=true frost=true max_frost_pixels=1048576 verified=true") {

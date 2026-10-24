@@ -448,7 +448,7 @@ extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
     // A processor trapped out of user mode while user tasks run on several:
     // take the kernel lock and make its task the live one.
     let entry = crate::scheduler::enter_from_user();
-    if entry.kill {
+    if entry.kill != 0 {
         // The task ends without the handler running, so the interrupt that
         // caught it must still be acknowledged or its line stays blocked.
         let vector = unsafe { (*frame).vector };
@@ -457,13 +457,14 @@ extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
             48..=254 => crate::arch::apic::end_interrupt(),
             _ => {}
         }
-        user::set_exit_code(128 + 9);
+        user::set_exit_code(128 + u64::from(entry.kill));
         return 1;
     }
     let result = interrupt_inner(frame);
     if result == 0 {
-        if crate::scheduler::take_kill_pending() {
-            user::set_exit_code(128 + 9);
+        let killed = crate::scheduler::take_kill_pending();
+        if killed != 0 {
+            user::set_exit_code(128 + u64::from(killed));
             return 1;
         }
         crate::scheduler::leave_to_user();

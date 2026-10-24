@@ -12,6 +12,8 @@ const LINE_MAX: usize = 1024;
 const ICRNL: u32 = 0o400;
 const INLCR: u32 = 0o100;
 const IGNCR: u32 = 0o200;
+const OPOST: u32 = 0o1;
+const ONLCR: u32 = 0o4;
 const ISIG: u32 = 0o1;
 const ICANON: u32 = 0o2;
 const ECHO: u32 = 0o10;
@@ -26,6 +28,7 @@ const VQUIT: usize = 1;
 const VERASE: usize = 2;
 const VKILL: usize = 3;
 const VEOF: usize = 4;
+const VSUSP: usize = 10;
 const VMIN: usize = 6;
 const VWERASE: usize = 14;
 const CC_COUNT: usize = 19;
@@ -93,6 +96,10 @@ struct Tty {
     session: u64,
     line: [u8; LINE_MAX],
     line_len: usize,
+    /// A pseudo-terminal from `/dev/ptmx` (its pipes are its own), and
+    /// whether its slave side has been opened yet.
+    pty: bool,
+    slave_opened: bool,
 }
 
 impl Tty {
@@ -107,6 +114,8 @@ impl Tty {
         session: 0,
         line: [0; LINE_MAX],
         line_len: 0,
+        pty: false,
+        slave_opened: false,
     };
 }
 
@@ -134,6 +143,9 @@ pub fn create(input: usize, output: usize) -> Option<usize> {
     }
     if let Some(pipe) = pipes.get_mut(input) {
         pipe.canonical = true;
+    }
+    if let Some(pipe) = pipes.get_mut(output) {
+        pipe.onlcr = true;
     }
     Some(index)
 }
@@ -163,6 +175,7 @@ pub fn release(index: usize) {
             pipe.canonical = false;
             pipe.nowait = false;
             pipe.eof_pending = 0;
+            pipe.onlcr = false;
         }
     }
 }
@@ -189,7 +202,11 @@ fn push(pipe: usize, bytes: &[u8]) {
     let mut guard = PIPES.lock();
     let table = &mut *guard;
     if let Some(entry) = table.pipes.get_mut(pipe).filter(|entry| entry.used) {
-        ring_put(&mut table.data[pipe], entry.head, &mut entry.length, bytes);
+        if entry.onlcr {
+            ring_put_crlf(&mut table.data[pipe], entry.head, &mut entry.length, bytes);
+        } else {
+            ring_put(&mut table.data[pipe], entry.head, &mut entry.length, bytes);
+        }
     }
 }
 
@@ -220,7 +237,7 @@ pub fn input(index: usize, bytes: &[u8]) {
                 other => other,
             };
             if lflag & ISIG != 0 {
-                let raised = [(VINTR, 2), (VQUIT, 3)]
+                let raised = [(VINTR, 2), (VQUIT, 3), (VSUSP, 20)]
                     .into_iter()
                     .find(|&(at, _)| termios.cc[at] != 0 && termios.cc[at] == byte);
                 if let Some((_, number)) = raised {
@@ -303,13 +320,13 @@ pub fn input(index: usize, bytes: &[u8]) {
 /// end is ended (as `Shell::job_interrupt` does).
 fn signal_group(pgid: u64, signal: u64) {
     let mut members = [0u64; 16];
-    let count = crate::scheduler::group_members(pgid, &mut members);
+    let count = crate::scheduler::group_members(Some(pgid), &mut members);
     for &id in &members[..count] {
         if matches!(
             crate::scheduler::signal_other_task(id, signal),
             Some(RemoteSignal::Fatal) | None
         ) {
-            let _ = crate::scheduler::kill_task(id);
+            let _ = crate::scheduler::kill_task_with(id, signal as u8);
         }
     }
 }
@@ -317,7 +334,7 @@ fn signal_group(pgid: u64, signal: u64) {
 /// `TCSETS`: leaving canonical mode makes the half-typed line readable, and
 /// `flush` (`TCSETSF`) throws away what has not been read.
 fn set_termios(index: usize, termios: Termios, flush: bool) {
-    let (input, line, length) = {
+    let (input, output, line, length) = {
         let mut ttys = TTYS.lock();
         let tty = &mut ttys[index];
         let leaving = tty.termios.lflag & ICANON != 0 && termios.lflag & ICANON == 0;
@@ -326,10 +343,13 @@ fn set_termios(index: usize, termios: Termios, flush: bool) {
         if leaving || flush {
             tty.line_len = 0;
         }
-        (tty.input, tty.line, length)
+        (tty.input, tty.output, tty.line, length)
     };
     let mut guard = PIPES.lock();
     let table = &mut *guard;
+    if let Some(pipe) = table.pipes.get_mut(output) {
+        pipe.onlcr = termios.oflag & (OPOST | ONLCR) == OPOST | ONLCR;
+    }
     if let Some(pipe) = table.pipes.get_mut(input) {
         pipe.canonical = termios.lflag & ICANON != 0;
         pipe.nowait = !pipe.canonical && termios.cc[VMIN] == 0;
@@ -346,6 +366,9 @@ fn set_termios(index: usize, termios: Termios, flush: bool) {
 }
 
 fn tty_of(process_fd: &ProcessFd) -> Option<usize> {
+    if matches!(process_fd.standard, DEVICE_TTY | DEVICE_PTMX) {
+        return Some(process_fd.handle as usize);
+    }
     if !process_fd.pipe {
         return None;
     }
@@ -353,6 +376,236 @@ fn tty_of(process_fd: &ProcessFd) -> Option<usize> {
     index.checked_sub(1).map(usize::from)
 }
 
+/// The terminal the running process has on a descriptor (a Terminal job's
+/// pipes, or a terminal device), if any.
+pub(super) fn controlling() -> Option<usize> {
+    let mut found = [None; PROCESS_FD_COUNT];
+    for (slot, fd) in found.iter_mut().zip(PROCESS_FDS.lock().iter()) {
+        if fd.open && fd.standard == DEVICE_TTY {
+            *slot = Some(Err(fd.handle as usize));
+        } else if fd.open && fd.pipe {
+            *slot = Some(Ok(fd.handle as usize));
+        }
+    }
+    let pipes = PIPES.lock();
+    found.iter().flatten().find_map(|&kind| match kind {
+        Err(terminal) => Some(terminal),
+        Ok(slot) => pipes
+            .get(slot)
+            .filter(|pipe| pipe.used)
+            .and_then(|pipe| pipe.tty.checked_sub(1))
+            .map(usize::from),
+    })
+}
+
+/// `/dev/ptmx`: a pseudo-terminal with its own pair of pipes.
+pub(super) fn open_master() -> Option<usize> {
+    let input = input_create()?;
+    let Some(output) = capture_create() else {
+        input_close(input);
+        capture_close(input);
+        return None;
+    };
+    let Some(index) = create(input, output) else {
+        for slot in [input, output] {
+            input_close(slot);
+            capture_close(slot);
+        }
+        return None;
+    };
+    TTYS.lock()[index].pty = true;
+    Some(index)
+}
+
+/// `/dev/pts/N`: whether pseudo-terminal `index` exists (it then counts as
+/// opened, so its master reads EIO once no slave is left).
+pub(super) fn open_slave(index: usize) -> bool {
+    let mut ttys = TTYS.lock();
+    let Some(tty) = ttys.get_mut(index).filter(|tty| tty.used && tty.pty) else {
+        return false;
+    };
+    tty.slave_opened = true;
+    true
+}
+
+/// The last master descriptor closed: the pseudo-terminal goes, and its
+/// slaves read the end of the file.
+pub(super) fn close_master(index: usize) {
+    let pipes = TTYS
+        .lock()
+        .get(index)
+        .filter(|tty| tty.used && tty.pty)
+        .map(|tty| (tty.input, tty.output));
+    let Some((input, output)) = pipes else {
+        return;
+    };
+    release(index);
+    for slot in [input, output] {
+        input_close(slot);
+        capture_close(slot);
+    }
+}
+
+/// The device number of terminal `index`'s slave, `/dev/pts/N` (major 136).
+pub(super) fn slave_number(index: u32) -> u64 {
+    let index = u64::from(index);
+    136 << 8 | (index & 0xff) | (index & !0xff) << 12
+}
+
+/// The device number of a terminal device path: `/dev/tty`, `/dev/ptmx`, or
+/// a `/dev/pts/N` that exists.
+pub(super) fn device_number(path: &str) -> Option<u64> {
+    match path {
+        "/dev/tty" => Some(0x500),
+        "/dev/ptmx" => Some(0x502),
+        _ => {
+            let index = path.strip_prefix("/dev/pts/")?.parse::<usize>().ok()?;
+            let ttys = TTYS.lock();
+            ttys.get(index)
+                .filter(|tty| tty.used && tty.pty)
+                .map(|_| slave_number(index as u32))
+        }
+    }
+}
+/// Whether any process still has a slave descriptor of terminal `index`.
+fn slave_open(index: usize) -> bool {
+    let slave =
+        |fd: &ProcessFd| fd.open && fd.standard == DEVICE_TTY && fd.handle as usize == index;
+    PROCESS_FDS.lock().iter().any(slave)
+        || crate::scheduler::any_other_task_shares_fd(|fd| slave(fd))
+}
+
+/// The terminal's pipes, if it is still there.
+fn pipes_of(index: usize) -> Option<(usize, usize)> {
+    TTYS.lock()
+        .get(index)
+        .filter(|tty| tty.used)
+        .map(|tty| (tty.input, tty.output))
+}
+
+/// The master's slaves are all gone (after one was opened).
+fn hung_up(index: usize) -> bool {
+    TTYS.lock()
+        .get(index)
+        .is_some_and(|tty| tty.pty && tty.slave_opened)
+        && !slave_open(index)
+}
+
+/// `read` on a terminal device: a slave reads what was typed (the line
+/// discipline's output), a master what the programs on it wrote. A master
+/// whose slaves have all closed reads EIO, as on Linux.
+pub(super) fn read(process_fd: &ProcessFd, address: u64, requested: u64) -> u64 {
+    let index = process_fd.handle as usize;
+    let Some((input, output)) = pipes_of(index) else {
+        return 0;
+    };
+    let master = process_fd.standard == DEVICE_PTMX;
+    let pipe = ProcessFd {
+        open: true,
+        pipe: true,
+        readable: true,
+        handle: if master { output } else { input } as u32,
+        nonblocking: true,
+        ..ProcessFd::EMPTY
+    };
+    if !master {
+        return read_from(
+            ProcessFd {
+                nonblocking: process_fd.nonblocking,
+                ..pipe
+            },
+            address,
+            requested,
+        );
+    }
+    loop {
+        let result = read_from(pipe, address, requested);
+        if result != error(11) {
+            return result;
+        }
+        if hung_up(index) {
+            return error(5);
+        }
+        if process_fd.nonblocking || crate::scheduler::current_task_pid_for_linux().is_none() {
+            return error(11);
+        }
+        if interrupted() {
+            return error(4);
+        }
+        yield_in_syscall();
+    }
+}
+
+/// `write` on a terminal device: a slave's goes to the terminal's output, a
+/// master's is typed into it (through the line discipline).
+pub(super) fn write(process_fd: &ProcessFd, address: u64, requested: u64) -> u64 {
+    let index = process_fd.handle as usize;
+    let Some((_, output)) = pipes_of(index) else {
+        return error(5);
+    };
+    if process_fd.standard != DEVICE_PTMX {
+        let pipe = ProcessFd {
+            open: true,
+            pipe: true,
+            writable: true,
+            handle: output as u32,
+            nonblocking: process_fd.nonblocking,
+            ..ProcessFd::EMPTY
+        };
+        return write_to(pipe, address, requested);
+    }
+    let Ok(requested) = usize::try_from(requested) else {
+        return error(22);
+    };
+    let requested = requested.min(MAX_IO);
+    let mut chunk = [0u8; 256];
+    let mut total = 0;
+    while total < requested {
+        let amount = (requested - total).min(chunk.len());
+        if !user::copy_from_user(address + total as u64, &mut chunk[..amount]) {
+            return if total == 0 { error(14) } else { total as u64 };
+        }
+        input(index, &chunk[..amount]);
+        total += amount;
+    }
+    total as u64
+}
+
+/// `poll` readiness of a terminal device.
+pub(super) fn ready_events(process_fd: &ProcessFd) -> u32 {
+    let index = process_fd.handle as usize;
+    let Some((input, output)) = pipes_of(index) else {
+        return EPOLLIN | EPOLLHUP;
+    };
+    let pipes = PIPES.lock();
+    let queued = |slot: usize| {
+        pipes
+            .get(slot)
+            .map_or((0, 0), |pipe| (pipe.length, pipe.eof_pending))
+    };
+    if process_fd.standard == DEVICE_PTMX {
+        let (length, _) = queued(output);
+        drop(pipes);
+        let mut events = EPOLLOUT;
+        if length > 0 {
+            events |= EPOLLIN;
+        }
+        if hung_up(index) {
+            events |= EPOLLIN | EPOLLHUP;
+        }
+        return events;
+    }
+    let (length, ends) = queued(input);
+    let (written, _) = queued(output);
+    let mut events = 0;
+    if length > 0 || ends > 0 {
+        events |= EPOLLIN;
+    }
+    if PIPE_BUFFER_BYTES - written >= PIPE_ATOMIC_BYTES {
+        events |= EPOLLOUT;
+    }
+    events
+}
 /// The terminal ioctls on a terminal's pipe; `None` for any other descriptor.
 pub(super) fn ioctl(process_fd: &ProcessFd, request: u64, address: u64) -> Option<u64> {
     let index = tty_of(process_fd)?;
@@ -390,7 +643,7 @@ pub(super) fn ioctl(process_fd: &ProcessFd, request: u64, address: u64) -> Optio
                 return Some(error(14));
             }
             let pgid = u64::from(u32::from_le_bytes(bytes));
-            if crate::scheduler::group_members(pgid, &mut [0u64; 1]) == 0 {
+            if crate::scheduler::group_members(Some(pgid), &mut [0u64; 1]) == 0 {
                 return Some(error(1));
             }
             TTYS.lock()[index].foreground = pgid;
@@ -432,6 +685,15 @@ pub(super) fn ioctl(process_fd: &ProcessFd, request: u64, address: u64) -> Optio
             0
         }
         0x5411 => copy_out(&0u32.to_le_bytes()),
+        // TIOCGPTN: which `/dev/pts/N` a master's slave is; TIOCSPTLCK.
+        0x8004_5430 if process_fd.standard == DEVICE_PTMX => {
+            copy_out(&(index as u32).to_le_bytes())
+        }
+        0x4004_5431 if process_fd.standard == DEVICE_PTMX => 0,
+        // TIOCGPTPEER: the slave, opened straight from the master.
+        0x5441 if process_fd.standard == DEVICE_PTMX && open_slave(index) => {
+            install_device(DEVICE_TTY, index as u32, address & 0o2000000 != 0)
+        }
         0x5409 | 0x540a | 0x540e | 0x5422 | 0x5425 => 0,
         _ => error(25),
     };
@@ -457,7 +719,7 @@ pub(crate) fn self_test() -> bool {
     let first = pipe_read(keys, &mut buffer) == Ok(6) && &buffer[..6] == b"hello\n";
     let second = pipe_read(keys, &mut buffer) == Ok(7) && &buffer[..7] == b"second\n";
     let echoed = capture_read(output, &mut buffer);
-    let echo_ok = &buffer[..echoed] == b"helo\x08 \x08lo\nsecond\n";
+    let echo_ok = &buffer[..echoed] == b"helo\x08 \x08lo\r\nsecond\r\n";
     input(index, b"\x04");
     let eof_once = pipe_read(keys, &mut buffer) == Ok(0);
     input(index, b"x");

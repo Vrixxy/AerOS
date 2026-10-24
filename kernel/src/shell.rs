@@ -11,8 +11,8 @@ use crate::pci::PciInventory;
 use crate::{heap, process, rtc, scheduler, time, vfs};
 
 const MAX_ARGUMENTS: usize = 16;
-const MAX_ARGUMENT_BYTES: usize = 96;
-pub(crate) const MAX_INPUT: usize = 192;
+const MAX_ARGUMENT_BYTES: usize = 256;
+pub(crate) const MAX_INPUT: usize = 512;
 const MAX_PATH: usize = 256;
 pub(crate) const MAX_OUTPUT: usize = 8192;
 const HISTORY_ITEMS: usize = 16;
@@ -95,6 +95,7 @@ enum Handler {
     Top,
     Kill,
     Jobs,
+    Fg,
     Wait,
     Fw,
     Dmesg,
@@ -184,7 +185,7 @@ const fn command(
     }
 }
 
-static COMMANDS: [CommandSpec; 94] = [
+static COMMANDS: [CommandSpec; 95] = [
     command(
         "notify",
         "notify <message...>",
@@ -403,6 +404,13 @@ static COMMANDS: [CommandSpec; 94] = [
         "list `run ... &` background jobs",
         false,
         Handler::Jobs,
+    ),
+    command(
+        "fg",
+        "fg",
+        "resume the program Ctrl+Z stopped, in the foreground",
+        false,
+        Handler::Fg,
     ),
     command(
         "wait",
@@ -981,7 +989,7 @@ pub(crate) fn foreground_job_self_test(info: SystemInfo<'_>) -> bool {
         let sent = shell.job_send(b"through the job\n");
         // The terminal echoes the line, then `cat` writes it back.
         let echoed = run(&mut shell, &mut output, &|text| {
-            text.matches("through the job\n").count() == 2
+            text.matches("through the job\r\n").count() == 2
         })
         .is_none();
         shell.job_end_input();
@@ -1012,16 +1020,86 @@ pub(crate) fn foreground_job_self_test(info: SystemInfo<'_>) -> bool {
             crate::serial::format(format_args!("AEROS_TERMINAL_JOBS_RAW {:?}\n", output.as_str()));
         }
         output.clear();
+        // A curses program: terminfo for TERM=vt100 and the terminal ioctls.
+        shell.execute(
+            "/usr/bin/python3 -c \"import curses; s = curses.initscr(); s.addstr(2, 3, 'curses-ok'); s.refresh(); curses.endwin()\"",
+            &mut output,
+        );
+        let curses = run(&mut shell, &mut output, &|_| false) == Some(0)
+            && output.as_str().contains("curses-ok");
+        if !curses {
+            crate::serial::format(format_args!(
+                "AEROS_TERMINAL_JOBS_CURSES {:?}\n",
+                output.as_str()
+            ));
+        }
+        output.clear();
+        // An argument well past what fits the Terminal's width.
+        let mut long: Text<MAX_INPUT> = Text::new();
+        let _ = long.push_str_checked("/bin/echo ");
+        for _ in 0..20 {
+            let _ = long.push_str_checked("long-word-");
+        }
+        shell.execute(long.as_str(), &mut output);
+        let wide = run(&mut shell, &mut output, &|_| false) == Some(0)
+            && output.as_str().matches("long-word-").count() == 20;
+        output.clear();
+        // `getpass` opens `/dev/tty` (the job's terminal) and turns echo off.
+        shell.execute(
+            "/usr/bin/python3 -c \"import getpass; print('got', getpass.getpass())\"",
+            &mut output,
+        );
+        for _ in 0..20_000 {
+            if shell.job_mode().is_none_or(|(_, echo)| !echo) {
+                break;
+            }
+            let mut written: Text<MAX_OUTPUT> = Text::new();
+            let _ = shell.job_poll(&mut written);
+            let _ = output.push_str_checked(written.as_str());
+            crate::scheduler::wait_tick();
+        }
+        let _ = shell.job_send(b"secret\n");
+        let hidden = run(&mut shell, &mut output, &|_| false) == Some(0)
+            && output.as_str().contains("got secret")
+            && output.as_str().matches("secret").count() == 1;
+        if !hidden {
+            crate::serial::format(format_args!(
+                "AEROS_TERMINAL_JOBS_HIDDEN {:?}\n",
+                output.as_str()
+            ));
+        }
+        output.clear();
         shell.execute("/bin/sleep 30", &mut output);
         let sleeping = shell.job_running();
+        // Ctrl+Z stops it and gives the prompt back; `fg` resumes it.
+        let _ = shell.job_send(&[0x1a]);
+        let stopped = run(&mut shell, &mut output, &|_| false) == Some(148) && !shell.job_running();
+        output.clear();
+        shell.execute("fg", &mut output);
+        let resumed = shell.job_running()
+            && shell
+                .job
+                .is_some_and(|job| !crate::scheduler::process_stopped(job.task_id));
         shell.job_interrupt();
         let interrupted = run(&mut shell, &mut output, &|_| false)
             .is_some_and(|status| status != 0)
             && !shell.job_running();
         crate::serial::format(format_args!(
-            "AEROS_TERMINAL_JOBS_PARTS started={started} sent={sent} echoed={echoed} ended={ended} terminal={terminal} raw={raw} sleeping={sleeping} interrupted={interrupted}\n"
+            "AEROS_TERMINAL_JOBS_PARTS started={started} sent={sent} echoed={echoed} ended={ended} terminal={terminal} raw={raw} curses={curses} wide={wide} hidden={hidden} sleeping={sleeping} stopped={stopped} resumed={resumed} interrupted={interrupted}\n"
         ));
-        started && sent && echoed && ended && terminal && raw && sleeping && interrupted
+        started
+            && sent
+            && echoed
+            && ended
+            && terminal
+            && raw
+            && curses
+            && wide
+            && hidden
+            && sleeping
+            && stopped
+            && resumed
+            && interrupted
     })
     .unwrap_or(false)
 }
@@ -1043,8 +1121,10 @@ fn push_printable(output: &mut Text<MAX_OUTPUT>, bytes: &[u8]) {
 /// returns, backspaces and the common escape sequences itself.
 fn push_terminal(output: &mut Text<MAX_OUTPUT>, bytes: &[u8]) {
     for byte in bytes {
+        // Control characters (SO/SI, which vt100 attributes use, among them)
+        // are the screen's to act on or drop.
         let character = match *byte {
-            b'\n' | b'\t' | b'\r' | 0x08 | 0x07 | 0x1b | 0x20..=0x7e => *byte as char,
+            0x00..=0x7f => *byte as char,
             _ => '?',
         };
         let _ = output.push_str_checked(character.encode_utf8(&mut [0; 4]));
@@ -1255,6 +1335,8 @@ pub(crate) struct Shell<'a> {
     job: Option<ForegroundJob>,
     /// Rows and columns a foreground job's terminal reports.
     terminal_size: (u16, u16),
+    /// The foreground job Ctrl+Z stopped, until `fg` resumes it.
+    stopped_job: Option<ForegroundJob>,
 }
 
 impl<'a> Shell<'a> {
@@ -1283,6 +1365,7 @@ impl<'a> Shell<'a> {
             job_allowed: false,
             job: None,
             terminal_size: (25, 80),
+            stopped_job: None,
         };
         shell.cwd.push_str_checked("/");
         shell.hostname.push_str_checked("aeros");
@@ -1380,6 +1463,13 @@ impl<'a> Shell<'a> {
     /// ended, returns its exit status (and the job is gone).
     pub(crate) fn job_poll(&mut self, output: &mut Text<MAX_OUTPUT>) -> Option<u8> {
         let job = self.job?;
+        if crate::scheduler::process_stopped(job.task_id) && self.stopped_job.is_none() {
+            // Ctrl+Z: the prompt comes back and `fg` resumes the job.
+            self.stopped_job = self.job.take();
+            let _ = output.push_str_checked("\n[stopped] fg resumes it\n");
+            self.last_status = 148;
+            return Some(self.last_status);
+        }
         let ended = crate::scheduler::finished_child(job.task_id);
         let mut chunk = [0u8; 256];
         loop {
@@ -1434,7 +1524,7 @@ impl<'a> Shell<'a> {
             crate::scheduler::signal_other_task(job.task_id, 2),
             Some(crate::syscall::RemoteSignal::Fatal) | None
         ) {
-            let _ = crate::scheduler::kill_task(job.task_id);
+            let _ = crate::scheduler::kill_task_with(job.task_id, 2);
         }
     }
 
@@ -1734,6 +1824,7 @@ impl<'a> Shell<'a> {
             Handler::Top => self.command_top(output),
             Handler::Kill => self.command_kill(arguments, offset, output),
             Handler::Jobs => self.command_jobs(output),
+            Handler::Fg => self.command_fg(output),
             Handler::Wait => self.command_wait(arguments, offset, output),
             Handler::Fw => self.command_fw(arguments, offset, output),
             Handler::Dmesg => self.command_dmesg(arguments, offset, output),
@@ -3322,7 +3413,31 @@ impl Shell<'_> {
     /// then dropped from the table - a later `jobs` call won't show it
     /// again, matching real shells discarding a job once its exit is
     /// reported once.
+    /// `fg`: the job Ctrl+Z stopped runs again and has the terminal back.
+    fn command_fg(&mut self, output: &mut Text<MAX_OUTPUT>) {
+        let Some(job) = self.stopped_job.take() else {
+            let _ = writeln!(output, "fg: no stopped job");
+            self.last_status = 1;
+            return;
+        };
+        if self.job.is_some() || !crate::scheduler::continue_process(job.task_id) {
+            self.stopped_job = Some(job);
+            let _ = writeln!(output, "fg: the job cannot be resumed");
+            self.last_status = 1;
+            return;
+        }
+        self.job = Some(job);
+        self.last_status = 0;
+    }
+
     fn command_jobs(&mut self, output: &mut Text<MAX_OUTPUT>) {
+        if let Some(job) = self.stopped_job {
+            let _ = writeln!(
+                output,
+                "[+]  Stopped   (task {}; fg resumes it)",
+                job.task_id
+            );
+        }
         for slot in 0..self.background_jobs.len() {
             let Some(job) = self.background_jobs[slot] else {
                 continue;
@@ -6741,7 +6856,7 @@ pub fn self_test(info: SystemInfo<'_>) -> ShellReport {
         pipelines,
         strace_command,
         fsck_command,
-        verified: COMMANDS.len() == 94
+        verified: COMMANDS.len() == 95
             && unique
             && parser
             && privilege

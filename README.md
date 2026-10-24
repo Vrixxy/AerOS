@@ -71,7 +71,7 @@ AerOS is an independent x86-64 operating-system kernel written in Rust. The curr
 - Roboto Mono diagnostic rendering
 - IRQ-driven PS/2 keyboard input routed through I/O APIC vector 52
 - Interactive framebuffer terminal with quoting, escaping, history navigation, and command completion
-- `aersh` registry containing 94 built-in commands with one-command `ear` privilege elevation, real salted-and-hashed account passwords (`passwd`), loading and running arbitrary ELF binaries (`run`), the AerOS Shield scanner (`av`), and a `notify` command that posts a desktop notification
+- `aersh` registry containing 95 built-in commands with one-command `ear` privilege elevation, real salted-and-hashed account passwords (`passwd`), loading and running arbitrary ELF binaries (`run`), the AerOS Shield scanner (`av`), and a `notify` command that posts a desktop notification
 - Native AerUI geometry, fixed-point scaling, button interaction state, clipping, and bounded software backdrop blur
 - Responsive AerOS desktop with the prototype's 752×458 logical layout, embedded mountain wallpaper, a 700×66 dock of seven app slots, a live time/date capsule that opens Quick Settings when clicked, a 700×418 six-column app launcher, Quick Settings, Settings, Browser, a Store app, a windowed Linux-guest session, and a shell launcher — icon art is a mix of hand-drawn vector glyphs (status tray, Quick Settings) and designed bitmap icons (the dock and app-grid tiles)
 - Full setup flow from the Figma mockup: Language, a searchable Keyboard-language list (drawn from all 12 real keyboard layouts and applied live), Username, Password, Confirm, and a "Welcome to AerOS" screen with the traced leaf mark, before falling into the two-stage lock/sign-in screen on a shared glass card; advanced with Enter, skippable with Escape, and the account — a real salted PBKDF2-HMAC-SHA256 password hash — is only written to disk once the Welcome screen has shown
@@ -118,7 +118,7 @@ AerOS is an independent x86-64 operating-system kernel written in Rust. The curr
 - Linux compatibility: 258 syscall numbers including System V IPC, shared memory, inotify, pidfd, POSIX timers and real CPU-time accounting; what is partial or missing is in `docs/LINUX_COMPAT.md`
 - Unmodified Debian programs run natively, dynamically linked through `ld.so`: BusyBox, bash, 60 GNU tools, Perl, git, make, tar, xz, bzip2 and Python 3.13 with `ssl`, `sqlite3`, `asyncio`, `multiprocessing` and `subprocess` (154 command lines in the boot gate)
 - A 256 MiB address space per process with demand-zero anonymous memory, POSIX shared memory (`/dev/shm`), shared futexes, AF_UNIX stream, datagram and sequenced-packet sockets, and 64 KiB pipes with atomic `PIPE_BUF` writes
-- The desktop Terminal runs `/bin` and `/usr/bin` programs as interactive foreground jobs on a terminal device: a line discipline with echo, Ctrl+C and Ctrl+D, raw mode for line editors, and termios and window-size ioctls
+- The desktop Terminal runs `/bin` and `/usr/bin` programs as interactive foreground jobs on a terminal device: a line discipline with echo, Ctrl+C, Ctrl+D and Ctrl+Z (`fg` resumes), raw mode for line editors, termios and window-size ioctls, and a VT100 screen (cursor addressing, scroll regions, the alternate screen) with terminfo, so curses and full-screen programs draw
 - `docs/SECURITY_AUDIT.md` (self-audit), `docs/BENCHMARKS.md` (first comparison with Linux) and `CHANGELOG.md` (everything above in detail)
 - Headless QEMU boot test with a machine-readable ready signal
 
@@ -196,7 +196,7 @@ The current command set is:
 ```text
 notify help man clear echo pwd cd ls cat head tail wc stat touch mkdir rm ln
 readlink cp mv chmod uname hostname whoami id passwd date uptime sleep ps
-kill jobs wait fw sigcheck bench measure update swap acpi battery thermal cpufreq tpm install aerfs fsck strace
+kill jobs fg wait fw sigcheck bench measure update swap acpi battery thermal cpufreq tpm install aerfs fsck strace
 crashes renice grep find du uniq tee sort basename dirname seq true false svc
 pkg dmesg free lscpu lspci lsblk mount umount df sync which env export unset
 history ip ping dns https route arp netstat reboot shutdown ear run av

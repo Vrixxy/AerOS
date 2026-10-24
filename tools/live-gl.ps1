@@ -23,7 +23,7 @@ Copy-Item -Force -LiteralPath $variablesTemplate -Destination $variables
 
 & $qemu `
     -machine q35,accel=whpx:tcg `
-    -m 512M `
+    -m 1024M `
     -smp 2 `
     -cpu "qemu64,+nx,+smep,+smap,+xsave,+xsaveopt,+rdrand,+rdtscp,+pdpe1gb" `
     -drive "if=pflash,format=raw,unit=0,readonly=on,file=$firmware" `

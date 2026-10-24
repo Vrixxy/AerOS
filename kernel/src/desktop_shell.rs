@@ -94,7 +94,7 @@ impl DesktopState {
                 self.close_power_menu();
                 self.set_app(DesktopApp::Terminal);
                 let command = b"ps";
-                self.terminal_input = [0; SHELL_LINE_MAX];
+                self.terminal_input = [0; TERMINAL_INPUT_MAX];
                 self.terminal_input[..command.len()].copy_from_slice(command);
                 self.terminal_input_len = command.len();
             }
