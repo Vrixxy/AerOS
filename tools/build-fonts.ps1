@@ -66,6 +66,6 @@ function Build-Font {
     Write-Output $outputPath
 }
 
-Build-Font "PlusJakartaSans-Regular.ttf" "PlusJakartaSans-Regular.aerfont"
+Build-Font "CHDomRound-Regular.ttf" "CHDomRound-Regular.aerfont"
 Build-Font "RobotoMono-Variable.ttf" "RobotoMono-Regular.aerfont"
 

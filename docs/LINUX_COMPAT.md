@@ -4,7 +4,7 @@ AerOS runs static Linux x86-64 programs through the native `SYSCALL` entry. This
 boot test drives the new corners from real programs (`userspace/sysx`, `userspace/threads`,
 `userspace/ptrace`, ...); `tools/test.ps1` is the gate.
 
-## Implemented syscalls (258 numbers)
+## Implemented syscalls (259 numbers)
 
 | | | | |
 |---|---|---|---|
@@ -54,7 +54,8 @@ boot test drives the new corners from real programs (`userspace/sysx`, `userspac
 | 222 `timer_create` | 223 `timer_settime` | 224 `timer_gettime` | 225 `timer_getoverrun` |
 | 226 `timer_delete` | 227 `clock_settime` | 228 `clock_gettime` | 229 `clock_getres` |
 | 230 `clock_nanosleep` | 231 `exit_group` | 232 `epoll_wait` | 233 `epoll_ctl` |
-| 234 `tgkill` | 235 `utimes` | 253 `inotify_init` | 254 `inotify_add_watch` |
+| 234 `tgkill` | 235 `utimes` | 247 `waitid` | 253 `inotify_init` |
+| 254 `inotify_add_watch` | | | |
 | 255 `inotify_rm_watch` | 257 `openat` | 258 `mkdirat` | 259 `mknodat` |
 | 260 `fchownat` | 261 `futimesat` | 262 `newfstatat` | 263 `unlinkat` |
 | 264 `renameat` | 265 `linkat` | 266 `symlinkat` | 267 `readlinkat` |
@@ -101,7 +102,7 @@ The extended attribute family (188-199) answers EOPNOTSUPP, as a filesystem with
   (from the initramfs) after the program and `ld.so` maps the libraries (`/lib/x86_64-linux-gnu`, from
   the initramfs too). Debian's bash and 60 GNU programs are in the boot gate, with Perl, Python 3.13
   (the standard library without tests, Tk and IDLE, with `ssl`, `hashlib`, `sqlite3`, `readline` and `curses`), git, make, tar,
-  awk and more (159 command lines). `execve` and the shell's own program launcher (the desktop
+  awk and more (171 command lines). `execve` and the shell's own program launcher (the desktop
   Terminal runs any `/bin` or `/usr/bin` program for a command it does not know) both start them
   through the interpreter.
   A process window is 256 MiB: image area 16 MiB, heap 32 MiB, stack up to 8 MiB, then about 200 MiB
@@ -141,8 +142,9 @@ The extended attribute family (188-199) answers EOPNOTSUPP, as a filesystem with
   `sendfile`, `copy_file_range`, `inotify` (events raised by what processes do; consecutive identical
   events are not merged), `flock`, no `fanotify`. Hard links are refused (EPERM): no filesystem has them (inside
   `/dev/shm`, `link` renames, which is all `sem_open` needs).
-- **IPC**: pipes (64 KiB, writes up to 4 KiB are atomic), `eventfd`, `socketpair` (stream, and datagram and sequenced-packet pairs that keep message boundaries, up to 4000 bytes a message), named AF_UNIX stream and sequenced-packet sockets (`bind`/`listen`/`accept`/`connect`) and datagram sockets (`bind`, `sendto` a name, `connect` then `send`; BusyBox `syslogd` and `logger` talk over `/dev/log` in the boot gate). Names are matched in a kernel table like Linux's abstract namespace, nothing is created in the filesystem, and a received datagram has no sender address. System V message queues, semaphores and
-  shared memory (small fixed tables, kernel-wide so unrelated processes meet by key), `epoll`.
+- **IPC**: pipes (64 KiB, writes up to 4 KiB are atomic), `eventfd`, `socketpair` (stream, and datagram and sequenced-packet pairs that keep message boundaries, up to 4000 bytes a message), named AF_UNIX stream and sequenced-packet sockets (`bind`/`listen`/`accept`/`connect`) and datagram sockets (`bind`, `sendto` a name, `connect` then `send`; BusyBox `syslogd` and `logger` talk over `/dev/log` in the boot gate). Names are matched in a kernel table like Linux's abstract namespace, nothing is created in the filesystem, and a received datagram has no sender address. Connected AF_UNIX sockets pass descriptors (`SCM_RIGHTS`, up to 16 a message; `SCM_CREDENTIALS` is dropped) and report the peer's process (`SO_PEERCRED`). System V message queues, semaphores and
+  shared memory (small fixed tables, kernel-wide so unrelated processes meet by key), `epoll`
+  (`EPOLLONESHOT` is honoured, `EPOLLET` watches act level-triggered).
 - **Network sockets**: TCP (64 KiB windows without window scaling, SACK, Nagle unless `TCP_NODELAY`; `TCP_CORK` is stored but not acted on) and UDP over IPv4 and IPv6, and IPv4 ping sockets
   (`SOCK_DGRAM` + `IPPROTO_ICMP`: echo requests out, replies in, the identifier is the socket's).
   No raw sockets or `AF_PACKET`.

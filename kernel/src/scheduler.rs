@@ -139,6 +139,11 @@ struct Task {
     /// `wait4` has not reported yet.
     stop_report: u8,
     continue_report: bool,
+    /// `PR_SET_PDEATHSIG`: the signal this task gets when its parent exits.
+    death_signal: u8,
+    /// `PR_SET_NAME` (0 bytes: the program's name).
+    name: [u8; 16],
+    name_length: u8,
     /// When the task first ran and when it ended (monotonic nanoseconds; SMP test).
     started_ns: u64,
     ended_ns: u64,
@@ -194,6 +199,9 @@ impl Task {
         job_stopped: false,
         stop_report: 0,
         continue_report: false,
+        death_signal: 0,
+        name: [0; 16],
+        name_length: 0,
         started_ns: 0,
         ended_ns: 0,
         cpu_user_ns: 0,
@@ -281,6 +289,9 @@ impl Scheduler {
             job_stopped: false,
             stop_report: 0,
             continue_report: false,
+            death_signal: 0,
+            name: [0; 16],
+            name_length: 0,
             started_ns: 0,
             ended_ns: 0,
             cpu_user_ns: 0,
@@ -301,7 +312,6 @@ impl Scheduler {
         arch::gdt::set_ring0_stack(RSP0_CPU, self.tasks[0].interrupt_stack_top);
     }
 
-    /// Picks the next ready task in round-robin order, but preferring a lower
     /// The thread group a task belongs to (its own id unless it is a thread).
     fn group(&self, slot: usize) -> u64 {
         let task = &self.tasks[slot];
@@ -835,6 +845,9 @@ pub fn spawn(entry: extern "C" fn() -> !) -> Option<u64> {
         job_stopped: false,
         stop_report: 0,
         continue_report: false,
+        death_signal: 0,
+        name: [0; 16],
+        name_length: 0,
         started_ns: 0,
         ended_ns: 0,
         cpu_user_ns: 0,
@@ -1871,7 +1884,42 @@ pub fn task_finished(code: u64) -> bool {
             kick_task(slot);
         }
     }
+    // Children that asked for a signal when their parent goes (PDEATHSIG).
+    let mut orphans = [(0u64, 0u8); 16];
+    let mut count = 0;
+    for task in &scheduler.tasks {
+        if count < orphans.len()
+            && task.parent_id == child
+            && task.death_signal != 0
+            && !matches!(task.state, TaskState::Empty | TaskState::Exited)
+        {
+            orphans[count] = (task.id, task.death_signal);
+            count += 1;
+        }
+    }
+    for &(orphan, signal) in &orphans[..count] {
+        if matches!(
+            signal_other_task(orphan, u64::from(signal)),
+            Some(crate::syscall::RemoteSignal::Fatal)
+        ) {
+            let _ = kill_task_with(orphan, signal);
+        }
+    }
     true
+}
+
+/// `prctl(PR_SET_PDEATHSIG)` / `PR_GET_PDEATHSIG` for the running task.
+pub fn set_death_signal(signal: u8) {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let current = scheduler.current;
+    scheduler.tasks[current].death_signal = signal;
+}
+
+pub fn death_signal() -> u8 {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    scheduler.tasks[scheduler.current].death_signal
 }
 
 /// What a task has to undo before it goes: the word `CLONE_CHILD_CLEARTID`
@@ -2188,6 +2236,14 @@ pub fn linux_munmap_for_current_task(address: u64, pages: usize) -> Option<bool>
     Some(arch::paging::process_munmap(space, address, pages))
 }
 
+pub fn linux_discard_for_current_task(address: u64, pages: usize) -> Option<bool> {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let current = scheduler.current;
+    let owner = scheduler.leader_slot(current);
+    let space = scheduler.tasks[owner].process_space.as_mut()?;
+    Some(arch::paging::process_discard(space, address, pages))
+}
 pub fn grow_current_heap(additional_pages: u64) -> Option<u64> {
     arch::disable_interrupts();
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
@@ -2380,6 +2436,84 @@ fn set_exe(task: &mut Task, path: &str) {
     let count = path.len().min(task.exe.len());
     task.exe[..count].copy_from_slice(&path.as_bytes()[..count]);
     task.exe_length = count as u8;
+    task.name_length = 0;
+}
+
+/// The name of task `id` (the running one for `None`) as `comm` and `ps`
+/// show it: what `PR_SET_NAME` set, else its program's file name.
+pub fn task_name(id: Option<u64>) -> ([u8; 16], usize) {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    let slot = match id {
+        None => Some(scheduler.current),
+        Some(id) => scheduler
+            .tasks
+            .iter()
+            .position(|task| task.id == id && task.state != TaskState::Empty),
+    };
+    let mut name = [0u8; 16];
+    let Some(slot) = slot else {
+        return (name, 0);
+    };
+    let task = &scheduler.tasks[slot];
+    if task.name_length > 0 {
+        return (task.name, usize::from(task.name_length));
+    }
+    let leader = &scheduler.tasks[scheduler.leader_slot(slot)];
+    let exe = &leader.exe[..usize::from(leader.exe_length)];
+    let base = exe.rsplit(|&byte| byte == b'/').next().unwrap_or(&[]);
+    let base: &[u8] = if base.is_empty() { b"aeros" } else { base };
+    let count = base.len().min(15);
+    name[..count].copy_from_slice(&base[..count]);
+    (name, count)
+}
+
+/// How many live threads process `id` has (the running one's for `None`).
+pub fn thread_count(id: Option<u64>) -> usize {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    let group = match id {
+        None => scheduler.group(scheduler.current),
+        Some(id) => id,
+    };
+    scheduler
+        .tasks
+        .iter()
+        .filter(|task| {
+            !matches!(task.state, TaskState::Empty | TaskState::Exited)
+                && (if task.tgid == 0 { task.id } else { task.tgid }) == group
+        })
+        .count()
+        .max(1)
+}
+
+/// The live threads of process `id` (the running one's for `None`): each
+/// one's id and CPU time (user, system nanoseconds).
+pub fn threads_of(id: Option<u64>, mut visit: impl FnMut(u64, u64, u64)) {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    let group = match id {
+        None => scheduler.group(scheduler.current),
+        Some(id) => id,
+    };
+    for task in &scheduler.tasks {
+        if !matches!(task.state, TaskState::Empty | TaskState::Exited)
+            && (if task.tgid == 0 { task.id } else { task.tgid }) == group
+        {
+            visit(task.id, task.cpu_user_ns, task.cpu_system_ns);
+        }
+    }
+}
+
+/// `PR_SET_NAME` for the running task (up to 15 bytes).
+pub fn set_current_name(name: &[u8]) {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let current = scheduler.current;
+    let count = name.len().min(15);
+    scheduler.tasks[current].name = [0; 16];
+    scheduler.tasks[current].name[..count].copy_from_slice(&name[..count]);
+    scheduler.tasks[current].name_length = count as u8;
 }
 
 /// The path of the running process's program, empty when unknown.

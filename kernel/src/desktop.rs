@@ -10348,6 +10348,58 @@ fn centered_text(
     );
 }
 
+/// Text that reads as glass: the scene behind shows through a pale tint,
+/// inside a rim lit from above and a faint shadow below.
+fn glass_centered_text(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    font: RasterFont,
+    bounds: Rect,
+    value: &str,
+    height: i32,
+) {
+    let physical = layout.rect(bounds);
+    let size = layout.scale.logical(height);
+    let width = font.text_width(value, size);
+    let origin = Point::new(
+        physical.x + physical.width.saturating_sub(width) / 2,
+        physical.y + physical.height.saturating_sub(size) / 2,
+    );
+    let behind = painter
+        .color_at(Point::new(
+            physical.x + physical.width / 2,
+            physical.y + physical.height / 2,
+        ))
+        .unwrap_or(Color::rgb(120, 150, 160));
+    let white = Color::rgb(255, 255, 255);
+    let rim = (size / 36).max(1);
+    let at = |dx: i32, dy: i32| Point::new(origin.x + dx, origin.y + dy);
+    painter.text(
+        font,
+        at(0, rim * 2),
+        value,
+        size,
+        mix_color(behind, Color::rgb(0, 0, 0), 220),
+    );
+    for (dx, dy, light) in [
+        (rim, rim, 520),
+        (rim, 0, 640),
+        (0, rim, 600),
+        (-rim, 0, 820),
+        (0, -rim, 900),
+        (-rim, -rim, 940),
+    ] {
+        painter.text(
+            font,
+            at(dx, dy),
+            value,
+            size,
+            mix_color(behind, white, light),
+        );
+    }
+    painter.text(font, origin, value, size, mix_color(behind, white, 180));
+}
+
 /// Light text set straight on the wallpaper, on a soft dark chip so it stays
 /// readable over snow and cloud.
 fn chip_centered_text(
@@ -12049,29 +12101,32 @@ fn draw_lock(
     let rise = 1000 - ease_out_milli(progress_of(entered, 0, 700_000_000)) as i32;
     let pop = ease_out_back_milli(progress_of(entered, 120_000_000, 720_000_000)).max(0);
     let clock = time_text();
-    let breathe = wave_milli(now / 4_000_000).abs();
-    centered_text(
+    glass_centered_text(
         painter,
         layout,
         font,
         Rect::new(LOGIN_CARD.x, 40 + rise * 26 / 1000, LOGIN_CARD.width, 64),
         clock.as_str(),
         56,
-        mix_color(
-            Color::rgb(255, 255, 255),
-            Color::rgb(226, 238, 246),
-            breathe,
-        ),
     );
     let mut date = ClockBuffer::new();
     let current = crate::rtc::local_date_time();
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let suffix = match (current.day % 10, current.day % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
     let _ = write!(
         date,
-        "{}  {}/{}/{:02}",
+        "{}     {}{suffix} {}",
         weekday_text(),
         current.day,
-        current.month,
-        current.year % 100
+        MONTHS[usize::from(current.month.clamp(1, 12)) - 1],
     );
     centered_text(
         painter,

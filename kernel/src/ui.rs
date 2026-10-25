@@ -140,7 +140,7 @@ pub fn draw_boot_complete(frame: &mut FrameBuffer, fonts: &FontCatalog, health: 
     mono_font.draw(frame, inner_x, row_y, frame_line.as_str(), 17, MUTED);
 
     let footer_y = panel_y + panel_height - 42;
-    let footer = "Plus Jakarta Sans  /  Roboto Mono";
+    let footer = "CH Dom Round  /  Roboto Mono";
     let footer_x = margin + (content_width - mono_font.text_width(footer, 15)) / 2;
     mono_font.draw(
         frame,

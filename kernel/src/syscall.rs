@@ -310,6 +310,7 @@ const MAP_POPULATE: u64 = 0x8000;
 const MAP_STACK: u64 = 0x20000;
 const MAP_FIXED_NOREPLACE: u64 = 0x100000;
 const MAX_PATH: usize = 256;
+mod fdpass;
 mod futex;
 mod inotify;
 mod posixshm;
@@ -665,6 +666,8 @@ struct UnixPair {
     b_to_a: UnixBuffer,
     end_a_open: bool,
     end_b_open: bool,
+    /// The process at each end (A, B) for `SO_PEERCRED` (0: not known yet).
+    owners: [u32; 2],
 }
 
 impl UnixPair {
@@ -678,6 +681,7 @@ impl UnixPair {
         b_to_a: UnixBuffer::EMPTY,
         end_a_open: false,
         end_b_open: false,
+        owners: [0; 2],
     };
 }
 
@@ -2216,6 +2220,7 @@ const LINUX_FORK: u64 = 57;
 const LINUX_VFORK: u64 = 58;
 const LINUX_EXECVE: u64 = 59;
 const LINUX_WAIT4: u64 = 61;
+const LINUX_WAITID: u64 = 247;
 const LINUX_KILL: u64 = 62;
 const LINUX_RT_SIGRETURN: u64 = 15;
 const LINUX_SECCOMP: u64 = 317;
@@ -2453,7 +2458,98 @@ fn wait_status(exit_code: u64) -> u32 {
 }
 
 /// Waits for a child to end, or for a task this process traces to stop.
-fn linux_wait4(pid: u64, status_address: u64, options: u64) -> u64 {
+fn linux_wait4(pid: u64, status_address: u64, options: u64, usage: u64) -> u64 {
+    // Reaping the child adds its CPU time to ours for children: the
+    // difference is its `rusage`.
+    let before = crate::scheduler::current_children_cpu_time();
+    match wait_for_child(pid, options, true) {
+        Ok(Some((child, status))) => {
+            if status_address != 0 && !user::copy_to_user(status_address, &status.to_le_bytes()) {
+                return error(14);
+            }
+            if usage != 0 {
+                let after = crate::scheduler::current_children_cpu_time();
+                let mut record = [0u8; 144];
+                let mut times = [0u8; 32];
+                write_timeval(&mut times, 0, after.0.saturating_sub(before.0));
+                write_timeval(&mut times, 16, after.1.saturating_sub(before.1));
+                record[..32].copy_from_slice(&times);
+                if !user::copy_to_user(usage, &record) {
+                    return error(14);
+                }
+            }
+            child
+        }
+        Ok(None) => 0,
+        Err(failure) => failure,
+    }
+}
+
+/// `waitid`: the child that changed state, described in a `siginfo_t`
+/// (`P_ALL`, `P_PID`, `P_PGID`, `P_PIDFD`; `WEXITED`, `WSTOPPED`,
+/// `WCONTINUED`, `WNOHANG`). `WNOWAIT` is not supported.
+fn linux_waitid(kind: u64, id: u64, info_address: u64, options: u64, usage: u64) -> u64 {
+    const WNOHANG: u64 = 1;
+    const WSTOPPED: u64 = 2;
+    const WEXITED: u64 = 4;
+    const WCONTINUED: u64 = 8;
+    const KNOWN: u64 = WNOHANG | WSTOPPED | WEXITED | WCONTINUED | 0x6000_0000;
+    if options & !KNOWN != 0 || options & (WSTOPPED | WEXITED | WCONTINUED) == 0 {
+        return error(22);
+    }
+    let selector = match kind {
+        0 => (-1i32) as u32 as u64,
+        1 if id as u32 as i32 > 0 => id as u32 as u64,
+        2 if id as u32 == 0 => 0,
+        2 if (id as u32 as i32) > 0 => (-(id as u32 as i32)) as u32 as u64,
+        3 => match pidfd_target(id) {
+            Ok(pid) => pid,
+            Err(failure) => return failure,
+        },
+        _ => return error(22),
+    };
+    let found = match wait_for_child(selector, options & !WEXITED, options & WEXITED != 0) {
+        Ok(found) => found,
+        Err(failure) => return failure,
+    };
+    let mut info = [0u8; 128];
+    if let Some((child, status)) = found {
+        const CLD_EXITED: i32 = 1;
+        const CLD_KILLED: i32 = 2;
+        const CLD_DUMPED: i32 = 3;
+        const CLD_STOPPED: i32 = 5;
+        const CLD_CONTINUED: i32 = 6;
+        let (code, value) = if status & 0x7f == 0 {
+            (CLD_EXITED, status >> 8 & 0xff)
+        } else if status == 0xffff {
+            (CLD_CONTINUED, 18)
+        } else if status & 0xff == 0x7f {
+            (CLD_STOPPED, status >> 8 & 0xff)
+        } else if status & 0x80 != 0 {
+            (CLD_DUMPED, status & 0x7f)
+        } else {
+            (CLD_KILLED, status & 0x7f)
+        };
+        info[..4].copy_from_slice(&17i32.to_le_bytes());
+        info[8..12].copy_from_slice(&code.to_le_bytes());
+        info[16..20].copy_from_slice(&(child as u32).to_le_bytes());
+        info[24..28].copy_from_slice(&value.to_le_bytes());
+    }
+    if info_address != 0 && !user::copy_to_user(info_address, &info) {
+        return error(14);
+    }
+    if usage != 0 && !user::copy_to_user(usage, &[0u8; 144]) {
+        return error(14);
+    }
+    COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
+    0
+}
+
+/// What `wait4` and `waitid` wait for: a child (`pid` as `wait4` takes it)
+/// that ended (when `exited`), or stopped or continued (`WUNTRACED`,
+/// `WCONTINUED`), and its `wait4` status; `None` with `WNOHANG` when none
+/// has yet.
+fn wait_for_child(pid: u64, options: u64, exited: bool) -> Result<Option<(u64, u32)>, u64> {
     const WNOHANG: u64 = 1;
     const WUNTRACED: u64 = 2;
     const WCONTINUED: u64 = 8;
@@ -2497,6 +2593,10 @@ fn linux_wait4(pid: u64, status_address: u64, options: u64) -> u64 {
                 {
                     Some(status)
                 }
+                None if !exited => {
+                    alive |= !crate::scheduler::task_ended(child);
+                    None
+                }
                 None => match crate::scheduler::poll_child(child) {
                     Some(Some(code)) => Some(wait_status(code)),
                     Some(None) => {
@@ -2507,21 +2607,17 @@ fn linux_wait4(pid: u64, status_address: u64, options: u64) -> u64 {
                 },
             };
             if let Some(status) = status {
-                if status_address != 0 && !user::copy_to_user(status_address, &status.to_le_bytes())
-                {
-                    return error(14);
-                }
-                return child;
+                return Ok(Some((child, status)));
             }
         }
         if !alive {
-            return error(10);
+            return Err(error(10));
         }
         if options & WNOHANG != 0 {
-            return 0;
+            return Ok(None);
         }
         if interrupted() {
-            return error(4);
+            return Err(error(4));
         }
         yield_in_syscall();
     }
@@ -2954,7 +3050,7 @@ fn linux_syscall(frame: &mut LinuxSyscallFrame) -> u64 {
             };
         }
         LINUX_WAIT4 => {
-            frame.number = linux_wait4(arguments[0], arguments[1], arguments[2]);
+            frame.number = linux_wait4(arguments[0], arguments[1], arguments[2], arguments[3]);
             set_user_stack_pointer(saved_user_rsp);
             return finish_syscall(frame);
         }
@@ -3275,6 +3371,13 @@ fn dispatch_linux(number: u64, arguments: [u64; 6]) -> SyscallResult {
             0,
         )),
         LINUX_MSYNC => SyscallResult::Return(linux_msync(arguments[0], arguments[1], arguments[2])),
+        LINUX_WAITID => SyscallResult::Return(linux_waitid(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+            arguments[4],
+        )),
         LINUX_MADVISE => {
             SyscallResult::Return(linux_madvise(arguments[0], arguments[1], arguments[2]))
         }
@@ -4751,12 +4854,14 @@ fn linux_socketpair(domain: u64, kind: u64, protocol: u64, fds_address: u64) -> 
     let Some(slot) = pairs.iter().position(|pair| !pair.used) else {
         return error(24);
     };
+    let creator = current_process_id() as u32;
     pairs[slot] = UnixPair {
         used: true,
         message: base_kind != 1,
         kind: base_kind as u8,
         end_a_open: true,
         end_b_open: true,
+        owners: [creator; 2],
         ..UnixPair::EMPTY
     };
     drop(pairs);
@@ -4940,6 +5045,7 @@ fn unix_connect_apply(fd_index: usize, name: &[u8]) -> u64 {
         kind: if message { 5 } else { 1 },
         end_a_open: true,
         end_b_open: true,
+        owners: [current_process_id() as u32, 0],
         ..UnixPair::EMPTY
     };
     drop(pairs);
@@ -5060,6 +5166,9 @@ fn linux_accept(descriptor: u64, address: u64, length: u64, flags: u64) -> u64 {
     let close_on_exec = flags & O_CLOEXEC != 0;
     for attempt in 0..PIPE_WAIT_ITERATIONS {
         if let Some(pair_slot) = unix_accept_apply(process_fd.handle) {
+            if let Some(pair) = UNIX_PAIRS.lock().get_mut(pair_slot) {
+                pair.owners[1] = current_process_id() as u32;
+            }
             let Some(new_fd) = install_unix_socket_fd(pair_slot as u32, true, close_on_exec) else {
                 UNIX_PAIRS.lock()[pair_slot] = UnixPair::EMPTY;
                 return error(24);
@@ -5194,6 +5303,7 @@ pub(crate) fn linux_syscall_name(number: u64) -> &'static str {
         LINUX_EXECVEAT => "execveat",
         LINUX_EXIT => "exit",
         LINUX_WAIT4 => "wait4",
+        LINUX_WAITID => "waitid",
         LINUX_KILL => "kill",
         LINUX_GETDENTS => "getdents",
         LINUX_LINK => "link",
@@ -5625,6 +5735,24 @@ fn linux_getsockopt(arguments: [u64; 6]) -> u64 {
             (crate::sockopt::IPPROTO_IPV6, _) if !process_fd.inet6 => None,
             _ => options.get(level, option),
         }
+    } else if level == SOL_SOCKET
+        && option == SO_PEERCRED
+        && process_fd.unix_socket
+        && !unix_unbound(process_fd.handle)
+    {
+        // The other end's process (uid and gid are 0, the only user).
+        let peer = UNIX_PAIRS
+            .lock()
+            .get(process_fd.handle as usize)
+            .map_or(0, |pair| pair.owners[usize::from(!process_fd.unix_end_b)]);
+        let pid = if peer == 0 {
+            current_process_id() as u32
+        } else {
+            peer
+        };
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&pid.to_le_bytes());
+        Some((bytes, 12))
     } else if level == SOL_SOCKET && option == SO_TYPE && !process_fd.socket {
         integer(unix_type(&process_fd))
     } else if level == SOL_SOCKET {
@@ -5650,6 +5778,9 @@ fn linux_getsockopt(arguments: [u64; 6]) -> u64 {
 }
 
 /// `getsockname` (`peer == false`) and `getpeername` (`peer == true`).
+/// SO_PEERCRED: the peer's `struct ucred` (pid, uid, gid).
+const SO_PEERCRED: u64 = 17;
+
 fn linux_getsockname(descriptor: u64, address: u64, length_address: u64, peer: bool) -> u64 {
     let Some(process_fd) = lookup_process_fd(descriptor) else {
         return error(9);
@@ -5964,6 +6095,7 @@ struct MessageHeader {
     name_length: u32,
     vectors: u64,
     vector_count: u64,
+    control: u64,
     control_length: u64,
 }
 
@@ -5978,6 +6110,7 @@ fn read_message_header(address: u64) -> Option<MessageHeader> {
         name_length: u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
         vectors: read_array_u64(&raw, 16),
         vector_count: read_array_u64(&raw, 24),
+        control: read_array_u64(&raw, 32),
         control_length: read_array_u64(&raw, 40),
     })
 }
@@ -5995,14 +6128,32 @@ fn linux_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
     let Some(header) = read_message_header(message) else {
         return error(14);
     };
-    if header.control_length != 0 {
-        return error(95);
-    }
     let Some(process_fd) = lookup_process_fd(descriptor) else {
         return error(9);
     };
+    // Descriptors (SCM_RIGHTS) travel with the data, once it has gone out.
+    if header.control_length != 0 {
+        let bundle = match fdpass::collect(&process_fd, header.control, header.control_length) {
+            Ok(bundle) => bundle,
+            Err(failure) => return error(failure),
+        };
+        let sent = send_message(descriptor, &process_fd, &header, flags);
+        if sent as i64 >= 0 {
+            fdpass::queue(bundle);
+        }
+        return sent;
+    }
+    send_message(descriptor, &process_fd, &header, flags)
+}
+
+fn send_message(
+    descriptor: u64,
+    process_fd: &ProcessFd,
+    header: &MessageHeader,
+    flags: u64,
+) -> u64 {
     if process_fd.socket && !process_fd.unix_socket {
-        let Some((base, length)) = first_vector(&header) else {
+        let Some((base, length)) = first_vector(header) else {
             return error(22);
         };
         return linux_sendto([
@@ -6014,11 +6165,11 @@ fn linux_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
             header.name_length as u64,
         ]);
     }
-    if !is_socket_fd(&process_fd) || flags & !0x4040 != 0 {
-        return error(if is_socket_fd(&process_fd) { 95 } else { 88 });
+    if !is_socket_fd(process_fd) || flags & !0x4040 != 0 {
+        return error(if is_socket_fd(process_fd) { 95 } else { 88 });
     }
     if process_fd.unix_socket && (header.name != 0 || unix_keeps_messages(process_fd.handle)) {
-        let Some((base, length)) = first_vector(&header) else {
+        let Some((base, length)) = first_vector(header) else {
             return error(22);
         };
         return linux_sendto([
@@ -6083,7 +6234,7 @@ fn linux_recvmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
             }
             return received;
         }
-        if flags & !0x40 != 0 {
+        if flags & !(0x40 | MSG_CMSG_CLOEXEC) != 0 {
             return error(95);
         }
         let mut first = true;
@@ -6104,14 +6255,49 @@ fn linux_recvmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
     if received as i64 >= 0 {
         let name_failed = (header.name == 0 || process_fd.tcp || process_fd.unix_socket)
             && !user::copy_to_user(message + 8, &0u32.to_le_bytes());
+        // Descriptors sent with what was read (SCM_RIGHTS).
+        let (control_length, message_flags) = fdpass::deliver(
+            &process_fd,
+            header.control,
+            header.control_length,
+            flags & MSG_CMSG_CLOEXEC != 0,
+        );
         if name_failed
-            || !user::copy_to_user(message + 40, &0u64.to_le_bytes())
-            || !user::copy_to_user(message + 48, &0u32.to_le_bytes())
+            || !user::copy_to_user(message + 40, &control_length.to_le_bytes())
+            || !user::copy_to_user(message + 48, &message_flags.to_le_bytes())
         {
             return error(14);
         }
     }
     received
+}
+
+/// `recvmsg`'s MSG_CMSG_CLOEXEC: received descriptors close on `execve`.
+const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
+
+/// Installs a copy of `process_fd` (another process's, sent over a socket)
+/// in the lowest free slot under the descriptor limit.
+fn install_copy(process_fd: ProcessFd, close_on_exec: bool) -> Option<u64> {
+    let limit = nofile_limit();
+    let mut descriptors = PROCESS_FDS.lock();
+    let index = descriptors.iter().position(|descriptor| !descriptor.open)?;
+    if index as u64 >= limit {
+        return None;
+    }
+    descriptors[index] = ProcessFd {
+        close_on_exec,
+        ..process_fd
+    };
+    Some(index as u64)
+}
+
+/// Whether anything still holds what `process_fd` refers to: a descriptor of
+/// this process or another, or a copy in flight on a socket.
+fn referenced(process_fd: ProcessFd) -> bool {
+    let same = |candidate: &ProcessFd| same_open_description(*candidate, process_fd);
+    PROCESS_FDS.lock().iter().any(same)
+        || crate::scheduler::any_other_task_shares_fd(same)
+        || fdpass::holds(same)
 }
 
 /// The peer address of a `connect` or `sendto`: a `sockaddr_in` for an
@@ -7135,8 +7321,11 @@ fn epoll_scan(epoll_handle: u32, output: &mut [(u32, u64)]) -> Option<usize> {
         instance.watches
     };
     let mut count = 0usize;
-    for watch in watches.iter() {
-        if watch.fd < 0 || count >= output.len() {
+    let mut fired = [false; EPOLL_MAX_WATCHES];
+    for (index, watch) in watches.iter().enumerate() {
+        // A one-shot watch that has reported waits for EPOLL_CTL_MOD.
+        let disarmed = watch.events & EPOLLONESHOT != 0 && watch.events & !EPOLL_FLAGS == 0;
+        if watch.fd < 0 || count >= output.len() || disarmed {
             continue;
         }
         let ready = fd_ready_events(watch.fd as u64) & (watch.events | EPOLLERR | EPOLLHUP);
@@ -7145,9 +7334,26 @@ fn epoll_scan(epoll_handle: u32, output: &mut [(u32, u64)]) -> Option<usize> {
         }
         output[count] = (ready, watch.data);
         count += 1;
+        fired[index] = watch.events & EPOLLONESHOT != 0;
+    }
+    if fired.iter().any(|&shot| shot) {
+        let mut instances = EPOLL_INSTANCES.lock();
+        if let Some(instance) = instances.get_mut(epoll_handle as usize) {
+            for (watch, &shot) in instance.watches.iter_mut().zip(&fired) {
+                if shot {
+                    watch.events &= EPOLL_FLAGS;
+                }
+            }
+        }
     }
     Some(count)
 }
+
+/// `EPOLLONESHOT` (reports once, then nothing until re-armed) and the other
+/// flag bits of a watch's events; edge-triggered `EPOLLET` watches are kept
+/// level-triggered, which only ever wakes a reader more often.
+const EPOLLONESHOT: u32 = 1 << 30;
+const EPOLL_FLAGS: u32 = EPOLLONESHOT | 1 << 31 | 1 << 29 | 1 << 28;
 
 /// `epoll_wait` with nothing ready yet cooperatively retries against a real
 /// wall-clock deadline (same idea as `linux_poll`'s `wait_until`, but
@@ -8476,9 +8682,16 @@ fn linux_madvise(address: u64, length: u64, advice: u64) -> u64 {
     let Ok(length) = usize::try_from(length) else {
         return error(22);
     };
-    if address & 0xfff != 0 || length == 0 || advice > 4 || !user::range_in_window(address, length)
+    const MADV_DONTNEED: u64 = 4;
+    // The rest (MADV_FREE, MADV_HUGEPAGE, MADV_DONTDUMP, ...) are hints.
+    if address & 0xfff != 0 || length == 0 || advice > 25 || !user::range_in_window(address, length)
     {
         return error(22);
+    }
+    // Private anonymous memory reads as zero afterwards; outside the mapping
+    // area (the heap, the stack) the pages are kept.
+    if advice == MADV_DONTNEED {
+        let _ = crate::scheduler::linux_discard_for_current_task(address, length.div_ceil(4096));
     }
     RUNTIME_CALLS.fetch_add(1, Ordering::Relaxed);
     COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -10829,13 +11042,36 @@ fn linux_sched_getparam(address: u64) -> u64 {
 
 fn linux_prctl(option: u64, argument: u64) -> u64 {
     COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
+    const PR_SET_PDEATHSIG: u64 = 1;
+    const PR_GET_PDEATHSIG: u64 = 2;
     match option {
-        PR_SET_NAME | PR_SET_DUMPABLE | PR_SET_NO_NEW_PRIVS => 0,
+        PR_SET_PDEATHSIG if argument <= 64 => {
+            crate::scheduler::set_death_signal(argument as u8);
+            0
+        }
+        PR_GET_PDEATHSIG => {
+            let signal = u32::from(crate::scheduler::death_signal());
+            if user::copy_to_user(argument, &signal.to_le_bytes()) {
+                0
+            } else {
+                error(14)
+            }
+        }
+        PR_SET_NAME => {
+            let mut name = [0u8; 16];
+            if !user::copy_from_user(argument, &mut name) {
+                return error(14);
+            }
+            let length = name.iter().position(|&byte| byte == 0).unwrap_or(16);
+            crate::scheduler::set_current_name(&name[..length]);
+            0
+        }
+        PR_SET_DUMPABLE | PR_SET_NO_NEW_PRIVS => 0,
         PR_GET_DUMPABLE => 1,
         PR_GET_NO_NEW_PRIVS => 0,
         PR_GET_NAME => {
-            let mut name = [0u8; 16];
-            name[..5].copy_from_slice(b"aeros");
+            let (mut name, length) = crate::scheduler::task_name(None);
+            name[length.min(15)..].fill(0);
             if user::copy_to_user(argument, &name) {
                 0
             } else {
@@ -12851,6 +13087,11 @@ pub(crate) fn proc_working_directory() -> ([u8; MAX_PATH], usize) {
     (path, length)
 }
 
+/// Reads another process's memory (for `/proc/<pid>/cmdline`).
+pub(crate) fn read_process_memory(pid: u64, address: u64, out: &mut [u8]) -> bool {
+    ptrace::read_memory(pid, address, out)
+}
+
 pub(crate) fn proc_descriptor_limit() -> u64 {
     nofile_limit()
 }
@@ -12994,9 +13235,10 @@ fn remove_process_fd(descriptor: u64) -> Option<(ProcessFd, bool)> {
     // handle here must not tear it down while any other live task (this
     // process's own ancestors/descendants sharing the same open file
     // description, via fork) still has it open.
-    let shared_elsewhere = crate::scheduler::any_other_task_shares_fd(|candidate| {
-        same_open_description(*candidate, process_fd)
-    });
+    let shared_elsewhere =
+        crate::scheduler::any_other_task_shares_fd(|candidate| {
+            same_open_description(*candidate, process_fd)
+        }) || fdpass::holds(|candidate| same_open_description(*candidate, process_fd));
     let last_reference = matches!(process_fd.standard, 0 | DEVICE_PTMX)
         && !shared_in_this_process
         && !shared_elsewhere;
@@ -13097,7 +13339,8 @@ fn release_process_fd(process_fd: ProcessFd) -> u64 {
             pair.end_a_open = false;
         }
         let inbox_closed = pair.inbox && !pair.end_b_open;
-        if inbox_closed || !pair.end_a_open && !pair.end_b_open {
+        let freed = inbox_closed || !pair.end_a_open && !pair.end_b_open;
+        if freed {
             *pair = UnixPair::EMPTY;
         }
         if inbox_closed {
@@ -13113,6 +13356,11 @@ fn release_process_fd(process_fd: ProcessFd) -> u64 {
                     *listener = UnixListener::EMPTY;
                 }
             }
+        } else {
+            drop(pairs);
+        }
+        if freed {
+            fdpass::discard(process_fd.handle);
         }
         return 0;
     }
@@ -13224,9 +13472,9 @@ fn duplicate_process_fd_exact(descriptor: u64, target: u64, close_on_exec: bool)
     // A forked relative may still have it open (as `remove_process_fd` checks).
     let replaced = replaced.map(|(previous, last)| {
         let shared = last
-            && crate::scheduler::any_other_task_shares_fd(|candidate| {
+            && (crate::scheduler::any_other_task_shares_fd(|candidate| {
                 same_open_description(*candidate, previous)
-            });
+            }) || fdpass::holds(|candidate| same_open_description(*candidate, previous)));
         (previous, last && !shared)
     });
     if let Some((previous, true)) = replaced {

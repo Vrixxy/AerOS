@@ -929,6 +929,10 @@ pub struct ProcessAddressSpace {
     /// search for free pages starts).
     mmap_high: usize,
     mmap_hint: usize,
+    /// Where the program's argument and environment strings lie
+    /// (`/proc/<pid>/cmdline`, `/proc/<pid>/environ`).
+    pub arguments: (u64, u64),
+    pub environment: (u64, u64),
 }
 
 /// What a process records about each page of its window lives in the
@@ -1549,6 +1553,8 @@ fn create_process_raw(state: &PagingState, code: &[u8]) -> Option<ProcessAddress
         heap_mapped: 0,
         mmap_high: 0,
         mmap_hint: 0,
+        arguments: (0, 0),
+        environment: (0, 0),
     })
 }
 
@@ -1784,6 +1790,8 @@ fn create_process_from_elf(
         heap_mapped: 0,
         mmap_high: 0,
         mmap_hint: 0,
+        arguments: (0, 0),
+        environment: (0, 0),
     })
 }
 
@@ -1925,6 +1933,8 @@ pub fn fork_process(parent: &ProcessAddressSpace) -> Option<ProcessAddressSpace>
         heap_mapped: parent.heap_mapped,
         mmap_high: parent.mmap_high,
         mmap_hint: parent.mmap_hint,
+        arguments: (0, 0),
+        environment: (0, 0),
     })
 }
 
@@ -2890,6 +2900,27 @@ pub fn process_munmap(space: &mut ProcessAddressSpace, address: u64, pages: usiz
     true
 }
 
+/// `madvise(MADV_DONTNEED)`: the private mapping pages in the range give
+/// their memory back and read as zero when next touched; shared ones keep
+/// theirs, as on Linux. False when the range is not in the mapping area.
+pub fn process_discard(space: &mut ProcessAddressSpace, address: u64, pages: usize) -> bool {
+    let Some(start) = mmap_index_for_address(space.user_slot, address) else {
+        return false;
+    };
+    if pages == 0 || start + pages > mmap_limit(space.user_slot) {
+        return false;
+    }
+    crate::scheduler::stop_siblings(space.root_physical);
+    for index in start..start + pages {
+        let entry = space.mmap_pte(index);
+        if entry == 0 || entry & SOFT_SHARED != 0 || entry & (PRESENT | SWAPPED) == 0 {
+            continue;
+        }
+        space.set_mmap(index, fresh_mmap_entry(soft_protection(entry)));
+        release_entry(entry_value(entry));
+    }
+    true
+}
 pub fn map_user_image(
     state: &PagingState,
     frames: &mut FrameAllocator,

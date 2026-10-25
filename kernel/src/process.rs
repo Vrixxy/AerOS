@@ -420,22 +420,41 @@ pub fn prepare_scheduled_process_stack_with(
         return false;
     };
     random.fill(0);
-    let mut arg_addresses = [0u64; EXEC_STRINGS_MAX];
-    for (slot, arg) in args.iter().enumerate() {
-        let Some(address) = push_bytes(stack_physical, stack_virtual, &mut cursor, arg, true)
-        else {
-            return false;
-        };
-        arg_addresses[slot] = address;
-    }
+    // Pushed last to first, so the strings lie in order as on Linux: the
+    // arguments (one block, for /proc/<pid>/cmdline), then the environment.
+    let environment_end = stack_virtual + cursor as u64;
+    let arguments_end = environment_end;
     let mut env_addresses = [0u64; EXEC_STRINGS_MAX];
-    for (slot, value) in env.iter().enumerate() {
+    for (slot, value) in env.iter().enumerate().rev() {
         let Some(address) = push_bytes(stack_physical, stack_virtual, &mut cursor, value, true)
         else {
             return false;
         };
         env_addresses[slot] = address;
     }
+    let arguments_end = if env.is_empty() {
+        arguments_end
+    } else {
+        env_addresses[0]
+    };
+    let mut arg_addresses = [0u64; EXEC_STRINGS_MAX];
+    for (slot, arg) in args.iter().enumerate().rev() {
+        let Some(address) = push_bytes(stack_physical, stack_virtual, &mut cursor, arg, true)
+        else {
+            return false;
+        };
+        arg_addresses[slot] = address;
+    }
+    space.arguments = if args.is_empty() {
+        (0, 0)
+    } else {
+        (arg_addresses[0], arguments_end)
+    };
+    space.environment = if env.is_empty() {
+        (0, 0)
+    } else {
+        (env_addresses[0], environment_end)
+    };
     cursor &= !15;
     let mut words = [0u64; 2 * EXEC_STRINGS_MAX + 64];
     let mut count = 0;

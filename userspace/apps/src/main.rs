@@ -551,6 +551,206 @@ b
              assert os.WEXITSTATUS(status) == 3, status\n\
              print('pty ok')",
         ),        (
+            "python-fd-passing",
+            "import os, socket\n\
+             a, b = socket.socketpair()\n\
+             r, w = os.pipe()\n\
+             socket.send_fds(a, [b'pipe'], [w])\n\
+             os.close(w)\n\
+             msg, fds, _, _ = socket.recv_fds(b, 16, 4)\n\
+             assert msg == b'pipe' and len(fds) == 1, (msg, fds)\n\
+             os.write(fds[0], b'through a passed fd')\n\
+             os.close(fds[0])\n\
+             assert os.read(r, 64) == b'through a passed fd'\n\
+             assert os.read(r, 64) == b''\n\
+             pid = os.fork()\n\
+             if pid == 0:\n\
+             \x20   _, got, _, _ = socket.recv_fds(b, 16, 1)\n\
+             \x20   os.write(got[0], b'child'); os._exit(0)\n\
+             f = os.open('/tmp/fdpass', os.O_RDWR | os.O_CREAT | os.O_TRUNC)\n\
+             socket.send_fds(a, [b'file'], [f])\n\
+             os.waitpid(pid, 0)\n\
+             os.lseek(f, 0, 0)\n\
+             assert os.read(f, 16) == b'child'\n\
+             os.unlink('/tmp/fdpass')\n\
+             print('fd passing ok')",
+        ),        (
+            "python-madvise",
+            "import mmap\n\
+             m = mmap.mmap(-1, 1 << 20, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)\n\
+             m[:5] = b'hello'; m[500000:500003] = b'abc'\n\
+             m.madvise(mmap.MADV_DONTNEED)\n\
+             assert m[:5] == bytes(5) and m[500000:500003] == bytes(3), (m[:5], m[500000:500003])\n\
+             m[:2] = b'ok'\n\
+             assert m[:2] == b'ok'\n\
+             s = mmap.mmap(-1, 4096)\n\
+             s[:3] = b'xyz'; s.madvise(mmap.MADV_DONTNEED)\n\
+             assert s[:3] == b'xyz'\n\
+             m.madvise(mmap.MADV_HUGEPAGE)\n\
+             print('madvise ok')",
+        ),        (
+            "python-epoll-oneshot",
+            "import os, select\n\
+             r, w = os.pipe()\n\
+             ep = select.epoll()\n\
+             ep.register(r, select.EPOLLIN | select.EPOLLONESHOT)\n\
+             os.write(w, b'x')\n\
+             assert ep.poll(0) == [(r, select.EPOLLIN)]\n\
+             assert ep.poll(0) == []\n\
+             ep.modify(r, select.EPOLLIN | select.EPOLLONESHOT)\n\
+             assert ep.poll(0) == [(r, select.EPOLLIN)]\n\
+             ep.register(w, select.EPOLLOUT | select.EPOLLET)\n\
+             assert (w, select.EPOLLOUT) in ep.poll(0)\n\
+             print('epoll ok')",
+        ),        (
+            "python-waitid",
+            "import os, signal, time\n\
+             pid = os.fork()\n\
+             if pid == 0:\n\
+             \x20   os._exit(5)\n\
+             info = os.waitid(os.P_PID, pid, os.WEXITED)\n\
+             assert info.si_pid == pid and info.si_code == os.CLD_EXITED and info.si_status == 5, info\n\
+             pid = os.fork()\n\
+             if pid == 0:\n\
+             \x20   time.sleep(30); os._exit(0)\n\
+             assert os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG) is None\n\
+             os.kill(pid, signal.SIGSTOP)\n\
+             info = os.waitid(os.P_PID, pid, os.WSTOPPED)\n\
+             assert info.si_code == os.CLD_STOPPED and info.si_status == signal.SIGSTOP, info\n\
+             os.kill(pid, signal.SIGKILL)\n\
+             info = os.waitid(os.P_PID, pid, os.WEXITED)\n\
+             assert info.si_code == os.CLD_KILLED and info.si_status == signal.SIGKILL, info\n\
+             print('waitid ok')",
+        ),        (
+            "python-peercred",
+            "import os, socket, struct\n\
+             a, b = socket.socketpair()\n\
+             pid, uid, gid = struct.unpack('3i', a.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))\n\
+             assert pid == os.getpid() and uid == 0, (pid, uid, gid)\n\
+             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+             server.bind('/tmp/peercred.sock'); server.listen()\n\
+             child = os.fork()\n\
+             if child == 0:\n\
+             \x20   c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+             \x20   c.connect('/tmp/peercred.sock'); c.recv(1); os._exit(0)\n\
+             conn, _ = server.accept()\n\
+             pid, _, _ = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))\n\
+             assert pid == child, (pid, child)\n\
+             conn.send(b'x'); os.waitpid(child, 0)\n\
+             print('peercred ok')",
+        ),        (
+            "python-pdeathsig",
+            "import ctypes, os, signal, time\n\
+             libc = ctypes.CDLL(None, use_errno=True)\n\
+             r, w = os.pipe()\n\
+             held_r, held_w = os.pipe()\n\
+             middle = os.fork()\n\
+             if middle == 0:\n\
+             \x20   if os.fork() == 0:\n\
+             \x20       libc.prctl(1, signal.SIGTERM)\n\
+             \x20       got = ctypes.c_int(0); libc.prctl(2, ctypes.byref(got))\n\
+             \x20       os.write(w, b'%d' % got.value); time.sleep(30); os._exit(0)\n\
+             \x20   os.read(r, 0); time.sleep(0.5); os._exit(0)\n\
+             os.close(held_w)\n\
+             start = time.monotonic()\n\
+             assert os.read(r, 8) == b'15'\n\
+             os.waitpid(middle, 0)\n\
+             assert os.read(held_r, 1) == b''\n\
+             assert time.monotonic() - start < 20, time.monotonic() - start\n\
+             print('pdeathsig ok')",
+        ),        (
+            "python-task-names",
+            "import ctypes, subprocess, time\n\
+             libc = ctypes.CDLL(None)\n\
+             assert open('/proc/self/comm').read().strip() == 'python3', open('/proc/self/comm').read()\n\
+             libc.prctl(15, b'renamed')\n\
+             assert open('/proc/self/comm').read().strip() == 'renamed'\n\
+             name = ctypes.create_string_buffer(16); libc.prctl(16, name)\n\
+             assert name.value == b'renamed', name.value\n\
+             child = subprocess.Popen(['/bin/sleep', '5'])\n\
+             time.sleep(0.5)\n\
+             assert open('/proc/%d/comm' % child.pid).read().strip() == 'sleep'\n\
+             child.kill(); child.wait()\n\
+             print('names ok')",
+        ),        (
+            "python-cmdline",
+            "import subprocess, time\n\
+             own = open('/proc/self/cmdline', 'rb').read()\n\
+             assert own.startswith(b'/usr/bin/python3\\x00-c\\x00'), own[:40]\n\
+             child = subprocess.Popen(['/bin/sleep', '5'])\n\
+             time.sleep(0.5)\n\
+             theirs = open('/proc/%d/cmdline' % child.pid, 'rb').read()\n\
+             assert theirs == b'/bin/sleep\\x005\\x00', theirs\n\
+             child.kill(); child.wait()\n\
+             print('cmdline ok')",
+        ),        (
+            "python-environ",
+            "import subprocess, time\n\
+             own = open('/proc/self/environ', 'rb').read()\n\
+             assert own and own.endswith(b'\\x00'), own[:60]\n\
+             child = subprocess.Popen(['/bin/sleep', '5'], env={'AEROS_PROBE': 'yes'})\n\
+             time.sleep(0.5)\n\
+             theirs = open('/proc/%d/environ' % child.pid, 'rb').read()\n\
+             assert theirs == b'AEROS_PROBE=yes\\x00', theirs\n\
+             child.kill(); child.wait()\n\
+             print('environ ok')",
+        ),        (
+            "python-wait4-rusage",
+            "import os, time\n\
+             pid = os.fork()\n\
+             if pid == 0:\n\
+             \x20   end = time.monotonic() + 0.5\n\
+             \x20   while time.monotonic() < end:\n\
+             \x20       pass\n\
+             \x20   os._exit(0)\n\
+             _, status, usage = os.wait4(pid, 0)\n\
+             assert status == 0 and usage.ru_utime + usage.ru_stime > 0.1, usage\n\
+             print('wait4 rusage ok')",
+        ),        (
+            "python-thread-count",
+            "import threading, time\n\
+             def threads():\n\
+             \x20   for line in open('/proc/self/status'):\n\
+             \x20       if line.startswith('Threads:'):\n\
+             \x20           return int(line.split()[1])\n\
+             assert threads() == 1, threads()\n\
+             release = threading.Event()\n\
+             workers = [threading.Thread(target=release.wait) for _ in range(3)]\n\
+             for worker in workers: worker.start()\n\
+             assert threads() == 4, threads()\n\
+             release.set()\n\
+             for worker in workers: worker.join()\n\
+             end = time.monotonic() + 2\n\
+             while threads() > 1 and time.monotonic() < end: time.sleep(0.05)\n\
+             assert threads() == 1, threads()\n\
+             print('thread count ok')",
+        ),        (
+            "python-proc-task",
+            "import os, threading, time\n\
+             main = threading.get_native_id()\n\
+             assert os.listdir('/proc/self/task') == [str(main)], os.listdir('/proc/self/task')\n\
+             ids = []\n\
+             release = threading.Event()\n\
+             def work():\n\
+             \x20   ids.append(threading.get_native_id())\n\
+             \x20   release.wait()\n\
+             workers = [threading.Thread(target=work) for _ in range(2)]\n\
+             for worker in workers: worker.start()\n\
+             while len(ids) < 2: time.sleep(0.01)\n\
+             listed = sorted(int(name) for name in os.listdir('/proc/%d/task' % os.getpid()))\n\
+             assert listed == sorted([main] + ids), (listed, main, ids)\n\
+             stat = open('/proc/self/task/%d/stat' % ids[0]).read()\n\
+             assert stat.startswith('%d (python3) S ' % ids[0]) or stat.startswith('%d (python3) R ' % ids[0]), stat[:40]\n\
+             status = open('/proc/self/task/%d/status' % ids[1]).read()\n\
+             assert 'Tgid:\\t%d\\n' % os.getpid() in status and 'Pid:\\t%d\\n' % ids[1] in status, status\n\
+             assert open('/proc/self/task/%d/comm' % main).read() == 'python3\\n'\n\
+             release.set()\n\
+             for worker in workers: worker.join()\n\
+             end = time.monotonic() + 2\n\
+             while len(os.listdir('/proc/self/task')) > 1 and time.monotonic() < end: time.sleep(0.05)\n\
+             assert os.listdir('/proc/self/task') == [str(main)], os.listdir('/proc/self/task')\n\
+             print('proc task ok')",
+        ),        (
             "python-rlimits",
             "import os, resource\n\
              resource.setrlimit(resource.RLIMIT_CORE, (0, resource.RLIM_INFINITY))\n\

@@ -53,6 +53,7 @@ mod heap;
 mod image;
 mod inflate;
 mod initramfs;
+mod initramfs_fonts;
 mod initramfs_gnu;
 mod initramfs_perl;
 mod initramfs_python;
@@ -368,7 +369,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         *phase = 2;
     }
     serial::format(format_args!(
-        "AEROS_FONTS plus_jakarta={} roboto_mono={}\n",
+        "AEROS_FONTS ch_dom_round={} roboto_mono={}\n",
         fonts.ui_ready(),
         fonts.mono_ready()
     ));
@@ -838,6 +839,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
             &initramfs_perl::PERL_FILES,
             &initramfs_python::PYTHON_FILES,
             &initramfs_terminfo::TERMINFO_FILES,
+            &initramfs_fonts::FONT_FILES,
         ],
     );
     let home = datafs::initialize();
@@ -1139,13 +1141,14 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     let runtime_vfs = vfs::stats();
     let tmpfs_valid = runtime_vfs.verified
         && runtime_vfs.nodes == runtime_vfs.directories + runtime_vfs.files
-        && runtime_vfs.directories == 98
+        && runtime_vfs.directories == 98 + 3 * usize::from(!initramfs_fonts::FONT_FILES.is_empty())
         && runtime_vfs.files
             == initramfs::entries().len()
                 + initramfs_gnu::GNU.len()
                 + initramfs_perl::PERL_FILES.len()
                 + initramfs_python::PYTHON_FILES.len()
                 + initramfs_terminfo::TERMINFO_FILES.len()
+                + initramfs_fonts::FONT_FILES.len()
                 + 1
         && runtime_vfs.mutable_files == 1
         && runtime_vfs.mutable_bytes == 6
@@ -4131,6 +4134,8 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     #[cfg(feature = "boot-test")]
     font::truetype_self_test();
     #[cfg(feature = "boot-test")]
+    system_fonts_self_test();
+    #[cfg(feature = "boot-test")]
     screenshot::self_test(&framebuffer);
     #[cfg(feature = "boot-test")]
     logo::self_test();
@@ -4280,4 +4285,41 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     }
 
     desktop::run(&mut framebuffer, &fonts, shell_info)
+}
+
+/// The fonts in the system image (all of initramfs_fonts, none in a copy
+/// without them)
+/// parse with the kernel's TrueType decoder, map Latin and Western European
+/// characters, and rasterize.
+#[cfg(feature = "boot-test")]
+fn system_fonts_self_test() {
+    let mut bitmap = truetype::GlyphBitmap::empty();
+    let (mut fonts, mut readable) = (0, 0);
+    for entry in initramfs_fonts::FONT_FILES.iter() {
+        if !entry.path.ends_with(".ttf") {
+            continue;
+        }
+        fonts += 1;
+        let Some(font) = truetype::TrueType::parse(entry.data) else {
+            continue;
+        };
+        let mapped = ['A', 'g', 'ß', '€']
+            .iter()
+            .all(|&character| font.glyph_index(character as u32).is_some());
+        let drawn = font.glyph_index('A' as u32).is_some_and(|glyph| {
+            font.rasterize(glyph, 24, &mut bitmap) && bitmap.width > 0 && bitmap.height > 0
+        });
+        if mapped && drawn {
+            readable += 1;
+        }
+    }
+    let verified =
+        fonts == initramfs_fonts::FONT_FILES.len().saturating_sub(1) && readable == fonts;
+    serial::format(format_args!(
+        "AEROS_SYSTEM_FONTS fonts={fonts} readable={readable} verified={verified}\n"
+    ));
+    if !verified {
+        serial::line("AEROS_SYSTEM_FONTS_FAILURE");
+        arch::halt_forever();
+    }
 }

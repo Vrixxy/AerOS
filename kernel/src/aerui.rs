@@ -950,6 +950,11 @@ impl<'a> Painter<'a> {
         font.draw(self.frame, origin.x, origin.y, value, height, color);
     }
 
+    /// What is already drawn at `point`.
+    pub fn color_at(&self, point: Point) -> Option<Color> {
+        self.frame.color_at(point.x, point.y)
+    }
+
     pub fn frosted_rounded_rect(
         &mut self,
         bounds: Rect,

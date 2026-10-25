@@ -24,7 +24,7 @@ Process return and fault paths remove the owned PML4 branch before reuse, flush 
 
 Kernel diagnostics use COM1 independently of the framebuffer. Every automated boot emits structured stage records and reaches `AEROS_READY` only after the allocator invariant test and framebuffer render have completed.
 
-Plus Jakarta Sans is the interface face. Roboto Mono is the diagnostic and developer face. Runtime rendering consumes deterministic pre-rasterized atlases derived from the bundled original font files.
+CH Dom Round (Regular) is the interface face. Roboto Mono is the diagnostic and developer face. Runtime rendering consumes deterministic pre-rasterized atlases derived from the bundled original font files.
 
 The compatibility design keeps directly supported Linux ELF and syscall execution above AerOS primitives and routes applications that need the broader Linux environment into an isolated Debian 13 guest.
 

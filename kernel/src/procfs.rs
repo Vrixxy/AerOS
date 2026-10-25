@@ -48,6 +48,46 @@ impl Text {
     fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.length]
     }
+
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        let count = bytes.len().min(TEXT_BYTES - self.length);
+        self.bytes[self.length..self.length + count].copy_from_slice(&bytes[..count]);
+        self.length += count;
+    }
+}
+
+/// `cmdline`: the argument strings, each ending in a NUL, read from the
+/// process's memory (`pid`; the caller for `None`), as Linux does.
+fn write_cmdline(out: &mut Text, pid: Option<u64>) {
+    write_strings(out, pid, |space| space.arguments);
+}
+
+/// `environ`: the environment strings, the same way.
+fn write_environ(out: &mut Text, pid: Option<u64>) {
+    write_strings(out, pid, |space| space.environment);
+}
+
+fn write_strings(
+    out: &mut Text,
+    pid: Option<u64>,
+    which: impl Fn(&crate::arch::paging::ProcessAddressSpace) -> (u64, u64),
+) {
+    let range = match pid {
+        None => crate::scheduler::current_process_space().map(|space| which(&space)),
+        Some(pid) => crate::scheduler::with_task_space(pid, |space| which(space)),
+    };
+    let Some((start, end)) = range.filter(|&(start, end)| end > start) else {
+        return;
+    };
+    let mut bytes = [0u8; 1024];
+    let length = ((end - start) as usize).min(bytes.len());
+    let read = match pid {
+        None => crate::arch::user::copy_from_user(start, &mut bytes[..length]),
+        Some(pid) => crate::syscall::read_process_memory(pid, start, &mut bytes[..length]),
+    };
+    if read {
+        out.push_bytes(&bytes[..length]);
+    }
 }
 
 impl Write for Text {
@@ -243,6 +283,7 @@ fn refresh(relative: &str) {
             }
             refresh_descriptors();
             refresh_working_directory();
+            refresh_threads("self");
         }
         "/self/fd" => refresh_descriptors(),
         "/self/cwd" => refresh_working_directory(),
@@ -262,13 +303,88 @@ fn refresh(relative: &str) {
             }
             match name.split_once('/') {
                 None if name.parse::<u64>().is_ok() => refresh_process(name),
+                Some((owner, "task")) => refresh_threads(owner),
+                Some((owner, rest)) if rest.starts_with("task/") && !rest[5..].contains('/') => {
+                    refresh_thread(owner, &rest[5..]);
+                }
                 _ => refresh_one(name),
             }
         }
     }
 }
 
-const PROCESS_FILES: [&str; 6] = ["stat", "status", "comm", "cmdline", "maps", "statm"];
+const PROCESS_FILES: [&str; 7] = [
+    "stat", "status", "comm", "cmdline", "environ", "maps", "statm",
+];
+const THREAD_FILES: [&str; 3] = ["stat", "status", "comm"];
+
+/// `<owner>/task`: a directory per live thread of the process (`self` or a
+/// pid); those of threads that have ended are removed.
+fn refresh_threads(owner: &str) {
+    let pid = match owner {
+        "self" => None,
+        other => match other.parse::<u64>() {
+            Ok(pid) if task_summary(pid).is_some() => Some(pid),
+            _ => return,
+        },
+    };
+    let mut live = [0u64; 64];
+    let mut count = 0;
+    crate::scheduler::threads_of(pid, |tid, _, _| {
+        if count < live.len() {
+            live[count] = tid;
+            count += 1;
+        }
+    });
+    let mut directory = Text::new();
+    let _ = write!(directory, "{BACKING}/{owner}");
+    ensure_directory(directory.as_ref());
+    let _ = write!(directory, "/task");
+    ensure_directory(directory.as_ref());
+    for tid in &live[..count] {
+        let mut path = Text::new();
+        let _ = write!(path, "{BACKING}/{owner}/task/{tid}");
+        ensure_directory(path.as_ref());
+    }
+    let Ok(handle) = vfs::open_directory(directory.as_ref()) else {
+        return;
+    };
+    let mut stale = [0u64; 16];
+    let mut stale_count = 0;
+    while let Ok(Some(entry)) = vfs::next_directory_entry(handle) {
+        if let Ok(name) = core::str::from_utf8(&entry.name[..entry.name_len as usize])
+            && let Ok(tid) = name.parse::<u64>()
+            && !live[..count].contains(&tid)
+            && stale_count < stale.len()
+        {
+            stale[stale_count] = tid;
+            stale_count += 1;
+        }
+    }
+    let _ = vfs::close(handle);
+    for tid in &stale[..stale_count] {
+        remove_thread(owner, *tid);
+    }
+}
+
+fn refresh_thread(owner: &str, tid: &str) {
+    for file in THREAD_FILES {
+        let mut name = Text::new();
+        let _ = write!(name, "{owner}/task/{tid}/{file}");
+        refresh_one(name);
+    }
+}
+
+fn remove_thread(owner: &str, tid: u64) {
+    for file in THREAD_FILES {
+        let mut path = Text::new();
+        let _ = write!(path, "{BACKING}/{owner}/task/{tid}/{file}");
+        let _ = vfs::remove(path.as_ref(), false);
+    }
+    let mut path = Text::new();
+    let _ = write!(path, "{BACKING}/{owner}/task/{tid}");
+    let _ = vfs::remove(path.as_ref(), true);
+}
 
 /// `/proc/self/cwd`: a link to the working directory.
 fn refresh_working_directory() {
@@ -337,6 +453,7 @@ fn refresh_process(pid: &str) {
         let _ = write!(name, "{pid}/{file}");
         refresh_one(name);
     }
+    refresh_threads(pid);
 }
 
 /// Directories for the live processes under the backing store; those of
@@ -376,6 +493,28 @@ fn refresh_processes() {
     }
     let _ = vfs::close(directory);
     for pid in &stale[..stale_count] {
+        let mut owner = Text::new();
+        let _ = write!(owner, "{pid}");
+        let mut task = Text::new();
+        let _ = write!(task, "{BACKING}/{pid}/task");
+        if let Ok(handle) = vfs::open_directory(task.as_ref()) {
+            let mut threads = [0u64; 64];
+            let mut thread_count = 0;
+            while let Ok(Some(entry)) = vfs::next_directory_entry(handle) {
+                if let Ok(name) = core::str::from_utf8(&entry.name[..entry.name_len as usize])
+                    && let Ok(tid) = name.parse::<u64>()
+                    && thread_count < threads.len()
+                {
+                    threads[thread_count] = tid;
+                    thread_count += 1;
+                }
+            }
+            let _ = vfs::close(handle);
+            for tid in &threads[..thread_count] {
+                remove_thread(owner.as_ref(), *tid);
+            }
+            let _ = vfs::remove(task.as_ref(), true);
+        }
         for file in PROCESS_FILES {
             let mut path = Text::new();
             let _ = write!(path, "{BACKING}/{pid}/{file}");
@@ -651,9 +790,10 @@ fn render(name: &str, out: &mut Text) -> bool {
             let _ = writeln!(out, "0");
         }
         "self/comm" => {
-            let _ = writeln!(out, "aeros");
+            let _ = writeln!(out, "{}", own().name());
         }
-        "self/cmdline" | "self/environ" => {}
+        "self/cmdline" => write_cmdline(out, None),
+        "self/environ" => write_environ(out, None),
         "self/maps" => {
             if let Some(space) = crate::scheduler::current_process_space() {
                 space.regions(&mut |start, end, permissions, name| {
@@ -723,38 +863,37 @@ fn render_other(name: &str, out: &mut Text) -> bool {
     let Some((pid, file)) = name.split_once('/') else {
         return false;
     };
+    if let Some(rest) = file.strip_prefix("task/") {
+        return render_thread(pid, rest, out);
+    }
     let Some(task) = pid.parse::<u64>().ok().and_then(task_summary) else {
         return false;
     };
-    let details = Own {
-        pid: task.id,
-        parent: task.parent_id,
-        group: task.pgid,
-        session: task.sid,
-        resident_kib: task.resident_pages * 4,
-        nice: task.nice,
-    };
+    let details = other_details(&task);
     match file {
         "stat" => write_stat(out, &details, task.cpu_ms * 1_000_000, 0),
         "status" => {
             let _ = write!(
                 out,
-                "Name:\taeros\nState:\t{state}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{parent}\n\
-                 Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\nVmRSS:\t{rss:>8} kB\n",
+                "Name:\t{name}\nState:\t{state}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{parent}\n\
+                 Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t{threads}\nVmRSS:\t{rss:>8} kB\n",
+                threads = crate::scheduler::thread_count(Some(details.pid)),
                 state = if task.running {
                     "R (running)"
                 } else {
                     "S (sleeping)"
                 },
+                name = details.name(),
                 pid = details.pid,
                 parent = details.parent,
                 rss = details.resident_kib,
             );
         }
         "comm" => {
-            let _ = writeln!(out, "aeros");
+            let _ = writeln!(out, "{}", details.name());
         }
-        "cmdline" => {}
+        "cmdline" => write_cmdline(out, Some(task.id)),
+        "environ" => write_environ(out, Some(task.id)),
         "maps" => {
             crate::scheduler::with_task_space(task.id, |space| {
                 space.regions(&mut |start, end, permissions, name| {
@@ -780,6 +919,75 @@ fn render_other(name: &str, out: &mut Text) -> bool {
     true
 }
 
+fn other_details(task: &crate::scheduler::TaskSummary) -> Own {
+    Own {
+        pid: task.id,
+        parent: task.parent_id,
+        group: task.pgid,
+        session: task.sid,
+        resident_kib: task.resident_pages * 4,
+        nice: task.nice,
+        name: crate::scheduler::task_name(Some(task.id)),
+    }
+}
+
+/// `<owner>/task/<tid>/stat`, `status` and `comm`: one thread of a process.
+fn render_thread(owner: &str, rest: &str, out: &mut Text) -> bool {
+    let Some((tid, file)) = rest.split_once('/') else {
+        return false;
+    };
+    let Ok(tid) = tid.parse::<u64>() else {
+        return false;
+    };
+    let (process, pid) = if owner == "self" {
+        (own(), None)
+    } else {
+        let Some(task) = owner.parse::<u64>().ok().and_then(task_summary) else {
+            return false;
+        };
+        (other_details(&task), Some(task.id))
+    };
+    let mut cpu = None;
+    crate::scheduler::threads_of(pid, |id, user_ns, system_ns| {
+        if id == tid {
+            cpu = Some((user_ns, system_ns));
+        }
+    });
+    let Some((user_ns, system_ns)) = cpu else {
+        return false;
+    };
+    let group = process.pid;
+    let thread = Own {
+        pid: tid,
+        name: crate::scheduler::task_name(Some(tid)),
+        ..process
+    };
+    match file {
+        "stat" => write_stat(out, &thread, user_ns, system_ns),
+        "status" => {
+            let _ = write!(
+                out,
+                "Name:\t{name}\nState:\t{state}\nTgid:\t{group}\nPid:\t{tid}\nPPid:\t{parent}\n\
+                 Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t{threads}\nVmRSS:\t{rss:>8} kB\n",
+                name = thread.name(),
+                state = if tid == crate::scheduler::current_tid() {
+                    "R (running)"
+                } else {
+                    "S (sleeping)"
+                },
+                parent = thread.parent,
+                threads = crate::scheduler::thread_count(Some(group)),
+                rss = thread.resident_kib,
+            );
+        }
+        "comm" => {
+            let _ = writeln!(out, "{}", thread.name());
+        }
+        _ => return false,
+    }
+    true
+}
+
 struct Own {
     pid: u64,
     parent: u64,
@@ -787,6 +995,14 @@ struct Own {
     session: u64,
     resident_kib: u64,
     nice: i8,
+    /// The `comm` name and its length.
+    name: ([u8; 16], usize),
+}
+
+impl Own {
+    fn name(&self) -> &str {
+        core::str::from_utf8(&self.name.0[..self.name.1]).unwrap_or("aeros")
+    }
 }
 
 fn own() -> Own {
@@ -798,6 +1014,7 @@ fn own() -> Own {
         session: pid,
         resident_kib: 0,
         nice: 0,
+        name: crate::scheduler::task_name(None),
     };
     crate::scheduler::list_tasks(|task| {
         if task.id == pid {
@@ -816,9 +1033,11 @@ fn render_status(out: &mut Text) {
     let seccomp = crate::syscall::proc_seccomp_mode();
     let _ = write!(
         out,
-        "Name:\taeros\nState:\tR (running)\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{parent}\n\
-         Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\nVmRSS:\t{rss:>8} kB\n\
+        "Name:\t{name}\nState:\tR (running)\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{parent}\n\
+         Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t{threads}\nVmRSS:\t{rss:>8} kB\n\
          CapPrm:\t{permitted:016x}\nCapEff:\t{effective:016x}\nSeccomp:\t{seccomp}\n",
+        name = own.name(),
+        threads = crate::scheduler::thread_count(None),
         pid = own.pid,
         parent = own.parent,
         rss = own.resident_kib,
@@ -836,7 +1055,8 @@ fn render_stat(out: &mut Text) {
 fn write_stat(out: &mut Text, own: &Own, user_ns: u64, system_ns: u64) {
     let _ = write!(
         out,
-        "{pid} (aeros) R {parent} {group} {session} 0 -1 0 0 0 0 0 {user} {system} 0 0 {priority} {nice} 1 0 0 {vsize} {rss}",
+        "{pid} ({name}) R {parent} {group} {session} 0 -1 0 0 0 0 0 {user} {system} 0 0 {priority} {nice} 1 0 0 {vsize} {rss}",
+        name = own.name(),
         user = user_ns / 10_000_000,
         system = system_ns / 10_000_000,
         pid = own.pid,

@@ -4,10 +4,9 @@ use crate::truetype::{GlyphBitmap, MAX_EDGE, TrueType};
 
 const HEADER_SIZE: usize = 32;
 const MAGIC: &[u8; 8] = b"AERFNT01";
-const PLUS_JAKARTA_TTF: &[u8] = include_bytes!("../../assets/fonts/PlusJakartaSans-Regular.ttf");
+const UI_TTF: &[u8] = include_bytes!("../../assets/fonts/CHDomRound-Regular.ttf");
 const ROBOTO_MONO_TTF: &[u8] = include_bytes!("../../assets/fonts/RobotoMono-Variable.ttf");
-const PLUS_JAKARTA_ATLAS: &[u8] =
-    include_bytes!("../../assets/fonts/PlusJakartaSans-Regular.aerfont");
+const UI_ATLAS: &[u8] = include_bytes!("../../assets/fonts/CHDomRound-Regular.aerfont");
 const ROBOTO_MONO_ATLAS: &[u8] = include_bytes!("../../assets/fonts/RobotoMono-Regular.aerfont");
 
 #[derive(Clone, Copy)]
@@ -328,11 +327,10 @@ pub struct FontCatalog {
 impl FontCatalog {
     pub fn load() -> Self {
         Self {
-            ui: RasterFont::parse(PLUS_JAKARTA_ATLAS)
-                .map(|font| font.with_truetype(PLUS_JAKARTA_TTF, 67)),
+            ui: RasterFont::parse(UI_ATLAS).map(|font| font.with_truetype(UI_TTF, 61)),
             mono: RasterFont::parse(ROBOTO_MONO_ATLAS)
                 .map(|font| font.with_truetype(ROBOTO_MONO_TTF, 68)),
-            ui_ttf_valid: valid_sfnt(PLUS_JAKARTA_TTF),
+            ui_ttf_valid: valid_sfnt(UI_TTF),
             mono_ttf_valid: valid_sfnt(ROBOTO_MONO_TTF),
         }
     }
@@ -402,7 +400,7 @@ pub fn truetype_self_test() {
     use crate::serial;
     use crate::truetype::{GlyphBitmap, TrueType};
     let fonts: [(&str, &'static [u8], &'static [u8]); 2] = [
-        ("ui", PLUS_JAKARTA_TTF, PLUS_JAKARTA_ATLAS),
+        ("ui", UI_TTF, UI_ATLAS),
         ("mono", ROBOTO_MONO_TTF, ROBOTO_MONO_ATLAS),
     ];
     let mut bitmap = GlyphBitmap::empty();
@@ -465,8 +463,14 @@ pub fn truetype_self_test() {
             worst = worst.min(best);
             shift_report = best_shift;
         }
-        // Non-ASCII coverage: Latin-1 and Latin Extended-A; Roboto Mono also has Greek and Cyrillic.
+        // Non-ASCII coverage: Latin-1 (CH Dom Round), plus Latin Extended-A,
+        // Greek and Cyrillic for Roboto Mono.
         let latin = ['\u{e9}', '\u{fc}', '\u{f1}', '\u{df}', '\u{15f}'];
+        let latin = if name == "mono" {
+            &latin[..]
+        } else {
+            &latin[..4]
+        };
         let non_ascii = latin.iter().all(|c| {
             ttf.glyph_index(*c as u32).is_some_and(|g| {
                 ttf.rasterize(g, 32, &mut bitmap) && bitmap.width > 0 && bitmap.height > 0
