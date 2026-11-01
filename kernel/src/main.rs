@@ -197,9 +197,9 @@ impl core::fmt::Write for PanicText {
     }
 }
 
-/// Paints the panic message on the framebuffer: the location and text in
-/// wrapped lines under a title. Runs inside the panic handler, so it takes
-/// no lock it cannot give up and needs no allocation.
+/// Paints the panic screen: the feather, what happened in plain words, the
+/// error, and what to do next, all centered on black. Runs inside the panic
+/// handler, so it takes no lock it cannot give up and needs no allocation.
 fn show_panic_screen(info: &PanicInfo<'_>) {
     use core::fmt::Write;
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -212,53 +212,110 @@ fn show_panic_screen(info: &PanicInfo<'_>) {
         return;
     };
     let mut frame = unsafe { FrameBuffer::new(screen) };
-    frame.clear(framebuffer::Color::rgb(120, 22, 30));
+    frame.clear(framebuffer::Color::rgb(0, 0, 0));
+    let (width, height) = (frame.width() as i32, frame.height() as i32);
+    let logo_w = width * 17 / 100;
+    let logo_h = logo::height_for(logo_w);
+    aerui::Painter::new(&mut frame).draw_rgba_scaled(
+        aerui::Rect::new(
+            (width - logo_w) / 2,
+            height * 21 / 100 - logo_h / 2,
+            logo_w,
+            logo_h,
+        ),
+        logo::rgba(),
+        logo::WIDTH,
+        logo::HEIGHT,
+    );
     let fonts = font::FontCatalog::load();
-    if let Some(font) = fonts.mono() {
-        let mut text = PanicText {
-            bytes: [0; 1024],
-            len: 0,
-        };
-        let _ = write!(text, "{info}");
-        let message = match core::str::from_utf8(&text.bytes[..text.len]) {
-            Ok(message) => message,
-            Err(error) => core::str::from_utf8(&text.bytes[..error.valid_up_to()]).unwrap_or(""),
-        };
-        let margin = (frame.width() as i32 / 16).clamp(16, 96);
-        let size = if frame.width() >= 1600 { 22 } else { 16 };
-        let character = font.text_width("M", size).max(1);
-        let columns = ((frame.width() as i32 - margin * 2) / character).max(16) as usize;
-        let white = framebuffer::Color::rgb(255, 245, 245);
-        font.draw(&mut frame, margin, margin, "AerOS stopped", size * 2, white);
-        let mut y = margin + size * 4;
-        let line_height = size + size / 3;
-        let mut rest = message;
-        while !rest.is_empty() && y < frame.height() as i32 - margin * 2 {
-            let mut take = rest.len().min(columns);
-            while !rest.is_char_boundary(take) {
-                take -= 1;
+    let Some(font) = fonts.ui().or(fonts.mono()) else {
+        virtio_gpu::publish_panic(&frame);
+        return;
+    };
+    let mut error = PanicText {
+        bytes: [0; 1024],
+        len: 0,
+    };
+    let _ = write!(error, "Error: {}", info.message());
+    let error = match core::str::from_utf8(&error.bytes[..error.len]) {
+        Ok(text) => text,
+        Err(fault) => core::str::from_utf8(&error.bytes[..fault.valid_up_to()]).unwrap_or(""),
+    };
+    let mut place = PanicText {
+        bytes: [0; 1024],
+        len: 0,
+    };
+    if let Some(location) = info.location() {
+        let _ = write!(place, "{}:{}", location.file(), location.line());
+    }
+    let place = core::str::from_utf8(&place.bytes[..place.len]).unwrap_or("");
+    let title = (width / 40).clamp(16, 44);
+    let body = (width / 54).clamp(13, 32);
+    let white = framebuffer::Color::rgb(255, 255, 255);
+    let dim = framebuffer::Color::rgb(150, 150, 150);
+    let gap = height * 8 / 100;
+    let mut y = height * 37 / 100;
+    for offset in [0, 1] {
+        let x = (width - font.text_width("AerOS ran into a problem", title)) / 2 + offset;
+        font.draw(&mut frame, x, y, "AerOS ran into a problem", title, white);
+    }
+    y += gap;
+    let paragraphs: [(&str, framebuffer::Color); 3] = [
+        (
+            "Something went wrong and AerOS had to stop. Anything you hadn't saved may be lost.",
+            white,
+        ),
+        (error, white),
+        (place, dim),
+    ];
+    let limit = width * 84 / 100;
+    for (paragraph, color) in paragraphs {
+        let mut rest = paragraph.trim();
+        let mut lines = 0;
+        while !rest.is_empty() && lines < 3 {
+            let mut take = rest.len();
+            while font.text_width(&rest[..take], body) > limit {
+                take = rest[..take]
+                    .rfind(' ')
+                    .filter(|&space| space > 0)
+                    .unwrap_or_else(|| {
+                        let mut cut = take - 1;
+                        while !rest.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
+                        cut
+                    });
             }
             if let Some(newline) = rest[..take].find('\n') {
-                take = newline;
-            } else if take < rest.len()
-                && let Some(space) = rest[..take].rfind(' ')
-                && space > 0
-            {
-                take = space;
+                take = newline.max(1);
             }
-            font.draw(&mut frame, margin, y, rest[..take].trim_end(), size, white);
-            y += line_height;
+            let line = rest[..take].trim_end();
+            font.draw(
+                &mut frame,
+                (width - font.text_width(line, body)) / 2,
+                y,
+                line,
+                body,
+                color,
+            );
+            y += body * 3 / 2;
+            lines += 1;
             rest = rest[take..].trim_start_matches([' ', '\n']);
         }
-        let footer = frame.height() as i32 - margin - size;
+        if lines > 0 {
+            y += gap - body * 3 / 2;
+        }
+    }
+    for line in ["Your saved files should be safe.", "You may reboot now"] {
         font.draw(
             &mut frame,
-            margin,
-            footer,
-            "Hold the power button to turn the machine off.",
-            size,
-            framebuffer::Color::rgb(240, 190, 190),
+            (width - font.text_width(line, body)) / 2,
+            y,
+            line,
+            body,
+            white,
         );
+        y += gap;
     }
     virtio_gpu::publish_panic(&frame);
 }

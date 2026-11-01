@@ -311,10 +311,13 @@ const MAP_STACK: u64 = 0x20000;
 const MAP_FIXED_NOREPLACE: u64 = 0x100000;
 const MAX_PATH: usize = 256;
 mod fdpass;
+mod fifo;
+mod flock;
 mod futex;
 mod inotify;
 mod posixshm;
 mod ptrace;
+mod records;
 mod sysv;
 pub(crate) mod tty;
 
@@ -580,6 +583,10 @@ struct Pipe {
     eof_pending: u8,
     /// A terminal's output pipe with OPOST|ONLCR: `\n` is written as `\r\n`.
     onlcr: bool,
+    /// The named pipe (FIFO file inode) this pipe serves, 0 for none.
+    fifo: u64,
+    /// A writer has opened the FIFO (so a reader stops waiting).
+    fifo_writer: bool,
 }
 
 impl Pipe {
@@ -603,6 +610,8 @@ impl Pipe {
         nowait: false,
         eof_pending: 0,
         onlcr: false,
+        fifo: 0,
+        fifo_writer: false,
     };
 }
 
@@ -784,6 +793,9 @@ struct EpollWatch {
     events: u32,
     /// Opaque `epoll_data_t` the caller gets back verbatim in `epoll_wait`.
     data: u64,
+    /// For `EPOLLET`: the readiness seen at the last scan, so only bits that
+    /// have risen since are reported.
+    seen: u32,
 }
 
 impl EpollWatch {
@@ -791,6 +803,7 @@ impl EpollWatch {
         fd: -1,
         events: 0,
         data: 0,
+        seen: 0,
     };
 }
 
@@ -1890,6 +1903,7 @@ pub fn restore_process_state(state: &ProcessState) {
 /// alone (`remove_process_fd` checks the other live tasks). Deliberately
 /// doesn't touch the CLOSES statistic - these aren't close() syscalls.
 pub fn close_all_process_fds() {
+    records::release_process(crate::scheduler::current_group(), None);
     for descriptor in 0..PROCESS_FD_COUNT as u64 {
         if let Some((process_fd, last_reference)) = remove_process_fd(descriptor)
             && last_reference
@@ -2462,7 +2476,7 @@ fn linux_wait4(pid: u64, status_address: u64, options: u64, usage: u64) -> u64 {
     // Reaping the child adds its CPU time to ours for children: the
     // difference is its `rusage`.
     let before = crate::scheduler::current_children_cpu_time();
-    match wait_for_child(pid, options, true) {
+    match wait_for_child(pid, options, true, false) {
         Ok(Some((child, status))) => {
             if status_address != 0 && !user::copy_to_user(status_address, &status.to_le_bytes()) {
                 return error(14);
@@ -2493,7 +2507,8 @@ fn linux_waitid(kind: u64, id: u64, info_address: u64, options: u64, usage: u64)
     const WSTOPPED: u64 = 2;
     const WEXITED: u64 = 4;
     const WCONTINUED: u64 = 8;
-    const KNOWN: u64 = WNOHANG | WSTOPPED | WEXITED | WCONTINUED | 0x6000_0000;
+    const WNOWAIT: u64 = 0x0100_0000;
+    const KNOWN: u64 = WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | 0x6000_0000;
     if options & !KNOWN != 0 || options & (WSTOPPED | WEXITED | WCONTINUED) == 0 {
         return error(22);
     }
@@ -2508,7 +2523,12 @@ fn linux_waitid(kind: u64, id: u64, info_address: u64, options: u64, usage: u64)
         },
         _ => return error(22),
     };
-    let found = match wait_for_child(selector, options & !WEXITED, options & WEXITED != 0) {
+    let found = match wait_for_child(
+        selector,
+        options & !(WEXITED | WNOWAIT),
+        options & WEXITED != 0,
+        options & WNOWAIT != 0,
+    ) {
         Ok(found) => found,
         Err(failure) => return failure,
     };
@@ -2549,7 +2569,13 @@ fn linux_waitid(kind: u64, id: u64, info_address: u64, options: u64, usage: u64)
 /// that ended (when `exited`), or stopped or continued (`WUNTRACED`,
 /// `WCONTINUED`), and its `wait4` status; `None` with `WNOHANG` when none
 /// has yet.
-fn wait_for_child(pid: u64, options: u64, exited: bool) -> Result<Option<(u64, u32)>, u64> {
+/// `keep` (`WNOWAIT`) reports an exited child without reaping it.
+fn wait_for_child(
+    pid: u64,
+    options: u64,
+    exited: bool,
+    keep: bool,
+) -> Result<Option<(u64, u32)>, u64> {
     const WNOHANG: u64 = 1;
     const WUNTRACED: u64 = 2;
     const WCONTINUED: u64 = 8;
@@ -2597,7 +2623,11 @@ fn wait_for_child(pid: u64, options: u64, exited: bool) -> Result<Option<(u64, u
                     alive |= !crate::scheduler::task_ended(child);
                     None
                 }
-                None => match crate::scheduler::poll_child(child) {
+                None => match if keep {
+                    crate::scheduler::peek_child(child)
+                } else {
+                    crate::scheduler::poll_child(child)
+                } {
                     Some(Some(code)) => Some(wait_status(code)),
                     Some(None) => {
                         alive = true;
@@ -3201,9 +3231,18 @@ fn dispatch_linux(number: u64, arguments: [u64; 6]) -> SyscallResult {
             arguments[2],
             arguments[3],
         )),
-        LINUX_UTIMENSAT | LINUX_FUTIMESAT => {
-            SyscallResult::Return(linux_utimensat(arguments[0], arguments[1]))
-        }
+        LINUX_UTIMENSAT => SyscallResult::Return(linux_utimensat(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            TimeLayout::Timespec,
+        )),
+        LINUX_FUTIMESAT => SyscallResult::Return(linux_utimensat(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            TimeLayout::Timeval,
+        )),
         LINUX_EPOLL_PWAIT2 => {
             let timeout = if arguments[3] == 0 {
                 Some(u64::MAX)
@@ -3436,9 +3475,18 @@ fn dispatch_linux(number: u64, arguments: [u64; 6]) -> SyscallResult {
         LINUX_RT_SIGSUSPEND => {
             SyscallResult::Return(linux_rt_sigsuspend(arguments[0], arguments[1]))
         }
-        LINUX_UTIME | LINUX_UTIMES => {
-            SyscallResult::Return(linux_utimensat(AT_FDCWD as u64, arguments[0]))
-        }
+        LINUX_UTIME => SyscallResult::Return(linux_utimensat(
+            AT_FDCWD as u64,
+            arguments[0],
+            arguments[1],
+            TimeLayout::Utimbuf,
+        )),
+        LINUX_UTIMES => SyscallResult::Return(linux_utimensat(
+            AT_FDCWD as u64,
+            arguments[0],
+            arguments[1],
+            TimeLayout::Timeval,
+        )),
         LINUX_MKNOD => {
             SyscallResult::Return(linux_mknodat(AT_FDCWD as u64, arguments[0], arguments[1]))
         }
@@ -5185,15 +5233,63 @@ fn linux_accept(descriptor: u64, address: u64, length: u64, flags: u64) -> u64 {
 
 /// The filesystem keeps no per-file timestamps (every `modified` is 0), so
 /// this only checks that the path exists and reports success.
-fn linux_utimensat(directory: u64, path_address: u64) -> u64 {
+/// How a time-setting call passes its times: `utimensat`'s two `timespec`s,
+/// `utimes`/`futimesat`'s two `timeval`s, or `utime`'s `utimbuf`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TimeLayout {
+    Timespec,
+    Timeval,
+    Utimbuf,
+}
+
+/// The modification time a time-setting call asks for: `Some(seconds)`, or
+/// `None` to leave it (`UTIME_OMIT`).
+fn requested_mtime(times: u64, layout: TimeLayout) -> Result<Option<u64>, u64> {
+    const UTIME_NOW: u64 = 0x3fff_ffff;
+    const UTIME_OMIT: u64 = 0x3fff_fffe;
+    let now = crate::rtc::unix_seconds();
+    if times == 0 {
+        return Ok(Some(now));
+    }
+    let mut raw = [0u8; 32];
+    let length = if layout == TimeLayout::Utimbuf {
+        16
+    } else {
+        32
+    };
+    if !user::copy_from_user(times, &mut raw[..length]) {
+        return Err(error(14));
+    }
+    let word = |at: usize| u64::from_le_bytes(raw[at..at + 8].try_into().unwrap_or([0; 8]));
+    Ok(match layout {
+        TimeLayout::Utimbuf => Some(word(8)),
+        TimeLayout::Timeval => Some(word(16)),
+        TimeLayout::Timespec => match word(24) {
+            UTIME_NOW => Some(now),
+            UTIME_OMIT => None,
+            _ => Some(word(16)),
+        },
+    })
+}
+
+fn linux_utimensat(directory: u64, path_address: u64, times: u64, layout: TimeLayout) -> u64 {
+    let mtime = match requested_mtime(times, layout) {
+        Ok(mtime) => mtime,
+        Err(failure) => return failure,
+    };
     // futimens: no path, the descriptor itself is the target.
     if path_address == 0 {
-        return if lookup_process_fd(directory).is_some_and(|process_fd| process_fd.open) {
-            COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
-            0
-        } else {
-            error(9)
+        let Some(process_fd) = lookup_process_fd(directory).filter(|process_fd| process_fd.open)
+        else {
+            return error(9);
         };
+        if let Some(seconds) = mtime
+            && records::file_of(&process_fd).is_some()
+        {
+            let _ = vfs::set_modified_handle(process_fd.handle, seconds);
+        }
+        COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
+        return 0;
     }
     let mut resolved = [0u8; MAX_PATH];
     let (length, _) = match resolve_user_path(directory, path_address, &mut resolved) {
@@ -5203,15 +5299,16 @@ fn linux_utimensat(directory: u64, path_address: u64) -> u64 {
     let Ok(path) = core::str::from_utf8(&resolved[..length]) else {
         return error(84);
     };
-    match vfs::metadata(path) {
-        Ok(_) => {
-            COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
-            0
-        }
-        Err(failure) => vfs_error(failure),
+    if let Err(failure) = vfs::metadata(path) {
+        return vfs_error(failure);
     }
+    if let Some(seconds) = mtime {
+        // The image's own files (read-only) keep their time, as before.
+        let _ = vfs::set_modified(path, seconds);
+    }
+    COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
+    0
 }
-
 /// Only `PRIO_PROCESS` is supported. The raw syscall reports `20 - nice`.
 /// Names of the commonly seen Linux syscalls, for the `strace` listing.
 pub(crate) fn linux_syscall_name(number: u64) -> &'static str {
@@ -5587,9 +5684,12 @@ fn linux_sched_setaffinity(pid: u64, size: u64, address: u64) -> u64 {
     if !user::copy_from_user(address, &mut mask) {
         return error(14);
     }
-    if u64::from_le_bytes(mask) & crate::smp::online_mask() == 0 {
+    let online = crate::smp::online_mask();
+    let mask = u64::from_le_bytes(mask) & online;
+    if mask == 0 {
         return error(22);
     }
+    crate::scheduler::set_affinity(if mask == online { 0 } else { mask });
     COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
     0
 }
@@ -6328,10 +6428,11 @@ fn read_sockaddr(address: u64, length: u64, v6: bool) -> Result<(crate::ip::Addr
         }
     } else {
         let v4 = [encoded[4], encoded[5], encoded[6], encoded[7]];
-        if v4 == [0; 4] || v4[0] >= 224 {
+        if v4[0] >= 224 {
             return Err(error(22));
         }
-        crate::ip::v4(v4)
+        // Sending to 0.0.0.0 reaches this machine, as on Linux.
+        crate::ip::v4(if v4 == [0; 4] { [127, 0, 0, 1] } else { v4 })
     };
     if port == 0 || crate::ip::is_multicast(&remote) {
         return Err(error(22));
@@ -7260,7 +7361,12 @@ fn epoll_ctl_apply(epoll_handle: u32, op: u64, fd: i32, events: u32, data: u64) 
             let Some(slot) = instance.watches.iter_mut().find(|watch| watch.fd == -1) else {
                 return error(28);
             };
-            *slot = EpollWatch { fd, events, data };
+            *slot = EpollWatch {
+                fd,
+                events,
+                data,
+                seen: 0,
+            };
             0
         }
         EPOLL_CTL_MOD => {
@@ -7269,6 +7375,7 @@ fn epoll_ctl_apply(epoll_handle: u32, op: u64, fd: i32, events: u32, data: u64) 
             };
             slot.events = events;
             slot.data = data;
+            slot.seen = 0;
             0
         }
         _ => error(22),
@@ -7322,13 +7429,20 @@ fn epoll_scan(epoll_handle: u32, output: &mut [(u32, u64)]) -> Option<usize> {
     };
     let mut count = 0usize;
     let mut fired = [false; EPOLL_MAX_WATCHES];
+    let mut seen = [None; EPOLL_MAX_WATCHES];
     for (index, watch) in watches.iter().enumerate() {
         // A one-shot watch that has reported waits for EPOLL_CTL_MOD.
         let disarmed = watch.events & EPOLLONESHOT != 0 && watch.events & !EPOLL_FLAGS == 0;
         if watch.fd < 0 || count >= output.len() || disarmed {
             continue;
         }
-        let ready = fd_ready_events(watch.fd as u64) & (watch.events | EPOLLERR | EPOLLHUP);
+        let now = fd_ready_events(watch.fd as u64) & (watch.events | EPOLLERR | EPOLLHUP);
+        let ready = if watch.events & EPOLLET != 0 {
+            seen[index] = Some(now);
+            now & !watch.seen
+        } else {
+            now
+        };
         if ready == 0 {
             continue;
         }
@@ -7336,12 +7450,15 @@ fn epoll_scan(epoll_handle: u32, output: &mut [(u32, u64)]) -> Option<usize> {
         count += 1;
         fired[index] = watch.events & EPOLLONESHOT != 0;
     }
-    if fired.iter().any(|&shot| shot) {
+    if fired.iter().any(|&shot| shot) || seen.iter().any(Option::is_some) {
         let mut instances = EPOLL_INSTANCES.lock();
         if let Some(instance) = instances.get_mut(epoll_handle as usize) {
-            for (watch, &shot) in instance.watches.iter_mut().zip(&fired) {
+            for ((watch, &shot), now) in instance.watches.iter_mut().zip(&fired).zip(seen) {
                 if shot {
                     watch.events &= EPOLL_FLAGS;
+                }
+                if let Some(now) = now {
+                    watch.seen = now;
                 }
             }
         }
@@ -7350,9 +7467,12 @@ fn epoll_scan(epoll_handle: u32, output: &mut [(u32, u64)]) -> Option<usize> {
 }
 
 /// `EPOLLONESHOT` (reports once, then nothing until re-armed) and the other
-/// flag bits of a watch's events; edge-triggered `EPOLLET` watches are kept
-/// level-triggered, which only ever wakes a reader more often.
+/// flag bits of a watch's events. An `EPOLLET` watch reports only readiness
+/// that has risen since its last scan (so after a reader drains a source, the
+/// next arrival reports again); unlike Linux, more data arriving at a source
+/// that was never drained does not report again.
 const EPOLLONESHOT: u32 = 1 << 30;
+const EPOLLET: u32 = 1 << 31;
 const EPOLL_FLAGS: u32 = EPOLLONESHOT | 1 << 31 | 1 << 29 | 1 << 28;
 
 /// `epoll_wait` with nothing ready yet cooperatively retries against a real
@@ -8203,7 +8323,8 @@ fn linux_statx(arguments: [u64; 6]) -> u64 {
     }
     statx[..4].copy_from_slice(&0x7ffu32.to_le_bytes());
     statx[4..8].copy_from_slice(&4096u32.to_le_bytes());
-    statx[16..20].copy_from_slice(&1u32.to_le_bytes());
+    statx[16..20].copy_from_slice(&vfs::link_count(metadata.inode).to_le_bytes());
+    let metadata = fifo::reported(metadata);
     statx[28..30].copy_from_slice(&(metadata.mode as u16).to_le_bytes());
     statx[32..40].copy_from_slice(&metadata.inode.to_le_bytes());
     statx[40..48].copy_from_slice(&metadata.size.to_le_bytes());
@@ -9013,7 +9134,8 @@ fn linux_linkat(
     destination_address: u64,
     flags: u64,
 ) -> u64 {
-    if flags != 0 || source_address == 0 || destination_address == 0 {
+    const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    if flags & !AT_SYMLINK_FOLLOW != 0 || source_address == 0 || destination_address == 0 {
         return error(1);
     }
     let mut source = [0u8; MAX_PATH];
@@ -9030,7 +9152,13 @@ fn linux_linkat(
     ) else {
         return error(1);
     };
-    posixshm::link(source, destination).unwrap_or(error(1))
+    posixshm::link(source, destination).unwrap_or_else(|| match vfs::link(source, destination) {
+        Ok(()) => {
+            COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        Err(failure) => vfs_error(failure),
+    })
 }
 
 fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
@@ -9053,10 +9181,18 @@ fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
         0
     };
     let shared_inode = posixshm::inode_before_removal(path);
+    let fifo_inode = if fifo::any() {
+        vfs::metadata(path).ok().map(|metadata| metadata.inode)
+    } else {
+        None
+    };
     match vfs::remove(path, flags & AT_REMOVEDIR != 0) {
         Ok(()) => {
             if let Some(inode) = shared_inode {
                 posixshm::forget(inode);
+            }
+            if let Some(inode) = fifo_inode {
+                fifo::forget(inode);
             }
             inotify::notify(path, inotify::IN_DELETE | directory_flag, 0);
             REMOVE_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -9386,7 +9522,7 @@ fn extra_syscalls_self_test() -> bool {
         && call(LINUX_SETXATTR_FIRST, [0; 6]) == error(95)
         && call(LINUX_SETXATTR_LAST, [0; 6]) == error(95)
         && call(LINUX_RESTART_SYSCALL, [0; 6]) == error(4)
-        && call(LINUX_MKNOD, [0, 0o010000 | 0o644, 0, 0, 0, 0]) == error(1);
+        && call(LINUX_MKNOD, [0, 0o140000 | 0o644, 0, 0, 0, 0]) == error(1);
     let advice = call(LINUX_READAHEAD, [9999, 0, 0, 0, 0, 0]) == error(9)
         && call(LINUX_SYNC_FILE_RANGE, [9999, 0, 0, 0, 0, 0]) == error(9);
     let inotify = inotify::self_test()
@@ -9844,16 +9980,18 @@ fn flock_operation_valid(operation: u64) -> bool {
     matches!(operation & !LOCK_NB, 1 | 2 | 8)
 }
 
-/// Advisory locks are accepted and not enforced.
 fn linux_flock(descriptor: u64, operation: u64) -> u64 {
-    if lookup_process_fd(descriptor).is_none() {
+    let Some(process_fd) = lookup_process_fd(descriptor) else {
         return error(9);
-    }
+    };
     if !flock_operation_valid(operation) {
         return error(22);
     }
-    COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
-    0
+    let result = flock::apply(&process_fd, operation);
+    if result == 0 {
+        COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    result
 }
 
 fn linux_syncfs(descriptor: u64) -> u64 {
@@ -10333,7 +10471,12 @@ fn linux_sched_getaffinity(pid: u64, size: u64, address: u64) -> u64 {
     if size < 8 {
         return error(22);
     }
-    if !user::copy_to_user(address, &crate::smp::online_mask().to_le_bytes()) {
+    let online = crate::smp::online_mask();
+    let mask = match crate::scheduler::affinity() & online {
+        0 => online,
+        mask => mask,
+    };
+    if !user::copy_to_user(address, &mask.to_le_bytes()) {
         return error(14);
     }
     RUNTIME_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -10866,10 +11009,11 @@ fn write_device_stat(address: u64, number: u64) -> u64 {
 }
 
 fn write_linux_stat(address: u64, metadata: vfs::Metadata) -> u64 {
+    let metadata = fifo::reported(metadata);
     let mut stat = [0u8; 144];
     stat[..8].copy_from_slice(&1u64.to_le_bytes());
     stat[8..16].copy_from_slice(&metadata.inode.to_le_bytes());
-    stat[16..24].copy_from_slice(&1u64.to_le_bytes());
+    stat[16..24].copy_from_slice(&u64::from(vfs::link_count(metadata.inode)).to_le_bytes());
     stat[24..28].copy_from_slice(&metadata.mode.to_le_bytes());
     stat[48..56].copy_from_slice(&metadata.size.to_le_bytes());
     stat[56..64].copy_from_slice(&4096u64.to_le_bytes());
@@ -11769,15 +11913,22 @@ fn linux_rt_sigsuspend(set: u64, set_size: u64) -> u64 {
 fn linux_mknodat(directory: u64, path_address: u64, mode: u64) -> u64 {
     const S_IFMT: u64 = 0o170000;
     const S_IFREG: u64 = 0o100000;
+    const S_IFIFO: u64 = 0o010000;
     let kind = mode & S_IFMT;
-    if kind != 0 && kind != S_IFREG {
+    if kind != 0 && kind != S_IFREG && kind != S_IFIFO {
         return error(1);
     }
     let created = linux_openat(directory, path_address, O_CREAT | 0o200 | 1, mode & 0o7777);
     if (created as i64) < 0 {
         return created;
     }
+    let inode = lookup_process_fd(created)
+        .and_then(|process_fd| vfs::descriptor_metadata(process_fd.handle).ok())
+        .map(|metadata| metadata.inode);
     let _ = linux_close(created);
+    if kind == S_IFIFO && !inode.is_some_and(fifo::mark) {
+        return error(28);
+    }
     0
 }
 
@@ -12241,9 +12392,28 @@ fn linux_openat(directory: u64, path_address: u64, flags: u64, mode: u64) -> u64
         OPENS.fetch_add(1, Ordering::Relaxed);
         return descriptor;
     }
+    if flags & O_DIRECTORY == 0
+        && fifo::any()
+        && let Ok(metadata) = vfs::metadata(path)
+        && fifo::is_fifo(metadata.inode)
+    {
+        return fifo::open(
+            metadata.inode,
+            readable,
+            writable,
+            flags & 0x800 != 0,
+            cloexec,
+        );
+    }
     let watched = inotify::any_watches();
     let existed = watched && vfs::metadata(path).is_ok();
-    let opened = if flags & O_DIRECTORY != 0 {
+    // A directory opened read-only without O_DIRECTORY opens too, as on
+    // Linux (`shutil.rmtree` opens each directory that way).
+    let directory = flags & O_DIRECTORY != 0
+        || !writable
+            && flags & O_CREAT == 0
+            && vfs::metadata(path).is_ok_and(|metadata| metadata.mode & 0o170000 == 0o040000);
+    let opened = if directory {
         if flags & (O_CREAT | O_TRUNC) != 0 || writable {
             return error(21);
         }
@@ -12743,6 +12913,9 @@ fn linux_close(descriptor: u64) -> u64 {
     let Some((process_fd, last_reference)) = remove_process_fd(descriptor) else {
         return error(9);
     };
+    if let Some(file) = records::file_of(&process_fd) {
+        records::release_process(crate::scheduler::current_group(), Some(file));
+    }
     if last_reference
         && inotify::any_watches()
         && !process_fd.pipe
@@ -12839,16 +13012,13 @@ fn linux_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
             set_status_flags(process_fd, argument & O_APPEND != 0, argument & 0x800 != 0);
             0
         }
-        // Record locks: one process at a time uses each file here, so a lock
-        // is always granted.
-        5 | 36 => {
-            if user::copy_to_user(argument, &2u16.to_le_bytes()) {
-                0
-            } else {
-                return error(14);
+        5..=7 | 36..=38 => {
+            let result = records::command(&process_fd, command, argument);
+            if result != 0 {
+                return result;
             }
+            0
         }
-        6 | 7 | 37 | 38 => 0,
         1031 | 1032 => 65536,
         1030 => duplicate_process_fd(descriptor, argument, true),
         _ => return error(22),
@@ -13395,6 +13565,8 @@ fn release_process_fd(process_fd: ProcessFd) -> u64 {
         *instance = EpollInstance::EMPTY;
         return 0;
     }
+    flock::release(process_fd.handle);
+    records::release_open_file(process_fd.handle);
     match close_file_handle(process_fd.handle, process_fd.memfd) {
         Ok(()) => 0,
         Err(failure) => vfs_error(failure),

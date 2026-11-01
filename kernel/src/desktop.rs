@@ -6,7 +6,7 @@ use crate::aerui::{
     CornerRadii, FrostReport, FrostStyle, Painter, Point, Rect, Rgba, Scale, fit_rect,
 };
 use crate::arch;
-use crate::button::{self, Button, ButtonStyles};
+use crate::button;
 use crate::font::{FontCatalog, RasterFont};
 use crate::framebuffer::{Color, FrameBuffer, FrameBufferInfo};
 use crate::keyboard;
@@ -120,6 +120,7 @@ const SHELL_LINE_MAX: usize = 56;
 /// past the window's width).
 const TERMINAL_INPUT_MAX: usize = shell::MAX_INPUT;
 const SHELL_HISTORY_LINES: usize = 14;
+const SHELL_ROW: i32 = 14;
 
 /// The Terminal's older lines, scrolled off its top: kept outside
 /// `DesktopState` (which lives on a stack) for scrolling back.
@@ -201,27 +202,41 @@ fn ease_out_milli(progress_milli: u32) -> u32 {
     let inverse = 1000 - progress_milli.min(1000);
     1000 - (inverse * inverse) / 1000
 }
-/// The dock as designed: a rounded bar with seven square slots and a capsule
+/// The dock as designed: a rounded bar with nine square slots and a capsule
 /// holding the time and the date (logical units).
-const DOCK_RECT: Rect = Rect::new(24, 365, 700, 66);
-const DOCK_ICON_SIZE: i32 = 45;
-const DOCK_ICON_X: i32 = 40;
-const DOCK_ICON_Y: i32 = 376;
-const DOCK_PITCH: i32 = 67;
-const DOCK_CLOCK: Rect = Rect::new(502, 373, 211, 51);
+const DOCK_RECT: Rect = Rect::new(27, 364, 697, 58);
+const DOCK_ICON_SIZE: i32 = 39;
+const DOCK_ICON_X: i32 = 43;
+const DOCK_ICON_Y: i32 = 374;
+const DOCK_PITCH: i32 = 51;
+const DOCK_CLOCK: Rect = Rect::new(503, 371, 212, 44);
 
-/// The app launcher as designed: a panel with six columns of app tiles and
-/// three columns of folders (logical units).
-const LAUNCHER_PANEL: Rect = Rect::new(29, 19, 700, 418);
+/// The app launcher as designed: a search pill over pages of six by three
+/// app tiles, with a dot per page, on frosted glass above the dock (logical
+/// units).
+const LAUNCHER_PANEL: Rect = Rect::new(0, 0, DESIGN_WIDTH, DESIGN_HEIGHT);
 const LAUNCHER_COLUMNS: usize = 6;
+const LAUNCHER_PAGE: usize = LAUNCHER_COLUMNS * 3;
+const LAUNCHER_SEARCH: Rect = Rect::new(244, 33, 263, 43);
 
+/// Tile `index` (any page) on its own page.
 fn launcher_tile(index: usize) -> Rect {
+    let slot = index % LAUNCHER_PAGE;
     Rect::new(
-        64 + (index % LAUNCHER_COLUMNS) as i32 * 64,
-        70 + (index / LAUNCHER_COLUMNS) as i32 * 67,
-        50,
-        50,
+        136 + (slot % LAUNCHER_COLUMNS) as i32 * 165 / 2,
+        101 + (slot / LAUNCHER_COLUMNS) as i32 * 86,
+        67,
+        67,
     )
+}
+
+fn launcher_pages() -> usize {
+    APP_LABELS.len().div_ceil(LAUNCHER_PAGE)
+}
+
+fn launcher_dot(page: usize) -> Rect {
+    let first = 376 - (launcher_pages() as i32 * 12 - 4) / 2;
+    Rect::new(first + page as i32 * 12, 352, 8, 8)
 }
 
 fn dock_icon_rect(index: usize) -> Rect {
@@ -233,16 +248,20 @@ fn dock_icon_rect(index: usize) -> Rect {
     )
 }
 
-const DOCK_BUTTONS: [&str; 7] = ["", "", "", "", "", "", ""];
-const DOCK_NAMES: [&str; 7] = [
+const DOCK_BUTTONS: [&str; 9] = ["", "", "", "", "", "", "", "", ""];
+const DOCK_NAMES: [&str; 9] = [
     "Apps",
     "Terminal",
     "Quick settings",
     "Files",
     "Browser",
     "Notes",
+    "Store",
+    "Linux",
     "Trash",
 ];
+/// The `draw_icon` kind each dock slot shows.
+const DOCK_KINDS: [usize; 9] = [0, 1, 2, 3, 4, 5, 8, 9, 6];
 const APP_LABELS: [&str; 20] = [
     "", "", "", "", "", "L", "M", "P", "E", "I", "D", "V", "R", "L", "H", "W", "G", "K", "U", "S",
 ];
@@ -922,6 +941,7 @@ struct DesktopState {
     wifi: bool,
     bluetooth: bool,
     airplane: bool,
+    battery_saver: bool,
     airplane_stash: (bool, bool),
     screenshot_at_ns: u64,
     dock_press_ns: [u64; DOCK_BUTTONS.len()],
@@ -1154,6 +1174,7 @@ impl DesktopState {
             wifi: true,
             bluetooth: true,
             airplane: false,
+            battery_saver: false,
             airplane_stash: (true, true),
             screenshot_at_ns: 0,
             dock_press_ns: [0; DOCK_BUTTONS.len()],
@@ -2039,6 +2060,8 @@ impl DesktopState {
             3 => self.open_files(),
             4 => self.open_browser(),
             5 => self.open_notes(),
+            6 => self.open_store(),
+            7 => self.set_app(DesktopApp::Linux),
             _ => self.open_trash(),
         }
     }
@@ -2081,13 +2104,9 @@ impl DesktopState {
             return self.reset_click(point);
         }
         if self.screen == Screen::Login {
-            if flow::RESET_LINK.contains(point) {
+            if self.reset_link_shown() && flow::RESET_LINK.contains(point) {
                 self.reset_open = true;
                 self.reset_focus = 0;
-                return DesktopAction::Redraw;
-            }
-            if login_eye_rect().contains(point) {
-                self.reveal_password = !self.reveal_password;
                 return DesktopAction::Redraw;
             }
             return DesktopAction::Idle;
@@ -2101,8 +2120,12 @@ impl DesktopState {
         }
         if self.app != DesktopApp::None && self.overlay == Overlay::None {
             let base = window_base_rect(self.app);
-            let (minimize, maximize, close) = window_control_rects(base);
-            if close.contains(point) {
+            let (minimize, maximize, close) = window_control_rects(self.app, base);
+            let tab = terminal_tab(base);
+            if close.contains(point)
+                || self.app == DesktopApp::Terminal
+                    && Rect::new(tab.right() - 24, tab.y, 24, tab.height).contains(point)
+            {
                 self.app_close();
                 return DesktopAction::Redraw;
             }
@@ -2200,10 +2223,10 @@ impl DesktopState {
         if self.app == DesktopApp::Notes && self.overlay == Overlay::None {
             let base = window_base_rect(DesktopApp::Notes);
             let content_x = base.x + 14;
-            let content_y = base.y + 36;
+            let content_y = base.y + 64;
             let content_right = base.x + base.width - 14;
             if self.notes_mode == NotesMode::Editing {
-                if Rect::new(content_right - 56, content_y - 4, 56, 26).contains(point) {
+                if notes_save_button(base).contains(point) {
                     self.notes_save();
                     return DesktopAction::Redraw;
                 }
@@ -2304,7 +2327,8 @@ impl DesktopState {
             }
         }
         if self.overlay == Overlay::Apps {
-            for index in 0..APP_LABELS.len().min(6) {
+            let page = self.app_focus / LAUNCHER_PAGE;
+            for index in page * LAUNCHER_PAGE..APP_LABELS.len().min((page + 1) * LAUNCHER_PAGE) {
                 let bounds = launcher_tile(index);
                 if bounds.contains(point) {
                     self.app_focus = index;
@@ -2312,10 +2336,18 @@ impl DesktopState {
                     return self.handle(DesktopKey::Activate);
                 }
             }
-            if LAUNCHER_PANEL.contains(point) {
-                return DesktopAction::Idle;
+            for page in 0..launcher_pages() {
+                if launcher_dot(page).expand(5).contains(point) {
+                    self.app_focus = page * LAUNCHER_PAGE;
+                    return DesktopAction::Redraw;
+                }
             }
-            // Clicking away from the panel closes it.
+            if LAUNCHER_SEARCH.contains(point) {
+                self.set_overlay(Overlay::None);
+                self.open_search();
+                return DesktopAction::Redraw;
+            }
+            // Clicking anywhere else closes it.
             self.set_overlay(Overlay::None);
             return DesktopAction::Redraw;
         }
@@ -6699,21 +6731,10 @@ fn draw_desktop_base(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &Deskt
         } else {
             state.overlay_close_at_ns
         };
-        let panel_layout = overlay_slide_layout(layout, opening, at_ns, now);
-        // While sliding, nothing may show below the dock's bottom edge: the
-        // panel rises out of (and sinks back into) the dock, which is drawn
-        // in front of it, instead of coming up from the screen edge.
-        let sliding = sliding_overlay == Some(Overlay::Apps);
-        if sliding {
-            // The visible part ends at the dock's top edge (logical y 369)
-            // and the limit eases down to the dock's bottom (440, where the
-            // settled panel ends) as it settles, so lifting the clip at the
-            // end changes nothing on screen.
-            let reveal = overlay_reveal_milli(opening, at_ns, now).clamp(0, 1000);
-            let limit = DOCK_RECT.y + (DOCK_RECT.bottom() - DOCK_RECT.y) * reveal / 1000;
-            let clip_bottom = layout.point(Point::new(0, limit)).y;
-            painter.set_clip(Rect::new(0, 0, screen_bounds.width, clip_bottom));
-        }
+        // The launcher appears in place (like Launchpad): no slide out of the
+        // dock, the tiles simply drop into their places.
+        let panel_layout = layout;
+        let sliding = false;
         let _ = draw_app_switcher(
             &mut painter,
             panel_layout,
@@ -6743,7 +6764,7 @@ fn draw_desktop_base(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &Deskt
     }
     prof_add(PROF_PANELS, t_panels);
     let t_dock = crate::time::monotonic_nanoseconds();
-    let outer_dock = !apps_active;
+    let outer_dock = true;
     // What lies under the dock's glass is the wallpaper (and a settled
     // window's edge): the capsules can be replayed even while icons animate.
     let dock_base_stable = outer_dock
@@ -6987,6 +7008,7 @@ fn draw_dock(
     let base_key = dock_cache_key(layout, region)
         ^ ((state.app as u64 + 1) << 8)
         ^ ((is_maximized(state.app) as u64) << 30)
+        ^ ((state.overlay == Overlay::Apps) as u64) << 40
         ^ 0x6b0d_0000;
     // While things move the glass is drawn in the cheap mode; that result is
     // kept under its own key and replaced by a full-quality one at rest.
@@ -7015,7 +7037,7 @@ fn draw_dock(
             painter,
             layout,
             DOCK_RECT,
-            CornerRadii::all(30),
+            CornerRadii::all(DOCK_RECT.height / 2),
             dock_style(),
             0xaed0_0001,
         )
@@ -7038,10 +7060,7 @@ fn draw_dock(
         }
         capsule
     };
-    let styles = ButtonStyles::figma_glass()
-        .with_font(font)
-        .with_font_size(13);
-    for index in 0..DOCK_BUTTONS.len() {
+    for (index, &kind) in DOCK_KINDS.iter().enumerate() {
         let press_at = state.dock_press_ns[index];
         let release_at = state.dock_release_ns[index];
         let held = press_at != 0 && now_ns < release_at;
@@ -7052,7 +7071,9 @@ fn draw_dock(
             3 => DesktopApp::Files,
             4 => DesktopApp::Browser,
             5 => DesktopApp::Notes,
-            6 => DesktopApp::Trash,
+            6 => DesktopApp::Store,
+            7 => DesktopApp::Linux,
+            8 => DesktopApp::Trash,
             _ => DesktopApp::None,
         };
         if opens != DesktopApp::None
@@ -7066,31 +7087,34 @@ fn draw_dock(
         fall_offset -= state.dock_lift(index, now_ns);
         let mut icon_rect = dock_icon_rect(index);
         icon_rect.y += fall_offset;
-        let mut button = Button::new(icon_rect, DOCK_BUTTONS[index], DOCK_NAMES[index], &styles)
-            .with_transition(
-                if held { press_at } else { 0 },
-                if held { 0 } else { release_at },
-            );
         let lit = (state.focus_visible && state.dock_focus == index)
             || (opens != DesktopApp::None && state.app == opens);
-        button.selected = lit;
-        button.interaction.focused = lit;
-        button.interaction.pressed = held;
-        controls &= button
-            .paint_translated(painter, layout.scale, layout.offset, now_ns)
-            .captured;
-        draw_icon(painter, layout, index, icon_rect);
+        let tile = if held {
+            icon_rect.expand(-2)
+        } else {
+            icon_rect
+        };
+        draw_app_tile(painter, layout, tile);
+        if lit {
+            painter.stroke_rounded_rect(
+                layout.rect(tile.expand(3)),
+                layout.radii(CornerRadii::all(tile.width * 31 / 100 + 3)),
+                2,
+                Rgba::new(255, 255, 255, 230),
+            );
+        }
+        draw_icon(painter, layout, kind, tile);
         if opens != DesktopApp::None && state.app_is_open(opens) {
             let center = icon_rect.x + DOCK_ICON_SIZE / 2;
             painter.fill_rounded_rect(
                 layout.rect(Rect::new(
-                    center - 2,
-                    DOCK_ICON_Y + DOCK_ICON_SIZE + 2,
-                    4,
+                    center - 6,
+                    DOCK_ICON_Y + DOCK_ICON_SIZE + 1,
+                    12,
                     4,
                 )),
                 layout.radii(CornerRadii::all(2)),
-                Rgba::new(18, 30, 36, 235),
+                Rgba::new(40, 40, 40, 235),
             );
         }
     }
@@ -7100,18 +7124,19 @@ fn draw_dock(
         painter,
         layout,
         font,
-        Rect::new(DOCK_CLOCK.x, DOCK_CLOCK.y, 98, DOCK_CLOCK.height),
+        Rect::new(DOCK_CLOCK.x, DOCK_CLOCK.y, 97, DOCK_CLOCK.height),
         time.as_str(),
         15,
         Color::rgb(255, 255, 255),
     );
+    let divider = DOCK_CLOCK.x + 97;
     painter.fill_rounded_rect(
-        layout.rect(Rect::new(600, 379, 6, 39)),
+        layout.rect(Rect::new(divider, DOCK_CLOCK.y + 5, 6, 34)),
         layout.radii(CornerRadii::all(3)),
         Rgba::new(235, 247, 250, 120),
     );
     painter.fill_rounded_rect(
-        layout.rect(Rect::new(604, 379, 2, 39)),
+        layout.rect(Rect::new(divider + 4, DOCK_CLOCK.y + 5, 2, 34)),
         layout.radii(CornerRadii::all(1)),
         Rgba::new(32, 57, 66, 60),
     );
@@ -7119,7 +7144,12 @@ fn draw_dock(
         painter,
         layout,
         font,
-        Rect::new(606, DOCK_CLOCK.y, 107, DOCK_CLOCK.height),
+        Rect::new(
+            divider + 6,
+            DOCK_CLOCK.y,
+            DOCK_CLOCK.right() - divider - 6,
+            DOCK_CLOCK.height,
+        ),
         date.as_str(),
         14,
         Color::rgb(255, 255, 255),
@@ -7194,46 +7224,72 @@ fn draw_app_switcher(
             if cheap { 4 } else { 2 },
         )
         .captured;
-    let styles = ButtonStyles::figma_glass()
-        .with_font(font)
-        .with_font_size(13);
-    let mut controls = true;
+    let controls = true;
+    let page = state.app_focus / LAUNCHER_PAGE;
     for (index, label) in APP_LABELS.iter().enumerate() {
+        if index / LAUNCHER_PAGE != page {
+            continue;
+        }
         let fall = if opening {
             app_icon_fall_offset(panel_opened_at_ns, index, now_ns)
         } else {
             0
         };
         let icon_layout = shift_layout_y(layout, fall);
-        let mut button = Button::new(launcher_tile(index), label, "Application", &styles);
-        button.selected = state.focus_visible && state.app_focus == index;
-        button.interaction.focused = state.focus_visible && state.app_focus == index;
-        controls &= button
-            .paint_translated(painter, icon_layout.scale, icon_layout.offset, now_ns)
-            .captured;
+        let tile = launcher_tile(index);
+        draw_app_tile(painter, icon_layout, tile);
+        if state.focus_visible && state.app_focus == index {
+            painter.stroke_rounded_rect(
+                icon_layout.rect(tile.expand(3)),
+                icon_layout.radii(CornerRadii::all(tile.width * 31 / 100 + 3)),
+                2,
+                Rgba::new(255, 255, 255, 230),
+            );
+        }
         if index < 5 {
-            draw_icon(
+            draw_icon(painter, icon_layout, [1, 7, 4, 5, 2][index], tile);
+        } else {
+            centered_text(
                 painter,
                 icon_layout,
-                [1, 7, 4, 5, 2][index],
-                launcher_tile(index),
+                font,
+                tile,
+                label,
+                22,
+                Color::rgb(30, 40, 46),
             );
         }
     }
-    for row in 0..4 {
-        for x in [484, 557, 629] {
-            let y = 75 + row * 67;
-            painter.fill_rounded_rect(
-                layout.rect(Rect::new(x, y + 6, 47, 34)),
-                layout.radii(CornerRadii::all(6)),
-                Rgba::new(203, 225, 255, 190),
-            );
-            painter.fill_rounded_rect(
-                layout.rect(Rect::new(x, y, 22, 12)),
-                layout.radii(CornerRadii::all(4)),
-                Rgba::new(203, 225, 255, 190),
-            );
-        }
+    painter.fill_rounded_rect(
+        layout.rect(LAUNCHER_SEARCH),
+        layout.radii(CornerRadii::all(LAUNCHER_SEARCH.height / 2)),
+        Rgba::new(40, 82, 92, 150),
+    );
+    painter.stroke_rounded_rect(
+        layout.rect(LAUNCHER_SEARCH),
+        layout.radii(CornerRadii::all(LAUNCHER_SEARCH.height / 2)),
+        1,
+        Rgba::new(10, 22, 28, 200),
+    );
+    centered_text(
+        painter,
+        layout,
+        font,
+        LAUNCHER_SEARCH,
+        "Search",
+        15,
+        Color::rgb(12, 20, 24),
+    );
+    for dot in 0..launcher_pages() {
+        painter.fill_rounded_rect(
+            layout.rect(launcher_dot(dot)),
+            layout.radii(CornerRadii::all(4)),
+            if dot == page {
+                Rgba::new(255, 255, 255, 245)
+            } else {
+                Rgba::new(255, 255, 255, 110)
+            },
+        );
     }
     if state.focus_visible {
         let tile = launcher_tile(state.app_focus);
@@ -7241,11 +7297,24 @@ fn draw_app_switcher(
             painter,
             layout,
             font,
-            Point::new(tile.x + 25, tile.y - 4),
+            Point::new(tile.x + tile.width / 2, tile.y - 4),
             APP_NAMES[state.app_focus.min(APP_NAMES.len() - 1)],
         );
     }
     surface && controls
+}
+
+/// An app's white tile as designed: corners at 31% of its size, a soft
+/// inner shadow along the top and a half-grey stroke just inside the edge.
+fn draw_app_tile(painter: &mut Painter<'_>, layout: Layout, tile: Rect) {
+    let corner = layout.radii(CornerRadii::all(tile.width * 31 / 100));
+    painter.fill_rounded_rect(layout.rect(tile), corner, Rgba::opaque(200, 200, 200));
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(tile.x, tile.y + 2, tile.width, tile.height - 2)),
+        corner,
+        Rgba::opaque(255, 255, 255),
+    );
+    painter.stroke_rounded_rect(layout.rect(tile), corner, 1, Rgba::new(128, 128, 128, 140));
 }
 
 fn draw_icon(painter: &mut Painter<'_>, layout: Layout, kind: usize, bounds: Rect) {
@@ -7273,9 +7342,48 @@ fn draw_icon(painter: &mut Painter<'_>, layout: Layout, kind: usize, bounds: Rec
         );
         return;
     }
-    let x = bounds.x + 13;
-    let y = bounds.y + 13;
     let ink = Rgba::new(10, 25, 31, 235);
+    let centre = Point::new(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+    let part = |dx: i32, dy: i32, width: i32, height: i32| {
+        layout.rect(Rect::new(centre.x + dx, centre.y + dy, width, height))
+    };
+    match kind {
+        8 => {
+            painter.stroke_rounded_rect(
+                part(-6, -11, 12, 12),
+                layout.radii(CornerRadii::all(6)),
+                layout.scale.logical(2).max(1) as u8,
+                ink,
+            );
+            painter.fill_rounded_rect(
+                part(-10, -5, 20, 16),
+                layout.radii(CornerRadii::all(4)),
+                Rgba::new(46, 120, 232, 255),
+            );
+            return;
+        }
+        9 => {
+            painter.fill_rounded_rect(
+                part(-8, -12, 16, 24),
+                layout.radii(CornerRadii::all(8)),
+                ink,
+            );
+            painter.fill_rounded_rect(
+                part(-5, -3, 10, 13),
+                layout.radii(CornerRadii::all(5)),
+                Rgba::opaque(245, 245, 245),
+            );
+            painter.fill_rounded_rect(
+                part(-3, -6, 6, 3),
+                layout.radii(CornerRadii::all(1)),
+                Rgba::opaque(245, 170, 30),
+            );
+            return;
+        }
+        _ => {}
+    }
+    let x = centre.x - 12;
+    let y = centre.y - 12;
     painter.stroke_rounded_rect(
         layout.rect(Rect::new(x + 2, y + 2, 21, 21)),
         layout.radii(CornerRadii::all(11)),
@@ -7304,18 +7412,85 @@ fn is_maximized(app: DesktopApp) -> bool {
     MAXIMIZED_APP.load(Ordering::Relaxed) == app as u8 + 1
 }
 
+/// The Terminal's one tab in its title bar (its right end closes it).
+fn terminal_tab(window: Rect) -> Rect {
+    Rect::new(window.x + 19, window.y + 9, 151, 38)
+}
+
+/// The Terminal as designed: black, with a dark grey title bar holding a
+/// black tab pill and a "+".
+fn draw_terminal_chrome(painter: &mut Painter<'_>, layout: Layout, font: RasterFont, outer: Rect) {
+    let white = Rgba::opaque(255, 255, 255);
+    painter.fill_rounded_rect(
+        layout.rect(outer),
+        layout.radii(CornerRadii::all(30)),
+        Rgba::opaque(0, 0, 0),
+    );
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(outer.x, outer.y, outer.width, 53)),
+        layout.radii(CornerRadii::new(30, 30, 0, 0)),
+        Rgba::opaque(58, 58, 58),
+    );
+    let tab = terminal_tab(outer);
+    painter.fill_rounded_rect(
+        layout.rect(tab),
+        layout.radii(CornerRadii::all(tab.height / 2)),
+        Rgba::opaque(0, 0, 0),
+    );
+    text(
+        painter,
+        layout,
+        font,
+        Point::new(tab.x + 24, tab.y + 11),
+        "Terminal",
+        14,
+        Color::rgb(255, 255, 255),
+    );
+    let cross = Point::new(tab.right() - 19, tab.y + tab.height / 2);
+    for step in -3..=3 {
+        for sign in [1, -1] {
+            painter.fill_rounded_rect(
+                layout.rect(Rect::new(
+                    cross.x + step - 1,
+                    cross.y + sign * step - 1,
+                    3,
+                    3,
+                )),
+                layout.radii(CornerRadii::all(1)),
+                white,
+            );
+        }
+    }
+    let plus = Point::new(tab.right() + 24, tab.y + tab.height / 2);
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(plus.x - 6, plus.y - 1, 12, 3)),
+        layout.radii(CornerRadii::all(1)),
+        white,
+    );
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(plus.x - 1, plus.y - 6, 3, 12)),
+        layout.radii(CornerRadii::all(1)),
+        white,
+    );
+}
+
 /// The three controls at the right of a window's title bar (minimize,
 /// maximize, close), as touch-sized hit boxes.
-fn window_control_rects(window: Rect) -> (Rect, Rect, Rect) {
-    let box_at = |from_right: i32| {
-        Rect::new(
-            window.x + window.width - from_right - 12,
-            window.y + 2,
-            24,
-            24,
-        )
-    };
-    (box_at(72), box_at(46), box_at(20))
+fn window_control_rects(app: DesktopApp, window: Rect) -> (Rect, Rect, Rect) {
+    let (close_x, centre_y, spacing) = window_controls_anchor(app, window);
+    let box_at = |steps: i32| Rect::new(close_x - steps * spacing - 12, centre_y - 12, 24, 24);
+    (box_at(2), box_at(1), box_at(0))
+}
+
+/// Where a window's controls sit: the close button's centre and the
+/// distance between buttons (Settings places them inside its black body).
+fn window_controls_anchor(app: DesktopApp, window: Rect) -> (i32, i32, i32) {
+    match app {
+        DesktopApp::Settings => (window.right() - 37, window.y + 29, 24),
+        DesktopApp::Terminal => (window.right() - 21, window.y + 27, 24),
+        DesktopApp::Notes => (window.right() - 36, window.y + 40, 24),
+        _ => (window.right() - 20, window.y + 14, 26),
+    }
 }
 
 fn window_base_rect(app: DesktopApp) -> Rect {
@@ -7323,14 +7498,15 @@ fn window_base_rect(app: DesktopApp) -> Rect {
         return Rect::new(10, 10, 732, 354);
     }
     match app {
-        DesktopApp::Terminal => Rect::new(14, 15, 724, 340),
+        DesktopApp::Terminal => Rect::new(121, 31, 510, 320),
         DesktopApp::Files => Rect::new(70, 36, 610, 300),
-        DesktopApp::Notes => Rect::new(232, 18, 360, 356),
+        DesktopApp::Notes => Rect::new(233, 29, 286, 305),
         DesktopApp::Trash => Rect::new(256, 90, 336, 260),
         // 602x320 of content: the guest screen is scaled down to fit.
         DesktopApp::Linux => Rect::new(65, 10, 622, 364),
         DesktopApp::Browser => Rect::new(60, 16, 632, 350),
         DesktopApp::Store => Rect::new(80, 18, 592, 346),
+        DesktopApp::Settings => Rect::new(91, 29, 570, 330),
         _ => Rect::new(113, 32, 531, 303),
     }
 }
@@ -7382,68 +7558,55 @@ fn window_titlebar_color(app: DesktopApp) -> Rgba {
     }
 }
 
-/// Minimize, maximize and close, drawn as in the design: small light glyphs
-/// with a thin dark outline (a pill, a rounded square and a crossed pair of bars).
-fn draw_window_controls(painter: &mut Painter<'_>, layout: Layout, window: Rect) {
-    let outline = Rgba::opaque(73, 73, 73);
-    let fill = Rgba::opaque(217, 217, 217);
-    let centre_y = window.y + 14;
+/// Minimize, maximize and close, as in the design: green, yellow and red
+/// circles with a dark rim, holding a dash, a square and a cross.
+fn draw_window_controls(painter: &mut Painter<'_>, layout: Layout, app: DesktopApp, window: Rect) {
+    let ink = Rgba::opaque(20, 20, 20);
+    let (close_x, centre_y, spacing) = window_controls_anchor(app, window);
     let round = |value: i32| layout.radii(CornerRadii::all(value));
-    let minimize = Rect::new(window.x + window.width - 72 - 8, centre_y - 3, 16, 7);
-    painter.fill_rounded_rect(layout.rect(minimize), round(3), outline);
+    let circle = |painter: &mut Painter<'_>, centre_x: i32, fill: Rgba| {
+        painter.fill_rounded_rect(
+            layout.rect(Rect::new(centre_x - 8, centre_y - 8, 16, 16)),
+            round(8),
+            ink,
+        );
+        painter.fill_rounded_rect(
+            layout.rect(Rect::new(centre_x - 7, centre_y - 7, 14, 14)),
+            round(7),
+            fill,
+        );
+    };
+    let minimize_x = close_x - spacing * 2;
+    circle(painter, minimize_x, Rgba::opaque(40, 220, 40));
     painter.fill_rounded_rect(
-        layout.rect(Rect::new(
-            minimize.x + 1,
-            minimize.y + 1,
-            minimize.width - 2,
-            minimize.height - 2,
-        )),
+        layout.rect(Rect::new(minimize_x - 4, centre_y - 1, 8, 3)),
+        round(1),
+        ink,
+    );
+    let maximize_x = close_x - spacing;
+    circle(painter, maximize_x, Rgba::opaque(240, 222, 30));
+    painter.stroke_rounded_rect(
+        layout.rect(Rect::new(maximize_x - 4, centre_y - 4, 8, 8)),
         round(2),
-        fill,
+        layout.scale.logical(2).max(1) as u8,
+        ink,
     );
-    let maximize = Rect::new(window.x + window.width - 46 - 8, centre_y - 8, 16, 16);
-    painter.fill_rounded_rect(layout.rect(maximize), round(5), outline);
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(
-            maximize.x + 1,
-            maximize.y + 1,
-            maximize.width - 2,
-            maximize.height - 2,
-        )),
-        round(4),
-        fill,
-    );
-    let centre_x = window.x + window.width - 20;
-    for step in -5..=5 {
+    circle(painter, close_x, Rgba::opaque(232, 40, 40));
+    for step in -3..=3 {
         for sign in [1, -1] {
             painter.fill_rounded_rect(
                 layout.rect(Rect::new(
-                    centre_x + step - 3,
-                    centre_y + sign * step - 3,
-                    6,
-                    6,
+                    close_x + step - 1,
+                    centre_y + sign * step - 1,
+                    3,
+                    3,
                 )),
-                round(3),
-                outline,
-            );
-        }
-    }
-    for step in -5..=5 {
-        for sign in [1, -1] {
-            painter.fill_rounded_rect(
-                layout.rect(Rect::new(
-                    centre_x + step - 2,
-                    centre_y + sign * step - 2,
-                    4,
-                    4,
-                )),
-                round(2),
-                fill,
+                round(1),
+                ink,
             );
         }
     }
 }
-
 fn draw_window(
     painter: &mut Painter<'_>,
     layout: Layout,
@@ -7513,11 +7676,27 @@ fn draw_window(
         }
         captured
     };
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(outer.x, outer.y, outer.width, 28)),
-        layout.radii(CornerRadii::new(14, 14, 0, 0)),
-        window_titlebar_color(state.app),
-    );
+    if state.app == DesktopApp::Terminal {
+        draw_terminal_chrome(painter, layout, ui_font, outer);
+    } else if state.app == DesktopApp::Settings {
+        painter.fill_rounded_rect(
+            layout.rect(outer),
+            layout.radii(CornerRadii::all(30)),
+            Rgba::opaque(0, 0, 0),
+        );
+    } else if state.app == DesktopApp::Notes {
+        painter.fill_rounded_rect(
+            layout.rect(outer),
+            layout.radii(CornerRadii::all(46)),
+            Rgba::new(255, 251, 0, 130),
+        );
+    } else {
+        painter.fill_rounded_rect(
+            layout.rect(Rect::new(outer.x, outer.y, outer.width, 28)),
+            layout.radii(CornerRadii::new(14, 14, 0, 0)),
+            window_titlebar_color(state.app),
+        );
+    }
     text(
         painter,
         layout,
@@ -7525,11 +7704,11 @@ fn draw_window(
         Point::new(outer.x + 15, outer.y + 6),
         match state.app {
             DesktopApp::Browser => "Browser",
-            DesktopApp::Settings => "Settings",
+            DesktopApp::Settings => "",
             DesktopApp::Files => "Files",
-            DesktopApp::Notes => "Notes",
+            DesktopApp::Notes => "",
             DesktopApp::Trash => "Trash",
-            DesktopApp::Terminal => "Shell",
+            DesktopApp::Terminal => "",
             DesktopApp::Linux => "Linux",
             DesktopApp::Store => "App Store",
             DesktopApp::None => "AerOS",
@@ -7537,7 +7716,7 @@ fn draw_window(
         13,
         Color::rgb(18, 23, 26),
     );
-    draw_window_controls(painter, layout, outer);
+    draw_window_controls(painter, layout, state.app, outer);
     if state.app == DesktopApp::Browser {
         draw_browser(painter, layout, ui_font, mono_font, state);
         return captured;
@@ -7626,37 +7805,6 @@ fn draw_window(
     );
     captured
 }
-
-const AEROS_LOGO: &str = r"                                                 .-+%@@#.     :#@#-.
-                                            .-%@@@@@@@@=    :#@@@@@@%:.
-                                        ..=@@@@@@@@@@@%.  .*@@@@@@@@@@@-.
-                                      .=#@@@@@@@@@@@@@+ :*@@@@@@@@@@@@@@%-.
-                                    .+@@@@@@@@@@@@@@@@:*@@@@@@@@@@@@@@@@@@%=.
-                                  .*@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@#-.
-                                 =@@@@@@@@@@@@@@@@@@@@@@@@@@@@@= .+@@@@@@@@@@@@@@@@%###%@@@@@@@%=
-                               :%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@+.  -%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@-
-                             .=@@@@@@@@@@@@@@@@%**@@@@@@@@@@@*.  .*@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@*
-                            .*@@@@@@@@@@@@@@@@*.  -%@@@@@@@@%:   +@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@+
-                           .*@@@@@@@@@@@@@@@@#:  .+@@@@@@@@@-   -@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@:
-                           +@@@@@@@@@@@@@@@@%-   -@@@@@@@@@+   .@@@@@@@@@@@@@@@@@%=:-%@@@@@@@@@@@=
-                          -@@@@@@@@@@@@@@@@@+   .@@@@@@@@@*   .#@@@@@@@@@@@@@#=.      =@@@@@@@@@+
-                         .@@@@@@@@@@@@@@@@@#   .%@@@@@@@@%.  .*@@@@@@@@@#+-.          +@@@@@@@@=.
-     .@@@@.              +@@@@@@@@@@@@@@@@%.  .*@@@@@@@@@-. .=@@@@%*=-.           .-+%@@@@@@@@=.
-   @@@@.@@@@@@@@@@@@.   .#@@@@@@@@@@@@@@@@:   =@@@@@@@@@+.  .=-:..            .=#%@@@@@@@@@@%-
-   @@           .....@-=+#%@@@@@@@@@@@@@@=.  -%@@@@%#+=:..                .-*@@@@@@@@@@@@@@@#.
-   @@.                                                            ...-*@@@@@@@@@@@@@@@@@@@-
-    @@@@@@@..                                                     .:=#%@@@@@@@@@@@@@@@@@*:
-        ..@@@@@@@@@@@@..                           .:-=+*#%@@#+-.      .-+#@@@@@@@@@@@%-.
-                  ...@@@-=%%%%%%%#######+:.      .:=#@@@@@@@@@@@@%#=.      .-%@@@@@@@=.
-                          =@@@@@@@@@@@@@@@@@%=.      ..:*@@@@@@@@@@@@@@+:   :#@@@@@+.
-                           =@@@@@@@@@@@@@@@@@@@@@+:..      .+%@@@@@@@@@@@@@@@@@@@+.
-                           .=@@@@@@@@@@@@@@@@@@@@@@@@*-:.    :#@@@@@@@@@@@@@@@%=
-                            .:#@@@@@@@@@@@=@@@@@@@@@@@@@@%+--*@@@@@@@@@@@@@@#-.
-                              .-%@@@@@@@@*.+@@@@@@@@@@@@@@@@@@@#=%@@@@@@@%=.
-                                .:*@@@@@@-..#@@@@@@@@@@@@@@@@@@@ .:#@@@=..
-                                    :#@@%:  :%@@@@@@@@@@@@@@@@@@:
-                                       ...  .=@@@@@@@@@@@@@%%*=:
-                                              ...::::::..";
 
 /// The Linux guest as an ordinary AerOS window: same chrome as every other
 /// app, with the guest's framebuffer drawn straight into the content area.
@@ -7747,82 +7895,30 @@ fn draw_shell_window(
     outer: Rect,
     now_ns: u64,
 ) {
-    let content_x = outer.x + 16;
-    let content_y = outer.y + 44;
-    text(
-        painter,
-        layout,
-        mono_font,
-        Point::new(content_x, content_y),
-        AEROS_LOGO,
-        4,
-        Color::rgb(19, 88, 112),
-    );
-
-    // Real dark-terminal card for the functional right column, distinct
-    // from the light-glass chrome every other app shares - this is the one
-    // app where the content itself should look like an actual terminal,
-    // not another frosted panel with text on it. Sized to actually fit
-    // SHELL_LINE_MAX (40 monospace characters) without clipping real
-    // command output like `help`'s column listing - narrower than that
-    // and real shell output gets cut off mid-word, not just decoration.
-    let card_x = content_x + 300;
+    // A fresh Terminal shows the ASCII feather above the prompt; once there is output, the lines take its
+    // place, as in a real terminal.
+    let fresh = !state.terminal_screen_live
+        && state.terminal_line_count == 0
+        && TERMINAL_OLDER.lock().count == 0;
+    if fresh {
+        draw_ascii_art(
+            painter,
+            layout,
+            (outer.x * 1000 + 13_600, outer.y * 1000 + 64_400),
+            (1_459, 3_210),
+            (992, 129),
+            2,
+        );
+    }
+    let card_top = if fresh { outer.y + 178 } else { outer.y + 62 };
     let card = Rect::new(
-        card_x,
-        content_y - 10,
-        (outer.x + outer.width - 14) - card_x,
-        (outer.y + outer.height - 12) - (content_y - 10),
+        outer.x + 20,
+        card_top,
+        outer.width - 40,
+        outer.bottom() - 10 - card_top,
     );
-    painter.fill_rounded_rect(
-        layout.rect(card),
-        layout.radii(CornerRadii::all(12)),
-        Rgba::new(14, 17, 22, 250),
-    );
-    painter.stroke_rounded_rect(
-        layout.rect(card),
-        layout.radii(CornerRadii::all(12)),
-        layout.scale.logical(1).max(1) as u8,
-        Rgba::new(60, 72, 82, 150),
-    );
-
-    let ram_mb = crate::memory::global_stats()
-        .map(|stats| stats.allocated_pages * 4096 / (1024 * 1024))
-        .unwrap_or(0);
-    let group = if state.terminal_elevated {
-        "root"
-    } else {
-        "standard"
-    };
-    let mut header: shell::Text<96> = shell::Text::new();
-    let _ = write!(
-        header,
-        "{}@aeros  RAM {}MB  {}",
-        state.display_name(),
-        ram_mb,
-        group
-    );
-    text(
-        painter,
-        layout,
-        mono_font,
-        Point::new(card.x + 12, card.y + 9),
-        header.as_str(),
-        10,
-        Color::rgb(150, 160, 168),
-    );
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(card.x + 12, card.y + 24, card.width - 24, 1)),
-        CornerRadii::all(0),
-        Rgba::new(70, 82, 92, 160),
-    );
-
-    let scrollback_top = card.y + 32;
-    let clip = layout.rect(Rect::new(
-        card.x,
-        scrollback_top,
-        card.width,
-        card.height - 40,
-    ));
+    let scrollback_top = card.y;
+    let clip = layout.rect(Rect::new(card.x, scrollback_top, card.width, card.height));
     let previous_clip = painter.clip();
     painter.set_clip(clip);
     // While a program runs, the terminal shows its screen.
@@ -7842,7 +7938,7 @@ fn draw_shell_window(
     };
     let first = (total - scroll).saturating_sub(visible);
     for row in 0..visible {
-        let at = Point::new(card.x + 12, scrollback_top + row as i32 * 16);
+        let at = Point::new(card.x + 12, scrollback_top + row as i32 * SHELL_ROW);
         if job {
             draw_screen_row(painter, layout, mono_font, at, &state.terminal_screen, row);
             continue;
@@ -7874,7 +7970,7 @@ fn draw_shell_window(
     } else {
         visible
     };
-    let prompt_y = scrollback_top + prompt_row as i32 * 16;
+    let prompt_y = scrollback_top + prompt_row as i32 * SHELL_ROW;
     let mut prompt: shell::Text<48> = shell::Text::new();
     if job {
     } else if scroll > 0 {
@@ -7906,7 +8002,7 @@ fn draw_shell_window(
         Point::new(card.x + 12, prompt_y),
         prompt.as_str(),
         11,
-        Color::rgb(90, 205, 145),
+        Color::rgb(40, 240, 40),
     );
     // Text width measurement only works in physical pixels, so everything
     // from here on works in the same physical space `layout.point` maps
@@ -9536,6 +9632,11 @@ fn draw_name_prompt(
     );
 }
 
+/// Save, in the corner of a note being edited.
+fn notes_save_button(window: Rect) -> Rect {
+    Rect::new(window.right() - 93, window.bottom() - 40, 56, 26)
+}
+
 fn draw_notes(
     painter: &mut Painter<'_>,
     layout: Layout,
@@ -9556,78 +9657,45 @@ fn draw_notes(
         return;
     }
     let content_x = outer.x + 14;
-    let content_y = outer.y + 36;
+    let content_y = outer.y + 64;
     let content_right = outer.x + outer.width - 14;
     let content_bottom = outer.y + outer.height - 14;
     if state.notes_mode == NotesMode::Editing {
-        text(
-            painter,
-            layout,
-            ui_font,
-            Point::new(content_x, content_y),
-            state.notes_current_name.as_str(),
-            16,
-            Color::rgb(90, 62, 20),
+        let page = Rect::new(
+            outer.x + 37,
+            outer.y + 32,
+            outer.width - 74,
+            outer.height - 80,
         );
-        small_button(
-            painter,
-            layout,
-            ui_font,
-            Rect::new(content_right - 56, content_y - 4, 56, 26),
-            "Save",
-        );
-        let card = Rect::new(
-            content_x,
-            content_y + 32,
-            content_right - content_x,
-            content_bottom - content_y - 32,
-        );
-        painter.fill_rounded_rect(
-            layout.rect(card),
-            layout.radii(CornerRadii::all(10)),
-            Rgba::new(255, 250, 236, 245),
-        );
-        let clip = layout.rect(card);
         let previous_clip = painter.clip();
-        painter.set_clip(clip);
-        for line_index in 0..12 {
-            painter.fill_rounded_rect(
-                layout.rect(Rect::new(
-                    card.x + 10,
-                    card.y + 30 + line_index * 20,
-                    card.width - 20,
-                    1,
-                )),
-                CornerRadii::all(0),
-                Rgba::new(224, 205, 160, 90),
-            );
-        }
-        let char_width = mono_font.text_width("M", layout.scale.logical(13)).max(1);
-        let margin = layout.scale.logical(24);
-        let chars_per_line = ((clip.width - margin).max(char_width) / char_width).max(4) as usize;
+        painter.set_clip(layout.rect(page));
+        let size = layout.scale.logical(19);
+        let char_width = ui_font.text_width("n", size).max(1);
+        let chars_per_line = ((layout.rect(page).width / char_width).max(4)) as usize;
         let mut lines: [&str; 13] = [""; 13];
         let count = wrap_monospace(state.notes_content.as_str(), chars_per_line, &mut lines);
         for (row, line) in lines[..count].iter().enumerate() {
             text(
                 painter,
                 layout,
-                mono_font,
-                Point::new(card.x + 12, card.y + 16 + row as i32 * 20),
+                ui_font,
+                Point::new(page.x, outer.y + 36 + row as i32 * 24),
                 line,
-                13,
-                Color::rgb(70, 50, 20),
+                19,
+                Color::rgb(0, 0, 0),
             );
         }
         painter.set_clip(previous_clip);
+        small_button(painter, layout, ui_font, notes_save_button(outer), "Save");
         if !state.notes_status.as_str().is_empty() {
             text(
                 painter,
                 layout,
                 mono_font,
-                Point::new(content_x, content_bottom + 2),
+                Point::new(outer.x + 37, outer.bottom() - 32),
                 state.notes_status.as_str(),
                 11,
-                Color::rgb(90, 62, 20),
+                Color::rgb(60, 50, 10),
             );
         }
         return;
@@ -10348,8 +10416,141 @@ fn centered_text(
     );
 }
 
-/// Text that reads as glass: the scene behind shows through a pale tint,
-/// inside a rim lit from above and a faint shadow below.
+/// The feather as ASCII art (the Terminal's banner and the sign-in avatar).
+const AEROS_LOGO: &str = r"                                                 .-+%@@#.     :#@#-.
+                                            .-%@@@@@@@@=    :#@@@@@@%:.
+                                        ..=@@@@@@@@@@@%.  .*@@@@@@@@@@@-.
+                                      .=#@@@@@@@@@@@@@+ :*@@@@@@@@@@@@@@%-.
+                                    .+@@@@@@@@@@@@@@@@:*@@@@@@@@@@@@@@@@@@%=.
+                                  .*@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@#-.
+                                 =@@@@@@@@@@@@@@@@@@@@@@@@@@@@@= .+@@@@@@@@@@@@@@@@%###%@@@@@@@%=
+                               :%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@+.  -%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@-
+                             .=@@@@@@@@@@@@@@@@%**@@@@@@@@@@@*.  .*@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@*
+                            .*@@@@@@@@@@@@@@@@*.  -%@@@@@@@@%:   +@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@+
+                           .*@@@@@@@@@@@@@@@@#:  .+@@@@@@@@@-   -@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@:
+                           +@@@@@@@@@@@@@@@@%-   -@@@@@@@@@+   .@@@@@@@@@@@@@@@@@%=:-%@@@@@@@@@@@=
+                          -@@@@@@@@@@@@@@@@@+   .@@@@@@@@@*   .#@@@@@@@@@@@@@#=.      =@@@@@@@@@+
+                         .@@@@@@@@@@@@@@@@@#   .%@@@@@@@@%.  .*@@@@@@@@@#+-.          +@@@@@@@@=.
+     .@@@@.              +@@@@@@@@@@@@@@@@%.  .*@@@@@@@@@-. .=@@@@%*=-.           .-+%@@@@@@@@=.
+   @@@@.@@@@@@@@@@@@.   .#@@@@@@@@@@@@@@@@:   =@@@@@@@@@+.  .=-:..            .=#%@@@@@@@@@@%-
+   @@           .....@-=+#%@@@@@@@@@@@@@@=.  -%@@@@%#+=:..                .-*@@@@@@@@@@@@@@@#.
+   @@.                                                            ...-*@@@@@@@@@@@@@@@@@@@-
+    @@@@@@@..                                                     .:=#%@@@@@@@@@@@@@@@@@*:
+        ..@@@@@@@@@@@@..                           .:-=+*#%@@#+-.      .-+#@@@@@@@@@@@%-.
+                  ...@@@-=%%%%%%%#######+:.      .:=#@@@@@@@@@@@@%#=.      .-%@@@@@@@=.
+                          =@@@@@@@@@@@@@@@@@%=.      ..:*@@@@@@@@@@@@@@+:   :#@@@@@+.
+                           =@@@@@@@@@@@@@@@@@@@@@+:..      .+%@@@@@@@@@@@@@@@@@@@+.
+                           .=@@@@@@@@@@@@@@@@@@@@@@@@*-:.    :#@@@@@@@@@@@@@@@%=
+                            .:#@@@@@@@@@@@=@@@@@@@@@@@@@@%+--*@@@@@@@@@@@@@@#-.
+                              .-%@@@@@@@@*.+@@@@@@@@@@@@@@@@@@@#=%@@@@@@@%=.
+                                .:*@@@@@@-..#@@@@@@@@@@@@@@@@@@@ .:#@@@=..
+                                    :#@@%:  :%@@@@@@@@@@@@@@@@@@:
+                                       ...  .=@@@@@@@@@@@@@%%*=:
+                                              ...::::::..";
+
+/// Draws ASCII art the way Figma renders it at a few pixels per character:
+/// each character is a short dash (denser characters brighter), so its rows
+/// read as fine stripes. `origin` is the art's top-left and `cell` a
+/// character's width and line height, both in thousandths of a design unit;
+/// `turn` is the rotation's cosine and sine in thousandths (clockwise);
+/// `dash` the dash width in pixels.
+fn draw_ascii_art(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    origin: (i32, i32),
+    cell: (i32, i32),
+    turn: (i32, i32),
+    dash: i32,
+) {
+    let base = layout.point(Point::new(0, 0));
+    let to_pixels = |milli: i64| (milli * i64::from(layout.scale.logical(1000)) / 1_000_000) as i32;
+    for (row, line) in AEROS_LOGO.lines().enumerate() {
+        for (column, character) in line.bytes().enumerate() {
+            let alpha = match character {
+                b'@' => 255,
+                b'%' | b'#' => 215,
+                b'*' | b'+' | b'=' => 165,
+                b'-' | b':' => 115,
+                b'.' => 75,
+                _ => continue,
+            };
+            let x = i64::from(column as i32 * cell.0 + cell.0 / 2);
+            let y = i64::from(row as i32 * cell.1 + cell.1 * 6 / 10);
+            let turned_x =
+                i64::from(origin.0) + (x * i64::from(turn.0) - y * i64::from(turn.1)) / 1000;
+            let turned_y =
+                i64::from(origin.1) + (x * i64::from(turn.1) + y * i64::from(turn.0)) / 1000;
+            painter.fill_rounded_rect(
+                Rect::new(
+                    base.x + to_pixels(turned_x),
+                    base.y + to_pixels(turned_y),
+                    dash,
+                    1,
+                ),
+                CornerRadii::all(0),
+                Rgba::new(255, 255, 255, alpha),
+            );
+        }
+    }
+}
+
+/// White text with Figma's default inner shadow (a soft dark band along the
+/// top of each letter), optionally inside a 1-pixel outline of `stroke`.
+#[allow(clippy::too_many_arguments)]
+fn shadowed_text(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    font: RasterFont,
+    bounds: Rect,
+    value: &str,
+    height: i32,
+    stroke: Option<Color>,
+) {
+    let physical = layout.rect(bounds);
+    let size = layout.scale.logical(height);
+    let origin = Point::new(
+        physical.x + physical.width.saturating_sub(font.text_width(value, size)) / 2,
+        physical.y + physical.height.saturating_sub(size) / 2,
+    );
+    if let Some(stroke) = stroke {
+        for (dx, dy) in [
+            (-1, 0),
+            (1, 0),
+            (0, -1),
+            (0, 1),
+            (-1, -1),
+            (1, -1),
+            (-1, 1),
+            (1, 1),
+        ] {
+            painter.text(
+                font,
+                Point::new(origin.x + dx, origin.y + dy),
+                value,
+                size,
+                stroke,
+            );
+        }
+    }
+    painter.text(font, origin, value, size, Color::rgb(192, 192, 192));
+    painter.text(
+        font,
+        Point::new(origin.x, origin.y + (size / 24).max(1)),
+        value,
+        size,
+        Color::rgb(255, 255, 255),
+    );
+}
+
+impl DesktopState {
+    /// "Forgot password?" appears on the sign-in screen after a wrong password.
+    fn reset_link_shown(&self) -> bool {
+        self.lockout.failures() > 0
+    }
+}
+/// Text as Figma's Glass effect draws it on the lock screen: the scene behind
+/// shows through a 10% white fill, a 1-pixel #838383 stroke runs outside
+/// each letter, and the light (from the upper right) catches the edges.
 fn glass_centered_text(
     painter: &mut Painter<'_>,
     layout: Layout,
@@ -10368,64 +10569,25 @@ fn glass_centered_text(
     let behind = painter
         .color_at(Point::new(
             physical.x + physical.width / 2,
-            physical.y + physical.height / 2,
+            origin.y + size / 2,
         ))
         .unwrap_or(Color::rgb(120, 150, 160));
     let white = Color::rgb(255, 255, 255);
-    let rim = (size / 36).max(1);
     let at = |dx: i32, dy: i32| Point::new(origin.x + dx, origin.y + dy);
-    painter.text(
-        font,
-        at(0, rim * 2),
-        value,
-        size,
-        mix_color(behind, Color::rgb(0, 0, 0), 220),
-    );
-    for (dx, dy, light) in [
-        (rim, rim, 520),
-        (rim, 0, 640),
-        (0, rim, 600),
-        (-rim, 0, 820),
-        (0, -rim, 900),
-        (-rim, -rim, 940),
+    for (dx, dy) in [
+        (-1, 0),
+        (1, 0),
+        (0, -1),
+        (0, 1),
+        (-1, -1),
+        (1, -1),
+        (-1, 1),
+        (1, 1),
     ] {
-        painter.text(
-            font,
-            at(dx, dy),
-            value,
-            size,
-            mix_color(behind, white, light),
-        );
+        painter.text(font, at(dx, dy), value, size, Color::rgb(131, 131, 131));
     }
-    painter.text(font, origin, value, size, mix_color(behind, white, 180));
-}
-
-/// Light text set straight on the wallpaper, on a soft dark chip so it stays
-/// readable over snow and cloud.
-fn chip_centered_text(
-    painter: &mut Painter<'_>,
-    layout: Layout,
-    font: RasterFont,
-    bounds: Rect,
-    value: &str,
-    height: i32,
-    color: Color,
-) {
-    let physical = layout.rect(bounds);
-    let width = font.text_width(value, layout.scale.logical(height));
-    let pad = layout.scale.logical(12);
-    let chip = Rect::new(
-        physical.x + physical.width.saturating_sub(width) / 2 - pad,
-        physical.y,
-        width + pad * 2,
-        physical.height,
-    );
-    painter.fill_rounded_rect(
-        chip,
-        CornerRadii::all(chip.height / 2),
-        Rgba::new(10, 30, 42, 96),
-    );
-    centered_text(painter, layout, font, bounds, value, height, color);
+    painter.text(font, at(1, -1), value, size, mix_color(behind, white, 620));
+    painter.text(font, at(0, 0), value, size, mix_color(behind, white, 130));
 }
 
 /// One row of a program's screen in the Terminal: runs of cells that share
@@ -10568,20 +10730,20 @@ fn frost_mode(
 fn dock_style() -> FrostStyle {
     FrostStyle {
         blur_radius: 14,
-        saturation_percent: 115,
-        brightness_percent: 105,
-        tint: Rgba::new(196, 196, 196, 51),
-        border: Rgba::new(0, 0, 0, 255),
+        saturation_percent: 100,
+        brightness_percent: 100,
+        tint: Rgba::new(0, 0, 0, 3),
+        border: Rgba::new(110, 110, 110, 190),
         border_width: 1,
         inner_highlight: Rgba::new(255, 255, 255, 34),
         inner_shadow: Rgba::new(0, 0, 0, 64),
-        inner_shadow_offset: Point::new(9, 9),
-        inner_shadow_softness: 18,
-        shadow: Rgba::new(0, 0, 0, 45),
-        shadow_offset: Point::new(0, 4),
-        shadow_spread: 1,
-        shadow_softness: 8,
-        noise_alpha: 7,
+        inner_shadow_offset: Point::new(0, 4),
+        inner_shadow_softness: 4,
+        shadow: Rgba::transparent(),
+        shadow_offset: Point::new(0, 0),
+        shadow_spread: 0,
+        shadow_softness: 0,
+        noise_alpha: 4,
     }
 }
 
@@ -10590,9 +10752,9 @@ fn time_style() -> FrostStyle {
         blur_radius: 9,
         saturation_percent: 110,
         brightness_percent: 103,
-        tint: Rgba::new(14, 26, 32, 120),
-        border: Rgba::new(239, 248, 250, 110),
-        border_width: 1,
+        tint: Rgba::new(73, 73, 73, 51),
+        border: Rgba::transparent(),
+        border_width: 0,
         inner_highlight: Rgba::new(255, 255, 255, 25),
         inner_shadow: Rgba::new(0, 0, 0, 28),
         inner_shadow_offset: Point::new(4, 4),
@@ -10889,11 +11051,15 @@ fn terminal_edit_self_test() -> bool {
 fn pointer_self_test() -> bool {
     let mut launch = DesktopState::new();
     launch.screen = Screen::Desktop;
-    let terminal = launch.click(Point::new(133, 405)) == DesktopAction::Redraw
-        && launch.app == DesktopApp::Terminal;
+    let centre = |slot: usize| {
+        let icon = dock_icon_rect(slot);
+        Point::new(icon.x + icon.width / 2, icon.y + icon.height / 2)
+    };
+    let terminal =
+        launch.click(centre(1)) == DesktopAction::Redraw && launch.app == DesktopApp::Terminal;
     let mut apps = DesktopState::new();
     apps.screen = Screen::Desktop;
-    apps.click(Point::new(69, 405));
+    apps.click(centre(0));
     let opened = apps.overlay == Overlay::Apps;
     let mut wake = DesktopState::new();
     let ignored =
@@ -11293,7 +11459,7 @@ fn date_text() -> ClockBuffer {
     let mut result = ClockBuffer::new();
     let _ = write!(
         result,
-        "{:02}.{:02}.{:02}",
+        "{:02}:{:02}:{:02}",
         current.day,
         current.month,
         current.year % 100
@@ -11451,11 +11617,6 @@ fn mix_color(from: Color, to: Color, t_milli: i32) -> Color {
 fn weekday_text() -> &'static str {
     const NAMES: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     NAMES[((crate::rtc::local_seconds() / 86_400 + 4) % 7) as usize]
-}
-
-/// Where the show/hide-password eye sits on the sign-in pill.
-fn login_eye_rect() -> Rect {
-    Rect::new(446, 306, 30, 28)
 }
 
 /// A small eye glyph; blue while the password text is showing.
@@ -11727,8 +11888,8 @@ impl DesktopState {
             1000 - ease_out_milli(progress_of(now, self.music_expand_until_ns, 320_000_000)) as i32
         }
         .clamp(-120, 1120);
-        let width = lerp_i32(176, 262, morph);
-        let height = lerp_i32(27, 96, morph).max(20);
+        let width = 192;
+        let height = lerp_i32(27, 95, morph).max(20);
         let appear = ease_out_back_milli(progress_of(now, self.music_shown_ns, MUSIC_SLIDE_NS));
         let leave = if self.music_playing {
             0
@@ -11925,7 +12086,7 @@ fn draw_music_hub(
             painter,
             layout,
             font,
-            Point::new(bounds.x + 86, bounds.y + 14),
+            Point::new(bounds.x + 85, bounds.y + 12),
             track.0,
             12,
             Color::rgb(244, 246, 248),
@@ -11934,13 +12095,13 @@ fn draw_music_hub(
             painter,
             layout,
             font,
-            Point::new(bounds.x + 86, bounds.y + 32),
+            Point::new(bounds.x + 85, bounds.y + 24),
             track.1,
             9,
             Color::rgb(196, 214, 202),
         );
         let white = Rgba::new(244, 246, 248, 255);
-        let cy = bounds.y + 70;
+        let cy = bounds.y + 47;
         draw_triangle(painter, layout, bounds.x + 88, cy, 8, 12, false, white);
         draw_triangle(painter, layout, bounds.x + 95, cy, 8, 12, false, white);
         if state.music_playing {
@@ -11994,122 +12155,25 @@ fn draw_music_hub(
     }
 }
 
-fn draw_leaf_mark(painter: &mut Painter<'_>, layout: Layout, center: Point, radius: i32, now: u64) {
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(
-            center.x - radius,
-            center.y - radius,
-            radius * 2,
-            radius * 2,
-        )),
-        layout.radii(CornerRadii::all(radius)),
-        Rgba::new(4, 5, 6, 252),
-    );
-    let mask = crate::logo::rgba();
-    let box_w = (radius * 190 / 100).max(4);
-    let box_h = box_w * crate::logo::HEIGHT as i32 / crate::logo::WIDTH as i32;
-    let shimmer = (now / 8_000_000) as i32;
-    let step = 2;
-    let mut y = -box_h / 2;
-    while y < box_h / 2 {
-        let mut x = -box_w / 2;
-        while x < box_w / 2 {
-            let u = ((x + box_w / 2) * crate::logo::WIDTH as i32 / box_w) as usize;
-            let v = ((y + box_h / 2) * crate::logo::HEIGHT as i32 / box_h) as usize;
-            let covered = u < crate::logo::WIDTH
-                && v < crate::logo::HEIGHT
-                && mask[(v * crate::logo::WIDTH + u) * 4 + 3] > 140;
-            if covered {
-                let glint = ((x * 3 + y * 5 + shimmer) & 63) < 4;
-                let alpha = if glint { 255 } else { 205 };
-                painter.fill_rounded_rect(
-                    layout.rect(Rect::new(center.x + x, center.y + y, 2, 2)),
-                    layout.radii(CornerRadii::all(1)),
-                    Rgba::new(230, 236, 240, alpha),
-                );
-            }
-            x += step;
-        }
-        y += step;
-    }
-}
-
-/// The glass square holding the account mark, with a floating bob and a
-/// slow pulsing halo. `size` already includes any pop-in scaling.
-fn draw_account_tile(
-    painter: &mut Painter<'_>,
-    layout: Layout,
-    center: Point,
-    size: i32,
-    now: u64,
-    cheap: bool,
-    seed: u32,
-) -> bool {
-    let bob = wave_milli(now / 3_000_000) * 3 / 1000;
-    let halo_phase = (now / 2_400_000) % 1000;
-    let halo = (halo_phase as i32) * 14 / 1000;
-    let halo_alpha = (70 - (halo_phase as i32) * 70 / 1000).max(0) as u8;
-    let tile = Rect::new(center.x - size / 2, center.y - size / 2 + bob, size, size);
-    let radius = size * 28 / 100;
-    painter.stroke_rounded_rect(
-        layout.rect(Rect::new(
-            tile.x - halo,
-            tile.y - halo,
-            tile.width + halo * 2,
-            tile.height + halo * 2,
-        )),
-        layout.radii(CornerRadii::all(radius + halo)),
-        2,
-        Rgba::new(255, 255, 255, halo_alpha),
-    );
-    let _ = frost_mode(
-        painter,
-        layout,
-        tile,
-        CornerRadii::all(radius),
-        setup_card_style(),
-        seed,
-        // The tile sits on a smooth wallpaper, so a flat tint reads the
-        // same as the blur and keeps every animated frame cheap.
-        true,
-    );
-    let _ = cheap;
-    painter.fill_rounded_rect(
-        layout.rect(tile),
-        layout.radii(CornerRadii::all(radius)),
-        Rgba::new(150, 156, 160, 52),
-    );
-    draw_leaf_mark(
-        painter,
-        layout,
-        Point::new(tile.x + size / 2, tile.y + size / 2),
-        size * 36 / 100,
-        now,
-    );
-    true
-}
-
 fn draw_lock(
     painter: &mut Painter<'_>,
     layout: Layout,
     font: RasterFont,
     state: &DesktopState,
     now: u64,
-    cheap: bool,
+    _cheap: bool,
 ) -> bool {
     let entered = now.saturating_sub(state.screen_transition_at_ns);
     let rise = 1000 - ease_out_milli(progress_of(entered, 0, 700_000_000)) as i32;
-    let pop = ease_out_back_milli(progress_of(entered, 120_000_000, 720_000_000)).max(0);
     let clock = time_text();
     glass_centered_text(
         painter,
         layout,
-        font,
-        Rect::new(LOGIN_CARD.x, 40 + rise * 26 / 1000, LOGIN_CARD.width, 64),
+        crate::font::clock_font().unwrap_or(font),
+        Rect::new(LOGIN_CARD.x, 31 + rise * 26 / 1000, LOGIN_CARD.width, 152),
         clock.as_str(),
-        56,
+        152,
     );
-    let mut date = ClockBuffer::new();
     let current = crate::rtc::local_date_time();
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -12121,94 +12185,72 @@ fn draw_lock(
         (3, _) => "rd",
         _ => "th",
     };
+    let mut date = ClockBuffer::new();
     let _ = write!(
         date,
-        "{}     {}{suffix} {}",
-        weekday_text(),
+        "{}{suffix} {}",
         current.day,
         MONTHS[usize::from(current.month.clamp(1, 12)) - 1],
     );
-    centered_text(
-        painter,
-        layout,
-        font,
-        Rect::new(LOGIN_CARD.x, 102 + rise * 34 / 1000, LOGIN_CARD.width, 18),
-        date.as_str(),
-        11,
-        Color::rgb(232, 238, 242),
-    );
-    let captured = draw_account_tile(
-        painter,
-        layout,
-        Point::new(376, 236),
-        (128 * pop / 1000).max(8),
-        now,
-        cheap,
-        0xae5e_0020,
-    );
-    let hint_glow = (wave_milli(now / 5_000_000) + 1000) / 2;
-    centered_text(
-        painter,
-        layout,
-        font,
-        Rect::new(LOGIN_CARD.x, 336 + rise * 30 / 1000, LOGIN_CARD.width, 22),
-        state.display_name(),
-        16,
-        Color::rgb(244, 247, 249),
-    );
-    chip_centered_text(
-        painter,
-        layout,
-        font,
-        Rect::new(LOGIN_CARD.x, 362 + rise * 40 / 1000, LOGIN_CARD.width, 20),
-        "Type your password to sign in",
-        11,
-        mix_color(
-            Color::rgb(190, 200, 208),
-            Color::rgb(255, 255, 255),
-            hint_glow,
-        ),
-    );
-    captured
+    let date_y = 157 + rise * 34 / 1000;
+    for (centre, value) in [(294, weekday_text()), (457, date.as_str())] {
+        shadowed_text(
+            painter,
+            layout,
+            font,
+            Rect::new(centre - 80, date_y, 160, 27),
+            value,
+            27,
+            None,
+        );
+    }
+    true
 }
-
 fn draw_signin(
     painter: &mut Painter<'_>,
     layout: Layout,
     font: RasterFont,
     state: &DesktopState,
     now_ns: u64,
-    cheap: bool,
+    _cheap: bool,
 ) -> bool {
     let entered = now_ns.saturating_sub(state.screen_transition_at_ns);
     let rise = 1000 - ease_out_milli(progress_of(entered, 0, 600_000_000)) as i32;
     let pop = ease_out_back_milli(progress_of(entered, 60_000_000, 680_000_000)).max(0);
-    centered_text(
+    shadowed_text(
         painter,
         layout,
         font,
-        Rect::new(LOGIN_CARD.x, 44 + rise * 24 / 1000, LOGIN_CARD.width, 34),
+        Rect::new(LOGIN_CARD.x, 25 + rise * 24 / 1000, LOGIN_CARD.width, 30),
         "Welcome back",
-        26,
-        Color::rgb(248, 250, 252),
+        30,
+        None,
     );
-    let captured = draw_account_tile(
-        painter,
-        layout,
-        Point::new(376, 170),
-        (112 * pop / 1000).max(8),
-        now_ns,
-        cheap,
-        0xae5e_0021,
+    let size = (139 * pop / 1000).max(8);
+    let avatar = Rect::new(376 - size / 2, 175 - size / 2, size, size);
+    painter.fill_rounded_rect(
+        layout.rect(avatar),
+        layout.radii(CornerRadii::all(size / 2)),
+        Rgba::opaque(0, 0, 0),
     );
-    centered_text(
+    if pop >= 900 {
+        draw_ascii_art(
+            painter,
+            layout,
+            (303_500, 113_700),
+            (1_094, 2_410),
+            (878, 479),
+            1,
+        );
+    }
+    shadowed_text(
         painter,
         layout,
         font,
-        Rect::new(LOGIN_CARD.x, 240 + rise * 30 / 1000, LOGIN_CARD.width, 22),
+        Rect::new(LOGIN_CARD.x, 300 + rise * 30 / 1000, LOGIN_CARD.width, 19),
         state.display_name(),
-        14,
-        Color::rgb(240, 244, 247),
+        19,
+        None,
     );
     let error_active = now_ns < state.login_error_until_ns;
     let error_started = state.login_error_until_ns.saturating_sub(LOGIN_ERROR_NS);
@@ -12219,47 +12261,25 @@ fn draw_signin(
         0
     };
     let grow = ease_out_back_milli(progress_of(entered, 220_000_000, 620_000_000)).max(0);
-    let width = (220 * grow / 1000).max(40);
-    let field = Rect::new(376 - width / 2 + shake, 296 + rise * 34 / 1000, width, 48);
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(
-            field.x - 2,
-            field.y + 3,
-            field.width + 4,
-            field.height + 2,
-        )),
-        layout.radii(CornerRadii::all(26)),
-        Rgba::new(0, 0, 0, 34),
-    );
-    let flash = if error_active {
-        mix_color(
-            Color::rgb(255, 255, 255),
-            Color::rgb(250, 208, 202),
-            wave_milli(now_ns / 2_000_000).abs(),
-        )
-    } else {
-        Color::rgb(255, 255, 255)
-    };
+    let width = (234 * grow / 1000).max(40);
+    let field = Rect::new(376 - width / 2 + shake, 345 + rise * 34 / 1000, width, 41);
     painter.fill_rounded_rect(
         layout.rect(field),
-        layout.radii(CornerRadii::all(24)),
-        Rgba::new(flash.red, flash.green, flash.blue, 244),
+        layout.radii(CornerRadii::all(field.height / 2)),
+        Rgba::opaque(255, 255, 255),
     );
     if error_active {
         let pop = ease_out_back_milli(progress_of(now_ns, error_started, 360_000_000)).max(0);
         panels::icon_cross(
             painter,
             layout,
-            Point::new(field.x + width - 30, field.y + 24),
-            (11 * pop / 1000).max(3),
-            Rgba::new(232, 54, 42, 255),
+            Point::new(field.right() - 26, field.y + field.height / 2),
+            (12 * pop / 1000).max(3),
+            Rgba::new(232, 30, 30, 255),
         );
     }
-    if width > 150 {
-        draw_eye(painter, layout, login_eye_rect(), state.reveal_password);
-    }
     // Typed characters appear as dots that pop in one by one (or as the
-    // text itself while the eye is on).
+    // text itself while revealed).
     let dots = state.login_len.min(14) as i32;
     if state.reveal_password && state.login_len > 0 {
         let text_rect = Rect::new(field.x + 16, field.y, width - 60, field.height);
@@ -12276,7 +12296,7 @@ fn draw_signin(
         let blink = (now_ns / 500_000_000).is_multiple_of(2);
         if blink && width > 100 {
             painter.fill_rounded_rect(
-                layout.rect(Rect::new(field.x + width / 2 - 1, field.y + 14, 2, 20)),
+                layout.rect(Rect::new(field.x + width / 2 - 1, field.y + 11, 2, 19)),
                 layout.radii(CornerRadii::all(1)),
                 Rgba::new(70, 84, 92, 200),
             );
@@ -12294,7 +12314,7 @@ fn draw_signin(
             painter.fill_rounded_rect(
                 layout.rect(Rect::new(
                     start + index * step - size / 2,
-                    field.y + 24 - size / 2,
+                    field.y + field.height / 2 - size / 2,
                     size,
                     size,
                 )),
@@ -12303,53 +12323,19 @@ fn draw_signin(
             );
         }
     }
-    let wait = state.lockout.seconds_left(now_ns);
-    let mut wait_text = ClockBuffer::new();
-    let hint = if wait > 0 {
-        let _ = write!(wait_text, "Locked - wait {wait}s");
-        wait_text.as_str()
-    } else if error_active {
-        "Incorrect password"
-    } else if state.caps_lock {
-        "Caps Lock is on"
-    } else {
-        "Press Enter to sign in"
-    };
-    let hint_color = if error_active || wait > 0 {
-        Color::rgb(238, 132, 124)
-    } else if state.caps_lock {
-        Color::rgb(255, 206, 128)
-    } else {
-        Color::rgb(222, 228, 234)
-    };
-    chip_centered_text(
-        painter,
-        layout,
-        font,
-        Rect::new(LOGIN_CARD.x, 362 + rise * 40 / 1000, LOGIN_CARD.width, 22),
-        hint,
-        11,
-        hint_color,
-    );
-    if wait == 0 {
-        chip_centered_text(
+    if state.reset_link_shown() {
+        shadowed_text(
             painter,
             layout,
             font,
-            Rect::new(
-                flow::RESET_LINK.x,
-                flow::RESET_LINK.y,
-                flow::RESET_LINK.width,
-                22,
-            ),
+            flow::RESET_LINK,
             "Forgot password?",
-            11,
-            Color::rgb(190, 202, 210),
+            19,
+            Some(Color::rgb(0x54, 0xbc, 0xe3)),
         );
     }
-    captured
+    true
 }
-
 struct DockCache(UnsafeCell<[u32; 320_000]>);
 
 unsafe impl Sync for DockCache {}

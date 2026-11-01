@@ -14,7 +14,7 @@ $output = Join-Path $root "assets/desktop-icons.bin"
 $size = 64
 
 # Order must match kernel/src/desktop.rs's icon(index) lookup.
-$names = @("apps", "terminal", "files-dock", "browser", "notes", "trash", "files-grid")
+$names = @("apps", "terminal", "files-dock", "browser", "notes", "trash", "files-grid", "feather", "gear", "qs-wifi", "qs-bluetooth", "qs-power", "qs-battery", "qs-airplane", "set-6", "set-7", "set-8", "set-9", "set-10", "set-11", "set-12")
 
 if ((Test-Path -LiteralPath $output) -and -not $Force) {
     $expected = $names.Count * $size * $size * 4

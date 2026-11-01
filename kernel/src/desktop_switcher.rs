@@ -1,10 +1,12 @@
 use super::*;
 
-const CARD_WIDTH: i32 = 112;
-const CARD_HEIGHT: i32 = 98;
-const GAP: i32 = 12;
-const PADDING: i32 = 18;
-const CAPTION: i32 = 30;
+// Sizes from the Figma switcher (scaled to the 752-unit design width).
+const CARD_WIDTH: i32 = 207;
+const CARD_HEIGHT: i32 = 186;
+const GAP: i32 = 70;
+const PADDING: i32 = 50;
+const TOP: i32 = 64;
+const BOTTOM: i32 = 33;
 const MAX_APPS: usize = 8;
 
 const ALL_APPS: [DesktopApp; MAX_APPS] = [
@@ -128,7 +130,7 @@ impl DesktopState {
         let (_, count) = self.open_app_list();
         let panel = switcher_panel(count);
         for index in 0..count {
-            if switcher_card(panel, index).contains(point) {
+            if switcher_card(panel, index, count).contains(point) {
                 self.switcher_index = index;
                 self.switcher_commit();
                 return Some(DesktopAction::Redraw);
@@ -139,19 +141,28 @@ impl DesktopState {
     }
 }
 
-fn switcher_panel(count: usize) -> Rect {
+/// How much the cards shrink (in thousandths) so `count` of them fit.
+fn card_scale(count: usize) -> i32 {
     let count = count.max(1) as i32;
-    let width = PADDING * 2 + count * CARD_WIDTH + (count - 1) * GAP;
-    let height = PADDING * 2 + CARD_HEIGHT + CAPTION;
-    Rect::new((DESIGN_WIDTH - width) / 2, 168, width, height)
+    let natural = count * CARD_WIDTH + (count - 1) * GAP;
+    ((DESIGN_WIDTH - 40 - PADDING * 2) * 1000 / natural).min(1000)
 }
 
-fn switcher_card(panel: Rect, index: usize) -> Rect {
+fn switcher_panel(count: usize) -> Rect {
+    let scale = card_scale(count);
+    let count = count.max(1) as i32;
+    let width = PADDING * 2 + (count * CARD_WIDTH + (count - 1) * GAP) * scale / 1000;
+    let height = TOP + BOTTOM + CARD_HEIGHT * scale / 1000;
+    Rect::new((DESIGN_WIDTH - width) / 2, 58, width, height)
+}
+
+fn switcher_card(panel: Rect, index: usize, count: usize) -> Rect {
+    let scale = card_scale(count);
     Rect::new(
-        panel.x + PADDING + index as i32 * (CARD_WIDTH + GAP),
-        panel.y + PADDING,
-        CARD_WIDTH,
-        CARD_HEIGHT,
+        panel.x + PADDING + index as i32 * (CARD_WIDTH + GAP) * scale / 1000,
+        panel.y + TOP,
+        CARD_WIDTH * scale / 1000,
+        CARD_HEIGHT * scale / 1000,
     )
 }
 
@@ -179,76 +190,62 @@ pub(super) fn draw_switcher(
         width,
         height,
     );
-    let _ = frost(
-        painter,
-        layout,
-        panel,
-        CornerRadii::all(30),
-        window_style(),
-        0xaed0_0900,
+    painter.fill_rounded_rect(
+        layout.rect(panel),
+        layout.radii(CornerRadii::all(70.min(panel.height / 2))),
+        Rgba::new(0, 0, 0, 51),
     );
     if pop < 800 {
         return;
     }
     for (index, app) in list[..count].iter().enumerate() {
-        let card = switcher_card(full, index);
+        let card = switcher_card(full, index, count);
         let selected = index == state.switcher_index.min(count - 1);
-        painter.fill_rounded_rect(
-            layout.rect(card),
-            layout.radii(CornerRadii::all(22)),
-            if selected {
-                Rgba::new(246, 248, 250, 250)
-            } else {
-                Rgba::new(222, 226, 229, 232)
-            },
-        );
-        if selected {
-            painter.stroke_rounded_rect(
-                layout.rect(card.expand(2)),
-                layout.radii(CornerRadii::all(24)),
-                3,
-                Rgba::new(46, 120, 232, 255),
-            );
-        }
-        let icon = Rect::new(card.x + card.width / 2 - 26, card.y + 14, 52, 52);
-        match app_icon(*app) {
-            Some(kind) => draw_icon(painter, layout, kind, icon),
-            None => {
-                let title = app_title(*app);
-                painter.fill_rounded_rect(
-                    layout.rect(icon),
-                    layout.radii(CornerRadii::all(16)),
-                    Rgba::new(40, 48, 56, 255),
-                );
-                centered_text(
-                    painter,
-                    layout,
-                    font,
-                    icon,
-                    &title[..1],
-                    24,
-                    Color::rgb(240, 244, 247),
-                );
-            }
-        }
-        centered_text(
+        text(
             painter,
             layout,
             font,
-            Rect::new(card.x, card.y + 70, card.width, 22),
+            Point::new(card.x + 8, card.y - 26),
             app_title(*app),
-            13,
-            Color::rgb(20, 26, 32),
+            19,
+            Color::rgb(255, 255, 255),
         );
+        painter.fill_rounded_rect(
+            layout.rect(card),
+            layout.radii(CornerRadii::all(card.width / 5)),
+            Rgba::opaque(0xd9, 0xd9, 0xd9),
+        );
+        let side = (card.width * 31 / 100).max(24);
+        let icon = Rect::new(
+            card.x + (card.width - side) / 2,
+            card.y + (card.height - side) / 2,
+            side,
+            side,
+        );
+        match app_icon(*app) {
+            Some(kind) => draw_icon(painter, layout, kind, icon),
+            None => centered_text(
+                painter,
+                layout,
+                font,
+                icon,
+                &app_title(*app)[..1],
+                30,
+                Color::rgb(0, 0, 0),
+            ),
+        }
+        if selected {
+            let pill = Rect::new(card.x + card.width / 2 - 11, card.bottom() + 8, 22, 7);
+            painter.fill_rounded_rect(
+                layout.rect(pill),
+                layout.radii(CornerRadii::all(3)),
+                Rgba::opaque(0, 0, 0),
+            );
+            painter.fill_rounded_rect(
+                layout.rect(pill.expand(-1)),
+                layout.radii(CornerRadii::all(3)),
+                Rgba::opaque(0xd9, 0xd9, 0xd9),
+            );
+        }
     }
-    let current = list[state.switcher_index.min(count - 1)];
-    centered_text(
-        painter,
-        layout,
-        font,
-        Rect::new(full.x, full.bottom() - CAPTION + 2, full.width, 22),
-        app_title(current),
-        14,
-        Color::rgb(244, 247, 249),
-    );
 }

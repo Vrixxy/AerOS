@@ -141,6 +141,8 @@ struct Task {
     continue_report: bool,
     /// `PR_SET_PDEATHSIG`: the signal this task gets when its parent exits.
     death_signal: u8,
+    /// CPUs it may run on (sched_setaffinity), 0 for any.
+    affinity: u64,
     /// `PR_SET_NAME` (0 bytes: the program's name).
     name: [u8; 16],
     name_length: u8,
@@ -200,6 +202,7 @@ impl Task {
         stop_report: 0,
         continue_report: false,
         death_signal: 0,
+        affinity: 0,
         name: [0; 16],
         name_length: 0,
         started_ns: 0,
@@ -290,6 +293,7 @@ impl Scheduler {
             stop_report: 0,
             continue_report: false,
             death_signal: 0,
+            affinity: 0,
             name: [0; 16],
             name_length: 0,
             started_ns: 0,
@@ -448,6 +452,11 @@ impl Scheduler {
                 continue;
             }
             let task = &self.tasks[index];
+            if let Some(cpu) = cpu
+                && !affinity_allows(task.affinity, cpu)
+            {
+                continue;
+            }
             if task.state == TaskState::Ready && !task.job_stopped {
                 candidates[count] = (index, task.nice, task.skipped);
                 count += 1;
@@ -846,6 +855,7 @@ pub fn spawn(entry: extern "C" fn() -> !) -> Option<u64> {
         stop_report: 0,
         continue_report: false,
         death_signal: 0,
+        affinity: 0,
         name: [0; 16],
         name_length: 0,
         started_ns: 0,
@@ -1000,6 +1010,7 @@ pub fn fork_current_user_task(snapshot: &arch::user::ForkSnapshot) -> Option<u64
     let parent_pgid = scheduler.tasks[current].pgid;
     let parent_sid = scheduler.tasks[current].sid;
     let parent_nice = scheduler.tasks[current].nice;
+    let parent_affinity = scheduler.tasks[current].affinity;
     let parent_exe = (
         scheduler.tasks[owner].exe,
         scheduler.tasks[owner].exe_length,
@@ -1033,6 +1044,7 @@ pub fn fork_current_user_task(snapshot: &arch::user::ForkSnapshot) -> Option<u64
     scheduler.tasks[slot].pgid = parent_pgid;
     scheduler.tasks[slot].sid = parent_sid;
     scheduler.tasks[slot].nice = parent_nice;
+    scheduler.tasks[slot].affinity = parent_affinity;
     scheduler.tasks[slot].exe = parent_exe.0;
     scheduler.tasks[slot].exe_length = parent_exe.1;
     scheduler.tasks[slot].fs_base = arch::user::read_fs_base();
@@ -2000,6 +2012,13 @@ pub fn restore_nice(id: u64, nice: i8) {
     }
 }
 
+/// `poll_child` without reaping (`waitid` with `WNOWAIT`): the child stays
+/// waitable.
+pub fn peek_child(child_id: u64) -> Option<Option<u64>> {
+    let slot = slot_for_id(child_id)?;
+    let exit_code = USER_TASK_EXIT[slot].load(Ordering::Acquire);
+    Some((exit_code != u64::MAX).then_some(exit_code))
+}
 /// Non-blocking `wait_for_child`: `None` = no such task, `Some(None)` = still
 /// running, `Some(Some(code))` = it had exited and has now been reaped.
 pub fn poll_child(child_id: u64) -> Option<Option<u64>> {
@@ -2503,6 +2522,33 @@ pub fn threads_of(id: Option<u64>, mut visit: impl FnMut(u64, u64, u64)) {
             visit(task.id, task.cpu_user_ns, task.cpu_system_ns);
         }
     }
+}
+
+/// Whether a task with affinity `mask` may run on `cpu`. A mask naming no
+/// processor that runs tasks (processor 0 may not) is not enforced, so a
+/// task can never be left with nowhere to run.
+fn affinity_allows(mask: u64, cpu: usize) -> bool {
+    let mut usable = crate::smp::online_mask();
+    if !BSP_RUNS_TASKS.load(Ordering::Acquire) {
+        usable &= !1;
+    }
+    let effective = mask & usable;
+    effective == 0 || cpu < 64 && effective & (1 << cpu) != 0
+}
+
+/// `sched_setaffinity` for the running task.
+pub fn set_affinity(mask: u64) {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let current = scheduler.current;
+    scheduler.tasks[current].affinity = mask;
+}
+
+/// `sched_getaffinity` for the running task (0 when unrestricted).
+pub fn affinity() -> u64 {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    scheduler.tasks[scheduler.current].affinity
 }
 
 /// `PR_SET_NAME` for the running task (up to 15 bytes).

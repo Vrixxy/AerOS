@@ -836,9 +836,12 @@ fn main() {
         40,
     );
     let other = cstr("/tmp/sx-link");
+    let _ = std::fs::remove_file("/tmp/sx-link");
     step(
-        "link_refused",
-        sys(LINK, [node.as_ptr() as usize, other.as_ptr() as usize, 0, 0, 0, 0]) == -1,
+        "link",
+        sys(LINK, [node.as_ptr() as usize, other.as_ptr() as usize, 0, 0, 0, 0]) == 0
+            && std::fs::metadata("/tmp/sx-link").is_ok()
+            && std::fs::remove_file("/tmp/sx-link").is_ok(),
         41,
     );
     let root = cstr("/tmp");

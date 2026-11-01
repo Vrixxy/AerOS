@@ -8,7 +8,8 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $builtEsp = @(& (Join-Path $PSScriptRoot "build.ps1") -BootTest)[-1]
 # The test drive is a copy without the Linux guest's own files (kernel, initrd,
-# root file system: hundreds of MiB that no boot test uses), so what the
+# root file system: hundreds of MiB that no boot test uses) or the sign-in
+# lockout a session left behind, so what the
 # drive holds fits in the FAT16 volume QEMU makes of a directory.
 $esp = Join-Path $root "build\esp-test"
 if (Test-Path -LiteralPath $esp) {
@@ -16,7 +17,7 @@ if (Test-Path -LiteralPath $esp) {
 }
 New-Item -ItemType Directory -Force -Path $esp | Out-Null
 Get-ChildItem -Force -LiteralPath $builtEsp |
-    Where-Object { $_.Name -notin @("ROOTFS", "INITRD", "VMLINUZ") } |
+    Where-Object { $_.Name -notin @("ROOTFS", "INITRD", "VMLINUZ", "lockout.dat") } |
     Copy-Item -Recurse -Force -Destination $esp
 $qemu = Join-Path $env:ProgramFiles "qemu\qemu-system-x86_64.exe"
 $firmware = Join-Path $env:ProgramFiles "qemu\share\edk2-x86_64-code.fd"

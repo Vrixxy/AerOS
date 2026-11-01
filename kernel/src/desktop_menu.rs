@@ -7,11 +7,11 @@ const NOTE_NS: u64 = 2_400_000_000;
 /// top left opens the system menu, the gear at the top right the quick
 /// settings.
 pub(super) const FEATHER: Rect = Rect::new(2, 2, 48, 40);
-const FEATHER_ART: Rect = Rect::new(9, 9, 33, 22);
+const FEATHER_ART: Rect = Rect::new(6, 6, 30, 30);
 pub(super) const GEAR: Rect = Rect::new(DESIGN_WIDTH - 44, 2, 42, 40);
-const GEAR_CENTER: Point = Point::new(DESIGN_WIDTH - 23, 21);
+const GEAR_ART: Rect = Rect::new(712, 6, 28, 28);
 
-pub(super) const MENU_PANEL: Rect = Rect::new(10, 38, 118, 188);
+pub(super) const MENU_PANEL: Rect = Rect::new(21, 35, 113, 147);
 const MENU_ROWS: [(&str, bool); 8] = [
     ("Parcel", false),
     ("Settings", true),
@@ -27,19 +27,21 @@ pub(super) const PARCEL_PANEL: Rect = Rect::new(206, 66, 340, 258);
 const PEOPLE: usize = 4;
 const UPLOAD_SLOT: usize = PEOPLE;
 
+/// Each row's top and height, from the Figma menu.
+const MENU_ROW_SPANS: [(i32, i32); 8] = [
+    (45, 14),
+    (64, 14),
+    (78, 14),
+    (96, 14),
+    (114, 14),
+    (132, 12),
+    (144, 11),
+    (155, 13),
+];
+
 fn menu_row(index: usize) -> Rect {
-    let mut y = MENU_PANEL.y + 8;
-    for (slot, (_, gap)) in MENU_ROWS.iter().enumerate() {
-        if slot > 0 && *gap {
-            y += 8;
-        }
-        let height = if slot == 0 { 20 } else { 17 };
-        if slot == index {
-            return Rect::new(MENU_PANEL.x + 8, y, MENU_PANEL.width - 16, height);
-        }
-        y += height;
-    }
-    MENU_PANEL
+    let (top, height) = MENU_ROW_SPANS[index.min(MENU_ROW_SPANS.len() - 1)];
+    Rect::new(35, top, 82, height)
 }
 
 fn person_circle(index: usize) -> Rect {
@@ -246,47 +248,23 @@ pub(super) fn draw_corners(painter: &mut Painter<'_>, layout: Layout, state: &De
     let lit = state.menu_open || state.parcel_open;
     painter.draw_rgba_scaled_alpha(
         layout.rect(FEATHER_ART),
-        crate::logo::rgba(),
-        crate::logo::WIDTH,
-        crate::logo::HEIGHT,
+        desktop_icon(7),
+        DESKTOP_ICON_SIZE,
+        DESKTOP_ICON_SIZE,
         if lit { 255 } else { 235 },
     );
-    let ink = Rgba::new(
-        255,
-        255,
-        255,
+    painter.draw_rgba_scaled_alpha(
+        layout.rect(GEAR_ART),
+        desktop_icon(8),
+        DESKTOP_ICON_SIZE,
+        DESKTOP_ICON_SIZE,
         if state.overlay == Overlay::Quick {
             255
         } else {
             235
         },
     );
-    let center = GEAR_CENTER;
-    let ring = Rect::new(center.x - 7, center.y - 7, 14, 14);
-    painter.stroke_rounded_rect(
-        layout.rect(ring),
-        layout.radii(CornerRadii::all(7)),
-        layout.scale.logical(3).max(2) as u8,
-        ink,
-    );
-    for (dx, dy) in [
-        (8, 0),
-        (6, 6),
-        (0, 8),
-        (-6, 6),
-        (-8, 0),
-        (-6, -6),
-        (0, -8),
-        (6, -6),
-    ] {
-        painter.fill_rounded_rect(
-            layout.rect(Rect::new(center.x + dx - 2, center.y + dy - 2, 5, 5)),
-            layout.radii(CornerRadii::all(2)),
-            ink,
-        );
-    }
 }
-
 fn panel_glass(painter: &mut Painter<'_>, layout: Layout, panel: Rect, radius: i32) {
     let radii = layout.radii(CornerRadii::all(radius));
     painter.fill_rounded_rect(
@@ -315,7 +293,7 @@ pub(super) fn draw_menu(
         painter,
         layout,
         Rect::new(MENU_PANEL.x, MENU_PANEL.y, width, height),
-        18,
+        14,
     );
     if pop < 800 {
         return;
@@ -326,7 +304,7 @@ pub(super) fn draw_menu(
         let focused = state.menu_focus == index;
         if *gap {
             painter.fill_rounded_rect(
-                layout.rect(Rect::new(row.x + 4, row.y - 5, row.width - 8, 1)),
+                layout.rect(Rect::new(32, row.y - 2, 86, 1)),
                 layout.radii(CornerRadii::all(0)),
                 Rgba::new(20, 30, 34, 130),
             );
@@ -352,12 +330,12 @@ pub(super) fn draw_menu(
                 Rgba::new(255, 255, 255, 220),
             );
         }
-        let size = if index == 0 { 11 } else { 10 };
+        let size = 9;
         text(
             painter,
             layout,
             font,
-            Point::new(row.x + 12, row.y + (row.height - size) / 2),
+            Point::new(row.x + 11, row.y + (row.height - size) / 2),
             label,
             size,
             if index == 0 {
@@ -371,7 +349,7 @@ pub(super) fn draw_menu(
                 painter,
                 layout,
                 font,
-                Point::new(row.right() - 16, row.y + (row.height - size) / 2),
+                Point::new(row.right() - 12, row.y + (row.height - size) / 2),
                 ">",
                 size,
                 dark,

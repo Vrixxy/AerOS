@@ -14,8 +14,9 @@ const READ_BITS: u16 = 0o444;
 // files and quarantine entries, all transient), and self-tests that
 // exercise encryption need their own scratch file on top of that. /proc and /sys keep
 // about sixty generated files and links here (the fd links and the per-process
-// files come and go), hence 112.
-const MAX_MUTABLE_FILES: usize = 176;
+// files come and go), and real programs keep many small files in /tmp, so as
+// many as a one-byte storage index allows (255 means static).
+const MAX_MUTABLE_FILES: usize = 250;
 const MUTABLE_FILE_BYTES: usize = 4096;
 /// The most a file outside `/data` may hold; past `MUTABLE_FILE_BYTES` its
 /// bytes live in the kernel heap, so in practice the heap (an eighth of the
@@ -54,7 +55,34 @@ struct Node {
     mode: u16,
     data: &'static [u8],
     storage: u8,
+    /// A hard link: the node holding this name's file (`NO_LINK` for none).
+    link: u16,
+    /// Last change, Unix seconds (0 for the image's own files, which report
+    /// the boot time).
+    modified: u32,
 }
+
+/// Now, in the Unix seconds a node records.
+fn now_seconds() -> u32 {
+    crate::rtc::unix_seconds() as u32
+}
+
+/// When this boot began, the time the image's own files report.
+fn boot_seconds() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static BOOT: AtomicU64 = AtomicU64::new(0);
+    match BOOT.load(Ordering::Relaxed) {
+        0 => {
+            let now = crate::rtc::unix_seconds()
+                .saturating_sub(crate::time::monotonic_nanoseconds() / 1_000_000_000);
+            BOOT.store(now, Ordering::Relaxed);
+            now
+        }
+        seen => seen,
+    }
+}
+
+const NO_LINK: u16 = u16::MAX;
 
 impl Node {
     const EMPTY: Self = Self {
@@ -65,6 +93,8 @@ impl Node {
         mode: 0,
         data: &[],
         storage: STATIC_STORAGE,
+        link: NO_LINK,
+        modified: 0,
     };
 
     const ROOT: Self = Self {
@@ -75,6 +105,8 @@ impl Node {
         mode: 0o755,
         data: &[],
         storage: STATIC_STORAGE,
+        link: NO_LINK,
+        modified: 0,
     };
 
     fn named(kind: NodeKind, parent: u16, name: &str, mode: u16, data: &'static [u8]) -> Self {
@@ -88,6 +120,8 @@ impl Node {
             mode,
             data,
             storage: STATIC_STORAGE,
+            link: NO_LINK,
+            modified: 0,
         }
     }
 
@@ -726,6 +760,7 @@ impl Vfs {
             index
         };
         self.nodes[index] = Node::named(kind, parent, name, mode, data);
+        self.nodes[index].modified = now_seconds();
         Ok(index as u16)
     }
 
@@ -783,6 +818,24 @@ impl Vfs {
                 .any(|entry| entry.kind != NodeKind::Empty && entry.parent == node)
         {
             return Err(VfsError::NotEmpty);
+        }
+        // A hard link's own name just goes; the file's node keeps its name
+        // by handing it to one of its links, so the file and any handles
+        // open on it stay.
+        if stored.link != NO_LINK {
+            self.nodes[node as usize] = Node::EMPTY;
+            return Ok(());
+        }
+        if let Some(heir) = (0..self.node_count).find(|&index| {
+            self.nodes[index].kind != NodeKind::Empty && self.nodes[index].link == node
+        }) {
+            let name = self.nodes[heir];
+            let file = &mut self.nodes[node as usize];
+            file.parent = name.parent;
+            file.name = name.name;
+            file.name_len = name.name_len;
+            self.nodes[heir] = Node::EMPTY;
+            return Ok(());
         }
         let in_use = self
             .handles
@@ -933,7 +986,7 @@ impl Vfs {
     }
 
     fn chmod(&mut self, path: &str, mode: u16) -> Result<(), VfsError> {
-        let node = self.resolve(path)?;
+        let node = self.content(self.resolve(path)?);
         if !self.mutable_subtree(node) || is_mutable_mount(&self.nodes[node as usize]) {
             return Err(VfsError::PermissionDenied);
         }
@@ -964,6 +1017,8 @@ impl Vfs {
         if stored.storage == STATIC_STORAGE {
             return Err(VfsError::PermissionDenied);
         }
+        self.nodes[node as usize].modified = now_seconds();
+
         Self::guard(self.node_protection(node), true)?;
         let persist_name = self.persisted_short_name(&stored);
         {
@@ -1122,7 +1177,77 @@ impl Vfs {
         Ok(self.node_metadata(node))
     }
 
+    /// The node holding the file a name refers to (itself unless it is a
+    /// hard link).
+    fn content(&self, index: u16) -> u16 {
+        match self.nodes[index as usize].link {
+            NO_LINK => index,
+            target => target,
+        }
+    }
+
+    /// How many names file `inode` has (1 for anything without hard links).
+    /// `utimensat`: sets the modification time of the file `path` names (or
+    /// the open file `descriptor`).
+    fn set_modified(
+        &mut self,
+        target: Result<u16, VfsError>,
+        seconds: u64,
+    ) -> Result<(), VfsError> {
+        let node = self.content(target?);
+        if !self.mutable_subtree(node) {
+            return Err(VfsError::PermissionDenied);
+        }
+        self.nodes[node as usize].modified = seconds.min(u64::from(u32::MAX)) as u32;
+        Ok(())
+    }
+
+    fn link_count(&self, inode: u64) -> u32 {
+        let Some(index) = inode
+            .checked_sub(1)
+            .filter(|&index| (index as usize) < self.node_count)
+        else {
+            return 1;
+        };
+        1 + self.nodes[..self.node_count]
+            .iter()
+            .filter(|node| node.kind != NodeKind::Empty && u64::from(node.link) == index)
+            .count() as u32
+    }
+
+    /// `link(source, destination)`: another name for an in-memory file.
+    fn link(&mut self, source: &str, destination: &str) -> Result<(), VfsError> {
+        let target = self.content(self.resolve(source)?);
+        let stored = self.nodes[target as usize];
+        if stored.kind != NodeKind::File
+            || !self.mutable_subtree(target)
+            || stored.storage == STATIC_STORAGE
+            || self.persisted_short_name(&stored).is_some()
+        {
+            return Err(VfsError::PermissionDenied);
+        }
+        let parsed = ParsedPath::parse(destination)?;
+        if parsed.count == 0 {
+            return Err(VfsError::Exists);
+        }
+        let (parent, name) = self.resolve_parent(&parsed)?;
+        if !self.mutable_subtree(parent)
+            || self.nodes[parent as usize].mode & 0o222 == 0
+            || self.find_child(ROOT_NODE, "data") == Some(parent)
+        {
+            return Err(VfsError::PermissionDenied);
+        }
+        if self.find_child(parent, name).is_some() {
+            return Err(VfsError::Exists);
+        }
+        Self::guard(self.protection_of(parent, name), true)?;
+        let node = self.add_node(NodeKind::File, parent, name, stored.mode, &[])?;
+        self.nodes[node as usize].link = target;
+        Ok(())
+    }
+
     fn node_metadata(&self, index: u16) -> Metadata {
+        let index = self.content(index);
         let node = self.nodes[index as usize];
         let kind = match node.kind {
             NodeKind::Directory => 0o040000,
@@ -1132,7 +1257,10 @@ impl Vfs {
         };
         Metadata {
             inode: index as u64 + 1,
-            modified: 0,
+            modified: match node.modified {
+                0 => boot_seconds(),
+                seconds => u64::from(seconds),
+            },
             mode: kind | node.mode as u32,
             size: if node.storage == STATIC_STORAGE {
                 node.data.len() as u64
@@ -1332,7 +1460,7 @@ impl Vfs {
         for _ in 0..MAX_SYMLINK_HOPS {
             let stored = self.nodes[current as usize];
             if stored.kind != NodeKind::Symlink {
-                return Ok(current);
+                return Ok(self.content(current));
             }
             let (target_buf, target_len) = {
                 let files = MUTABLE_FILES.lock();
@@ -1426,7 +1554,7 @@ impl Vfs {
         self.handle_mut(descriptor)?.cursor = index + 1;
         let node = self.nodes[index];
         Ok(Some(DirectoryEntry {
-            inode: index as u64 + 1,
+            inode: self.content(index as u16) as u64 + 1,
             kind: match node.kind {
                 NodeKind::Directory => 4,
                 NodeKind::File => 8,
@@ -1522,6 +1650,7 @@ impl Vfs {
         if stored.storage == STATIC_STORAGE {
             return Err(VfsError::PermissionDenied);
         }
+        self.nodes[node as usize].modified = now_seconds();
         let persist_name = self.persisted_short_name(&stored);
         let end;
         let persisted_length;
@@ -2339,6 +2468,49 @@ pub fn rename_noreplace(source: &str, destination: &str) -> Result<(), VfsError>
         (None, None) => FILESYSTEM.lock().rename_noreplace(source, destination),
         _ => move_across(source, destination, false),
     }
+}
+
+/// Another name for a file (`link`); only in-memory files can have one.
+pub fn link(source: &str, destination: &str) -> Result<(), VfsError> {
+    if let Some(mapped) = crate::mounts::resolve(source) {
+        return link(mapped.as_str(), destination);
+    }
+    if let Some(mapped) = crate::mounts::resolve(destination) {
+        return link(source, mapped.as_str());
+    }
+    guard_path(source)?;
+    guard_path(destination)?;
+    if home(source).is_some() || home(destination).is_some() {
+        return Err(VfsError::PermissionDenied);
+    }
+    FILESYSTEM.lock().link(source, destination)
+}
+
+/// Sets the modification time of in-memory file `path`; other filesystems
+/// keep theirs.
+pub fn set_modified(path: &str, seconds: u64) -> Result<(), VfsError> {
+    if let Some(mapped) = crate::mounts::resolve(path) {
+        return set_modified(mapped.as_str(), seconds);
+    }
+    guard_path(path)?;
+    if home(path).is_some() {
+        return Ok(());
+    }
+    let mut filesystem = FILESYSTEM.lock();
+    let target = filesystem.resolve_following(path);
+    filesystem.set_modified(target, seconds)
+}
+
+/// `set_modified` for an open file.
+pub fn set_modified_handle(descriptor: u32, seconds: u64) -> Result<(), VfsError> {
+    let mut filesystem = FILESYSTEM.lock();
+    let target = filesystem.handle_mut(descriptor).map(|handle| handle.node);
+    filesystem.set_modified(target, seconds)
+}
+
+/// How many names in-memory file `inode` has.
+pub fn link_count(inode: u64) -> u32 {
+    FILESYSTEM.lock().link_count(inode)
 }
 
 pub fn chmod(path: &str, mode: u16) -> Result<(), VfsError> {

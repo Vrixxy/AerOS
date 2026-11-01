@@ -8,6 +8,12 @@ const UI_TTF: &[u8] = include_bytes!("../../assets/fonts/CHDomRound-Regular.ttf"
 const ROBOTO_MONO_TTF: &[u8] = include_bytes!("../../assets/fonts/RobotoMono-Variable.ttf");
 const UI_ATLAS: &[u8] = include_bytes!("../../assets/fonts/CHDomRound-Regular.aerfont");
 const ROBOTO_MONO_ATLAS: &[u8] = include_bytes!("../../assets/fonts/RobotoMono-Regular.aerfont");
+const CLOCK_ATLAS: &[u8] = include_bytes!("../../assets/fonts/CHDomRound-Medium-Clock.aerfont");
+
+/// The lock screen clock digits and colon (CH Dom Round Medium, 224-pixel cells).
+pub fn clock_font() -> Option<RasterFont> {
+    RasterFont::parse(CLOCK_ATLAS)
+}
 
 #[derive(Clone, Copy)]
 pub struct RasterFont {

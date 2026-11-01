@@ -1,12 +1,12 @@
 use super::*;
 
 pub(super) const CARD: Rect = Rect::new(126, 18, 500, 408);
-pub(super) const BACK: Rect = Rect::new(136, 40, 100, 38);
-pub(super) const NEXT: Rect = Rect::new(516, 40, 100, 38);
+pub(super) const BACK: Rect = Rect::new(144, 38, 103, 42);
+pub(super) const NEXT: Rect = Rect::new(511, 38, 103, 42);
 /// The show/hide-password eye inside the password field.
 pub(super) const EYE: Rect = Rect::new(508, 202, 32, 30);
 /// "Forgot password?" under the sign-in pill, and its confirmation card.
-pub(super) const RESET_LINK: Rect = Rect::new(296, 388, 160, 22);
+pub(super) const RESET_LINK: Rect = Rect::new(276, 399, 200, 19);
 const RESET_CARD: Rect = Rect::new(206, 112, 340, 230);
 pub(super) const RESET_CANCEL: Rect = Rect::new(226, 276, 140, 44);
 pub(super) const RESET_OK: Rect = Rect::new(386, 276, 140, 44);

@@ -10,20 +10,20 @@ function Set-Bytes {
 }
 
 function Build-Font {
-    param([string]$InputName, [string]$OutputName)
+    param([string]$InputName, [string]$OutputName, [int]$Em = 64, [int]$First = 32, [int]$Last = 126)
 
     $inputPath = Join-Path $fontRoot $InputName
     $outputPath = Join-Path $fontRoot $OutputName
     $privateFonts = [System.Drawing.Text.PrivateFontCollection]::new()
     $privateFonts.AddFontFile($inputPath)
     $family = $privateFonts.Families[0]
-    $font = [System.Drawing.Font]::new($family, 64.0, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+    $font = [System.Drawing.Font]::new($family, [single]$Em, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
     $format = [System.Drawing.StringFormat]::GenericTypographic
     $format.FormatFlags = $format.FormatFlags -bor [System.Drawing.StringFormatFlags]::MeasureTrailingSpaces
-    $width = 64
-    $height = 80
-    $first = 32
-    $last = 126
+    $width = $Em
+    $height = $Em * 5 / 4
+    $first = $First
+    $last = $Last
     $count = $last - $first + 1
     $glyphPixels = $width * $height
     $bitmapOffset = 32
@@ -46,7 +46,7 @@ function Build-Font {
         $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
         $graphics.Clear([System.Drawing.Color]::Transparent)
         $graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
-        $graphics.DrawString($glyph, $font, [System.Drawing.Brushes]::White, [System.Drawing.PointF]::new(2.0, 1.0), $format)
+        $graphics.DrawString($glyph, $font, [System.Drawing.Brushes]::White, [System.Drawing.PointF]::new(2.0 * $Em / 64, 1.0 * $Em / 64), $format)
         $graphics.Flush()
         for ($y = 0; $y -lt $height; $y++) {
             for ($x = 0; $x -lt $width; $x++) {
@@ -68,4 +68,7 @@ function Build-Font {
 
 Build-Font "CHDomRound-Regular.ttf" "CHDomRound-Regular.aerfont"
 Build-Font "RobotoMono-Variable.ttf" "RobotoMono-Regular.aerfont"
+# The lock-screen clock: CH Dom Round Medium digits and colon, large enough
+# to be drawn at full size without upscaling.
+Build-Font "CHDomRound-Medium.ttf" "CHDomRound-Medium-Clock.aerfont" -Em 224 -First 48 -Last 58
 

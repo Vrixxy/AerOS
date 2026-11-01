@@ -13,37 +13,72 @@ const PAGE_ACCOUNT: u8 = 6;
 
 const ROW: i32 = 28;
 const ROW_GAP: i32 = 4;
-const INK: Color = Color::rgb(15, 43, 53);
-const INK_SOFT: Color = Color::rgb(31, 68, 79);
+const INK: Color = Color::rgb(245, 245, 245);
+const INK_SOFT: Color = Color::rgb(165, 165, 165);
 const ACCENT: Rgba = Rgba::new(46, 120, 232, 255);
+const OUTLINE: Rgba = Rgba::new(235, 235, 235, 255);
+const PILL: Rgba = Rgba::new(222, 222, 222, 255);
+const ON: Rgba = Rgba::new(16, 170, 16, 255);
+
+// Sizes from the Figma Settings frame (1237 px wide), scaled to the 752-unit
+// design width.
+const SETTING_ROW: Rect = Rect::new(0, 0, 152, 37);
+const INFO_BOX: Rect = Rect::new(0, 0, 179, 108);
+const SLIDER_ROW: Rect = Rect::new(0, 0, 239, 43);
+const STACK_GAP: i32 = 12;
+
+fn sidebar(base: Rect) -> Rect {
+    Rect::new(base.x + 15, base.y + 23, 102, 286)
+}
 
 fn sidebar_row(base: Rect, index: usize) -> Rect {
-    Rect::new(base.x + 14, base.y + 46 + index as i32 * 30, 120, 26)
+    Rect::new(base.x + 25, base.y + 30 + index as i32 * 3526 / 100, 82, 24)
 }
 
 fn pane(base: Rect) -> Rect {
-    Rect::new(
-        base.x + 150,
-        base.y + 48,
-        (base.width - 164).max(120),
-        (base.height - 62).max(100),
-    )
+    Rect::new(base.x + 144, base.y + 61, 390, (base.height - 75).max(100))
 }
 
-fn slider_track(pane: Rect, y: i32) -> Rect {
-    Rect::new(pane.x, pane.y + y, pane.width - 24, 12)
-}
-
-fn time_toggle(pane: Rect) -> Rect {
-    Rect::new(pane.x, pane.y + 34, 250, 36)
+fn scrollbar(base: Rect) -> Rect {
+    Rect::new(base.right() - 17, base.y + 66, 17, 99)
 }
 
 fn toggle_rect(pane: Rect, y: i32) -> Rect {
-    Rect::new(pane.x, pane.y + y, 156, 36)
+    Rect::new(pane.x, pane.y + y, SETTING_ROW.width, SETTING_ROW.height)
+}
+
+fn time_toggle(pane: Rect) -> Rect {
+    Rect::new(pane.x, pane.y, SLIDER_ROW.width, SETTING_ROW.height)
+}
+
+fn info_rect(pane: Rect, y: i32) -> Rect {
+    Rect::new(pane.x, pane.y + y, INFO_BOX.width, INFO_BOX.height)
+}
+
+fn slider_row(pane: Rect, y: i32) -> Rect {
+    Rect::new(pane.x, pane.y + y, SLIDER_ROW.width, SLIDER_ROW.height)
+}
+
+fn slider_track(pane: Rect, y: i32) -> Rect {
+    let row = slider_row(pane, y);
+    Rect::new(row.x + 76, row.y + 19, 146, 4)
+}
+
+fn slider_percent(track: Rect, x: i32) -> i32 {
+    (x - track.x) * 100 / track.width.max(1)
+}
+
+/// Where the second item of a page's stack starts.
+const fn below(height: i32) -> i32 {
+    height + STACK_GAP
 }
 
 fn list_top(page: u8) -> i32 {
-    if page == PAGE_TIME { 84 } else { 34 }
+    if page == PAGE_TIME {
+        below(SETTING_ROW.height)
+    } else {
+        0
+    }
 }
 
 fn visible_rows(page: u8, pane: Rect) -> usize {
@@ -54,28 +89,26 @@ fn list_row(pane: Rect, page: u8, slot: usize) -> Rect {
     Rect::new(
         pane.x,
         pane.y + list_top(page) + slot as i32 * (ROW + ROW_GAP),
-        pane.width - 24,
+        SLIDER_ROW.width,
         ROW,
     )
 }
 
 fn power_button(pane: Rect, index: usize) -> Rect {
-    let width = (pane.width - 36) / 2;
     Rect::new(
-        pane.x + (index % 2) as i32 * (width + 12),
-        pane.y + 44 + (index / 2) as i32 * 56,
-        width,
-        44,
+        pane.x,
+        pane.y + index as i32 * below(SETTING_ROW.height),
+        SETTING_ROW.width,
+        SETTING_ROW.height,
     )
 }
 
 fn account_button(pane: Rect, index: usize) -> Rect {
-    let width = (pane.width - 36) / 2;
     Rect::new(
-        pane.x + (index % 2) as i32 * (width + 12),
-        pane.y + 84,
-        width,
-        44,
+        pane.x,
+        pane.y + below(INFO_BOX.height) + index as i32 * below(SETTING_ROW.height),
+        SETTING_ROW.width,
+        SETTING_ROW.height,
     )
 }
 
@@ -136,7 +169,7 @@ impl DesktopState {
         let page = self.settings_page;
         let now = crate::time::monotonic_nanoseconds();
         match page {
-            PAGE_NETWORK if toggle_rect(pane, 110).contains(point) => {
+            PAGE_NETWORK if toggle_rect(pane, 0).contains(point) => {
                 self.wifi = !self.wifi;
                 if self.wifi {
                     self.airplane = false;
@@ -144,21 +177,19 @@ impl DesktopState {
                 return Some(DesktopAction::Redraw);
             }
             PAGE_DISPLAY => {
-                let track = slider_track(pane, 62).expand(8);
-                if track.contains(point) {
-                    let raw = (point.x - pane.x) * 100 / (pane.width - 24).max(1);
+                if slider_row(pane, 0).contains(point) {
+                    let raw = slider_percent(slider_track(pane, 0), point.x);
                     self.set_brightness(raw.clamp(8, 100) as u8, now);
                     return Some(DesktopAction::Redraw);
                 }
             }
             PAGE_SOUND => {
-                let track = slider_track(pane, 62).expand(8);
-                if track.contains(point) {
-                    let raw = (point.x - pane.x) * 100 / (pane.width - 24).max(1);
+                if slider_row(pane, 0).contains(point) {
+                    let raw = slider_percent(slider_track(pane, 0), point.x);
                     self.set_volume_to(raw.clamp(0, 100) as u8);
                     return Some(DesktopAction::Redraw);
                 }
-                if toggle_rect(pane, 104).contains(point) {
+                if toggle_rect(pane, below(SLIDER_ROW.height)).contains(point) {
                     self.toggle_mute();
                     return Some(DesktopAction::Redraw);
                 }
@@ -289,96 +320,187 @@ fn draw_toggle_row(
     label: &str,
     on: bool,
 ) {
-    painter.fill_rounded_rect(
+    painter.stroke_rounded_rect(
         layout.rect(bounds),
         layout.radii(CornerRadii::all(bounds.height / 2)),
-        if on {
-            Rgba::new(223, 242, 251, 190)
-        } else {
-            Rgba::new(169, 184, 191, 120)
-        },
+        1,
+        OUTLINE,
+    );
+    let switch = Rect::new(bounds.right() - 69, bounds.y + 5, 65, 27);
+    painter.fill_rounded_rect(
+        layout.rect(switch),
+        layout.radii(CornerRadii::all(switch.height / 2)),
+        if on { ON } else { Rgba::new(80, 80, 80, 255) },
     );
     let knob = Rect::new(
-        if on {
-            bounds.right() - bounds.height + 4
-        } else {
-            bounds.x + 4
-        },
-        bounds.y + 4,
-        bounds.height - 8,
-        bounds.height - 8,
+        if on { switch.x + 32 } else { switch.x + 3 },
+        switch.y + 3,
+        30,
+        21,
     );
     painter.fill_rounded_rect(
         layout.rect(knob),
         layout.radii(CornerRadii::all(knob.height / 2)),
-        if on {
-            ACCENT
-        } else {
-            Rgba::new(250, 251, 252, 255)
-        },
+        Rgba::new(255, 255, 255, 255),
     );
-    centered_text(
+    text(
         painter,
         layout,
         font,
-        bounds,
+        Point::new(bounds.x + 12, bounds.y + 12),
         label,
-        13,
-        Color::rgb(9, 23, 29),
+        10,
+        INK,
     );
 }
 
-fn draw_slider(painter: &mut Painter<'_>, layout: Layout, track: Rect, percent: u8) {
-    painter.fill_rounded_rect(
-        layout.rect(track),
-        layout.radii(CornerRadii::all(6)),
-        Rgba::new(169, 184, 191, 150),
-    );
-    let filled = (track.width * percent as i32 / 100).max(12);
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(track.x, track.y, filled, track.height)),
-        layout.radii(CornerRadii::all(6)),
-        ACCENT,
-    );
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(
-            track.x + filled - 10,
-            track.y - 4,
-            20,
-            track.height + 8,
-        )),
-        layout.radii(CornerRadii::all(10)),
-        Rgba::new(250, 251, 252, 255),
-    );
-}
-
-fn value_line(
+fn draw_info_box(
     painter: &mut Painter<'_>,
     layout: Layout,
     font: RasterFont,
-    pane: Rect,
-    y: i32,
-    label: &str,
-    value: &str,
+    bounds: Rect,
+    lines: &[(&str, &str)],
 ) {
-    text(
-        painter,
-        layout,
-        font,
-        Point::new(pane.x, pane.y + y),
-        label,
-        12,
-        INK_SOFT,
+    painter.stroke_rounded_rect(
+        layout.rect(bounds),
+        layout.radii(CornerRadii::all(18)),
+        1,
+        OUTLINE,
+    );
+    for (index, (label, value)) in lines.iter().enumerate() {
+        let y = bounds.y + 13 + index as i32 * 17;
+        text(
+            painter,
+            layout,
+            font,
+            Point::new(bounds.x + 18, y),
+            label,
+            10,
+            INK_SOFT,
+        );
+        text(
+            painter,
+            layout,
+            font,
+            Point::new(bounds.x + 78, y),
+            value,
+            10,
+            INK,
+        );
+    }
+}
+
+fn draw_slider_row(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    font: RasterFont,
+    bounds: Rect,
+    track: Rect,
+    label: &str,
+    percent: u8,
+) {
+    painter.stroke_rounded_rect(
+        layout.rect(bounds),
+        layout.radii(CornerRadii::all(bounds.height / 2)),
+        1,
+        OUTLINE,
     );
     text(
         painter,
         layout,
         font,
-        Point::new(pane.x + 110, pane.y + y),
-        value,
-        12,
+        Point::new(bounds.x + 12, bounds.y + 16),
+        label,
+        10,
         INK,
     );
+    painter.fill_rounded_rect(
+        layout.rect(track),
+        layout.radii(CornerRadii::all(2)),
+        Rgba::new(225, 225, 225, 255),
+    );
+    let filled = track.width * i32::from(percent.min(100)) / 100;
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(track.x, track.y, filled.max(4), track.height)),
+        layout.radii(CornerRadii::all(2)),
+        Rgba::new(150, 150, 150, 255),
+    );
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(track.x + filled - 10, track.y - 9, 21, 21)),
+        layout.radii(CornerRadii::all(10)),
+        Rgba::new(70, 70, 70, 255),
+    );
+}
+/// The small blue icon at the left of sidebar row `page`.
+fn draw_page_icon(painter: &mut Painter<'_>, layout: Layout, page: usize, row: Rect) {
+    let x = row.x + 7;
+    let y = row.y + row.height / 2;
+    let part = |dx: i32, dy: i32, width: i32, height: i32| {
+        layout.rect(Rect::new(x + dx, y + dy, width, height))
+    };
+    let round = |value: i32| layout.radii(CornerRadii::all(value));
+    let thin = layout.scale.logical(2).max(1) as u8;
+    let art = match page {
+        0 => Some(9),
+        1 => Some(15),
+        3 => Some(16),
+        4 => Some(17),
+        5 => Some(18),
+        6 => Some(19),
+        7 => Some(20),
+        _ => None,
+    };
+    if let Some(index) = art {
+        painter.draw_rgba_scaled(
+            layout.rect(Rect::new(row.x + 4, row.y + (row.height - 16) / 2, 16, 16)),
+            desktop_icon(index),
+            DESKTOP_ICON_SIZE,
+            DESKTOP_ICON_SIZE,
+        );
+        return;
+    }
+    match page {
+        0 => {
+            for (step, height) in [3, 6, 9].iter().enumerate() {
+                painter.fill_rounded_rect(
+                    part(step as i32 * 4, 5 - height, 3, *height),
+                    round(1),
+                    ACCENT,
+                );
+            }
+        }
+        1 => {
+            painter.fill_rounded_rect(part(0, -6, 12, 9), round(2), ACCENT);
+            painter.fill_rounded_rect(part(4, 4, 4, 2), round(1), ACCENT);
+        }
+        2 => {
+            painter.fill_rounded_rect(part(0, -2, 4, 5), round(1), ACCENT);
+            painter.fill_rounded_rect(part(3, -5, 4, 11), round(2), ACCENT);
+            painter.fill_rounded_rect(part(9, -3, 2, 7), round(1), ACCENT);
+        }
+        3 => {
+            painter.stroke_rounded_rect(part(0, -5, 13, 10), round(2), thin, ACCENT);
+            painter.fill_rounded_rect(part(3, 0, 7, 2), round(1), ACCENT);
+        }
+        4 => {
+            painter.stroke_rounded_rect(part(0, -6, 12, 12), round(6), thin, ACCENT);
+            painter.fill_rounded_rect(part(5, -3, 2, 4), round(1), ACCENT);
+            painter.fill_rounded_rect(part(5, 0, 4, 2), round(1), ACCENT);
+        }
+        5 => {
+            painter.stroke_rounded_rect(part(0, -5, 12, 12), round(6), thin, ACCENT);
+            painter.fill_rounded_rect(part(5, -7, 2, 7), round(1), ACCENT);
+        }
+        6 => {
+            painter.fill_rounded_rect(part(3, -6, 6, 6), round(3), ACCENT);
+            painter.fill_rounded_rect(part(0, 1, 12, 6), round(3), ACCENT);
+        }
+        _ => {
+            painter.stroke_rounded_rect(part(0, -6, 12, 12), round(6), thin, ACCENT);
+            painter.fill_rounded_rect(part(5, -3, 2, 2), round(1), ACCENT);
+            painter.fill_rounded_rect(part(5, 0, 2, 4), round(1), ACCENT);
+        }
+    }
 }
 
 pub(super) fn draw_settings(
@@ -388,157 +510,126 @@ pub(super) fn draw_settings(
     state: &DesktopState,
 ) {
     let base = window_base_rect(DesktopApp::Settings);
-    let sidebar = Rect::new(base.x + 8, base.y + 42, 132, (base.height - 54).max(60));
     painter.fill_rounded_rect(
-        layout.rect(sidebar),
-        layout.radii(CornerRadii::all(18)),
-        Rgba::new(222, 237, 241, 110),
+        layout.rect(sidebar(base)),
+        layout.radii(CornerRadii::all(16)),
+        Rgba::new(58, 58, 58, 255),
     );
     let page = state.settings_page;
     for (index, label) in PAGES.iter().enumerate() {
         let row = sidebar_row(base, index);
-        if index as u8 == page {
-            painter.fill_rounded_rect(
-                layout.rect(row),
-                layout.radii(CornerRadii::all(15)),
-                Rgba::new(255, 255, 255, 190),
-            );
-        }
-        text(
+        painter.fill_rounded_rect(
+            layout.rect(row),
+            layout.radii(CornerRadii::all(row.height / 2)),
+            if index as u8 == page {
+                Rgba::new(255, 255, 255, 255)
+            } else {
+                PILL
+            },
+        );
+        draw_page_icon(painter, layout, index, row);
+        centered_text(
             painter,
             layout,
             font,
-            Point::new(row.x + 14, row.y + 6),
+            Rect::new(row.x + 12, row.y, row.width - 12, row.height),
             label,
             12,
-            INK,
+            Color::rgb(10, 10, 10),
         );
     }
+    let bar = scrollbar(base);
+    painter.fill_rounded_rect(
+        layout.rect(bar),
+        layout.radii(CornerRadii::all(bar.width / 2)),
+        Rgba::new(235, 235, 235, 255),
+    );
     let pane = pane(base);
     text(
         painter,
         layout,
         font,
-        Point::new(pane.x, pane.y - 2),
+        Point::new(pane.x, pane.y - 31),
         PAGES[page as usize % PAGES.len()],
-        20,
+        14,
         INK,
     );
     match page {
         PAGE_NETWORK => {
-            let ready = crate::net::is_ready();
-            value_line(
+            draw_toggle_row(
                 painter,
                 layout,
                 font,
-                pane,
-                40,
-                "Status",
-                if ready { "Connected" } else { "Not connected" },
+                toggle_rect(pane, 0),
+                "Wi-Fi",
+                state.wifi,
             );
+            let ready = crate::net::is_ready();
             let ip = crate::net::local_address();
             let mut address = ClockBuffer::new();
             let _ = write!(address, "{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
-            value_line(
+            draw_info_box(
                 painter,
                 layout,
                 font,
-                pane,
-                64,
-                "Address",
-                if ready { address.as_str() } else { "-" },
-            );
-            draw_toggle_row(
-                painter,
-                layout,
-                font,
-                toggle_rect(pane, 110),
-                if state.wifi { "Wi-Fi on" } else { "Wi-Fi off" },
-                state.wifi,
+                info_rect(pane, below(SETTING_ROW.height)),
+                &[
+                    ("Status", if ready { "Connected" } else { "Not connected" }),
+                    ("Address", if ready { address.as_str() } else { "-" }),
+                ],
             );
         }
         PAGE_DISPLAY => {
-            text(
+            draw_slider_row(
                 painter,
                 layout,
                 font,
-                Point::new(pane.x, pane.y + 36),
+                slider_row(pane, 0),
+                slider_track(pane, 0),
                 "Brightness",
-                12,
-                INK_SOFT,
+                state.brightness,
             );
-            draw_slider(painter, layout, slider_track(pane, 62), state.brightness);
-            let mut percent = ClockBuffer::new();
-            let _ = write!(percent, "{}%", state.brightness);
-            text(
+            draw_info_box(
                 painter,
                 layout,
                 font,
-                Point::new(pane.x + pane.width - 70, pane.y + 36),
-                percent.as_str(),
-                12,
-                INK,
-            );
-            value_line(
-                painter,
-                layout,
-                font,
-                pane,
-                104,
-                "Cursor",
-                if crate::virtio_gpu::cursor_active() {
-                    "Hardware (GPU)"
-                } else {
-                    "Software"
-                },
-            );
-            value_line(
-                painter,
-                layout,
-                font,
-                pane,
-                128,
-                "Glass",
-                if crate::virtio_gpu::frost_available() {
-                    "Blurred on the GPU"
-                } else {
-                    "Blurred on the CPU"
-                },
+                info_rect(pane, below(SLIDER_ROW.height)),
+                &[
+                    (
+                        "Cursor",
+                        if crate::virtio_gpu::cursor_active() {
+                            "Hardware (GPU)"
+                        } else {
+                            "Software"
+                        },
+                    ),
+                    (
+                        "Glass",
+                        if crate::virtio_gpu::frost_available() {
+                            "Blurred on the GPU"
+                        } else {
+                            "Blurred on the CPU"
+                        },
+                    ),
+                ],
             );
         }
         PAGE_SOUND => {
-            text(
+            draw_slider_row(
                 painter,
                 layout,
                 font,
-                Point::new(pane.x, pane.y + 36),
+                slider_row(pane, 0),
+                slider_track(pane, 0),
                 "Volume",
-                12,
-                INK_SOFT,
-            );
-            draw_slider(
-                painter,
-                layout,
-                slider_track(pane, 62),
                 if state.muted { 0 } else { state.volume },
-            );
-            let mut percent = ClockBuffer::new();
-            let _ = write!(percent, "{}%", if state.muted { 0 } else { state.volume });
-            text(
-                painter,
-                layout,
-                font,
-                Point::new(pane.x + pane.width - 70, pane.y + 36),
-                percent.as_str(),
-                12,
-                INK,
             );
             draw_toggle_row(
                 painter,
                 layout,
                 font,
-                toggle_rect(pane, 104),
-                if state.muted { "Muted" } else { "Sound on" },
+                toggle_rect(pane, below(SLIDER_ROW.height)),
+                "Sound",
                 !state.muted,
             );
         }
@@ -549,11 +640,7 @@ pub(super) fn draw_settings(
                     layout,
                     font,
                     time_toggle(pane),
-                    if crate::settings::ntp_enabled() {
-                        "Set time automatically"
-                    } else {
-                        "Time set manually"
-                    },
+                    "Set time automatically",
                     crate::settings::ntp_enabled(),
                 );
             }
@@ -565,38 +652,37 @@ pub(super) fn draw_settings(
                     break;
                 }
                 let row = list_row(pane, page, slot);
-                let current = index == selected;
-                painter.fill_rounded_rect(
-                    layout.rect(row),
-                    layout.radii(CornerRadii::all(row.height / 2)),
-                    if current {
-                        Rgba::new(223, 242, 251, 220)
-                    } else {
-                        Rgba::new(255, 255, 255, 90)
-                    },
-                );
-                if index == state.settings_cursor {
-                    painter.stroke_rounded_rect(
+                if index == selected {
+                    painter.fill_rounded_rect(
                         layout.rect(row),
                         layout.radii(CornerRadii::all(row.height / 2)),
-                        2,
-                        ACCENT,
+                        Rgba::new(255, 255, 255, 40),
                     );
                 }
+                painter.stroke_rounded_rect(
+                    layout.rect(row),
+                    layout.radii(CornerRadii::all(row.height / 2)),
+                    if index == state.settings_cursor { 2 } else { 1 },
+                    if index == state.settings_cursor {
+                        ACCENT
+                    } else {
+                        OUTLINE
+                    },
+                );
                 text(
                     painter,
                     layout,
                     font,
-                    Point::new(row.x + 16, row.y + 7),
+                    Point::new(row.x + 14, row.y + 8),
                     list_label(page, index),
-                    13,
+                    11,
                     INK,
                 );
-                if current {
+                if index == selected {
                     painter.fill_rounded_rect(
-                        layout.rect(Rect::new(row.right() - 24, row.y + 10, 8, 8)),
+                        layout.rect(Rect::new(row.right() - 22, row.y + 10, 8, 8)),
                         layout.radii(CornerRadii::all(4)),
-                        ACCENT,
+                        ON,
                     );
                 }
             }
@@ -604,45 +690,38 @@ pub(super) fn draw_settings(
         PAGE_POWER => {
             for (index, label) in ["Lock", "Sleep", "Restart", "Shut down"].iter().enumerate() {
                 let button = power_button(pane, index);
-                painter.fill_rounded_rect(
+                painter.stroke_rounded_rect(
                     layout.rect(button),
-                    layout.radii(CornerRadii::all(22)),
-                    Rgba::new(223, 242, 251, 200),
+                    layout.radii(CornerRadii::all(button.height / 2)),
+                    1,
+                    OUTLINE,
                 );
-                centered_text(painter, layout, font, button, label, 14, INK);
+                centered_text(painter, layout, font, button, label, 12, INK);
             }
         }
         PAGE_ACCOUNT => {
-            value_line(
+            draw_info_box(
                 painter,
                 layout,
                 font,
-                pane,
-                40,
-                "User name",
-                state.username_str(),
+                info_rect(pane, 0),
+                &[
+                    ("User name", state.username_str()),
+                    ("Password", "Forgot it? Use the sign-in screen"),
+                ],
             );
             for (index, label) in ["Lock now", "Change password"].iter().enumerate() {
                 let button = account_button(pane, index);
-                painter.fill_rounded_rect(
+                painter.stroke_rounded_rect(
                     layout.rect(button),
-                    layout.radii(CornerRadii::all(22)),
-                    Rgba::new(223, 242, 251, 200),
+                    layout.radii(CornerRadii::all(button.height / 2)),
+                    1,
+                    OUTLINE,
                 );
-                centered_text(painter, layout, font, button, label, 14, INK);
+                centered_text(painter, layout, font, button, label, 12, INK);
             }
-            text(
-                painter,
-                layout,
-                font,
-                Point::new(pane.x, pane.y + 150),
-                "Forgot your password? Use the link on the sign-in screen.",
-                11,
-                INK_SOFT,
-            );
         }
         _ => {
-            // About (the last page)
             let cpu = crate::arch::CpuInfo::detect();
             let uptime_s = crate::time::monotonic_nanoseconds() / 1_000_000_000;
             let mut up = ClockBuffer::new();
@@ -653,40 +732,28 @@ pub(super) fn draw_settings(
                 uptime_s / 60 % 60,
                 uptime_s % 60
             );
-            value_line(
-                painter,
-                layout,
-                font,
-                pane,
-                40,
-                "System",
-                "AerOS (x86-64, UEFI)",
-            );
             let processor = if cpu.brand().is_empty() {
                 cpu.vendor()
             } else {
                 cpu.brand()
             };
-            value_line(painter, layout, font, pane, 64, "Processor", processor);
-            value_line(painter, layout, font, pane, 88, "Uptime", up.as_str());
-            value_line(
+            draw_info_box(
                 painter,
                 layout,
                 font,
-                pane,
-                112,
-                "Time zone",
-                crate::timezone::ZONES[crate::rtc::timezone_index() % crate::timezone::ZONES.len()]
-                    .name,
-            );
-            value_line(
-                painter,
-                layout,
-                font,
-                pane,
-                136,
-                "Account",
-                state.username_str(),
+                Rect::new(pane.x, pane.y, SLIDER_ROW.width, INFO_BOX.height),
+                &[
+                    ("System", "AerOS (x86-64, UEFI)"),
+                    ("Processor", processor),
+                    ("Uptime", up.as_str()),
+                    (
+                        "Time zone",
+                        crate::timezone::ZONES
+                            [crate::rtc::timezone_index() % crate::timezone::ZONES.len()]
+                        .name,
+                    ),
+                    ("Account", state.username_str()),
+                ],
             );
         }
     }

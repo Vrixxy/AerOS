@@ -34,7 +34,7 @@ if (Test-Path -LiteralPath $stage) {
     }
     Remove-Item -Recurse -Force -LiteralPath $stage
 }
-$skip = if ($Fresh) { @("ROOTFS", "account.dat", "LOCKOUT.DAT") } else { @("ROOTFS") }
+[string[]]$skip = if ($Fresh) { @("ROOTFS", "account.dat", "LOCKOUT.DAT") } else { @("ROOTFS") }
 robocopy $Esp $stage /E /XF @skip /NFL /NDL /NJH /NJS /NP | Out-Null
 if ($LASTEXITCODE -ge 8) {
     throw "could not copy $Esp to $stage (robocopy $LASTEXITCODE)"

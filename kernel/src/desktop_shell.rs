@@ -15,19 +15,19 @@ pub(super) enum PowerAction {
 }
 
 pub(super) fn pill_rect(index: usize) -> Rect {
-    Rect::new(229, 46 + index as i32 * 104, 294, 76)
+    Rect::new(210, 60 + index as i32 * 116, 331, 86)
 }
 
 pub(super) fn power_button_rect() -> Rect {
-    Rect::new(640, 384, 62, 62)
+    Rect::new(663, 372, 69, 69)
 }
 
 pub(super) fn flyout_panel() -> Rect {
-    Rect::new(588, 254, 116, 122)
+    Rect::new(601, 226, 116, 138)
 }
 
 pub(super) fn flyout_rect(index: usize) -> Rect {
-    Rect::new(596, 262 + index as i32 * 36, 100, 30)
+    Rect::new(615, 243 + index as i32 * 41, 92, 26)
 }
 
 impl DesktopState {
@@ -289,7 +289,7 @@ fn menu_pill(
         font,
         bounds,
         label,
-        bounds.height * 36 / 100,
+        bounds.height * 44 / 100,
         Color::rgb(12, 18, 24),
     );
 }
@@ -478,7 +478,7 @@ pub(super) fn draw_power_menu(
                     font,
                     rect,
                     label,
-                    12,
+                    15,
                     Color::rgb(10, 16, 22),
                 );
             }
@@ -527,8 +527,9 @@ pub(super) fn draw_power_action(
     }
 }
 
-/// The screen shown after too many wrong passwords: the wallpaper melts to
-/// a blur around a slowly breathing dark disc.
+/// The screen shown after too many wrong passwords, as designed: the
+/// sign-in screen melts to a blur (its black avatar a soft dark disc) under
+/// two lines of white text.
 pub(super) fn draw_lockout(
     painter: &mut Painter<'_>,
     layout: Layout,
@@ -548,8 +549,8 @@ pub(super) fn draw_lockout(
         if entered < 900_000_000 { 5 } else { 3 },
     );
     let breathe = wave_milli(now / 5_500_000);
-    let radius = 46 + breathe * 5 / 1000;
-    let center = Point::new(376, 236);
+    let radius = 62 + breathe * 5 / 1000;
+    let center = Point::new(376, 175);
     for layer in 0..9i32 {
         let r = radius + 30 - layer * 4;
         let alpha = (10 + layer * 8) * appear / 1000;
@@ -563,10 +564,10 @@ pub(super) fn draw_lockout(
         painter,
         layout,
         font,
-        Rect::new(0, 62 - (1000 - appear) * 16 / 1000, DESIGN_WIDTH, 44),
+        Rect::new(0, 43 - (1000 - appear) * 16 / 1000, DESIGN_WIDTH, 38),
         "Too many wrong password attempts",
-        30,
-        Color::rgb(16, 22, 30),
+        38,
+        Color::rgb(255, 255, 255),
     );
     let mut line = ClockBuffer::new();
     if seconds >= 90 {
@@ -580,9 +581,9 @@ pub(super) fn draw_lockout(
         painter,
         layout,
         font,
-        Rect::new(0, 358 + (1000 - appear) * 16 / 1000, DESIGN_WIDTH, 40),
+        Rect::new(0, 325 + (1000 - appear) * 16 / 1000, DESIGN_WIDTH, 38),
         line.as_str(),
-        26,
-        Color::rgb(16, 22, 30),
+        38,
+        Color::rgb(255, 255, 255),
     );
 }

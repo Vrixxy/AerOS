@@ -3,7 +3,7 @@ use super::*;
 pub(super) const SEARCH_MAX: usize = 24;
 const OPEN_NS: u64 = 380_000_000;
 const CLOSE_NS: u64 = 240_000_000;
-pub(super) const SEARCH_PILL: Rect = Rect::new(188, 96, 376, 58);
+pub(super) const SEARCH_PILL: Rect = Rect::new(166, 146, 420, 69);
 const ROW_HEIGHT: i32 = 40;
 
 const ENTRIES: [(&str, u8); 8] = [
@@ -32,6 +32,11 @@ fn matches(state: &DesktopState, out: &mut [usize; 8]) -> usize {
         }
     }
     count
+}
+
+/// How many result rows fit between the pill and the dock.
+fn rows_that_fit() -> usize {
+    ((DOCK_RECT.y - 8 - (SEARCH_PILL.bottom() + 12) + 8) / (ROW_HEIGHT + 8)).max(1) as usize
 }
 
 fn row_rect(slot: usize) -> Rect {
@@ -132,7 +137,7 @@ impl DesktopState {
         }
         let mut hits = [0usize; 8];
         let count = matches(self, &mut hits);
-        for slot in 0..count {
+        for slot in 0..count.min(rows_that_fit()) {
             if row_rect(slot).contains(point) {
                 self.launch_entry(ENTRIES[hits[slot]].1);
                 return Some(DesktopAction::Redraw);
@@ -224,7 +229,7 @@ pub(super) fn draw_search(
     } else {
         0
     };
-    for slot in 0..count {
+    for slot in 0..count.min(rows_that_fit()) {
         let delay = 140_000_000 + slot as u64 * 45_000_000;
         let arrive = ease_out_milli(progress_of(age.saturating_sub(delay), 0, 260_000_000)) as i32;
         if arrive <= 0 {

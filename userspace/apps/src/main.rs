@@ -751,6 +751,347 @@ b
              assert os.listdir('/proc/self/task') == [str(main)], os.listdir('/proc/self/task')\n\
              print('proc task ok')",
         ),        (
+            "python-epoll-et",
+            "import os, select\n\
+             r, w = os.pipe()\n\
+             os.set_blocking(r, False)\n\
+             edge = select.epoll(); edge.register(r, select.EPOLLIN | select.EPOLLET)\n\
+             level = select.epoll(); level.register(r, select.EPOLLIN)\n\
+             os.write(w, b'a')\n\
+             assert len(edge.poll(0)) == 1\n\
+             assert edge.poll(0) == [], 'edge reported twice'\n\
+             assert len(level.poll(0)) == 1 and len(level.poll(0)) == 1\n\
+             assert os.read(r, 16) == b'a'\n\
+             assert edge.poll(0) == [] and level.poll(0) == []\n\
+             os.write(w, b'b')\n\
+             assert len(edge.poll(0.5)) == 1\n\
+             print('epoll et ok')",
+        ),        (
+            "python-waitid-nowait",
+            "import os\n\
+             pid = os.fork()\n\
+             if pid == 0:\n\
+             \x20   os._exit(7)\n\
+             info = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)\n\
+             assert info.si_pid == pid and info.si_status == 7, info\n\
+             again = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)\n\
+             assert again.si_status == 7, again\n\
+             assert os.waitpid(pid, 0) == (pid, 7 << 8)\n\
+             print('waitid nowait ok')",
+        ),        (
+            "python-multiprocessing",
+            "import multiprocessing\n\
+             if __name__ == '__main__':\n\
+             \x20   multiprocessing.set_start_method('fork')\n\
+             \x20   with multiprocessing.Pool(2) as pool:\n\
+             \x20       assert pool.map(abs, [-1, -2, -3]) == [1, 2, 3]\n\
+             \x20   queue = multiprocessing.Queue()\n\
+             \x20   worker = multiprocessing.Process(target=queue.put, args=(42,))\n\
+             \x20   worker.start(); assert queue.get(timeout=20) == 42; worker.join()\n\
+             \x20   print('multiprocessing ok')",
+        ),        (
+            "python-asyncio-tcp",
+            "import asyncio\n\
+             async def handle(reader, writer):\n\
+             \x20   writer.write(await reader.readline()); await writer.drain(); writer.close()\n\
+             async def main():\n\
+             \x20   server = await asyncio.start_server(handle, '127.0.0.1', 0)\n\
+             \x20   port = server.sockets[0].getsockname()[1]\n\
+             \x20   reader, writer = await asyncio.open_connection('127.0.0.1', port)\n\
+             \x20   writer.write(b'ping\\n'); await writer.drain()\n\
+             \x20   assert await asyncio.wait_for(reader.readline(), 10) == b'ping\\n'\n\
+             \x20   writer.close(); server.close(); await server.wait_closed()\n\
+             asyncio.run(main())\n\
+             print('asyncio tcp ok')",
+        ),        (
+            "python-process-pool",
+            "import concurrent.futures, multiprocessing\n\
+             if __name__ == '__main__':\n\
+             \x20   context = multiprocessing.get_context('fork')\n\
+             \x20   with concurrent.futures.ProcessPoolExecutor(2, mp_context=context) as pool:\n\
+             \x20       assert list(pool.map(pow, [2, 3], [5, 2])) == [32, 9]\n\
+             \x20   print('process pool ok')",
+        ),        (
+            "python-pty",
+            "import os, pty\n\
+             pid, fd = pty.fork()\n\
+             if pid == 0:\n\
+             \x20   os.write(1, b'from the child\\n'); os._exit(3)\n\
+             seen = b''\n\
+             while b'child' not in seen:\n\
+             \x20   seen += os.read(fd, 64)\n\
+             assert os.waitpid(pid, 0)[1] == 3 << 8\n\
+             print('pty ok')",
+        ),        (
+            "python-posix-spawn",
+            "import os\n\
+             pid = os.posix_spawn('/bin/true', ['true'], os.environ)\n\
+             assert os.waitpid(pid, 0) == (pid, 0)\n\
+             print('posix spawn ok')",
+        ),        (
+            "python-itimer",
+            "import signal, time\n\
+             fired = []\n\
+             signal.signal(signal.SIGALRM, lambda *_: fired.append(1))\n\
+             signal.setitimer(signal.ITIMER_REAL, 0.2)\n\
+             end = time.monotonic() + 5\n\
+             while not fired and time.monotonic() < end:\n\
+             \x20   time.sleep(0.05)\n\
+             assert fired, 'SIGALRM never came'\n\
+             print('itimer ok')",
+        ),        (
+            "python-shared-mmap",
+            "import mmap, os\n\
+             shared = mmap.mmap(-1, 4096)\n\
+             pid = os.fork()\n\
+             if pid == 0:\n\
+             \x20   shared[:5] = b'hello'; os._exit(0)\n\
+             os.waitpid(pid, 0)\n\
+             assert shared[:5] == b'hello', shared[:5]\n\
+             print('shared mmap ok')",
+        ),        (
+            "python-flock",
+            "import fcntl, os\n\
+             path = '/tmp/flock-probe'\n\
+             holder = open(path, 'w'); fcntl.flock(holder, fcntl.LOCK_EX)\n\
+             pid = os.fork()\n\
+             if pid == 0:\n\
+             \x20   other = open(path, 'w')\n\
+             \x20   try:\n\
+             \x20       fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB); os._exit(1)\n\
+             \x20   except BlockingIOError:\n\
+             \x20       os._exit(0)\n\
+             assert os.waitpid(pid, 0)[1] == 0, 'second lock was granted'\n\
+             print('flock ok')",
+        ),        (
+            "python-lockf",
+            "import fcntl, os\n\
+             path = '/tmp/lockf-probe'\n\
+             holder = open(path, 'w'); holder.write('x' * 64); holder.flush()\n\
+             fcntl.lockf(holder, fcntl.LOCK_EX, 10, 0)\n\
+             def child(start):\n\
+             \x20   other = open(path, 'r+')\n\
+             \x20   try:\n\
+             \x20       fcntl.lockf(other, fcntl.LOCK_EX | fcntl.LOCK_NB, 2, start); return 0\n\
+             \x20   except OSError:\n\
+             \x20       return 1\n\
+             def run(start):\n\
+             \x20   pid = os.fork()\n\
+             \x20   if pid == 0:\n\
+             \x20       os._exit(child(start))\n\
+             \x20   return os.waitpid(pid, 0)[1] >> 8\n\
+             assert run(5) == 1, 'overlapping lock granted'\n\
+             assert run(20) == 0, 'separate range refused'\n\
+             fcntl.lockf(holder, fcntl.LOCK_UN, 10, 0)\n\
+             assert run(5) == 0, 'lock refused after unlock'\n\
+             print('lockf ok')",
+        ),        (
+            "python-fifo",
+            "import os\n\
+             path = '/tmp/fifo-probe'\n\
+             os.mkfifo(path)\n\
+             pid = os.fork()\n\
+             if pid == 0:\n\
+             \x20   with open(path, 'wb') as pipe:\n\
+             \x20       pipe.write(b'through the fifo')\n\
+             \x20   os._exit(0)\n\
+             with open(path, 'rb') as pipe:\n\
+             \x20   assert pipe.read() == b'through the fifo'\n\
+             os.waitpid(pid, 0); os.unlink(path)\n\
+             print('fifo ok')",
+        ),        (
+            "python-copyfile",
+            "import os, shutil\n\
+             data = os.urandom(300000)\n\
+             open('/tmp/copy-a', 'wb').write(data)\n\
+             shutil.copyfile('/tmp/copy-a', '/tmp/copy-b')\n\
+             assert open('/tmp/copy-b', 'rb').read() == data\n\
+             source = os.open('/tmp/copy-a', os.O_RDONLY)\n\
+             target = os.open('/tmp/copy-c', os.O_WRONLY | os.O_CREAT | os.O_TRUNC)\n\
+             assert os.sendfile(target, source, 0, 1000) == 1000\n\
+             os.close(source); os.close(target)\n\
+             assert open('/tmp/copy-c', 'rb').read() == data[:1000]\n\
+             for name in ('/tmp/copy-a', '/tmp/copy-b', '/tmp/copy-c'): os.unlink(name)\n\
+             print('copyfile ok')",
+        ),        (
+            "python-eventfd-timerfd",
+            "import os, select, time\n\
+             event = os.eventfd(0)\n\
+             os.eventfd_write(event, 3); os.eventfd_write(event, 4)\n\
+             assert os.eventfd_read(event) == 7\n\
+             timer = os.timerfd_create(time.CLOCK_MONOTONIC)\n\
+             os.timerfd_settime(timer, initial=0.1)\n\
+             assert select.select([timer], [], [], 5)[0] == [timer]\n\
+             assert int.from_bytes(os.read(timer, 8), 'little') == 1\n\
+             print('eventfd timerfd ok')",
+        ),        (
+            "python-usage-clocks",
+            "import resource, time\n\
+             start = time.process_time()\n\
+             end = time.monotonic() + 0.3\n\
+             while time.monotonic() < end:\n\
+             \x20   pass\n\
+             spent = time.process_time() - start\n\
+             assert spent > 0.1, spent\n\
+             usage = resource.getrusage(resource.RUSAGE_SELF)\n\
+             assert usage.ru_utime + usage.ru_stime > 0.1, usage\n\
+             assert time.clock_gettime(time.CLOCK_THREAD_CPUTIME_ID) > 0\n\
+             print('usage clocks ok')",
+        ),        (
+            "python-fs-misc",
+            "import os\n\
+             stats = os.statvfs('/tmp')\n\
+             assert stats.f_bsize > 0 and stats.f_blocks >= stats.f_bfree, stats\n\
+             open('/tmp/link-a', 'w').write('shared')\n\
+             os.link('/tmp/link-a', '/tmp/link-b')\n\
+             assert os.stat('/tmp/link-a').st_nlink == 2\n\
+             assert os.stat('/tmp/link-a').st_ino == os.stat('/tmp/link-b').st_ino\n\
+             open('/tmp/link-b', 'a').write(' file')\n\
+             assert open('/tmp/link-a').read() == 'shared file'\n\
+             os.unlink('/tmp/link-a')\n\
+             assert open('/tmp/link-b').read() == 'shared file'\n\
+             assert os.stat('/tmp/link-b').st_nlink == 1\n\
+             assert len(os.getrandom(32)) == 32\n\
+             print('fs misc ok')",
+        ),        (
+            "python-udp-resolve",
+            "import socket\n\
+             server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); server.bind(('127.0.0.1', 0))\n\
+             client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n\
+             client.sendto(b'datagram', server.getsockname())\n\
+             server.settimeout(5); data, peer = server.recvfrom(64)\n\
+             assert data == b'datagram', data\n\
+             server.sendto(b'reply', peer); client.settimeout(5)\n\
+             assert client.recvfrom(64)[0] == b'reply'\n\
+             assert any(info[4][0] == '127.0.0.1' for info in socket.getaddrinfo('localhost', 80))\n\
+             print('udp resolve ok')",
+        ),        (
+            "python-subprocess-timeout",
+            "import subprocess, time\n\
+             start = time.monotonic()\n\
+             try:\n\
+             \x20   subprocess.run(['/bin/sleep', '30'], timeout=0.5)\n\
+             \x20   raise SystemExit('no timeout')\n\
+             except subprocess.TimeoutExpired:\n\
+             \x20   pass\n\
+             assert time.monotonic() - start < 10\n\
+             out = subprocess.run(['/bin/echo', 'hi'], capture_output=True, check=True).stdout\n\
+             assert out == b'hi\\n', out\n\
+             print('subprocess timeout ok')",
+        ),        (
+            "python-sched-load",
+            "import os\n\
+             cpus = os.sched_getaffinity(0)\n\
+             assert cpus and os.cpu_count() >= len(cpus), cpus\n\
+             os.sched_setaffinity(0, {min(cpus)})\n\
+             assert os.sched_getaffinity(0) == {min(cpus)}\n\
+             os.sched_setaffinity(0, cpus)\n\
+             assert len(os.getloadavg()) == 3\n\
+             print('sched load ok')",
+        ),        (
+            "python-pipe-ioctl-splice",
+            "import fcntl, os, struct, termios\n\
+             r, w = os.pipe(); os.write(w, b'12345')\n\
+             waiting = struct.unpack('i', fcntl.ioctl(r, termios.FIONREAD, b'\\0' * 4))[0]\n\
+             assert waiting == 5, waiting\n\
+             r2, w2 = os.pipe()\n\
+             assert os.splice(r, w2, 5) == 5 and os.read(r2, 5) == b'12345'\n\
+             fd = os.open('/tmp/falloc-probe', os.O_RDWR | os.O_CREAT)\n\
+             os.posix_fallocate(fd, 0, 8192); assert os.fstat(fd).st_size == 8192\n\
+             os.close(fd)\n\
+             print('pipe ioctl splice ok')",
+        ),        (
+            "python-zip-walk",
+            "import os, zipfile\n\
+             os.makedirs('/tmp/walk/a/b', exist_ok=True)\n\
+             for name in ['/tmp/walk/x', '/tmp/walk/a/y', '/tmp/walk/a/b/z']:\n\
+             \x20   open(name, 'w').write(name)\n\
+             found = sorted(os.path.join(root, f) for root, _, files in os.walk('/tmp/walk') for f in files)\n\
+             assert len(found) == 3, found\n\
+             with zipfile.ZipFile('/tmp/walk.zip', 'w', zipfile.ZIP_DEFLATED) as archive:\n\
+             \x20   for name in found: archive.write(name)\n\
+             with zipfile.ZipFile('/tmp/walk.zip') as archive:\n\
+             \x20   assert archive.testzip() is None and len(archive.namelist()) == 3\n\
+             import shutil; shutil.rmtree('/tmp/walk'); os.unlink('/tmp/walk.zip')\n\
+             print('zip walk ok')",
+        ),        (
+            "python-http-loopback",
+            "import http.server, threading, urllib.request\n\
+             class Handler(http.server.BaseHTTPRequestHandler):\n\
+             \x20   def do_GET(self):\n\
+             \x20       body = b'hello over http'\n\
+             \x20       self.send_response(200); self.send_header('Content-Length', str(len(body))); self.end_headers()\n\
+             \x20       self.wfile.write(body)\n\
+             \x20   def log_message(self, *args):\n\
+             \x20       pass\n\
+             server = http.server.HTTPServer(('127.0.0.1', 0), Handler)\n\
+             threading.Thread(target=server.serve_forever, daemon=True).start()\n\
+             url = 'http://127.0.0.1:%d/' % server.server_address[1]\n\
+             assert urllib.request.urlopen(url, timeout=10).read() == b'hello over http'\n\
+             server.shutdown()\n\
+             print('http loopback ok')",
+        ),        (
+            "python-sqlite-processes",
+            "import os, sqlite3\n\
+             path = '/tmp/shared.db'\n\
+             db = sqlite3.connect(path); db.execute('create table t(n)'); db.commit(); db.close()\n\
+             def add(start):\n\
+             \x20   db = sqlite3.connect(path, timeout=20)\n\
+             \x20   for n in range(start, start + 50):\n\
+             \x20       db.execute('insert into t values (?)', (n,)); db.commit()\n\
+             \x20   db.close()\n\
+             pid = os.fork()\n\
+             if pid == 0:\n\
+             \x20   add(1000); os._exit(0)\n\
+             add(0)\n\
+             assert os.waitpid(pid, 0)[1] == 0\n\
+             count = sqlite3.connect(path).execute('select count(*) from t').fetchone()[0]\n\
+             assert count == 100, count\n\
+             print('sqlite processes ok')",
+        ),        (
+            "python-thread-sync",
+            "import threading\n\
+             barrier = threading.Barrier(4); hits = []; lock = threading.Semaphore(2)\n\
+             def work(n):\n\
+             \x20   barrier.wait(timeout=10)\n\
+             \x20   with lock:\n\
+             \x20       hits.append(n)\n\
+             threads = [threading.Thread(target=work, args=(n,)) for n in range(4)]\n\
+             for thread in threads: thread.start()\n\
+             for thread in threads: thread.join(10)\n\
+             assert sorted(hits) == [0, 1, 2, 3], hits\n\
+             print('thread sync ok')",
+        ),        (
+            "python-sigwait",
+            "import os, signal\n\
+             signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})\n\
+             os.kill(os.getpid(), signal.SIGUSR1)\n\
+             assert signal.SIGUSR1 in signal.sigpending()\n\
+             assert signal.sigwait({signal.SIGUSR1}) == signal.SIGUSR1\n\
+             print('sigwait ok')",
+        ),        (
+            "python-rmtree",
+            "import os, shutil, tempfile\n\
+             root = tempfile.mkdtemp()\n\
+             for depth in range(4):\n\
+             \x20   path = os.path.join(root, *['d%d' % n for n in range(depth + 1)])\n\
+             \x20   os.makedirs(path, exist_ok=True)\n\
+             \x20   for n in range(5): open(os.path.join(path, 'f%d' % n), 'w').write('x')\n\
+             shutil.rmtree(root)\n\
+             assert not os.path.exists(root)\n\
+             print('rmtree ok')",
+        ),        (
+            "python-dgram-fds",
+            "import os, socket\n\
+             left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)\n\
+             r, w = os.pipe()\n\
+             socket.send_fds(left, [b'fd'], [w]); os.close(w)\n\
+             message, fds, _, _ = socket.recv_fds(right, 16, 4)\n\
+             assert message == b'fd' and len(fds) == 1, (message, fds)\n\
+             os.write(fds[0], b'via dgram'); os.close(fds[0])\n\
+             assert os.read(r, 16) == b'via dgram'\n\
+             print('dgram fds ok')",
+        ),        (
             "python-rlimits",
             "import os, resource\n\
              resource.setrlimit(resource.RLIMIT_CORE, (0, resource.RLIM_INFINITY))\n\
