@@ -329,7 +329,9 @@ pub fn initialize(pci: &PciInventory) -> SdReport {
         *byte = (index as u8).wrapping_mul(29).wrapping_add(5);
     }
     let mut readback = [0u8; 4096];
-    report.write_probe = report.sectors > 16
+    // Only the test card (signature above) is written, never a real one.
+    report.write_probe = report.read
+        && report.sectors > 16
         && write(8, 8, &pattern)
         && read(8, 8, &mut readback)
         && readback == pattern;

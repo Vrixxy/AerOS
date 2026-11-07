@@ -155,6 +155,9 @@ impl DesktopState {
         if self.settings_cursor >= rows {
             self.settings_scroll = self.settings_cursor + 1 - rows;
         }
+        if self.settings_page == PAGE_NETWORK && self.wifi && !self.airplane {
+            let _ = crate::mt7921::scan();
+        }
     }
 
     pub(super) fn settings_click(&mut self, point: Point) -> Option<DesktopAction> {
@@ -169,6 +172,7 @@ impl DesktopState {
         let page = self.settings_page;
         let now = crate::time::monotonic_nanoseconds();
         match page {
+            PAGE_NETWORK if crate::mt7921::present() => return self.wifi_click(pane, point),
             PAGE_NETWORK if toggle_rect(pane, 0).contains(point) => {
                 self.wifi = !self.wifi;
                 if self.wifi {
@@ -246,6 +250,9 @@ impl DesktopState {
         let page = self.settings_page;
         let now = crate::time::monotonic_nanoseconds();
         let base = window_base_rect(DesktopApp::Settings);
+        if page == PAGE_NETWORK && self.wifi_choice.is_some() {
+            return self.wifi_key(key);
+        }
         match key {
             DesktopKey::Tab => {
                 self.settings_show_page(page + 1);
@@ -555,6 +562,7 @@ pub(super) fn draw_settings(
         INK,
     );
     match page {
+        PAGE_NETWORK if crate::mt7921::present() => draw_wifi(painter, layout, font, state, pane),
         PAGE_NETWORK => {
             draw_toggle_row(
                 painter,
@@ -756,5 +764,390 @@ pub(super) fn draw_settings(
                 ],
             );
         }
+    }
+}
+
+pub(super) const WIFI_ROWS: usize = 6;
+const WIFI_LIST_TOP: i32 = 49;
+const WIFI_ROW_WIDTH: i32 = 360;
+
+fn wifi_row(pane: Rect, slot: usize) -> Rect {
+    Rect::new(
+        pane.x,
+        pane.y + WIFI_LIST_TOP + slot as i32 * (ROW + ROW_GAP),
+        WIFI_ROW_WIDTH,
+        ROW,
+    )
+}
+
+fn wifi_refresh_button(pane: Rect) -> Rect {
+    Rect::new(pane.x + WIFI_ROW_WIDTH - 86, pane.y + 6, 86, 25)
+}
+
+fn wifi_field(pane: Rect) -> Rect {
+    Rect::new(pane.x, pane.y + WIFI_LIST_TOP + 24, 280, 30)
+}
+
+fn wifi_reveal_button(pane: Rect) -> Rect {
+    let field = wifi_field(pane);
+    Rect::new(field.right() + 8, field.y + 2, 64, 26)
+}
+
+fn wifi_button(pane: Rect, index: usize) -> Rect {
+    Rect::new(
+        pane.x + index as i32 * 112,
+        pane.y + WIFI_LIST_TOP + 68,
+        100,
+        30,
+    )
+}
+
+impl DesktopState {
+    /// Polls the card, follows the Wi-Fi switch, and refreshes the list.
+    /// True when the screen should be redrawn.
+    pub(super) fn wifi_tick(&mut self) -> bool {
+        crate::mt7921::poll();
+        let wanted = self.wifi && !self.airplane;
+        if wanted != self.wifi_applied {
+            self.wifi_applied = wanted;
+            if wanted {
+                let _ = crate::mt7921::scan();
+            } else {
+                self.wifi_choice = None;
+                crate::mt7921::disconnect();
+            }
+        }
+        let status = crate::mt7921::status();
+        if self.wifi_choice.is_none() {
+            let mut found = [crate::mt7921::Network::EMPTY; crate::mt7921::MAX_NETWORKS];
+            let count = crate::mt7921::networks(&mut found).min(WIFI_ROWS);
+            self.wifi_rows[..count].copy_from_slice(&found[..count]);
+            self.wifi_row_count = if wanted { count } else { 0 };
+        }
+        let mut signature = status.link as u64
+            ^ (u64::from(status.scanning) << 4)
+            ^ ((status.message.as_ptr() as u64) << 8)
+            ^ ((self.wifi_row_count as u64) << 40)
+            ^ (u64::from(crate::net::is_ready()) << 48);
+        for (index, network) in self.wifi_rows[..self.wifi_row_count].iter().enumerate() {
+            signature = signature.rotate_left(7)
+                ^ u64::from(network.ssid[0])
+                ^ (u64::from(network.bars()) << 8)
+                ^ ((index as u64) << 12);
+        }
+        let changed = signature != self.wifi_signature;
+        self.wifi_signature = signature;
+        let visible = (self.app == DesktopApp::Settings && self.settings_page == PAGE_NETWORK)
+            || self.overlay == Overlay::Quick;
+        changed && visible
+    }
+
+    /// Runs a connection the user asked for, after the "Connecting" frame is shown.
+    pub(super) fn wifi_run_pending(&mut self) -> bool {
+        if !self.wifi_pending {
+            return false;
+        }
+        self.wifi_pending = false;
+        let Some(network) = self.wifi_choice.take() else {
+            return true;
+        };
+        let password =
+            core::str::from_utf8(&self.wifi_password[..self.wifi_password_len]).unwrap_or("");
+        let _ = crate::mt7921::connect(&network, password);
+        self.wifi_password.fill(0);
+        self.wifi_password_len = 0;
+        self.wifi_reveal = false;
+        true
+    }
+
+    fn wifi_pick(&mut self, network: crate::mt7921::Network) {
+        let status = crate::mt7921::status();
+        if status.link == crate::mt7921::Link::Connected
+            && status.ssid_len == network.ssid_len
+            && status.ssid == network.ssid
+        {
+            crate::mt7921::disconnect();
+            return;
+        }
+        self.wifi_choice = Some(network);
+        self.wifi_password_len = 0;
+        if network.security != crate::mt7921::Security::Wpa2 {
+            self.wifi_pending = true;
+        }
+    }
+
+    fn wifi_click(&mut self, pane: Rect, point: Point) -> Option<DesktopAction> {
+        if toggle_rect(pane, 0).contains(point) {
+            self.wifi = !self.wifi;
+            if self.wifi {
+                self.airplane = false;
+            }
+            return Some(DesktopAction::Redraw);
+        }
+        if let Some(network) = self.wifi_choice {
+            if network.security != crate::mt7921::Security::Wpa2 || self.wifi_pending {
+                return None;
+            }
+            if wifi_reveal_button(pane).contains(point) {
+                self.wifi_reveal = !self.wifi_reveal;
+            } else if wifi_button(pane, 0).contains(point) {
+                self.wifi_pending = self.wifi_password_len >= 8;
+            } else if wifi_button(pane, 1).contains(point) {
+                self.wifi_choice = None;
+            } else {
+                return None;
+            }
+            return Some(DesktopAction::Redraw);
+        }
+        if !self.wifi || self.airplane {
+            return None;
+        }
+        if wifi_refresh_button(pane).contains(point) {
+            let _ = crate::mt7921::scan();
+            return Some(DesktopAction::Redraw);
+        }
+        for slot in 0..self.wifi_row_count {
+            if wifi_row(pane, slot).contains(point) {
+                let network = self.wifi_rows[slot];
+                self.wifi_pick(network);
+                return Some(DesktopAction::Redraw);
+            }
+        }
+        None
+    }
+
+    fn wifi_key(&mut self, key: DesktopKey) -> Option<DesktopAction> {
+        if self.wifi_pending {
+            return Some(DesktopAction::Idle);
+        }
+        match key {
+            DesktopKey::Escape => self.wifi_choice = None,
+            DesktopKey::Activate => self.wifi_pending = self.wifi_password_len >= 8,
+            DesktopKey::Backspace => {
+                self.wifi_password_len = self.wifi_password_len.saturating_sub(1)
+            }
+            DesktopKey::Character(ch) if (' '..='~').contains(&ch) => {
+                if self.wifi_password_len < 63 {
+                    self.wifi_password[self.wifi_password_len] = ch as u8;
+                    self.wifi_password_len += 1;
+                }
+            }
+            _ => return Some(DesktopAction::Idle),
+        }
+        Some(DesktopAction::Redraw)
+    }
+}
+
+fn draw_signal(painter: &mut Painter<'_>, layout: Layout, at: Point, bars: u8) {
+    for bar in 0..3u8 {
+        let height = 5 + bar as i32 * 4;
+        let rect = Rect::new(at.x + bar as i32 * 6, at.y + 13 - height, 4, height);
+        painter.fill_rounded_rect(
+            layout.rect(rect),
+            layout.radii(CornerRadii::all(1)),
+            if bar < bars {
+                Rgba::new(245, 245, 245, 255)
+            } else {
+                Rgba::new(110, 110, 110, 255)
+            },
+        );
+    }
+}
+
+fn draw_button(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    font: RasterFont,
+    bounds: Rect,
+    label: &str,
+    filled: bool,
+) {
+    let radii = layout.radii(CornerRadii::all(bounds.height / 2));
+    if filled {
+        painter.fill_rounded_rect(layout.rect(bounds), radii, ACCENT);
+    } else {
+        painter.stroke_rounded_rect(layout.rect(bounds), radii, 1, OUTLINE);
+    }
+    centered_text(painter, layout, font, bounds, label, 11, INK);
+}
+
+fn wifi_status_line(state: &DesktopState, on: bool, line: &mut ClockBuffer) {
+    use crate::mt7921::Link;
+    let status = crate::mt7921::status();
+    if !on {
+        let _ = write!(line, "Wi-Fi is off");
+    } else if state.wifi_pending || status.link == Link::Connecting {
+        let _ = write!(line, "Connecting...");
+    } else if status.link == Link::Connected && crate::net::is_ready() {
+        let ip = crate::net::local_address();
+        let _ = write!(line, "{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    } else if !status.message.is_empty() {
+        let _ = write!(line, "{}", status.message);
+    } else if status.scanning {
+        let _ = write!(line, "Looking for networks...");
+    }
+}
+
+fn draw_wifi(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    font: RasterFont,
+    state: &DesktopState,
+    pane: Rect,
+) {
+    use crate::mt7921::{Link, Security};
+    let on = state.wifi && !state.airplane;
+    draw_toggle_row(painter, layout, font, toggle_rect(pane, 0), "Wi-Fi", on);
+    let mut line = ClockBuffer::new();
+    wifi_status_line(state, on, &mut line);
+    text(
+        painter,
+        layout,
+        font,
+        Point::new(pane.x + SETTING_ROW.width + 12, pane.y + 13),
+        line.as_str(),
+        10,
+        INK_SOFT,
+    );
+    if !on {
+        return;
+    }
+    let status = crate::mt7921::status();
+    if let Some(network) = state.wifi_choice {
+        if network.security != Security::Wpa2 || state.wifi_pending {
+            return;
+        }
+        let mut prompt = ClockBuffer::new();
+        let _ = write!(prompt, "Password for {}", network.name());
+        text(
+            painter,
+            layout,
+            font,
+            Point::new(pane.x, pane.y + WIFI_LIST_TOP + 4),
+            prompt.as_str(),
+            11,
+            INK,
+        );
+        let field = wifi_field(pane);
+        painter.stroke_rounded_rect(
+            layout.rect(field),
+            layout.radii(CornerRadii::all(field.height / 2)),
+            2,
+            ACCENT,
+        );
+        let len = state.wifi_password_len;
+        let mut shown = [b'*'; 64];
+        if state.wifi_reveal {
+            shown[..len].copy_from_slice(&state.wifi_password[..len]);
+        }
+        let mut typed = ClockBuffer::new();
+        let _ = write!(
+            typed,
+            "{}_",
+            core::str::from_utf8(&shown[..len]).unwrap_or("")
+        );
+        text(
+            painter,
+            layout,
+            font,
+            Point::new(field.x + 14, field.y + 9),
+            typed.as_str(),
+            11,
+            INK,
+        );
+        let reveal = if state.wifi_reveal { "Hide" } else { "Show" };
+        draw_button(
+            painter,
+            layout,
+            font,
+            wifi_reveal_button(pane),
+            reveal,
+            false,
+        );
+        draw_button(
+            painter,
+            layout,
+            font,
+            wifi_button(pane, 0),
+            "Connect",
+            len >= 8,
+        );
+        draw_button(painter, layout, font, wifi_button(pane, 1), "Cancel", false);
+        return;
+    }
+    let refresh = if status.scanning {
+        "Looking..."
+    } else {
+        "Refresh"
+    };
+    draw_button(
+        painter,
+        layout,
+        font,
+        wifi_refresh_button(pane),
+        refresh,
+        false,
+    );
+    if state.wifi_row_count == 0 {
+        let empty = if status.scanning {
+            "Looking for networks..."
+        } else {
+            "No networks found. Try Refresh."
+        };
+        text(
+            painter,
+            layout,
+            font,
+            Point::new(pane.x, pane.y + WIFI_LIST_TOP + 8),
+            empty,
+            11,
+            INK_SOFT,
+        );
+    }
+    for (slot, network) in state.wifi_rows[..state.wifi_row_count].iter().enumerate() {
+        let row = wifi_row(pane, slot);
+        let radii = layout.radii(CornerRadii::all(row.height / 2));
+        let joined = status.link == Link::Connected
+            && status.ssid_len == network.ssid_len
+            && status.ssid == network.ssid;
+        if joined {
+            painter.fill_rounded_rect(layout.rect(row), radii, Rgba::new(255, 255, 255, 40));
+        }
+        painter.stroke_rounded_rect(
+            layout.rect(row),
+            radii,
+            1,
+            if joined { ACCENT } else { OUTLINE },
+        );
+        text(
+            painter,
+            layout,
+            font,
+            Point::new(row.x + 14, row.y + 8),
+            network.name(),
+            11,
+            INK,
+        );
+        let note = match (joined, network.security) {
+            (true, _) => "Connected - click to disconnect",
+            (false, Security::Wpa2) => "Password",
+            (false, Security::Open) => "Open",
+            (false, Security::Unsupported) => "Not supported yet",
+        };
+        text(
+            painter,
+            layout,
+            font,
+            Point::new(row.right() - 200, row.y + 9),
+            note,
+            9,
+            INK_SOFT,
+        );
+        draw_signal(
+            painter,
+            layout,
+            Point::new(row.right() - 30, row.y + 7),
+            network.bars(),
+        );
     }
 }

@@ -181,6 +181,25 @@ fn notes_directory() -> &'static str {
     }
 }
 
+/// The Files sidebar: name and folder of each place.
+fn files_places() -> [(&'static str, &'static str); 4] {
+    if crate::datafs::route("/home").is_some() {
+        [
+            ("Home", "/home"),
+            ("Documents", "/home/Documents"),
+            ("Downloads", "/home/Downloads"),
+            ("USB drives", "/media"),
+        ]
+    } else {
+        [
+            ("Home", "/data"),
+            ("Documents", "/data/Documents"),
+            ("Downloads", "/data/Downloads"),
+            ("USB drives", "/media"),
+        ]
+    }
+}
+
 /// Removes the last complete UTF-8 scalar value's bytes from the end of
 /// `bytes` (1-4 bytes, not just the last byte, so backspacing a
 /// multi-byte character - e.g. an accented letter typed on a non-US
@@ -230,8 +249,23 @@ fn launcher_tile(index: usize) -> Rect {
     )
 }
 
+/// Tiles in the launcher: the built-in apps, then every app the Linux guest
+/// has (store installs included).
+fn launcher_len() -> usize {
+    LAUNCHER_BUILTINS.len() + crate::store::get().count
+}
+
 fn launcher_pages() -> usize {
-    APP_LABELS.len().div_ceil(LAUNCHER_PAGE)
+    launcher_len().div_ceil(LAUNCHER_PAGE).max(1)
+}
+
+fn launcher_name(index: usize) -> &'static str {
+    match LAUNCHER_BUILTINS.get(index) {
+        Some((name, _)) => name,
+        None => crate::store::get()
+            .app(index - LAUNCHER_BUILTINS.len())
+            .map_or("", |app| app.name_str()),
+    }
 }
 
 fn launcher_dot(page: usize) -> Rect {
@@ -262,30 +296,16 @@ const DOCK_NAMES: [&str; 9] = [
 ];
 /// The `draw_icon` kind each dock slot shows.
 const DOCK_KINDS: [usize; 9] = [0, 1, 2, 3, 4, 5, 8, 9, 6];
-const APP_LABELS: [&str; 20] = [
-    "", "", "", "", "", "L", "M", "P", "E", "I", "D", "V", "R", "L", "H", "W", "G", "K", "U", "S",
-];
-const APP_NAMES: [&str; 20] = [
-    "Terminal",
-    "Files",
-    "Browser",
-    "Notes",
-    "Settings",
-    "Linux",
-    "Mail",
-    "Photos",
-    "Editor",
-    "Messages",
-    "Downloads",
-    "Video",
-    "Reader",
-    "Calendar",
-    "Health",
-    "Weather",
-    "Games",
-    "Clock",
-    "Contacts",
-    "Store",
+/// The launcher's built-in apps: name and `draw_icon` kind.
+const LAUNCHER_BUILTINS: [(&str, usize); 8] = [
+    ("Terminal", 1),
+    ("Files", 7),
+    ("Browser", 4),
+    ("Notes", 5),
+    ("Settings", 2),
+    ("Store", 8),
+    ("Trash", 6),
+    ("Linux desktop", 9),
 ];
 
 /// The four full-screen buffers (the composed desktop, its shadow copy, the
@@ -522,6 +542,10 @@ fn list_directory(path: &str, rows: &mut [DirEntryRow]) -> (usize, bool) {
     loop {
         match vfs::next_directory_entry(descriptor) {
             Ok(Some(entry)) => {
+                // Dot names are system folders and files (.root, .trash).
+                if entry.name_len == 0 || entry.name[0] == b'.' {
+                    continue;
+                }
                 if count == rows.len() {
                     overflowed = true;
                     continue;
@@ -918,6 +942,8 @@ struct DesktopState {
     overlay: Overlay,
     dock_focus: usize,
     app_focus: usize,
+    /// The pointer is over launcher tile `app_focus` (its name shows).
+    launcher_hover: bool,
     focus_visible: bool,
     app: DesktopApp,
     browser_address: [u8; 4],
@@ -933,12 +959,25 @@ struct DesktopState {
     url_input: [u8; MAX_URL],
     url_len: usize,
     url_active: bool,
+    /// The adblock card under the shield is open; `adblock_off` once its
+    /// power button has turned blocking off.
+    browser_shield_open: bool,
+    adblock_off: bool,
     browser_phase: BrowserPhase,
     browser_host: [u8; MAX_URL],
     browser_host_len: usize,
     browser_path: [u8; MAX_PATH],
     browser_path_len: usize,
     wifi: bool,
+    wifi_applied: bool,
+    wifi_rows: [crate::mt7921::Network; settings_ui::WIFI_ROWS],
+    wifi_row_count: usize,
+    wifi_choice: Option<crate::mt7921::Network>,
+    wifi_password: [u8; 64],
+    wifi_password_len: usize,
+    wifi_reveal: bool,
+    wifi_pending: bool,
+    wifi_signature: u64,
     bluetooth: bool,
     airplane: bool,
     battery_saver: bool,
@@ -1151,6 +1190,7 @@ impl DesktopState {
             overlay: Overlay::None,
             dock_focus: 0,
             app_focus: 0,
+            launcher_hover: false,
             focus_visible: false,
             app: DesktopApp::None,
             browser_address: [0; 4],
@@ -1166,12 +1206,23 @@ impl DesktopState {
             url_input: [0; MAX_URL],
             url_len: 0,
             url_active: false,
+            browser_shield_open: false,
+            adblock_off: false,
             browser_phase: BrowserPhase::Editing,
             browser_host: [0; MAX_URL],
             browser_host_len: 0,
             browser_path: [0; MAX_PATH],
             browser_path_len: 0,
             wifi: true,
+            wifi_applied: true,
+            wifi_rows: [crate::mt7921::Network::EMPTY; settings_ui::WIFI_ROWS],
+            wifi_row_count: 0,
+            wifi_choice: None,
+            wifi_password: [0; 64],
+            wifi_password_len: 0,
+            wifi_reveal: false,
+            wifi_pending: false,
+            wifi_signature: 0,
             bluetooth: true,
             airplane: false,
             battery_saver: false,
@@ -1907,7 +1958,7 @@ impl DesktopState {
             DesktopKey::Linux => {
                 self.set_overlay(Overlay::None);
                 self.seamless.enabled = false;
-                self.set_app(DesktopApp::Linux);
+                self.open_linux_desktop();
             }
             DesktopKey::Store => {
                 self.set_overlay(Overlay::None);
@@ -1986,7 +2037,7 @@ impl DesktopState {
                 }
                 self.focus_visible = true;
                 if self.overlay == Overlay::Apps {
-                    self.app_focus = (self.app_focus + 1) % APP_LABELS.len();
+                    self.app_focus = (self.app_focus + 1) % launcher_len();
                 } else {
                     self.dock_focus = (self.dock_focus + 1) % DOCK_BUTTONS.len();
                 }
@@ -1994,7 +2045,7 @@ impl DesktopState {
             DesktopKey::Left => {
                 self.focus_visible = true;
                 if self.overlay == Overlay::Apps {
-                    self.app_focus = (self.app_focus + APP_LABELS.len() - 1) % APP_LABELS.len();
+                    self.app_focus = (self.app_focus + launcher_len() - 1) % launcher_len();
                 } else {
                     self.dock_focus =
                         (self.dock_focus + DOCK_BUTTONS.len() - 1) % DOCK_BUTTONS.len();
@@ -2003,7 +2054,7 @@ impl DesktopState {
             DesktopKey::Down => {
                 self.focus_visible = true;
                 if self.overlay == Overlay::Apps {
-                    self.app_focus = (self.app_focus + LAUNCHER_COLUMNS).min(APP_LABELS.len() - 1);
+                    self.app_focus = (self.app_focus + LAUNCHER_COLUMNS).min(launcher_len() - 1);
                 }
             }
             DesktopKey::Up => {
@@ -2024,16 +2075,7 @@ impl DesktopState {
                 }
                 if self.overlay == Overlay::Apps {
                     self.set_overlay(Overlay::None);
-                    match self.app_focus {
-                        0 => self.set_app(DesktopApp::Terminal),
-                        1 => self.open_files(),
-                        2 => self.open_browser(),
-                        3 => self.open_notes(),
-                        4 => self.set_app(DesktopApp::Settings),
-                        5 => self.set_app(DesktopApp::Linux),
-                        19 => self.open_store(),
-                        _ => self.open_files(),
-                    }
+                    self.launch_entry(self.app_focus);
                 } else if self.overlay == Overlay::Quick {
                     self.wifi = !self.wifi;
                 } else {
@@ -2042,6 +2084,25 @@ impl DesktopState {
             }
         }
         DesktopAction::Redraw
+    }
+
+    /// Opens launcher tile `index`.
+    fn launch_entry(&mut self, index: usize) {
+        match index {
+            0 => self.set_app(DesktopApp::Terminal),
+            1 => self.open_files(),
+            2 => self.open_browser(),
+            3 => self.open_notes(),
+            4 => self.set_app(DesktopApp::Settings),
+            5 => self.open_store(),
+            6 => self.open_trash(),
+            7 => self.open_linux_desktop(),
+            _ => {
+                if crate::store::get().launch(index - LAUNCHER_BUILTINS.len()) {
+                    self.show_linux_apps();
+                }
+            }
+        }
     }
 
     /// Launches the dock slot that has focus (Enter, or a click on its icon).
@@ -2061,7 +2122,7 @@ impl DesktopState {
             4 => self.open_browser(),
             5 => self.open_notes(),
             6 => self.open_store(),
-            7 => self.set_app(DesktopApp::Linux),
+            7 => self.open_linux_desktop(),
             _ => self.open_trash(),
         }
     }
@@ -2165,7 +2226,7 @@ impl DesktopState {
             let content_x = base.x + 10;
             let content_y = base.y + 36;
             let sidebar_width = 106;
-            for (index, path) in ["/", "/data", "/tmp", "/media"].iter().enumerate() {
+            for (index, (_, path)) in files_places().iter().enumerate() {
                 let bounds = Rect::new(
                     content_x + 8,
                     content_y + 28 + index as i32 * 30,
@@ -2173,6 +2234,7 @@ impl DesktopState {
                     26,
                 );
                 if bounds.contains(point) {
+                    let _ = crate::vfs::create_directory(path, 0o755);
                     let mut name: shell::Text<256> = shell::Text::new();
                     let _ = name.push_str_checked(path);
                     self.files_path = name;
@@ -2328,7 +2390,7 @@ impl DesktopState {
         }
         if self.overlay == Overlay::Apps {
             let page = self.app_focus / LAUNCHER_PAGE;
-            for index in page * LAUNCHER_PAGE..APP_LABELS.len().min((page + 1) * LAUNCHER_PAGE) {
+            for index in page * LAUNCHER_PAGE..launcher_len().min((page + 1) * LAUNCHER_PAGE) {
                 let bounds = launcher_tile(index);
                 if bounds.contains(point) {
                     self.app_focus = index;
@@ -2376,24 +2438,23 @@ impl DesktopState {
         let base = window_base_rect(DesktopApp::Browser);
         let now = crate::time::monotonic_nanoseconds();
         let web = crate::web::get();
-        let bar_y = base.y + 34;
-        let back = Rect::new(base.x + 14, bar_y, 28, 26);
-        let forward = Rect::new(base.x + 46, bar_y, 28, 26);
-        let reload = Rect::new(base.right() - 44, bar_y, 28, 26);
-        let pill = Rect::new(base.x + 84, bar_y, base.width - 84 - 58, 26);
-        if back.contains(point) {
-            web.back(now);
+        if self.browser_shield_open {
+            if BROWSER_ADBLOCK_POWER.contains(point) {
+                self.adblock_off = !self.adblock_off;
+            } else if !BROWSER_ADBLOCK.contains(point) {
+                self.browser_shield_open = false;
+            }
             return Some(DesktopAction::Redraw);
         }
-        if forward.contains(point) {
-            web.forward(now);
+        if BROWSER_SHIELD.contains(point) {
+            self.browser_shield_open = true;
             return Some(DesktopAction::Redraw);
         }
-        if reload.contains(point) {
+        if BROWSER_RELOAD.contains(point) {
             web.reload(now);
             return Some(DesktopAction::Redraw);
         }
-        if pill.contains(point) {
+        if BROWSER_PILL.contains(point) {
             self.url_active = true;
             if web.state == crate::web::WebState::Blank {
                 self.browser_phase = BrowserPhase::Editing;
@@ -2408,13 +2469,14 @@ impl DesktopState {
             }
             return Some(DesktopAction::Redraw);
         }
-        let content = browser_content_rect(base);
-        if !content.contains(point) {
-            return None;
-        }
-        if web.state == crate::web::WebState::Blank {
-            for (index, (_, address)) in BROWSER_FAVORITES.iter().enumerate() {
-                if browser_favorite_rect(content, index).contains(point) {
+        let page_open = if crate::svm::linux_ready() {
+            web.state != crate::web::WebState::Blank
+        } else {
+            self.browser_phase != BrowserPhase::Editing
+        };
+        if !page_open {
+            for (index, (_, address)) in BROWSER_FAVORITES.iter().take(3).enumerate() {
+                if browser_tile_rect(index).contains(point) {
                     let bytes = address.as_bytes();
                     self.url_input[..bytes.len()].copy_from_slice(bytes);
                     self.url_len = bytes.len();
@@ -2424,6 +2486,21 @@ impl DesktopState {
                     return Some(DesktopAction::Redraw);
                 }
             }
+            return None;
+        }
+        if hit_box(BROWSER_TAB_CLOSE, 20).contains(point)
+            || hit_box(BROWSER_NEW_TAB, 20).contains(point)
+        {
+            web.close();
+            self.browser_pending = false;
+            self.browser_host_len = 0;
+            self.browser_phase = BrowserPhase::Editing;
+            self.url_len = 0;
+            self.url_active = true;
+            return Some(DesktopAction::Redraw);
+        }
+        let content = browser_content_rect(base);
+        if !content.contains(point) || web.state == crate::web::WebState::Blank {
             return None;
         }
         // A click on a `[n]` link marker in the page text.
@@ -2539,13 +2616,6 @@ impl DesktopState {
             store.switch_tab(next);
             return Some(DesktopAction::Redraw);
         }
-        if store.tab == StoreTab::Installed
-            && !crate::svm::linux_agent_ready()
-            && store_start_button_rect(base).contains(point)
-        {
-            self.show_linux_apps();
-            return Some(DesktopAction::Redraw);
-        }
         for slot in 0..GRID_COLUMNS * GRID_ROWS {
             let (column, row) = (slot % GRID_COLUMNS, slot / GRID_COLUMNS);
             let position = (store.scroll + row) * GRID_COLUMNS + column;
@@ -2575,6 +2645,19 @@ impl DesktopState {
         self.set_app(DesktopApp::Store);
         self.set_overlay(Overlay::None);
         self.url_active = false;
+    }
+
+    /// The whole Linux desktop in one window; a terminal opens in it when
+    /// nothing else is running there.
+    fn open_linux_desktop(&mut self) {
+        self.set_app(DesktopApp::Linux);
+        if crate::svm::linux_windows().is_none_or(|windows| windows.count == 0) {
+            crate::svm::linux_command(
+                3,
+                [0; 4],
+                b"xterm -geometry 80x24 -fa 'DejaVu Sans Mono' -fs 10 -bg '#0d1117' -fg '#d7dee6'",
+            );
+        }
     }
 
     /// Enters seamless mode so Linux windows show as AerOS windows.
@@ -2646,7 +2729,7 @@ impl DesktopState {
         self.set_overlay(Overlay::None);
         self.set_app(DesktopApp::Files);
         if self.files_path.as_str().is_empty() {
-            self.files_path.push_str_checked("/");
+            self.files_path.push_str_checked(files_places()[0].1);
         }
         self.files_mode = FilesMode::Browsing;
         self.files_reload();
@@ -4275,9 +4358,12 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 }
             }
         }
+        // Saved once the welcome screen has settled, or at once if it was
+        // clicked through sooner.
         if state.account_unsaved
-            && state.screen == Screen::Welcome
-            && crate::time::monotonic_nanoseconds() >= state.screen_transition_at_ns + 700_000_000
+            && (state.screen != Screen::Welcome
+                || crate::time::monotonic_nanoseconds()
+                    >= state.screen_transition_at_ns + 700_000_000)
         {
             state.account_unsaved = false;
             state.save_account();
@@ -4466,48 +4552,15 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 }
                 continue;
             }
-            // Seamless mode with no guest window focused: single-key launchers
-            // (k = leave seamless mode, x = terminal, n = browser).
+            // Seamless mode with no guest window focused: k leaves it.
             if state.seamless.enabled
                 && state.screen == Screen::Desktop
                 && state.overlay == Overlay::None
-                && scancode < 0x80
+                && scancode == 0x25
             {
-                match scancode {
-                    0x25 => {
-                        state.seamless.enabled = false;
-                        redraw = true;
-                        continue;
-                    }
-                    0x2d => {
-                        crate::svm::linux_command(
-                            3,
-                            [0; 4],
-                            b"xterm -geometry 58x20 -fa 'DejaVu Sans Mono' -fs 10 -bg '#0d1117' -fg '#d7dee6'",
-                        );
-                        continue;
-                    }
-                    0x31 => {
-                        crate::svm::linux_command(3, [0; 4], b"netsurf-gtk");
-                        continue;
-                    }
-                    0x14 => {
-                        // Network self-test inside the guest; the result shows
-                        // up in the guest's status line on the serial log.
-                        crate::svm::linux_command(
-                            3,
-                            [0; 4],
-                            b"busybox nslookup example.com 2>&1|tail -n 2;busybox wget -T 12 -qO- http://example.com 2>&1|head -c 160",
-                        );
-                        continue;
-                    }
-                    0x21 => {
-                        // Only present in the full image; a no-op otherwise.
-                        crate::svm::linux_command(3, [0; 4], b"aeros-firefox");
-                        continue;
-                    }
-                    _ => {}
-                }
+                state.seamless.enabled = false;
+                redraw = true;
+                continue;
             }
             // Files: Ctrl+C / Ctrl+X / Ctrl+V set a file aside and place it.
             if ctrl_down
@@ -5197,7 +5250,9 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
             store.tick();
             let installing = store.install == crate::store::InstallState::Installing
                 && now_ns.saturating_sub(last_web_paint_ns) > 500_000_000;
-            if state.app == DesktopApp::Store
+            if (state.app == DesktopApp::Store
+                || state.overlay == Overlay::Apps
+                || state.search_open)
                 && ((store.count, store.install) != before || installing)
             {
                 last_web_paint_ns = now_ns;
@@ -5325,12 +5380,26 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 verified
             ));
         }
-        // The guest also runs while the browser or the store is open: it
-        // fetches the pages and lists the apps.
+        if crate::mt7921::present() && state.screen == Screen::Desktop {
+            if state.wifi_tick() {
+                present_desktop(frame, fonts, &state);
+                cursor.erase(frame);
+                cursor.paint(frame, cursor_target(frame));
+            }
+            if state.wifi_run_pending() {
+                present_desktop(frame, fonts, &state);
+                cursor.erase(frame);
+                cursor.paint(frame, cursor_target(frame));
+            }
+        }
+        // The guest also runs while the browser or the store is open (it
+        // fetches the pages and lists the apps), and in the background until
+        // its agent has listed the apps, so they're ready by the time they're opened.
         if (state.app == DesktopApp::Linux
             || state.seamless.enabled
             || state.app == DesktopApp::Browser
-            || state.app == DesktopApp::Store)
+            || state.app == DesktopApp::Store
+            || !crate::store::get().listed())
             && crate::svm::linux_ready()
         {
             let started = tsc();
@@ -6690,6 +6759,8 @@ fn draw_desktop_base(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &Deskt
     let panel_key = dock_cache_key(layout, screen_bounds)
         ^ ((state.app_focus as u64 + 1) << 8)
         ^ ((state.focus_visible as u64) << 20)
+        ^ ((state.launcher_hover as u64) << 21)
+        ^ ((crate::store::get().count as u64) << 24)
         ^ 0x9a7e_0000;
     let panel_cache = panel_buffer();
     if panel_static
@@ -7226,10 +7297,7 @@ fn draw_app_switcher(
         .captured;
     let controls = true;
     let page = state.app_focus / LAUNCHER_PAGE;
-    for (index, label) in APP_LABELS.iter().enumerate() {
-        if index / LAUNCHER_PAGE != page {
-            continue;
-        }
+    for index in page * LAUNCHER_PAGE..launcher_len().min((page + 1) * LAUNCHER_PAGE) {
         let fall = if opening {
             app_icon_fall_offset(panel_opened_at_ns, index, now_ns)
         } else {
@@ -7246,18 +7314,16 @@ fn draw_app_switcher(
                 Rgba::new(255, 255, 255, 230),
             );
         }
-        if index < 5 {
-            draw_icon(painter, icon_layout, [1, 7, 4, 5, 2][index], tile);
-        } else {
-            centered_text(
+        match LAUNCHER_BUILTINS.get(index) {
+            Some(&(_, kind)) => draw_icon(painter, icon_layout, kind, tile),
+            None => draw_store_icon(
                 painter,
                 icon_layout,
                 font,
-                tile,
-                label,
-                22,
-                Color::rgb(30, 40, 46),
-            );
+                tile.expand(-9),
+                launcher_name(index),
+                index,
+            ),
         }
     }
     painter.fill_rounded_rect(
@@ -7291,14 +7357,14 @@ fn draw_app_switcher(
             },
         );
     }
-    if state.focus_visible {
+    if (state.focus_visible || state.launcher_hover) && state.app_focus < launcher_len() {
         let tile = launcher_tile(state.app_focus);
         draw_hint_pill(
             painter,
             layout,
             font,
             Point::new(tile.x + tile.width / 2, tile.y - 4),
-            APP_NAMES[state.app_focus.min(APP_NAMES.len() - 1)],
+            launcher_name(state.app_focus),
         );
     }
     surface && controls
@@ -7489,11 +7555,15 @@ fn window_controls_anchor(app: DesktopApp, window: Rect) -> (i32, i32, i32) {
         DesktopApp::Settings => (window.right() - 37, window.y + 29, 24),
         DesktopApp::Terminal => (window.right() - 21, window.y + 27, 24),
         DesktopApp::Notes => (window.right() - 36, window.y + 40, 24),
+        DesktopApp::Browser => (window.right() - 22, window.y + 31, 24),
         _ => (window.right() - 20, window.y + 14, 26),
     }
 }
 
 fn window_base_rect(app: DesktopApp) -> Rect {
+    if app == DesktopApp::Browser {
+        return Rect::new(0, 0, 752, 458);
+    }
     if is_maximized(app) {
         return Rect::new(10, 10, 732, 354);
     }
@@ -7504,7 +7574,6 @@ fn window_base_rect(app: DesktopApp) -> Rect {
         DesktopApp::Trash => Rect::new(256, 90, 336, 260),
         // 602x320 of content: the guest screen is scaled down to fit.
         DesktopApp::Linux => Rect::new(65, 10, 622, 364),
-        DesktopApp::Browser => Rect::new(60, 16, 632, 350),
         DesktopApp::Store => Rect::new(80, 18, 592, 346),
         DesktopApp::Settings => Rect::new(91, 29, 570, 330),
         _ => Rect::new(113, 32, 531, 303),
@@ -7623,8 +7692,7 @@ fn draw_window(
         window_open_scale(base, state.window_open_at_ns, now_ns)
     };
     let opening = !closing && now_ns.saturating_sub(state.window_open_at_ns) < WINDOW_OPEN_NS;
-    let blur_off =
-        opening || closing || (state.app == DesktopApp::Browser && crate::web::get().busy());
+    let blur_off = opening || closing || state.app == DesktopApp::Browser;
     // A settled window's frosted body only depends on the wallpaper, so it is
     // rendered once and replayed (every keystroke used to re-blur it).
     let cacheable = !opening && !closing && !blur_off && !state.seamless.enabled;
@@ -7690,6 +7758,10 @@ fn draw_window(
             layout.radii(CornerRadii::all(46)),
             Rgba::new(255, 251, 0, 130),
         );
+    } else if state.app == DesktopApp::Browser {
+        draw_browser(painter, layout, ui_font, mono_font, state);
+        draw_window_controls(painter, layout, state.app, outer);
+        return captured;
     } else {
         painter.fill_rounded_rect(
             layout.rect(Rect::new(outer.x, outer.y, outer.width, 28)),
@@ -7717,10 +7789,6 @@ fn draw_window(
         Color::rgb(18, 23, 26),
     );
     draw_window_controls(painter, layout, state.app, outer);
-    if state.app == DesktopApp::Browser {
-        draw_browser(painter, layout, ui_font, mono_font, state);
-        return captured;
-    }
     if state.app == DesktopApp::Store {
         draw_store(painter, layout, ui_font, mono_font, state);
         return captured;
@@ -8083,19 +8151,31 @@ fn draw_shell_window(
     }
 }
 
+/// The browser's parts, from the Figma frames (1237 px scaled to 752).
+const BROWSER_PILL: Rect = Rect::new(187, 15, 360, 33);
+const BROWSER_SLIDERS: Rect = Rect::new(205, 23, 20, 16);
+const BROWSER_RELOAD: Rect = Rect::new(514, 18, 27, 27);
+const BROWSER_SHIELD: Rect = Rect::new(567, 21, 16, 20);
+const BROWSER_TAB: Rect = Rect::new(29, 57, 147, 33);
+const BROWSER_TAB_CLOSE: Point = Point::new(153, 73);
+const BROWSER_NEW_TAB: Point = Point::new(196, 73);
+const BROWSER_ADBLOCK: Rect = Rect::new(575, 59, 143, 176);
+const BROWSER_ADBLOCK_POWER: Rect = Rect::new(618, 89, 57, 57);
+const BROWSER_PANEL: Rgba = Rgba::opaque(0x26, 0x26, 0x26);
+const BROWSER_ICON: Rgba = Rgba::opaque(0x69, 0x69, 0x69);
+const BROWSER_MARK: Rgba = Rgba::opaque(0x7b, 0x7b, 0x7b);
+
 fn browser_content_rect(base: Rect) -> Rect {
-    Rect::new(base.x + 10, base.y + 70, base.width - 20, base.height - 80)
+    Rect::new(base.x, base.y + 99, base.width, base.height - 99)
 }
 
-fn browser_favorite_rect(content: Rect, index: usize) -> Rect {
-    let column = (index % 3) as i32;
-    let row = (index / 3) as i32;
-    Rect::new(
-        content.x + 28 + column * 190,
-        content.y + 64 + row * 80,
-        176,
-        66,
-    )
+/// A new tab's shortcut tiles: three in a row under the address bar.
+fn browser_tile_rect(index: usize) -> Rect {
+    Rect::new(118 + index as i32 * 180, 140, 156, 108)
+}
+
+fn hit_box(centre: Point, size: i32) -> Rect {
+    Rect::new(centre.x - size / 2, centre.y - size / 2, size, size)
 }
 
 fn tile_color(seed: usize) -> Rgba {
@@ -8109,28 +8189,6 @@ fn tile_color(seed: usize) -> Rgba {
     ];
     let (red, green, blue) = PALETTE[seed % PALETTE.len()];
     Rgba::opaque(red, green, blue)
-}
-
-/// A round-cornered toolbar button with a text glyph.
-fn browser_nav_button(
-    painter: &mut Painter<'_>,
-    layout: Layout,
-    font: RasterFont,
-    bounds: Rect,
-    glyph: &str,
-    enabled: bool,
-) {
-    painter.fill_rounded_rect(
-        layout.rect(bounds),
-        layout.radii(CornerRadii::all(9)),
-        Rgba::new(226, 231, 236, if enabled { 230 } else { 120 }),
-    );
-    let tone = if enabled {
-        Color::rgb(52, 62, 72)
-    } else {
-        Color::rgb(160, 168, 176)
-    };
-    centered_text(painter, layout, font, bounds, glyph, 17, tone);
 }
 
 /// Draws one line of page text, colouring `[n]` link markers blue.
@@ -8176,8 +8234,174 @@ fn draw_page_line(
     flush(painter, start, bytes.len(), plain, &mut x);
 }
 
-/// The browser: a Safari-style toolbar (back, forward, address pill, reload)
-/// over a white page area. Pages come from the Linux guest as text.
+/// A rounded bar through `centre` along `direction` (cosine and sine in
+/// thousandths), `length` long and `thickness` thick, in design units.
+fn draw_bar(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    centre: Point,
+    direction: (i32, i32),
+    length: i32,
+    thickness: i32,
+    color: Rgba,
+) {
+    let middle = layout.point(centre);
+    let half = layout.scale.logical(length - thickness) / 2;
+    let thick = layout.scale.logical(thickness).max(1);
+    for step in -half..=half {
+        painter.fill_rounded_rect(
+            Rect::new(
+                middle.x + step * direction.0 / 1000 - thick / 2,
+                middle.y + step * direction.1 / 1000 - thick / 2,
+                thick,
+                thick,
+            ),
+            CornerRadii::all(thick / 2),
+            color,
+        );
+    }
+}
+
+/// A ring: a disc of `color` with a disc of `inside` cut from it.
+fn draw_ring(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    bounds: Rect,
+    thickness: i32,
+    color: Rgba,
+    inside: Rgba,
+) {
+    painter.fill_rounded_rect(
+        layout.rect(bounds),
+        layout.radii(CornerRadii::all(bounds.width / 2)),
+        color,
+    );
+    let hole = Rect::new(
+        bounds.x + thickness,
+        bounds.y + thickness,
+        bounds.width - thickness * 2,
+        bounds.height - thickness * 2,
+    );
+    painter.fill_rounded_rect(
+        layout.rect(hole),
+        layout.radii(CornerRadii::all(hole.width / 2)),
+        inside,
+    );
+}
+
+/// Text centred on `centre_x` with its top at `y`.
+#[allow(clippy::too_many_arguments)]
+fn centred_line(
+    painter: &mut Painter<'_>,
+    layout: Layout,
+    font: RasterFont,
+    centre_x: i32,
+    y: i32,
+    value: &str,
+    height: i32,
+    color: Color,
+) {
+    let size = layout.scale.logical(height);
+    let origin = layout.point(Point::new(centre_x, y));
+    painter.text(
+        font,
+        Point::new(origin.x - font.text_width(value, size) / 2, origin.y),
+        value,
+        size,
+        color,
+    );
+}
+
+/// A shield filling `shape` (pixels): straight sides for the top third,
+/// then curving in to a point.
+fn fill_shield(painter: &mut Painter<'_>, shape: Rect, color: Rgba) {
+    for row in 0..shape.height {
+        let taper = (row * 1000 / shape.height.max(1) - 330).max(0) * 1000 / 670;
+        let corner = if row == 0 { 2 } else { 0 };
+        let width = shape.width * (1000 - taper * taper / 1000) / 1000 - corner;
+        painter.fill_rounded_rect(
+            Rect::new(shape.x + (shape.width - width) / 2, shape.y + row, width, 1),
+            CornerRadii::all(0),
+            color,
+        );
+    }
+}
+
+/// The adblock shield; outlined while its card is open.
+fn draw_browser_shield(painter: &mut Painter<'_>, layout: Layout, open: bool) {
+    let shape = layout.rect(BROWSER_SHIELD);
+    fill_shield(painter, shape, BROWSER_ICON);
+    if open {
+        let line = layout.scale.logical(1).max(1);
+        fill_shield(
+            painter,
+            Rect::new(
+                shape.x + line,
+                shape.y + line,
+                shape.width - line * 2,
+                shape.height - line * 3,
+            ),
+            BROWSER_PANEL,
+        );
+    }
+}
+
+/// The adblock card: a power button that turns blocking on and off, the
+/// time it has saved and how many ads it has blocked.
+fn draw_browser_adblock(painter: &mut Painter<'_>, layout: Layout, font: RasterFont, off: bool) {
+    let card = BROWSER_ADBLOCK;
+    painter.fill_rounded_rect(
+        layout.rect(card),
+        layout.radii(CornerRadii::all(15)),
+        BROWSER_PANEL,
+    );
+    let centre = card.x + card.width / 2;
+    let white = Color::rgb(255, 255, 255);
+    centred_line(painter, layout, font, centre, 77, "Adblocker", 11, white);
+    let tone = if off {
+        BROWSER_ICON
+    } else {
+        Rgba::opaque(0x1e, 0x96, 0xf0)
+    };
+    let power = BROWSER_ADBLOCK_POWER;
+    let ring = Rect::new(
+        power.x + 8,
+        power.y + 11,
+        power.width - 16,
+        power.width - 16,
+    );
+    draw_ring(painter, layout, ring, 6, tone, BROWSER_PANEL);
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(ring.x + ring.width / 2 - 8, ring.y - 2, 16, 14)),
+        layout.radii(CornerRadii::all(0)),
+        BROWSER_PANEL,
+    );
+    draw_bar(
+        painter,
+        layout,
+        Point::new(power.x + power.width / 2, power.y + 18),
+        (0, 1000),
+        24,
+        6,
+        tone,
+    );
+    centred_line(painter, layout, font, centre, 150, "00:00", 15, white);
+    centred_line(
+        painter,
+        layout,
+        font,
+        centre,
+        190,
+        "Blocked ads: 0",
+        11,
+        white,
+    );
+}
+
+/// The browser, after the Figma "webbrowser" frames: full screen on dark
+/// grey, a pill address bar (settings sliders, reload) beside the adblock
+/// shield, shortcut tiles on a new tab, and a tab strip over an open page.
+/// Pages come from the Linux guest as text.
 fn draw_browser(
     painter: &mut Painter<'_>,
     layout: Layout,
@@ -8188,60 +8412,15 @@ fn draw_browser(
     let base = window_base_rect(DesktopApp::Browser);
     let web = crate::web::get();
     let now = crate::time::monotonic_nanoseconds();
-    let bar_y = base.y + 34;
-    browser_nav_button(
-        painter,
-        layout,
-        ui_font,
-        Rect::new(base.x + 14, bar_y, 28, 26),
-        "<",
-        web.can_go_back(),
-    );
-    browser_nav_button(
-        painter,
-        layout,
-        ui_font,
-        Rect::new(base.x + 46, bar_y, 28, 26),
-        ">",
-        web.can_go_forward(),
-    );
-    // Reload: a ring with a gap.
-    let reload = Rect::new(base.right() - 44, bar_y, 28, 26);
-    browser_nav_button(painter, layout, ui_font, reload, "", true);
-    let ring = Rect::new(reload.x + 7, reload.y + 5, 14, 14);
-    let ring_color = Rgba::opaque(52, 62, 72);
+    let native_fallback = !crate::svm::linux_ready();
     painter.fill_rounded_rect(
-        layout.rect(ring),
-        layout.radii(CornerRadii::all(7)),
-        ring_color,
+        Rect::new(0, 0, painter.frame_width(), painter.frame_height()),
+        CornerRadii::all(0),
+        Rgba::opaque(0x14, 0x14, 0x14),
     );
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(ring.x + 2, ring.y + 2, 10, 10)),
-        layout.radii(CornerRadii::all(5)),
-        Rgba::new(226, 231, 236, 255),
-    );
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(ring.x + 8, ring.y - 1, 7, 6)),
-        layout.radii(CornerRadii::all(0)),
-        Rgba::new(226, 231, 236, 255),
-    );
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(ring.x + 10, ring.y, 5, 3)),
-        layout.radii(CornerRadii::all(1)),
-        ring_color,
-    );
-    // Address pill.
-    let pill = Rect::new(base.x + 84, bar_y, base.width - 84 - 58, 26);
+    let pill = BROWSER_PILL;
     let pill_radii = layout.radii(CornerRadii::all(13));
-    painter.fill_rounded_rect(
-        layout.rect(pill),
-        pill_radii,
-        if state.url_active {
-            Rgba::opaque(255, 255, 255)
-        } else {
-            Rgba::new(226, 231, 236, 235)
-        },
-    );
+    painter.fill_rounded_rect(layout.rect(pill), pill_radii, BROWSER_PANEL);
     if web.busy() {
         let elapsed_ms = now.saturating_sub(web.started_ns) / 1_000_000;
         let progress = crate::loading::creeping_progress(elapsed_ms) as i32;
@@ -8256,23 +8435,70 @@ fn draw_browser(
             Rgba::new(64, 140, 205, 70),
         );
     }
-    painter.stroke_rounded_rect(
-        layout.rect(pill),
-        pill_radii,
-        layout
-            .scale
-            .logical(if state.url_active { 2 } else { 1 })
-            .max(1) as u8,
-        if state.url_active {
-            Rgba::new(31, 108, 205, 230)
-        } else {
-            Rgba::new(150, 160, 170, 120)
-        },
+    if state.url_active {
+        painter.stroke_rounded_rect(
+            layout.rect(pill),
+            pill_radii,
+            layout.scale.logical(1).max(1) as u8,
+            Rgba::new(31, 108, 205, 230),
+        );
+    }
+    let sliders = BROWSER_SLIDERS;
+    for (row, knob) in [(3, sliders.right() - 5), (13, sliders.x + 5)] {
+        draw_bar(
+            painter,
+            layout,
+            Point::new(sliders.x + sliders.width / 2, sliders.y + row),
+            (1000, 0),
+            sliders.width,
+            2,
+            BROWSER_ICON,
+        );
+        draw_ring(
+            painter,
+            layout,
+            Rect::new(knob - 3, sliders.y + row - 3, 6, 6),
+            2,
+            BROWSER_ICON,
+            BROWSER_PANEL,
+        );
+    }
+    let reload = BROWSER_RELOAD;
+    let ring = Rect::new(reload.x + 5, reload.y + 5, 17, 17);
+    draw_ring(painter, layout, ring, 3, BROWSER_ICON, BROWSER_PANEL);
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(ring.x + 10, ring.y - 1, 8, 7)),
+        layout.radii(CornerRadii::all(0)),
+        BROWSER_PANEL,
+    );
+    draw_bar(
+        painter,
+        layout,
+        Point::new(ring.x + 13, ring.y + 1),
+        (0, 1000),
+        7,
+        3,
+        BROWSER_ICON,
+    );
+    draw_bar(
+        painter,
+        layout,
+        Point::new(ring.x + 11, ring.y + 3),
+        (1000, 0),
+        7,
+        3,
+        BROWSER_ICON,
+    );
+    let field = Rect::new(
+        sliders.right() + 10,
+        pill.y,
+        reload.x - sliders.right() - 20,
+        pill.height,
     );
     if state.url_active {
         let mut bar = [0u8; MAX_URL + 1];
         let shown = state.url_str().as_bytes();
-        let visible = shown.len().min(MAX_URL - 8).min(64);
+        let visible = shown.len().min(48);
         bar[..visible].copy_from_slice(&shown[shown.len() - visible..]);
         bar[visible] = b'_';
         if let Ok(bar_text) = core::str::from_utf8(&bar[..visible + 1]) {
@@ -8280,145 +8506,151 @@ fn draw_browser(
                 painter,
                 layout,
                 ui_font,
-                Point::new(pill.x + 14, pill.y + 6),
+                Point::new(field.x, pill.y + 10),
                 bar_text,
-                13,
-                Color::rgb(25, 32, 40),
+                11,
+                Color::rgb(255, 255, 255),
             );
         }
     } else {
-        let address = web.url();
-        let (label, tone) = if address.is_empty() {
-            ("Search or enter website name", Color::rgb(120, 130, 140))
-        } else {
-            (crate::web::host_of(address), Color::rgb(30, 38, 46))
+        let host = match web.url() {
+            "" => state.browser_host_str(),
+            address => crate::web::host_of(address),
         };
-        let width = ui_font.text_width(label, layout.scale.logical(13));
-        let lock = address.starts_with("https://");
-        let total = width + if lock { layout.scale.logical(14) } else { 0 };
-        let start = layout.rect(pill).x + (layout.rect(pill).width - total) / 2;
-        if lock {
-            let body = Rect::new(
-                pill.x + pill.width / 2 - (total / 2) / 2 - 2,
-                pill.y + 11,
-                8,
-                6,
-            );
-            let lock_color = Rgba::opaque(110, 120, 130);
-            let _ = body;
-            let lock_x = pixel_to_logical(layout, start);
-            painter.fill_rounded_rect(
-                layout.rect(Rect::new(lock_x, pill.y + 11, 8, 6)),
-                layout.radii(CornerRadii::all(2)),
-                lock_color,
-            );
-            painter.stroke_rounded_rect(
-                layout.rect(Rect::new(lock_x + 1, pill.y + 7, 6, 6)),
-                layout.radii(CornerRadii::all(3)),
-                1,
-                lock_color,
-            );
-        }
-        painter.text(
+        let (label, tone) = if host.is_empty() {
+            ("Search or enter website name", Color::rgb(0x7b, 0x7b, 0x7b))
+        } else {
+            (host, Color::rgb(220, 220, 220))
+        };
+        centred_line(
+            painter,
+            layout,
             ui_font,
-            Point::new(
-                start + if lock { layout.scale.logical(14) } else { 0 },
-                layout.point(Point::new(0, pill.y + 6)).y,
-            ),
+            field.x + field.width / 2,
+            pill.y + 10,
             label,
-            layout.scale.logical(13),
+            11,
             tone,
         );
     }
-    // Page area.
+    draw_browser_shield(painter, layout, state.browser_shield_open);
+    let page_open = if native_fallback {
+        state.browser_phase != BrowserPhase::Editing
+    } else {
+        web.state != crate::web::WebState::Blank
+    };
+    if !page_open {
+        for (index, (name, _)) in BROWSER_FAVORITES.iter().take(3).enumerate() {
+            let tile = browser_tile_rect(index);
+            painter.fill_rounded_rect(
+                layout.rect(tile),
+                layout.radii(CornerRadii::all(25)),
+                BROWSER_PANEL,
+            );
+            centred_line(
+                painter,
+                layout,
+                ui_font,
+                tile.x + tile.width / 2,
+                tile.y + tile.height / 2 - 6,
+                name,
+                11,
+                Color::rgb(0x7b, 0x7b, 0x7b),
+            );
+        }
+        if state.browser_shield_open {
+            draw_browser_adblock(painter, layout, ui_font, state.adblock_off);
+        }
+        return;
+    }
+    let tab = BROWSER_TAB;
+    painter.fill_rounded_rect(
+        layout.rect(tab),
+        layout.radii(CornerRadii::all(13)),
+        BROWSER_PANEL,
+    );
+    let favicon = Rect::new(tab.x + 7, tab.y + 3, 26, 26);
+    painter.fill_rounded_rect(
+        layout.rect(favicon),
+        layout.radii(CornerRadii::all(9)),
+        Rgba::opaque(0x3c, 0x3c, 0x3c),
+    );
+    let host = match web.url() {
+        "" => state.browser_host_str(),
+        address => crate::web::host_of(address),
+    };
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    let mut title_len = host.len().min(11);
+    while !host.is_char_boundary(title_len) {
+        title_len -= 1;
+    }
+    if let Some(initial) = host.get(..1) {
+        centered_text(
+            painter,
+            layout,
+            ui_font,
+            favicon,
+            initial,
+            11,
+            Color::rgb(220, 220, 220),
+        );
+    }
+    text(
+        painter,
+        layout,
+        ui_font,
+        Point::new(73, 67),
+        &host[..title_len],
+        11,
+        Color::rgb(255, 255, 255),
+    );
+    for direction in [(707, 707), (707, -707)] {
+        draw_bar(
+            painter,
+            layout,
+            BROWSER_TAB_CLOSE,
+            direction,
+            16,
+            3,
+            BROWSER_MARK,
+        );
+    }
+    for direction in [(1000, 0), (0, 1000)] {
+        draw_bar(
+            painter,
+            layout,
+            BROWSER_NEW_TAB,
+            direction,
+            16,
+            3,
+            BROWSER_MARK,
+        );
+    }
     let content = browser_content_rect(base);
     let card = layout.rect(content);
     painter.fill_rounded_rect(
-        card,
-        layout.radii(CornerRadii::all(10)),
-        Rgba::new(253, 253, 254, 245),
-    );
-    painter.stroke_rounded_rect(
-        card,
-        layout.radii(CornerRadii::all(10)),
-        1,
-        Rgba::new(150, 160, 170, 90),
+        Rect::new(
+            0,
+            card.y,
+            painter.frame_width(),
+            painter.frame_height() - card.y,
+        ),
+        CornerRadii::all(0),
+        Rgba::opaque(255, 255, 255),
     );
     let previous_clip = painter.clip();
     painter.set_clip(card);
     let dark = Color::rgb(28, 34, 40);
     let muted = Color::rgb(112, 122, 132);
-    let native_fallback = !crate::svm::linux_ready();
     match web.state {
         _ if native_fallback => {
             draw_browser_legacy_body(painter, layout, ui_font, mono_font, state);
         }
-        crate::web::WebState::Blank => {
-            text(
-                painter,
-                layout,
-                ui_font,
-                Point::new(content.x + 28, content.y + 26),
-                "Favorites",
-                17,
-                dark,
-            );
-            for (index, (name, address)) in BROWSER_FAVORITES.iter().enumerate() {
-                let tile = browser_favorite_rect(content, index);
-                painter.fill_rounded_rect(
-                    layout.rect(tile),
-                    layout.radii(CornerRadii::all(14)),
-                    Rgba::new(238, 242, 246, 255),
-                );
-                let icon = Rect::new(tile.x + 12, tile.y + 13, 40, 40);
-                painter.fill_rounded_rect(
-                    layout.rect(icon),
-                    layout.radii(CornerRadii::all(10)),
-                    tile_color(index),
-                );
-                let initial = &name[..1];
-                centered_text(
-                    painter,
-                    layout,
-                    ui_font,
-                    icon,
-                    initial,
-                    20,
-                    Color::rgb(255, 255, 255),
-                );
-                text(
-                    painter,
-                    layout,
-                    ui_font,
-                    Point::new(tile.x + 62, tile.y + 15),
-                    name,
-                    14,
-                    dark,
-                );
-                text(
-                    painter,
-                    layout,
-                    ui_font,
-                    Point::new(tile.x + 62, tile.y + 35),
-                    crate::web::host_of(address),
-                    10,
-                    muted,
-                );
-            }
-            text(
-                painter,
-                layout,
-                ui_font,
-                Point::new(content.x + 28, content.y + 232),
-                "Pages are fetched and drawn as text by the Linux system.",
-                11,
-                muted,
-            );
-        }
+        crate::web::WebState::Blank => {}
         crate::web::WebState::Starting | crate::web::WebState::Loading => {
             let (title, note) = if web.state == crate::web::WebState::Starting {
                 (
-                    "Starting the Linux web engine...",
+                    "Starting the browser...",
                     "The first page takes about a minute; later pages are quick.",
                 )
             } else {
@@ -8514,6 +8746,9 @@ fn draw_browser(
         }
     }
     painter.set_clip(previous_clip);
+    if state.browser_shield_open {
+        draw_browser_adblock(painter, layout, ui_font, state.adblock_off);
+    }
 }
 
 /// Converts a physical x back to logical units (for icon placement).
@@ -8585,10 +8820,6 @@ fn store_similar_rect(base: Rect, slot: usize) -> Rect {
         across - 2,
         58,
     )
-}
-
-fn store_start_button_rect(base: Rect) -> Rect {
-    Rect::new(base.x + base.width / 2 - 60, base.y + 190, 120, 34)
 }
 
 /// The first `count` bytes of an ASCII string.
@@ -8961,7 +9192,7 @@ fn draw_store(
             layout,
             ui_font,
             Rect::new(base.x, base.y + 130, base.width, 24),
-            "Linux isn't running",
+            "Your apps are starting",
             17,
             ink,
         );
@@ -8970,24 +9201,9 @@ fn draw_store(
             layout,
             ui_font,
             Rect::new(base.x, base.y + 158, base.width, 20),
-            "Start it to see the apps you have.",
+            "They show up here in a minute or so.",
             12,
             muted,
-        );
-        let button = store_start_button_rect(base);
-        painter.fill_rounded_rect(
-            layout.rect(button),
-            layout.radii(CornerRadii::all(17)),
-            accent,
-        );
-        centered_text(
-            painter,
-            layout,
-            ui_font,
-            button,
-            "Start Linux",
-            13,
-            Color::rgb(255, 255, 255),
         );
         return;
     }
@@ -9368,16 +9584,14 @@ fn draw_files(
         11,
         Color::rgb(60, 95, 110),
     );
-    let quick_labels = ["Home", "Data", "Temp", "Media"];
-    let quick_paths = ["/", "/data", "/tmp", "/media"];
-    for (index, label) in quick_labels.iter().enumerate() {
+    for (index, (label, path)) in files_places().iter().enumerate() {
         let bounds = Rect::new(
             sidebar.x + 8,
             sidebar.y + 28 + index as i32 * 30,
             sidebar_width - 16,
             26,
         );
-        let active = state.files_path.as_str() == quick_paths[index];
+        let active = state.files_path.as_str() == *path;
         painter.fill_rounded_rect(
             layout.rect(bounds),
             layout.radii(CornerRadii::all(8)),

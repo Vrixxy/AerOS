@@ -1,5 +1,3 @@
-use crate::ahci;
-
 const MAX_PARTITIONS: usize = 16;
 const MAX_GPT_ENTRIES: u32 = 128;
 const MAX_GPT_ENTRY_SIZE: u32 = 512;
@@ -64,7 +62,7 @@ impl PartitionReport {
 
 pub fn inspect(disk_sectors: u64) -> PartitionReport {
     let mut sector = [0u8; 512];
-    if disk_sectors < 2 || !ahci::read_sector(0, &mut sector) {
+    if disk_sectors < 2 || !crate::blockdev::read_sector(0, &mut sector) {
         return PartitionReport::EMPTY;
     }
     let mbr_valid = sector[510] == 0x55 && sector[511] == 0xaa;
@@ -122,7 +120,7 @@ fn inspect_gpt(disk_sectors: u64) -> PartitionReport {
         ..PartitionReport::EMPTY
     };
     let mut header = [0u8; 512];
-    if !ahci::read_sector(1, &mut header) || header[..8] != *b"EFI PART" {
+    if !crate::blockdev::read_sector(1, &mut header) || header[..8] != *b"EFI PART" {
         return report;
     }
     let header_size = read_u32(&header, 12) as usize;
@@ -163,7 +161,7 @@ fn inspect_gpt(disk_sectors: u64) -> PartitionReport {
     let mut remaining = total_bytes as usize;
     let mut entry_sector = [0u8; 512];
     for sector_index in 0..sectors {
-        if !ahci::read_sector(entry_lba + sector_index as u64, &mut entry_sector) {
+        if !crate::blockdev::read_sector(entry_lba + sector_index as u64, &mut entry_sector) {
             return report;
         }
         let count = remaining.min(512);
@@ -177,7 +175,9 @@ fn inspect_gpt(disk_sectors: u64) -> PartitionReport {
         let byte_offset = index as u64 * entry_size as u64;
         let lba = entry_lba + byte_offset / 512;
         let within = (byte_offset % 512) as usize;
-        if within + entry_size as usize > 512 || !ahci::read_sector(lba, &mut entry_sector) {
+        if within + entry_size as usize > 512
+            || !crate::blockdev::read_sector(lba, &mut entry_sector)
+        {
             return report;
         }
         let entry = &entry_sector[within..within + entry_size as usize];

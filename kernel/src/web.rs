@@ -128,6 +128,17 @@ impl Web {
         self.begin(now_ns);
     }
 
+    /// Closes the page (its tab): back to the new tab page, history gone.
+    pub fn close(&mut self) {
+        self.history_len = 0;
+        self.history_pos = 0;
+        self.page_len = 0;
+        self.line_count = 0;
+        self.scroll = 0;
+        self.request_pending = false;
+        self.state = WebState::Blank;
+    }
+
     pub fn reload(&mut self, now_ns: u64) {
         if self.history_len > 0 {
             self.begin(now_ns);

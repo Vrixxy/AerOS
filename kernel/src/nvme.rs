@@ -1,5 +1,6 @@
-//! NVMe controller driver: polled admin queue plus one I/O queue pair, one
-//! page of PRP-addressed data per command.
+//! NVMe controller driver: polled admin queue plus one I/O queue pair. Small
+//! transfers go through a bounce page; `read_phys`/`write_phys` move up to
+//! `max_bytes` per command straight to or from physical memory (PRP list).
 
 use core::hint::spin_loop;
 
@@ -13,6 +14,7 @@ const SQ_ENTRY_BYTES: usize = 64;
 const CQ_ENTRY_BYTES: usize = 16;
 const READY_TIMEOUT: usize = 20_000_000;
 const COMMAND_TIMEOUT: usize = 40_000_000;
+const MAX_TRANSFER: u32 = 128 * 1024;
 
 const REG_CAP: usize = 0x00;
 const REG_CC: usize = 0x14;
@@ -87,6 +89,8 @@ struct NvmeState {
     stride: usize,
     queues: [Queue; 2],
     data: u64,
+    prp_list: u64,
+    max_bytes: u32,
     command_id: u16,
     sectors: u64,
     sector_bytes: u32,
@@ -99,6 +103,8 @@ impl NvmeState {
         stride: 4,
         queues: [Queue::EMPTY; 2],
         data: 0,
+        prp_list: 0,
+        max_bytes: PAGE_SIZE as u32,
         command_id: 0,
         sectors: 0,
         sector_bytes: 0,
@@ -180,6 +186,44 @@ impl NvmeState {
         status
     }
 
+    fn transfer_phys(&mut self, write: bool, lba: u64, sectors: u32, phys: u64) -> bool {
+        let bytes = sectors as u64 * self.sector_bytes as u64;
+        if !self.ready
+            || sectors == 0
+            || bytes > self.max_bytes as u64
+            || !phys.is_multiple_of(4)
+            || lba
+                .checked_add(sectors as u64)
+                .is_none_or(|end| end > self.sectors)
+        {
+            return false;
+        }
+        let first_page = phys & !(PAGE_SIZE - 1);
+        let pages = ((phys - first_page) + bytes).div_ceil(PAGE_SIZE);
+        let prp2 = match pages {
+            1 => 0,
+            2 => first_page + PAGE_SIZE,
+            _ => {
+                for index in 1..pages {
+                    let entry = (self.prp_list + (index - 1) * 8) as usize as *mut u64;
+                    unsafe { core::ptr::write_volatile(entry, first_page + index * PAGE_SIZE) };
+                }
+                self.prp_list
+            }
+        };
+        let mut command = [0u32; 16];
+        command[0] = if write { IO_WRITE } else { IO_READ };
+        command[1] = 1;
+        command[6] = phys as u32;
+        command[7] = (phys >> 32) as u32;
+        command[8] = prp2 as u32;
+        command[9] = (prp2 >> 32) as u32;
+        command[10] = lba as u32;
+        command[11] = (lba >> 32) as u32;
+        command[12] = sectors - 1;
+        self.submit(1, command) == Some(0)
+    }
+
     fn transfer(&mut self, write: bool, lba: u64, sectors: u32, buffer: &mut [u8]) -> bool {
         let bytes = sectors as usize * self.sector_bytes as usize;
         if !self.ready
@@ -228,6 +272,22 @@ impl NvmeState {
 /// Reads `sectors` (at most one page worth) starting at `lba`.
 pub fn read(lba: u64, sectors: u32, buffer: &mut [u8]) -> bool {
     NVME.lock().transfer(false, lba, sectors, buffer)
+}
+
+/// Reads into physical memory at `phys` (4-byte aligned), at most
+/// `max_sectors()` per call.
+pub fn read_phys(lba: u64, sectors: u32, phys: u64) -> bool {
+    NVME.lock().transfer_phys(false, lba, sectors, phys)
+}
+
+pub fn write_phys(lba: u64, sectors: u32, phys: u64) -> bool {
+    NVME.lock().transfer_phys(true, lba, sectors, phys)
+}
+
+/// Sectors one `read_phys`/`write_phys` call may move.
+pub fn max_sectors() -> u32 {
+    let state = NVME.lock();
+    state.max_bytes.checked_div(state.sector_bytes).unwrap_or(0)
 }
 
 pub fn write(lba: u64, sectors: u32, buffer: &[u8]) -> bool {
@@ -338,11 +398,11 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> NvmeReport
     if !wait_for(|| unsafe { read32(base, REG_CSTS) } & 1 == 0, READY_TIMEOUT) {
         return report;
     }
-    let Some(dma) = frames.allocate_dma(6, 1) else {
+    let Some(dma) = frames.allocate_dma(7, 1) else {
         return report;
     };
     let memory = dma.address();
-    unsafe { core::ptr::write_bytes(memory as usize as *mut u8, 0, 6 * PAGE_SIZE as usize) };
+    unsafe { core::ptr::write_bytes(memory as usize as *mut u8, 0, 7 * PAGE_SIZE as usize) };
     let mut state = NvmeState::EMPTY;
     state.base = base;
     state.stride = stride;
@@ -358,6 +418,7 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> NvmeReport
     };
     state.data = memory + 4 * PAGE_SIZE;
     let identify_page = memory + 5 * PAGE_SIZE;
+    state.prp_list = memory + 6 * PAGE_SIZE;
     unsafe {
         let entries = QUEUE_ENTRIES as u32 - 1;
         write32(base, REG_AQA, entries << 16 | entries);
@@ -390,6 +451,13 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> NvmeReport
         }
     }
     report.model_length = length;
+    // MDTS: the largest transfer, in units of the minimum page size (0 = none).
+    let mdts = unsafe { core::ptr::read_volatile((identify_page + 77) as usize as *const u8) };
+    let min_page = PAGE_SIZE << ((capability >> 48) & 0xf);
+    state.max_bytes = match mdts {
+        0 => MAX_TRANSFER,
+        shift => (min_page << shift.min(16)).min(MAX_TRANSFER as u64) as u32,
+    };
     let mut command = [0u32; 16];
     command[0] = ADMIN_IDENTIFY;
     command[1] = 1;
@@ -448,7 +516,10 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> NvmeReport
         *byte = (index as u8).wrapping_mul(31).wrapping_add(7);
     }
     let mut readback = [0u8; 4096];
-    report.write_probe = report.sectors > 2
+    // Only the test image (signature above) is written: on a real disk
+    // sector 2 is the GPT partition array.
+    report.write_probe = report.read
+        && report.sectors > 2
         && write(2, 1, &pattern[..bytes])
         && read(2, 1, &mut readback[..bytes])
         && readback[..bytes] == pattern[..bytes];

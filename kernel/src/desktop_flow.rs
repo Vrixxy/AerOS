@@ -4,7 +4,11 @@ pub(super) const CARD: Rect = Rect::new(126, 18, 500, 408);
 pub(super) const BACK: Rect = Rect::new(144, 38, 103, 42);
 pub(super) const NEXT: Rect = Rect::new(511, 38, 103, 42);
 /// The show/hide-password eye inside the password field.
-pub(super) const EYE: Rect = Rect::new(508, 202, 32, 30);
+pub(super) const EYE: Rect = Rect::new(478, 214, 32, 30);
+/// The name and password steps (Figma files 16 and 17): a bordered card
+/// holding the question and a white pill with a black cursor bar.
+const CREDENTIALS_CARD: Rect = Rect::new(202, 98, 390, 278);
+const CREDENTIALS_FIELD: Rect = Rect::new(281, 196, 237, 66);
 /// "Forgot password?" under the sign-in pill, and its confirmation card.
 pub(super) const RESET_LINK: Rect = Rect::new(276, 399, 200, 19);
 const RESET_CARD: Rect = Rect::new(206, 112, 340, 230);
@@ -306,23 +310,66 @@ pub(super) fn draw_credentials(
         Screen::Password => ("Set a password", "Next"),
         _ => ("Confirm your password", "Finish"),
     };
-    chrome(painter, layout, font, heading, true, next);
-    let field = Rect::new(196, 184, 360, 66);
-    field_pill(painter, layout, field);
-    let caret = match state.screen {
-        Screen::Password => field_text(
+    chrome(painter, layout, font, "", true, next);
+    let card = CREDENTIALS_CARD;
+    let card_radii = layout.radii(CornerRadii::all(23));
+    painter.fill_rounded_rect(layout.rect(card), card_radii, Rgba::opaque(255, 255, 255));
+    painter.stroke_rounded_rect(layout.rect(card), card_radii, 1, Rgba::opaque(0, 0, 0));
+    centered_text(
+        painter,
+        layout,
+        font,
+        Rect::new(card.x, 136, card.width, 30),
+        heading,
+        19,
+        INK,
+    );
+    let field = CREDENTIALS_FIELD;
+    light_pill(painter, layout, field, Rgba::opaque(255, 255, 255));
+    let (bytes, masked) = match state.screen {
+        Screen::Password => (
             &state.setup_password_input[..state.setup_password_len],
             !state.reveal_password,
-            now,
         ),
-        Screen::Confirm => field_text(
+        Screen::Confirm => (
             &state.confirm_input[..state.confirm_len],
             !state.reveal_password,
-            now,
         ),
-        _ => field_text(&state.username_input[..state.username_len], false, now),
+        _ => (&state.username_input[..state.username_len], false),
     };
-    centered_text(painter, layout, font, field, caret.as_str(), 18, INK);
+    let mut shown = ClockBuffer::new();
+    if masked {
+        for _ in 0..bytes.len().min(MAX_NAME) {
+            let _ = shown.write_str("*");
+        }
+    } else {
+        let _ = shown.write_str(core::str::from_utf8(bytes).unwrap_or(""));
+    }
+    let size = layout.scale.logical(18);
+    let room = layout.scale.logical(EYE.x - 6 - 317);
+    let mut value = shown.as_str();
+    while font.text_width(value, size) > room && !value.is_empty() {
+        value = &value[value
+            .char_indices()
+            .nth(1)
+            .map_or(value.len(), |(at, _)| at)..];
+    }
+    let text_origin = layout.point(Point::new(317, field.y + 22));
+    painter.text(font, text_origin, value, size, INK);
+    if caret_on(now) {
+        let width = font.text_width(value, size);
+        let gap = if value.is_empty() {
+            0
+        } else {
+            layout.scale.logical(3)
+        };
+        let bar = layout.rect(Rect::new(317, 210, 8, 37));
+        painter.fill_rounded_rect(
+            Rect::new(bar.x + width + gap, bar.y, bar.width, bar.height),
+            layout.radii(CornerRadii::all(4)),
+            Rgba::opaque(0, 0, 0),
+        );
+    }
     if matches!(state.screen, Screen::Password | Screen::Confirm) {
         draw_eye(painter, layout, EYE, state.reveal_password);
     }
@@ -364,7 +411,7 @@ pub(super) fn draw_credentials(
         painter,
         shift_layout_x(layout, shake),
         font,
-        Rect::new(CARD.x, 274, CARD.width, 24),
+        Rect::new(card.x, 284, card.width, 24),
         message,
         13,
         tone,

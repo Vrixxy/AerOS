@@ -447,7 +447,13 @@ pub fn playback_probe() -> bool {
     play_song(0);
     let start = crate::time::monotonic_nanoseconds();
     let mut civ_max = 0u32;
-    while crate::time::monotonic_nanoseconds().saturating_sub(start) < 400_000_000 {
+    // At least 400 ms, up to 2 s while fewer than three buffers have played
+    // (QEMU's audio clock falls behind on a loaded host).
+    loop {
+        let elapsed = crate::time::monotonic_nanoseconds().saturating_sub(start);
+        if elapsed >= 2_000_000_000 || (elapsed >= 400_000_000 && civ_max >= 3) {
+            break;
+        }
         pump();
         let nabm = AC97.lock().nabm;
         civ_max = civ_max.max(unsafe { arch::inb(nabm + NABM_PO_CIV) } as u32);
@@ -571,7 +577,13 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> Ac97Report
     play_song(0);
     let start = crate::time::monotonic_nanoseconds();
     let mut civ_max = 0u32;
-    while crate::time::monotonic_nanoseconds().saturating_sub(start) < 400_000_000 {
+    // At least 400 ms, up to 2 s while fewer than three buffers have played
+    // (QEMU's audio clock falls behind on a loaded host).
+    loop {
+        let elapsed = crate::time::monotonic_nanoseconds().saturating_sub(start);
+        if elapsed >= 2_000_000_000 || (elapsed >= 400_000_000 && civ_max >= 3) {
+            break;
+        }
         pump();
         let nabm = AC97.lock().nabm;
         civ_max = civ_max.max(unsafe { arch::inb(nabm + NABM_PO_CIV) } as u32);

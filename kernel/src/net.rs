@@ -464,6 +464,65 @@ pub fn is_ready() -> bool {
     CONFIG.lock().ready
 }
 
+/// Leases an address over a link that came up after boot (Wi-Fi) and finds
+/// the router's MAC.
+pub fn configure_dhcp(mac: [u8; 6]) -> bool {
+    for _ in 0..3 {
+        let lease = dhcp_test(mac);
+        if !lease.verified {
+            continue;
+        }
+        let Some(gateway_mac) = resolve_mac(mac, lease.address, lease.gateway) else {
+            continue;
+        };
+        *CONFIG.lock() = NetworkConfig {
+            mac,
+            gateway_mac,
+            local_ip: lease.address,
+            dns_ip: lease.dns,
+            ready: true,
+        };
+        return true;
+    }
+    false
+}
+
+/// The link went away.
+pub fn forget() {
+    CONFIG.lock().ready = false;
+}
+
+fn resolve_mac(mac: [u8; 6], local: [u8; 4], target: [u8; 4]) -> Option<[u8; 6]> {
+    let mut request = [0u8; 42];
+    request[..6].fill(0xff);
+    request[6..12].copy_from_slice(&mac);
+    request[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+    request[14..22].copy_from_slice(&[0, 1, 8, 0, 6, 4, 0, 1]);
+    request[22..28].copy_from_slice(&mac);
+    request[28..32].copy_from_slice(&local);
+    request[38..42].copy_from_slice(&target);
+    let mut reply = [0u8; 2048];
+    for _ in 0..4 {
+        if !crate::nic::transmit(&request) {
+            continue;
+        }
+        let start = crate::time::monotonic_nanoseconds();
+        while crate::time::monotonic_nanoseconds().saturating_sub(start) < 700_000_000 {
+            if let Some(length) = crate::nic::try_receive(&mut reply)
+                && length >= 42
+                && reply[12..14] == [0x08, 0x06]
+                && reply[20..22] == [0, 2]
+                && reply[28..32] == target
+            {
+                let mut found = [0u8; 6];
+                found.copy_from_slice(&reply[22..28]);
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 pub fn send_udp(
     destination: [u8; 4],
     source_port: u16,

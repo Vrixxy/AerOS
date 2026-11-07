@@ -348,6 +348,11 @@ impl Store {
         }
     }
 
+    /// The guest has published its application list at least once.
+    pub fn listed(&self) -> bool {
+        self.seen != 0
+    }
+
     pub fn app(&self, index: usize) -> Option<&LinuxApp> {
         (index < self.count).then(|| &self.apps[index])
     }

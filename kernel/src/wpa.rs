@@ -639,6 +639,46 @@ impl Supplicant {
     }
 }
 
+impl Supplicant {
+    /// Message 1 of a group key handshake (the access point changing the
+    /// group key): returns the reply's length, the key, its length and index.
+    pub fn handle_group(
+        &mut self,
+        frame: &[u8],
+        out: &mut [u8; MAX_FRAME],
+    ) -> Result<(usize, [u8; 32], usize, u8), Error> {
+        let key = parse_key_frame(frame).ok_or(Error::Malformed)?;
+        let ptk = self.ptk.ok_or(Error::UnexpectedMessage)?;
+        let wanted = INFO_MIC | INFO_ACK | INFO_SECURE | INFO_ENCRYPTED;
+        if self.state != State::Done || key.info & INFO_PAIRWISE != 0 || key.info & wanted != wanted
+        {
+            return Err(Error::UnexpectedMessage);
+        }
+        if key.replay <= self.replay {
+            return Err(Error::Replay);
+        }
+        if !mic_matches(&ptk.kck, frame, &key.mic) {
+            return Err(Error::BadMic);
+        }
+        let mut plain = [0u8; MAX_FRAME];
+        if key.data.len() < 16 || !aes_unwrap(&ptk.kek, key.data, &mut plain) {
+            return Err(Error::BadKeyData);
+        }
+        let (gtk, length, index) =
+            find_group_key(&plain[..key.data.len() - 8]).ok_or(Error::BadKeyData)?;
+        self.replay = key.replay;
+        let send = build_key_frame(
+            out,
+            INFO_VERSION_2 | INFO_MIC | INFO_SECURE,
+            key.replay,
+            &[0; 32],
+            &[],
+            Some(&ptk.kck),
+        );
+        Ok((send, gtk, length, index))
+    }
+}
+
 /// The group key in message 3's key data: a vendor element with the OUI
 /// 00-0F-AC and data type 1 (GTK KDE), after the RSN element.
 fn find_group_key(data: &[u8]) -> Option<([u8; 32], usize, u8)> {

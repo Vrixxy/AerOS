@@ -74,6 +74,7 @@ mod memory;
 mod microcode;
 mod mounts;
 mod mouse;
+mod mt7921;
 mod net;
 mod nic;
 mod notify;
@@ -709,6 +710,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     let mut network = e1000::initialize(&pci, &mut frames);
     let rtl8139_nic = rtl8139::initialize(&pci, &mut frames);
     let rtl8168_nic = rtl8168::initialize(&pci, &mut frames);
+    let _ = mt7921::initialize(&pci, &mut frames);
     nic::select_primary(network.verified, &rtl8139_nic, &rtl8168_nic);
     let iommu_active = enable_iommu();
     #[cfg(feature = "boot-test")]
@@ -2157,8 +2159,11 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
             arch::halt_forever();
         }
     }
+    // An NVMe-only PC has no SATA disk at all; the boot disk checks below
+    // still stop a machine whose own volume can't be read.
     if !ahci.verified {
         serial::line("AEROS_AHCI_INVARIANT_FAILURE");
+        #[cfg(feature = "boot-test")]
         arch::halt_forever();
     }
     serial::format(format_args!(
@@ -2198,102 +2203,109 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         serial::line("AEROS_FAT_INVARIANT_FAILURE");
         arch::halt_forever();
     }
-    let fat_write_payload = b"AerOS persistent storage self-test payload\n";
-    let fat_write_supported = fat.fat_bits == 16 || fat.fat_bits == 32;
-    let fat_write_created =
-        fat_write_supported && fat::write_root_file(b"AEROSFS TXT", fat_write_payload);
-    let mut fat_read_buffer = [0u8; 128];
-    let fat_read_len = if fat_write_created {
-        fat::read_root_file(b"AEROSFS TXT", &mut fat_read_buffer).unwrap_or(0)
+    // An installed system's partition is the user's: the write probes would
+    // leave their files in it.
+    if fat::root_file_size(b"INSTALL TXT").is_some() {
+        serial::line("AEROS_FAT_WRITE skipped=installed");
     } else {
-        0
-    };
-    let fat_roundtrip = fat_read_len == fat_write_payload.len()
-        && fat_read_buffer[..fat_read_len] == *fat_write_payload;
-    let fat_write_verified = !fat_write_supported || (fat_write_created && fat_roundtrip);
-    serial::format(format_args!(
-        "AEROS_FAT_WRITE supported={} created={} bytes={} roundtrip={} verified={}\n",
-        fat_write_supported,
-        fat_write_created,
-        fat_write_payload.len(),
-        fat_roundtrip,
-        fat_write_verified
-    ));
-    if !fat_write_verified {
-        serial::line("AEROS_FAT_WRITE_INVARIANT_FAILURE");
-        #[cfg(feature = "boot-test")]
-        arch::halt_forever();
-    }
-    let persist_payload = b"vfs persistence self-test\n";
-    let persist_created = vfs::open_file("/data/PERSIST.TXT", true, true, false, 0o644, true).ok();
-    let persist_written = match persist_created {
-        Some(descriptor) => {
-            let written =
-                vfs::write(descriptor, persist_payload, false) == Ok(persist_payload.len());
-            let _ = vfs::close(descriptor);
-            written
+        let fat_write_payload = b"AerOS persistent storage self-test payload\n";
+        let fat_write_supported = fat.fat_bits == 16 || fat.fat_bits == 32;
+        let fat_write_created =
+            fat_write_supported && fat::write_root_file(b"AEROSFS TXT", fat_write_payload);
+        let mut fat_read_buffer = [0u8; 128];
+        let fat_read_len = if fat_write_created {
+            fat::read_root_file(b"AEROSFS TXT", &mut fat_read_buffer).unwrap_or(0)
+        } else {
+            0
+        };
+        let fat_roundtrip = fat_read_len == fat_write_payload.len()
+            && fat_read_buffer[..fat_read_len] == *fat_write_payload;
+        let fat_write_verified = !fat_write_supported || (fat_write_created && fat_roundtrip);
+        serial::format(format_args!(
+            "AEROS_FAT_WRITE supported={} created={} bytes={} roundtrip={} verified={}\n",
+            fat_write_supported,
+            fat_write_created,
+            fat_write_payload.len(),
+            fat_roundtrip,
+            fat_write_verified
+        ));
+        if !fat_write_verified {
+            serial::line("AEROS_FAT_WRITE_INVARIANT_FAILURE");
+            #[cfg(feature = "boot-test")]
+            arch::halt_forever();
         }
-        None => false,
-    };
-    let mut persist_read_buffer = [0u8; 64];
-    let persist_readback = if persist_written {
-        match vfs::open_file("/data/PERSIST.TXT", false, false, false, 0, false) {
-            Ok(descriptor) => {
-                let read_len = vfs::read(descriptor, &mut persist_read_buffer).unwrap_or(0);
+        let persist_payload = b"vfs persistence self-test\n";
+        let persist_created =
+            vfs::open_file("/data/PERSIST.TXT", true, true, false, 0o644, true).ok();
+        let persist_written = match persist_created {
+            Some(descriptor) => {
+                let written =
+                    vfs::write(descriptor, persist_payload, false) == Ok(persist_payload.len());
                 let _ = vfs::close(descriptor);
-                read_len == persist_payload.len()
-                    && persist_read_buffer[..read_len] == *persist_payload
+                written
             }
-            Err(_) => false,
+            None => false,
+        };
+        let mut persist_read_buffer = [0u8; 64];
+        let persist_readback = if persist_written {
+            match vfs::open_file("/data/PERSIST.TXT", false, false, false, 0, false) {
+                Ok(descriptor) => {
+                    let read_len = vfs::read(descriptor, &mut persist_read_buffer).unwrap_or(0);
+                    let _ = vfs::close(descriptor);
+                    read_len == persist_payload.len()
+                        && persist_read_buffer[..read_len] == *persist_payload
+                }
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+        let mut persist_disk_buffer = [0u8; 64];
+        let persist_disk_len =
+            fat::read_root_file(b"PERSIST TXT", &mut persist_disk_buffer).unwrap_or(0);
+        let persist_on_disk = persist_disk_len == persist_payload.len()
+            && persist_disk_buffer[..persist_disk_len] == *persist_payload;
+        let persist_verified = persist_written && persist_readback && persist_on_disk;
+        serial::format(format_args!(
+            "AEROS_VFS_PERSIST created={} written={} readback={} on_disk={} verified={}\n",
+            persist_created.is_some(),
+            persist_written,
+            persist_readback,
+            persist_on_disk,
+            persist_verified
+        ));
+        if !persist_verified {
+            serial::line("AEROS_VFS_PERSIST_INVARIANT_FAILURE");
+            #[cfg(feature = "boot-test")]
+            arch::halt_forever();
         }
-    } else {
-        false
-    };
-    let mut persist_disk_buffer = [0u8; 64];
-    let persist_disk_len =
-        fat::read_root_file(b"PERSIST TXT", &mut persist_disk_buffer).unwrap_or(0);
-    let persist_on_disk = persist_disk_len == persist_payload.len()
-        && persist_disk_buffer[..persist_disk_len] == *persist_payload;
-    let persist_verified = persist_written && persist_readback && persist_on_disk;
-    serial::format(format_args!(
-        "AEROS_VFS_PERSIST created={} written={} readback={} on_disk={} verified={}\n",
-        persist_created.is_some(),
-        persist_written,
-        persist_readback,
-        persist_on_disk,
-        persist_verified
-    ));
-    if !persist_verified {
-        serial::line("AEROS_VFS_PERSIST_INVARIANT_FAILURE");
-        #[cfg(feature = "boot-test")]
-        arch::halt_forever();
-    }
-    // Proves cross-reboot rediscovery, not just same-boot create+read: if a
-    // prior boot already created and left this directory, load_persisted_
-    // files() (run once, early, during vfs::initialize()) will have already
-    // recreated it as a VFS node by the time this runs - so success here
-    // *without* this boot creating it first is the actual evidence.
-    let dir_rediscovered = vfs::open_directory("/data/TESTDIR").is_ok();
-    let dir_create_result = if dir_rediscovered {
-        Ok(())
-    } else {
-        vfs::create_directory("/data/TESTDIR", 0o755)
-    };
-    let dir_present = dir_create_result.is_ok() || dir_rediscovered;
-    let mut dir_listing = [fat::FatFileEntry::EMPTY; 4];
-    let dir_listing_count = fat::list_root_directories(&mut dir_listing);
-    let dir_on_disk = dir_listing[..dir_listing_count]
-        .iter()
-        .any(|entry| entry.name == *b"TESTDIR    ");
-    let dir_verified = dir_present && dir_on_disk;
-    serial::format(format_args!(
-        "AEROS_VFS_PERSIST_DIR rediscovered={} present={} on_disk={} verified={}\n",
-        dir_rediscovered, dir_present, dir_on_disk, dir_verified
-    ));
-    if !dir_verified {
-        serial::line("AEROS_VFS_PERSIST_DIR_INVARIANT_FAILURE");
-        #[cfg(feature = "boot-test")]
-        arch::halt_forever();
+        // Proves cross-reboot rediscovery, not just same-boot create+read: if a
+        // prior boot already created and left this directory, load_persisted_
+        // files() (run once, early, during vfs::initialize()) will have already
+        // recreated it as a VFS node by the time this runs - so success here
+        // *without* this boot creating it first is the actual evidence.
+        let dir_rediscovered = vfs::open_directory("/data/TESTDIR").is_ok();
+        let dir_create_result = if dir_rediscovered {
+            Ok(())
+        } else {
+            vfs::create_directory("/data/TESTDIR", 0o755)
+        };
+        let dir_present = dir_create_result.is_ok() || dir_rediscovered;
+        let mut dir_listing = [fat::FatFileEntry::EMPTY; 4];
+        let dir_listing_count = fat::list_root_directories(&mut dir_listing);
+        let dir_on_disk = dir_listing[..dir_listing_count]
+            .iter()
+            .any(|entry| entry.name == *b"TESTDIR    ");
+        let dir_verified = dir_present && dir_on_disk;
+        serial::format(format_args!(
+            "AEROS_VFS_PERSIST_DIR rediscovered={} present={} on_disk={} verified={}\n",
+            dir_rediscovered, dir_present, dir_on_disk, dir_verified
+        ));
+        if !dir_verified {
+            serial::line("AEROS_VFS_PERSIST_DIR_INVARIANT_FAILURE");
+            #[cfg(feature = "boot-test")]
+            arch::halt_forever();
+        }
     }
     let pwrite_created = vfs::open_file("/tmp/PWRITE_TEST", true, true, false, 0o644, true).ok();
     let pwrite_verified = match pwrite_created {

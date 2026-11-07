@@ -20,7 +20,6 @@ WORK=/var/tmp/aeros-rootfs
 KVER=6.12.107+deb13-amd64
 SIZE_MB=${SIZE_MB:-420}
 BROWSER=${BROWSER:-netsurf-gtk}
-BROWSER_CMD=${BROWSER_CMD:-netsurf-gtk}
 OUT_NAME=linux-extract/rootfs-debian.img
 # FULL=1: a bigger image that also has Firefox (launched with F in seamless
 # mode). It doesn't fit the FAT boot volume, so it is written to
@@ -28,9 +27,16 @@ OUT_NAME=linux-extract/rootfs-debian.img
 # any extra disk labelled aeros-root); see tools/live-linux.ps1.
 if [ -n "${FULL:-}" ]; then
   WORK=/var/tmp/aeros-rootfs-full
-  SIZE_MB=${FULL_SIZE_MB:-1200}
+  SIZE_MB=${FULL_SIZE_MB:-1600}
   BROWSER="netsurf-gtk firefox-esr"
-  OUT_NAME=rootfs-disk.img
+  OUT_NAME=${FULL_OUT:-rootfs-disk.img}
+fi
+# The WPE WebKit + Cog packages from tools/build-webkit.sh, installed into the
+# FULL image when present (aeros-webkit launches them).
+WEBKIT_DEBS=${WEBKIT_DEBS:-$WIN/build/webkit}
+WEBKIT=
+if [ -n "${FULL:-}" ] && ls "$WEBKIT_DEBS"/libwpewebkit-2.0-1_*.deb "$WEBKIT_DEBS"/cog_*.deb >/dev/null 2>&1; then
+  WEBKIT=1
 fi
 
 export DEBIAN_FRONTEND=noninteractive
@@ -52,6 +58,12 @@ debootstrap --variant=minbase --arch=amd64 --include="$BASE" trixie "$WORK" http
 mount -t proc proc "$WORK/proc"
 mount --bind /dev "$WORK/dev"
 chroot "$WORK" apt-get install -y --no-install-recommends $BROWSER
+if [ -n "$WEBKIT" ]; then
+  mkdir -p "$WORK/tmp/webkit"
+  cp "$WEBKIT_DEBS"/libwpewebkit-2.0-1_*.deb "$WEBKIT_DEBS"/cog_*.deb "$WORK/tmp/webkit/"
+  chroot "$WORK" sh -c 'apt-get install -y --no-install-recommends /tmp/webkit/*.deb libgl1-mesa-dri libegl-mesa0 libgles2'
+  rm -rf "$WORK/tmp/webkit"
+fi
 
 # ---- kernel modules the initrd lacks (evdev), plus what depmod needs ------
 CLOUD=/mnt/aeros-cloud
@@ -180,6 +192,18 @@ done
 exec firefox-esr --no-remote --profile $P "$@"
 FFOX
 chmod 755 "$WORK/usr/local/bin/aeros-firefox"
+if [ -n "$WEBKIT" ]; then
+cat > "$WORK/usr/local/bin/aeros-webkit" <<'WPE'
+#!/bin/sh
+# Cog on WPE WebKit in an X11 window, rendered with Mesa's software GL.
+export LIBGL_ALWAYS_SOFTWARE=1 WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 NO_AT_BRIDGE=1
+mkdir -p /tmp/home/cog
+export XDG_CACHE_HOME=/tmp/home/cog XDG_DATA_HOME=/tmp/home/cog
+exec cog --platform=x11 "${@:-https://duckduckgo.com/}"
+WPE
+chmod 755 "$WORK/usr/local/bin/aeros-webkit"
+fi
+sh "$(dirname "$0")/guest-app-list.sh" "$WORK"
 cat > "$WORK/usr/local/bin/aeros-install" <<'INSTALL'
 #!/bin/sh
 # Installs Debian packages for the AerOS store (into the RAM overlay).
@@ -240,8 +264,6 @@ xrdb -merge /etc/aeros/Xresources
 xsetroot -solid '#1c2b36'
 openbox --config-file /etc/aeros/openbox-rc.xml &
 aeros-agent &
-xterm -geometry 58x20+0+0 -fa 'DejaVu Sans Mono' -fs 10 -bg '#0d1117' -fg '#d7dee6' &
-$BROWSER_CMD &
 wait
 XINIT
 chmod 755 "$WORK/etc/aeros/xinitrc"
@@ -413,7 +435,7 @@ setsid -c xinit /etc/aeros/xinitrc -- /usr/bin/Xorg :0 vt1 -config /tmp/xorg.con
   done
   # Each session program is waited for (up to 40 s) instead of sampled once:
   # on a busy or slow start they come up seconds apart.
-  for app in openbox xterm netsurf-gtk aeros-agent; do
+  for app in openbox aeros-agent; do
     for i in $(seq 1 40); do
       $BB pidof $app >/dev/null 2>&1 && { echo "AEROS_LINUX_APP_OK $app"; break; }
       $BB sleep 1
@@ -440,7 +462,7 @@ setsid -c xinit /etc/aeros/xinitrc -- /usr/bin/Xorg :0 vt1 -config /tmp/xorg.con
 # and the newest X errors (debugging aid; the desktop has no serial shell).
 ( while :; do
     $BB sleep 20
-    echo "AEROS_LINUX_STATUS pids: $($BB pidof Xorg openbox xterm netsurf-gtk aeros-agent firefox-esr firefox-bin | $BB tr '\n' ' ') mem: $($BB grep -E 'MemAvailable' /proc/meminfo | $BB tr -s ' ')"
+    echo "AEROS_LINUX_STATUS pids: $($BB pidof Xorg openbox xterm netsurf-gtk aeros-agent firefox-esr firefox-bin cog WPEWebProcess | $BB tr '\n' ' ') mem: $($BB grep -E 'MemAvailable' /proc/meminfo | $BB tr -s ' ')"
     $BB tail -n 4 /tmp/aeros-spawn.log 2>/dev/null | $BB cut -c1-160
     $BB tail -n 3 /tmp/aeros-install.log 2>/dev/null | $BB cut -c1-160
     $BB grep -a '(EE)' /tmp/Xorg.log 2>/dev/null | $BB tail -n 2
@@ -460,9 +482,13 @@ chmod 755 "$WORK/sbin/init"
 # nothing here uses OpenGL. Then make sure the programs we start still
 # resolve every library.
 LIBDIR="$WORK/usr/lib/x86_64-linux-gnu"
-rm -f "$LIBDIR"/libLLVM* "$LIBDIR"/libgallium* "$LIBDIR"/libz3* "$LIBDIR"/libgs.so*
-rm -rf "$LIBDIR/dri"
-for b in usr/lib/xorg/Xorg usr/bin/xterm usr/bin/openbox usr/bin/netsurf-gtk usr/bin/xinit $( [ -n "${FULL:-}" ] && echo usr/lib/firefox-esr/firefox-esr ); do
+# (WebKit renders through EGL, so the WEBKIT image keeps Mesa.)
+if [ -z "$WEBKIT" ]; then
+  rm -f "$LIBDIR"/libLLVM* "$LIBDIR"/libgallium* "$LIBDIR"/libz3*
+  rm -rf "$LIBDIR/dri"
+fi
+rm -f "$LIBDIR"/libgs.so*
+for b in usr/lib/xorg/Xorg usr/bin/xterm usr/bin/openbox usr/bin/netsurf-gtk usr/bin/xinit $( [ -n "${FULL:-}" ] && echo usr/lib/firefox-esr/firefox-esr ) $( [ -n "$WEBKIT" ] && echo usr/bin/cog ); do
   chroot "$WORK" ldd "/$b" 2>&1 | grep 'not found' | sed "s|^|MISSING for $b: |" || true
 done
 

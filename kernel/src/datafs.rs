@@ -237,24 +237,54 @@ pub fn initialize() -> HomeReport {
         free_clusters: 0,
         verified: false,
     };
-    for disk in candidates().into_iter().flatten() {
-        if adopt_home(disk, &mut report) {
-            break;
-        }
+    let found = candidates()
+        .into_iter()
+        .flatten()
+        .any(|disk| adopt_home(disk, &mut report));
+    if !found {
+        adopt_home_file(&mut report);
     }
     scan_media();
     report
 }
 
+/// An installed system keeps its home in `HOME`, a contiguous file on its own
+/// boot partition (made by AerOS Setup with the blank-disk marker).
+fn adopt_home_file(report: &mut HomeReport) -> bool {
+    let Some(disk) = crate::blockdev::boot_disk() else {
+        return false;
+    };
+    let size = crate::fat::root_file_size(b"HOME       ");
+    let extent = crate::fat::root_file_extent(b"HOME       ");
+    let adopted =
+        extent.is_some_and(|(start, bytes)| adopt_home_region(disk, start, bytes / 512, report));
+    if size.is_some() {
+        crate::serial::format(format_args!(
+            "AEROS_HOME_FILE bytes={} contiguous={} mounted={} formatted={}
+",
+            size.unwrap_or(0),
+            extent.is_some(),
+            adopted,
+            report.formatted
+        ));
+    }
+    adopted
+}
+
 /// Tries `disk` as the home volume: a blank-marked disk (formatted as FAT), a
 /// FAT volume labelled `AEROSHOME`, or an AerFS volume with that label.
 pub(crate) fn adopt_home(disk: Disk, report: &mut HomeReport) -> bool {
+    adopt_home_region(disk, 0, disk.sectors(), report)
+}
+
+/// `adopt_home` for the `sectors` sectors at `start` on `disk`.
+fn adopt_home_region(disk: Disk, start: u64, sectors: u64, report: &mut HomeReport) -> bool {
     let mut first = [0u8; 512];
-    if !disk_read(disk, 0, &mut first) {
+    if sectors < 2048 || !disk_read(disk, start, &mut first) {
         return false;
     }
     if Volume::sniff_aerfs(&first) {
-        return adopt_aerfs_home(disk, report);
+        return adopt_aerfs_home(disk, start, sectors, report);
     }
     let blank = first[..16] == BLANK_MARKER[..];
     let fat_label = if is_boot_sector(&first) {
@@ -273,12 +303,12 @@ pub(crate) fn adopt_home(disk: Disk, report: &mut HomeReport) -> bool {
     }
     report.present = true;
     if blank {
-        if fatfs::Fs::format(disk, 0, disk.sectors(), HOME_LABEL).is_err() {
+        if fatfs::Fs::format(disk, start, sectors, HOME_LABEL).is_err() {
             return false;
         }
         report.formatted = true;
     }
-    let Ok(mut fs) = fatfs::Fs::mount(disk, 0) else {
+    let Ok(mut fs) = fatfs::Fs::mount(disk, start) else {
         return false;
     };
     if let Ok(info) = fs.info() {
@@ -293,8 +323,8 @@ pub(crate) fn adopt_home(disk: Disk, report: &mut HomeReport) -> bool {
     true
 }
 
-fn adopt_aerfs_home(disk: Disk, report: &mut HomeReport) -> bool {
-    let Ok(volume) = Volume::mount_aerfs(disk, 0, disk.sectors()) else {
+fn adopt_aerfs_home(disk: Disk, start: u64, sectors: u64, report: &mut HomeReport) -> bool {
+    let Ok(volume) = Volume::mount_aerfs(disk, start, sectors) else {
         return false;
     };
     if volume.label()[..9] != HOME_LABEL[..] {

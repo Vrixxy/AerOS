@@ -18,7 +18,6 @@ static FAT_CACHE: TicketLock<Option<(u64, [u8; 512])>> = TicketLock::new(None);
 /// read into a large ROOTFS cost tens of thousands of FAT lookups.
 static CHAIN_HINT: TicketLock<Option<(u32, u64, u32)>> = TicketLock::new(None);
 
-#[cfg_attr(not(feature = "linux-guest"), allow(dead_code))]
 pub fn root_file_size(name: &[u8; 11]) -> Option<u64> {
     let volume = (*MOUNTED.lock())?;
     let entry = find_root(&volume, name)?;
@@ -26,6 +25,27 @@ pub fn root_file_size(name: &[u8; 11]) -> Option<u64> {
         return None;
     }
     Some(entry.bytes as u64)
+}
+
+/// Where a root-directory file lies when its clusters form one run: (first
+/// LBA, length in bytes). The Linux guest then reads and writes its ROOTFS
+/// there directly, like a disk of its own.
+pub fn root_file_extent(name: &[u8; 11]) -> Option<(u64, u64)> {
+    let volume = (*MOUNTED.lock())?;
+    let entry = find_root(&volume, name)?;
+    if entry.directory || entry.cluster < 2 {
+        return None;
+    }
+    let cluster_bytes = volume.sectors_per_cluster as u64 * SECTOR_BYTES;
+    let clusters = (entry.bytes as u64).div_ceil(cluster_bytes);
+    let mut cluster = entry.cluster;
+    for _ in 1..clusters {
+        match next_cluster(&volume, cluster)? {
+            Some(next) if next == cluster + 1 => cluster = next,
+            _ => return None,
+        }
+    }
+    Some((cluster_lba(&volume, entry.cluster), entry.bytes as u64))
 }
 
 #[cfg_attr(not(feature = "linux-guest"), allow(dead_code))]
@@ -484,10 +504,18 @@ struct DirectoryEntry {
 }
 
 pub fn inspect(partitions: &PartitionReport) -> FatReport {
-    for partition in partitions.entries() {
-        if !partition.fat_candidate() {
-            continue;
-        }
+    // The partition the firmware started AerOS from comes first (whatever its
+    // type), so a disk shared with Windows uses AerOS's volume, not Windows's.
+    let boot = crate::uefi::boot_partition_start();
+    let own = partitions
+        .entries()
+        .iter()
+        .filter(|partition| Some(partition.first_lba) == boot);
+    let fat = partitions
+        .entries()
+        .iter()
+        .filter(|partition| partition.fat_candidate() && Some(partition.first_lba) != boot);
+    for partition in own.chain(fat) {
         let Some(volume) = read_volume(*partition) else {
             continue;
         };

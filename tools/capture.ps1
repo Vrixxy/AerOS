@@ -1,6 +1,6 @@
 param(
     [string]$Command = "",
-    [ValidateSet("desktop", "apps", "quick", "browser", "settings", "setup", "lock", "login")]
+    [ValidateSet("desktop", "apps", "quick", "browser", "settings", "setup", "username", "lock", "login")]
     [string]$View = "desktop",
     [string]$Then = "",
     [int]$SettleMs = 250
@@ -157,14 +157,15 @@ function Wait-Screen {
 if ($View -eq "setup") {
     Start-Sleep -Milliseconds 250
 }
-elseif ($View -in @("lock", "login", "desktop")) {
+elseif ($View -ne "setup") {
     Start-Sleep -Milliseconds 250
     $waypoints = switch ($View) {
         "login" { @("username", "password", "lock", "login") }
         "lock" { @("username", "password", "lock") }
+        "username" { @("username") }
         default { @() }
     }
-    if ($View -eq "desktop") {
+    if ($View -notin @("lock", "login", "username")) {
         # The drive has no account: set one up (it lives in this copy only).
         # The first screen takes keys once it has faded in.
         Start-Sleep -Seconds 3
@@ -208,7 +209,7 @@ elseif ($View -in @("lock", "login", "desktop")) {
         }
     }
 }
-elseif ($View -ne "desktop") {
+if ($View -notin @("setup", "username", "lock", "login", "desktop")) {
     Start-Sleep -Milliseconds 250
     $viewKey = switch ($View) {
         "apps" { "a" }
@@ -237,7 +238,7 @@ elseif ($View -ne "desktop") {
         throw "AerOS $View view did not finish rendering"
     }
     if ($View -eq "browser") {
-        $browserDeadline = [DateTime]::UtcNow.AddSeconds(25)
+        $browserDeadline = [DateTime]::UtcNow.AddSeconds(3)
         $browserReady = $false
         while ([DateTime]::UtcNow -lt $browserDeadline) {
             $serialText = [string](Get-Content -Raw -LiteralPath $serial)
@@ -248,8 +249,7 @@ elseif ($View -ne "desktop") {
             Start-Sleep -Milliseconds 50
         }
         if (-not $browserReady) {
-            Send-Monitor "quit" 0
-            throw "AerOS browser network state did not finish"
+            Write-Host "AerOS browser has not fetched a page (start page)"
         }
     }
 }

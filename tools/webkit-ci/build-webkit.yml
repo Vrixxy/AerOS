@@ -1,0 +1,32 @@
+# Builds WPE WebKit + Cog as Debian 13 packages with tools/build-webkit.sh.
+# Copy to .github/workflows/ of a repo that also holds build-webkit.sh at
+# its root, then run it from the Actions tab (Run workflow).
+name: Build WPE WebKit
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          sudo docker image prune -af
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - name: Build in Debian 13
+        run: |
+          mkdir -p out
+          docker run --rm -v "$PWD:/work" -e OUT=/work/out -e WORK=/build -e JOBS=4 -e SWAP=0 \
+            debian:trixie sh /work/build-webkit.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wpewebkit-debs
+          path: out/*.deb
+          retention-days: 30

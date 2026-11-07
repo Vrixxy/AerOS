@@ -4,7 +4,7 @@
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use crate::{e1000, rtl8139, rtl8168, virtio_net};
+use crate::{e1000, mt7921, rtl8139, rtl8168, virtio_net};
 
 /// What a secondary NIC driver reports after probing.
 #[derive(Clone, Copy)]
@@ -85,6 +85,7 @@ const E1000: u8 = 1;
 const RTL8139: u8 = 2;
 const RTL8168: u8 = 3;
 const VIRTIO: u8 = 4;
+const WIFI: u8 = 5;
 
 static PRIMARY: AtomicU8 = AtomicU8::new(NONE);
 
@@ -130,6 +131,7 @@ pub fn transmit(packet: &[u8]) -> bool {
         RTL8139 => rtl8139::transmit(packet),
         RTL8168 => rtl8168::transmit(packet),
         VIRTIO => virtio_net::send(packet),
+        WIFI => mt7921::transmit(packet),
         _ => false,
     };
     if sent {
@@ -149,6 +151,7 @@ pub fn try_receive(destination: &mut [u8]) -> Option<usize> {
         RTL8139 => rtl8139::try_receive(destination),
         RTL8168 => rtl8168::try_receive(destination),
         VIRTIO => virtio_net::receive(destination),
+        WIFI => mt7921::try_receive(destination),
         _ => None,
     }?;
     if crate::firewall::blocks(&destination[..length]) {
@@ -186,6 +189,22 @@ pub fn mac_address() -> Option<[u8; 6]> {
         E1000 => e1000::mac_address(),
         RTL8139 => rtl8139::mac_address(),
         RTL8168 => rtl8168::mac_address(),
+        WIFI => mt7921::mac_address(),
         _ => None,
+    }
+}
+
+/// Wi-Fi joined a network: it carries the traffic unless a wired card already does.
+pub fn wifi_up() {
+    let _ = PRIMARY.compare_exchange(NONE, WIFI, Ordering::AcqRel, Ordering::Acquire);
+}
+
+/// Wi-Fi left its network.
+pub fn wifi_lost() {
+    if PRIMARY
+        .compare_exchange(WIFI, NONE, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        crate::net::forget();
     }
 }

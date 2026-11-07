@@ -165,7 +165,10 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> VirtioBlkR
         *byte = (index as u8).wrapping_mul(13).wrapping_add(5);
     }
     let mut readback = [0u8; SECTOR];
-    report.write_probe = report.sectors > 2
+    // Only the test image (signature above) is written: on a real disk
+    // sector 2 is the GPT partition array.
+    report.write_probe = report.read
+        && report.sectors > 2
         && write(2, 1, &pattern)
         && read(2, 1, &mut readback)
         && readback == pattern;

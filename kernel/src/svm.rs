@@ -722,6 +722,34 @@ mod linux {
     static BLK_OK: [core::sync::atomic::AtomicBool; BLK_SLOTS] =
         [const { core::sync::atomic::AtomicBool::new(false) }; BLK_SLOTS];
     static BLK_DISK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    /// The root is a contiguous ROOTFS file starting at this LBA of the boot
+    /// disk (u64::MAX = it is the AHCI disk `BLK_DISK` instead).
+    static BLK_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+    fn root_read(lba: u64, sectors: u32, phys: u64) -> bool {
+        use core::sync::atomic::Ordering::Acquire;
+        match BLK_BASE.load(Acquire) {
+            u64::MAX => crate::ahci::read_disk(BLK_DISK.load(Acquire), lba, sectors, phys),
+            base => crate::blockdev::read_into(base + lba, sectors, phys),
+        }
+    }
+
+    fn root_write(lba: u64, sectors: u32, phys: u64) -> bool {
+        use core::sync::atomic::Ordering::Acquire;
+        match BLK_BASE.load(Acquire) {
+            u64::MAX => {
+                let disk = BLK_DISK.load(Acquire);
+                crate::block::invalidate(crate::block::Disk::Ahci(disk), lba, sectors as u64);
+                crate::ahci::write_disk(disk, lba, sectors, phys)
+            }
+            base => {
+                if let Some(disk) = crate::blockdev::boot_disk() {
+                    crate::block::invalidate(disk, base + lba, sectors as u64);
+                }
+                crate::blockdev::write_from(base + lba, sectors, phys)
+            }
+        }
+    }
 
     /// Runs on the second host CPU: performs queued reads until none are left.
     fn blk_worker(_argument: u64) {
@@ -738,7 +766,6 @@ mod linux {
                 let mut ok = false;
                 if job.valid {
                     ok = true;
-                    let disk = BLK_DISK.load(Acquire);
                     let total = job.len / 512;
                     let mut sent = 0u32;
                     while sent < total {
@@ -746,14 +773,9 @@ mod linux {
                         let lba = job.sector + sent as u64;
                         let phys = job.dest_phys + sent as u64 * 512;
                         let done = if job.write {
-                            crate::block::invalidate(
-                                crate::block::Disk::Ahci(disk),
-                                lba,
-                                batch as u64,
-                            );
-                            crate::ahci::write_disk(disk, lba, batch, phys)
+                            root_write(lba, batch, phys)
                         } else {
-                            crate::ahci::read_disk(disk, lba, batch, phys)
+                            root_read(lba, batch, phys)
                         };
                         if !done {
                             ok = false;
@@ -840,7 +862,9 @@ mod linux {
         rootfs_bytes: u64,
         /// AHCI disk index backing the virtio-blk device, or usize::MAX when
         /// the root is the ROOTFS file on the boot volume.
-        rootfs_disk: usize,
+        /// The root is read and written by sector (a disk of its own, or a
+        /// contiguous ROOTFS file), not through the FAT layer.
+        root_direct: bool,
         pci_command: u16,
         bar0_raw: u32,
         virtio_guest_features: u32,
@@ -990,6 +1014,7 @@ mod linux {
     /// Runs the guest for about `budget_tsc` cycles. Returns false once the
     /// guest has powered off, reset or hit an unhandled exit.
     pub fn pump(budget_tsc: u64) -> bool {
+        flush_pending();
         pump_raw(budget_tsc, false)
     }
 
@@ -1089,18 +1114,66 @@ mod linux {
     /// Queues a command for the agent in the 16-slot ring: slot fields first,
     /// then the counter bump that publishes it. A full ring drops the new
     /// command (the agent drains it every ~60 ms).
+    /// Commands given before the agent was up (an app launched while Linux
+    /// is still starting), delivered in order once it is.
+    #[derive(Clone, Copy)]
+    struct Pending {
+        op: u32,
+        args: [u32; 4],
+        text: [u8; 128],
+    }
+    const PENDING_SLOTS: usize = 4;
+    static PENDING: crate::sync::TicketLock<([Option<Pending>; PENDING_SLOTS], usize)> =
+        crate::sync::TicketLock::new(([None; PENDING_SLOTS], 0));
+
     pub fn command(op: u32, args: [u32; 4], text: &[u8]) {
-        let Some(machine) = guest() else {
+        flush_pending();
+        let mut pending = PENDING.lock();
+        if pending.1 == 0 && deliver(op, args, text) {
             return;
+        }
+        if pending.1 < PENDING_SLOTS {
+            let mut copy = [0u8; 128];
+            let length = text.len().min(copy.len());
+            copy[..length].copy_from_slice(&text[..length]);
+            let index = pending.1;
+            pending.0[index] = Some(Pending {
+                op,
+                args,
+                text: copy,
+            });
+            pending.1 += 1;
+        }
+    }
+
+    fn flush_pending() {
+        let mut pending = PENDING.lock();
+        while pending.1 > 0 {
+            let Some(first) = pending.0[0] else {
+                break;
+            };
+            if !deliver(first.op, first.args, &first.text) {
+                break;
+            }
+            pending.0.copy_within(1.., 0);
+            pending.0[PENDING_SLOTS - 1] = None;
+            pending.1 -= 1;
+        }
+    }
+
+    /// Puts one command in the agent's mailbox (false: no agent yet, or full).
+    fn deliver(op: u32, args: [u32; 4], text: &[u8]) -> bool {
+        let Some(machine) = guest() else {
+            return false;
         };
         let base = machine.ram + FB_BASE + COMMAND_OFFSET;
         let word = |offset: u64| unsafe { core::ptr::read_volatile((base + offset) as *const u32) };
         if word(0) != COMMAND_MAGIC {
-            return; // the agent hasn't started yet
+            return false;
         }
         let (queued, acked) = (word(4), word(8));
         if queued.wrapping_sub(acked) >= COMMAND_SLOTS {
-            return;
+            return false;
         }
         let slot = base + 16 + (queued % COMMAND_SLOTS) as u64 * COMMAND_STRIDE;
         let put = |offset: u64, value: u32| unsafe {
@@ -1116,6 +1189,7 @@ mod linux {
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         unsafe { core::ptr::write_volatile((base + 4) as *mut u32, queued.wrapping_add(1)) };
+        true
     }
 
     const WEB_REQ_OFFSET: u64 = 0xA3_0000;
@@ -1329,24 +1403,29 @@ mod linux {
                 continue;
             }
             if block[56] == 0x53 && block[57] == 0xef && block[120..130] == *b"aeros-root" {
-                // The ext4 root's own size (blocks * block size); anything
-                // after it on the disk is a writable data area.
-                let blocks = u32::from_le_bytes([block[4], block[5], block[6], block[7]]) as u64;
-                let log = u32::from_le_bytes([block[24], block[25], block[26], block[27]]) & 7;
-                let root_bytes = blocks * (1024u64 << log);
-                if root_bytes + 1024 * 1024 <= sectors * 512 {
-                    DATA_START.store(root_bytes, core::sync::atomic::Ordering::Release);
-                    crate::serial::format(format_args!(
-                        "AEROS_VM_LINUX_DATA start_bytes={} data_bytes={}\n",
-                        root_bytes,
-                        sectors * 512 - root_bytes
-                    ));
-                }
+                note_data_area(&block, sectors * 512);
                 return Some((disk, sectors * 512));
             }
         }
         None
     }
+
+    /// The ext4 root's own size (blocks * block size) from its superblock
+    /// sector; whatever follows it, up to `total_bytes`, is a writable data area.
+    fn note_data_area(block: &[u8; 512], total_bytes: u64) {
+        let blocks = u32::from_le_bytes([block[4], block[5], block[6], block[7]]) as u64;
+        let log = u32::from_le_bytes([block[24], block[25], block[26], block[27]]) & 7;
+        let root_bytes = blocks * (1024u64 << log);
+        if root_bytes + 1024 * 1024 <= total_bytes {
+            DATA_START.store(root_bytes, core::sync::atomic::Ordering::Release);
+            crate::serial::format(format_args!(
+                "AEROS_VM_LINUX_DATA start_bytes={} data_bytes={}\n",
+                root_bytes,
+                total_bytes - root_bytes
+            ));
+        }
+    }
+
     fn prepare(frames: &mut FrameAllocator) -> bool {
         if !super::prepare_svm() {
             crate::serial::line("AEROS_VM_LINUX_KERNEL stage=svm-unavailable");
@@ -1365,9 +1444,32 @@ mod linux {
         // "aeros-root" is attached (no size limit - a full desktop image won't
         // fit the FAT boot volume), else from the ROOTFS file on the boot
         // volume.
+        use core::sync::atomic::Ordering::Release;
         let (rootfs_disk, rootfs_bytes) = if let Some((disk, bytes)) = find_root_disk() {
+            BLK_DISK.store(disk, Release);
+            BLK_BASE.store(u64::MAX, Release);
             (disk, bytes)
         } else if let Some(bytes) = fat::root_file_size(ROOTFS_NAME) {
+            // A ROOTFS file in one run (as the Windows installer writes it)
+            // is used like a disk: by sector, asynchronously, and writable
+            // past its ext4 root.
+            let extent = fat::root_file_extent(ROOTFS_NAME);
+            crate::serial::format(format_args!(
+                "AEROS_VM_LINUX_ROOTFILE bytes={} contiguous={} lba={}\n",
+                bytes,
+                extent.is_some(),
+                extent.map_or(0, |(lba, _)| lba)
+            ));
+            if let Some((lba, _)) = extent {
+                let mut block = [0u8; 512];
+                if crate::blockdev::read_sector(lba + 2, &mut block)
+                    && block[56] == 0x53
+                    && block[57] == 0xef
+                {
+                    note_data_area(&block, bytes);
+                }
+                BLK_BASE.store(lba, Release);
+            }
             (usize::MAX, bytes)
         } else {
             crate::serial::line("AEROS_VM_LINUX_KERNEL stage=image-absent file=ROOTFS");
@@ -1538,7 +1640,8 @@ mod linux {
             last_port: 0,
             npf_gpa: 0,
             rootfs_bytes,
-            rootfs_disk,
+            root_direct: rootfs_disk != usize::MAX
+                || BLK_BASE.load(core::sync::atomic::Ordering::Acquire) != u64::MAX,
             pci_command: 0,
             bar0_raw: VIRTIO_IO_BASE,
             virtio_guest_features: 0,
@@ -3498,10 +3601,7 @@ mod linux {
             if desc_addr >= self.ram_bytes || used_addr + 6 + 8 * num > self.ram_bytes {
                 return;
             }
-            let asynchronous = self.rootfs_disk != usize::MAX && crate::smp::online_mask() & 2 != 0;
-            if asynchronous {
-                BLK_DISK.store(self.rootfs_disk, core::sync::atomic::Ordering::Release);
-            }
+            let asynchronous = self.root_direct && crate::smp::online_mask() & 2 != 0;
 
             let avail_idx = self.gread_u16(avail_addr + 2);
             let mut processed = 0u64;
@@ -3804,17 +3904,12 @@ mod linux {
             if !dest_phys.is_multiple_of(512) {
                 return false;
             }
-            if self.rootfs_disk != usize::MAX {
+            if self.root_direct {
                 let mut done = 0u32;
                 let total = len / 512;
                 while done < total {
                     let batch = (total - done).min(8192);
-                    if !crate::ahci::read_disk(
-                        self.rootfs_disk,
-                        sector + done as u64,
-                        batch,
-                        dest_phys + done as u64 * 512,
-                    ) {
+                    if !root_read(sector + done as u64, batch, dest_phys + done as u64 * 512) {
                         return false;
                     }
                     done += batch;
@@ -3827,7 +3922,7 @@ mod linux {
         /// A write into the disk's data area (never the read-only root).
         fn blk_write_sectors(&mut self, sector: u64, src_gpa: u64, len: u32) -> bool {
             use core::sync::atomic::Ordering::Relaxed;
-            if self.rootfs_disk == usize::MAX
+            if !self.root_direct
                 || len == 0
                 || !(len as u64).is_multiple_of(512)
                 || sector.saturating_mul(512) < DATA_START.load(Relaxed)
@@ -3854,17 +3949,7 @@ mod linux {
             let mut done = 0u32;
             while done < total {
                 let batch = (total - done).min(8192);
-                crate::block::invalidate(
-                    crate::block::Disk::Ahci(self.rootfs_disk),
-                    sector + done as u64,
-                    batch as u64,
-                );
-                if !crate::ahci::write_disk(
-                    self.rootfs_disk,
-                    sector + done as u64,
-                    batch,
-                    src_phys + done as u64 * 512,
-                ) {
+                if !root_write(sector + done as u64, batch, src_phys + done as u64 * 512) {
                     return false;
                 }
                 done += batch;

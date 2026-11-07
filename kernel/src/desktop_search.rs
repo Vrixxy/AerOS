@@ -6,27 +6,17 @@ const CLOSE_NS: u64 = 240_000_000;
 pub(super) const SEARCH_PILL: Rect = Rect::new(166, 146, 420, 69);
 const ROW_HEIGHT: i32 = 40;
 
-const ENTRIES: [(&str, u8); 8] = [
-    ("Terminal", 0),
-    ("Files", 1),
-    ("Browser", 2),
-    ("Notes", 3),
-    ("Settings", 4),
-    ("Store", 5),
-    ("Trash", 6),
-    ("Linux", 7),
-];
-
+/// Launcher entries whose name contains the typed text (the first eight).
 fn matches(state: &DesktopState, out: &mut [usize; 8]) -> usize {
     let needle = &state.search_input[..state.search_len];
     let mut count = 0;
-    for (index, (name, _)) in ENTRIES.iter().enumerate() {
+    for index in 0..launcher_len() {
         let hit = needle.is_empty()
-            || name
+            || launcher_name(index)
                 .as_bytes()
                 .windows(needle.len())
                 .any(|window| window.eq_ignore_ascii_case(needle));
-        if hit {
+        if hit && count < out.len() {
             out[count] = index;
             count += 1;
         }
@@ -76,21 +66,9 @@ impl DesktopState {
         self.motion_until_ns = self.motion_until_ns.max(now + CLOSE_NS + 60_000_000);
     }
 
-    fn launch_entry(&mut self, entry: u8) {
+    fn search_launch(&mut self, entry: usize) {
         self.close_search();
-        match entry {
-            0 => self.set_app(DesktopApp::Terminal),
-            1 => self.open_files(),
-            2 => self.open_browser(),
-            3 => self.open_notes(),
-            4 => self.set_app(DesktopApp::Settings),
-            5 => self.open_store(),
-            6 => self.open_trash(),
-            _ => {
-                self.seamless.enabled = false;
-                self.set_app(DesktopApp::Linux);
-            }
-        }
+        self.launch_entry(entry);
     }
 
     pub(super) fn search_key(&mut self, key: DesktopKey) -> Option<DesktopAction> {
@@ -123,8 +101,7 @@ impl DesktopState {
                 self.search_focus = (self.search_focus + count - 1) % count;
             }
             DesktopKey::Activate if count > 0 => {
-                let entry = ENTRIES[hits[self.search_focus.min(count - 1)]].1;
-                self.launch_entry(entry);
+                self.search_launch(hits[self.search_focus.min(count - 1)]);
             }
             _ => {}
         }
@@ -137,9 +114,9 @@ impl DesktopState {
         }
         let mut hits = [0usize; 8];
         let count = matches(self, &mut hits);
-        for slot in 0..count.min(rows_that_fit()) {
+        for (slot, &hit) in hits.iter().enumerate().take(count.min(rows_that_fit())) {
             if row_rect(slot).contains(point) {
-                self.launch_entry(ENTRIES[hits[slot]].1);
+                self.search_launch(hit);
                 return Some(DesktopAction::Redraw);
             }
         }
@@ -229,7 +206,7 @@ pub(super) fn draw_search(
     } else {
         0
     };
-    for slot in 0..count.min(rows_that_fit()) {
+    for (slot, &hit) in hits.iter().enumerate().take(count.min(rows_that_fit())) {
         let delay = 140_000_000 + slot as u64 * 45_000_000;
         let arrive = ease_out_milli(progress_of(age.saturating_sub(delay), 0, 260_000_000)) as i32;
         if arrive <= 0 {
@@ -268,7 +245,7 @@ pub(super) fn draw_search(
             layout,
             font,
             row,
-            ENTRIES[hits[slot]].0,
+            launcher_name(hit),
             14,
             Color::rgb(14, 22, 28),
         );
@@ -307,6 +284,24 @@ pub(super) fn dock_app(index: usize) -> DesktopApp {
 impl DesktopState {
     /// Called with the pointer position (design coordinates) when it moves.
     pub(super) fn hover_dock(&mut self, point: Point, now: u64) -> bool {
+        if self.screen == Screen::Desktop && self.overlay == Overlay::Apps {
+            let page = self.app_focus / LAUNCHER_PAGE;
+            let tile = (page * LAUNCHER_PAGE..launcher_len().min((page + 1) * LAUNCHER_PAGE))
+                .find(|&index| launcher_tile(index).contains(point));
+            let changed = match tile {
+                Some(index) => !self.launcher_hover || self.app_focus != index,
+                None => self.launcher_hover,
+            };
+            if let Some(index) = tile {
+                self.app_focus = index;
+            }
+            self.launcher_hover = tile.is_some();
+            if changed {
+                self.focus_visible = false;
+            }
+            return changed;
+        }
+        self.launcher_hover = false;
         let mut over = usize::MAX;
         if self.screen == Screen::Desktop && self.overlay == Overlay::None {
             for index in 0..DOCK_BUTTONS.len() {

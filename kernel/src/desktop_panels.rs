@@ -272,7 +272,17 @@ pub(super) fn draw_quick(
         layout,
         font,
         Point::new(bounds.x + 56, bounds.y + 28),
-        if wifi_on { "Connected" } else { "Off" },
+        if !wifi_on {
+            "Off"
+        } else if crate::mt7921::connected() {
+            "Connected"
+        } else if crate::mt7921::present() {
+            "Not connected"
+        } else if crate::net::is_ready() {
+            "Connected"
+        } else {
+            "No network"
+        },
         10,
         Color::rgb(200, 220, 226),
     );

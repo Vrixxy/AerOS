@@ -439,6 +439,10 @@ pub fn handle_work_ipi() {
     else {
         return;
     };
+    run_job(logical);
+}
+
+fn run_job(logical: usize) {
     if JOBS[logical]
         .state
         .compare_exchange(1, 3, Ordering::AcqRel, Ordering::Acquire)
@@ -665,6 +669,10 @@ extern "sysv64" fn aeros_ap_entry(logical: u32, expected_apic_id: u32) -> ! {
             }
             crate::scheduler::IdleStep::Busy => {
                 crate::scheduler::mark_idle(logical, false);
+                // The lock holder may be waiting on a job sent here by IPI
+                // (the Linux guest's disk reads), which can't arrive while
+                // this loop keeps interrupts off: run it directly.
+                run_job(logical);
                 core::hint::spin_loop();
                 continue;
             }

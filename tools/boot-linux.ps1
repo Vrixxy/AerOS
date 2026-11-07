@@ -1,4 +1,4 @@
-param([int]$MemoryMiB = 2048, [int]$TimeoutSeconds = 240, [switch]$Single, [switch]$Smp)
+param([int]$MemoryMiB = 2048, [int]$TimeoutSeconds = 240, [switch]$Single, [switch]$Smp, [string]$RootDisk = "build\rootfs-disk.img")
 
 # Two virtual CPUs (feature linux-smp) are the default; -Single builds the
 # one-CPU guest. (-Smp is accepted and does nothing extra.)
@@ -69,7 +69,7 @@ $arguments = @(
     "-serial", "file:$serial",
     "-no-reboot"
 )
-$rootDisk = Join-Path $root "build\rootfs-disk.img"
+$rootDisk = Join-Path $root $RootDisk
 if (Test-Path -LiteralPath $rootDisk) { $arguments += @("-drive", "file=$rootDisk,format=raw,if=ide,index=1") }
 $quoted = $arguments | ForEach-Object { if ($_ -match "\s") { '"' + $_ + '"' } else { $_ } }
 $start = [System.Diagnostics.ProcessStartInfo]::new()

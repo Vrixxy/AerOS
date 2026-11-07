@@ -1,0 +1,118 @@
+diff -ru a/platform/x11/cog-platform-x11.c b/platform/x11/cog-platform-x11.c
+--- a/platform/x11/cog-platform-x11.c
++++ b/platform/x11/cog-platform-x11.c
+@@ -10,6 +10,8 @@
+ #include <assert.h>
+ #include <stdlib.h>
+ #include <stdint.h>
++#include <string.h>
++#include <wayland-server.h>
+ #include <wpe/webkit.h>
+ #include <wpe/fdo.h>
+ #include <wpe/fdo-egl.h>
+@@ -118,6 +120,17 @@
+ 
+         struct wpe_fdo_egl_exported_image *image;
+     } wpe;
++
++    /* Without a GPU the web process hands over shared-memory frames; the
++     * last one is kept to repaint the window on Expose. */
++    struct {
++        xcb_gcontext_t gc;
++        uint8_t depth;
++        uint8_t *pixels;
++        int32_t width;
++        int32_t height;
++        int32_t stride;
++    } shm;
+ };
+ 
+ static struct CogX11Display *s_display = NULL;
+@@ -150,8 +163,37 @@
+ }
+ 
+ static void
++xcb_put_shm_pixels(void)
++{
++    xcb_connection_t *connection = s_display->xcb.connection;
++    if (!s_window->shm.gc) {
++        s_window->shm.gc = xcb_generate_id(connection);
++        xcb_create_gc(connection, s_window->shm.gc, s_window->xcb.window, 0, NULL);
++        xcb_get_geometry_reply_t *geometry =
++            xcb_get_geometry_reply(connection, xcb_get_geometry(connection, s_window->xcb.window), NULL);
++        s_window->shm.depth = geometry ? geometry->depth : 24;
++        free(geometry);
++    }
++    uint32_t room = xcb_get_maximum_request_length(connection) * 4 - 64;
++    int32_t rows = MAX(1, (int32_t) (room / s_window->shm.stride));
++    for (int32_t y = 0; y < s_window->shm.height; y += rows) {
++        int32_t count = MIN(rows, s_window->shm.height - y);
++        xcb_put_image(connection, XCB_IMAGE_FORMAT_Z_PIXMAP, s_window->xcb.window, s_window->shm.gc,
++                      s_window->shm.stride / 4, count, 0, y, 0, s_window->shm.depth, count * s_window->shm.stride,
++                      s_window->shm.pixels + (size_t) y * s_window->shm.stride);
++    }
++    xcb_flush(connection);
++}
++
++static void
+ xcb_paint_image (struct wpe_fdo_egl_exported_image *image)
+ {
++    if (image == NULL && s_window->shm.pixels) {
++        s_window->xcb.needs_repaint = false;
++        xcb_put_shm_pixels();
++        return;
++    }
++
+     eglMakeCurrent (s_display->egl.display, s_window->egl.surface, s_window->egl.surface, s_display->egl.context);
+ 
+     glViewport (0, 0, s_window->xcb.width, s_window->xcb.height);
+@@ -384,6 +426,30 @@
+ }
+ 
+ static void
++on_export_shm_buffer(void *data, struct wpe_fdo_shm_exported_buffer *buffer)
++{
++    struct wl_shm_buffer *shm_buffer = wpe_fdo_shm_exported_buffer_get_shm_buffer(buffer);
++    int32_t width = wl_shm_buffer_get_width(shm_buffer);
++    int32_t height = wl_shm_buffer_get_height(shm_buffer);
++    int32_t stride = wl_shm_buffer_get_stride(shm_buffer);
++    if (s_window->shm.height != height || s_window->shm.stride != stride) {
++        g_free(s_window->shm.pixels);
++        s_window->shm.pixels = g_malloc((size_t) stride * height);
++    }
++    s_window->shm.width = width;
++    s_window->shm.height = height;
++    s_window->shm.stride = stride;
++
++    wl_shm_buffer_begin_access(shm_buffer);
++    memcpy(s_window->shm.pixels, wl_shm_buffer_get_data(shm_buffer), (size_t) stride * height);
++    wl_shm_buffer_end_access(shm_buffer);
++    wpe_view_backend_exportable_fdo_egl_dispatch_release_shm_exported_buffer(s_window->wpe.exportable, buffer);
++
++    xcb_put_shm_pixels();
++    wpe_view_backend_exportable_fdo_dispatch_frame_complete(s_window->wpe.exportable);
++}
++
++static void
+ xcb_process_events (void)
+ {
+     bool repaint_needed = false;
+@@ -847,6 +913,7 @@
+ {
+     static struct wpe_view_backend_exportable_fdo_egl_client exportable_egl_client = {
+         .export_fdo_egl_image = on_export_fdo_egl_image,
++        .export_shm_buffer = on_export_shm_buffer,
+     };
+ 
+     s_window->wpe.exportable =
+diff -ru a/platform/x11/meson.build b/platform/x11/meson.build
+--- a/platform/x11/meson.build
++++ b/platform/x11/meson.build
+@@ -8,6 +8,7 @@
+         dependency('xcb'),
+         dependency('xkbcommon-x11'),
+         dependency('x11-xcb'),
++        dependency('wayland-server'),
+     ],
+     gnu_symbol_visibility: 'hidden',
+     install_dir: plugin_path,

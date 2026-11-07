@@ -200,12 +200,56 @@ pub fn write_boot_sector(lba: u64, source: &[u8; 512]) -> bool {
     }
 }
 
+/// Writes `sectors` sectors from physical memory at `source` to the boot
+/// disk (the Linux guest's data area inside its ROOTFS file).
+#[cfg_attr(not(feature = "linux-guest"), allow(dead_code))]
+pub fn write_from(lba: u64, sectors: u32, source: u64) -> bool {
+    match backend() {
+        Backend::Ahci => ahci::write_disk(ahci::boot_disk(), lba, sectors, source),
+        Backend::Nvme if nvme::max_sectors() > 0 => {
+            let step = nvme::max_sectors();
+            let mut done = 0u32;
+            while done < sectors {
+                let count = (sectors - done).min(step);
+                if !nvme::write_phys(lba + done as u64, count, source + done as u64 * 512) {
+                    return false;
+                }
+                done += count;
+            }
+            true
+        }
+        _ => (0..sectors).all(|index| {
+            let mut sector = [0u8; 512];
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (source as usize + index as usize * 512) as *const u8,
+                    sector.as_mut_ptr(),
+                    512,
+                );
+            }
+            write_boot_sector(lba + index as u64, &sector)
+        }),
+    }
+}
+
 /// Reads `sectors` sectors starting at `lba` into physical memory at
 /// `destination` (the kernel identity-maps RAM).
 pub fn read_into(lba: u64, sectors: u32, destination: u64) -> bool {
     let backend = backend();
     if backend == Backend::Ahci {
         return ahci::read_into(lba, sectors, destination);
+    }
+    if backend == Backend::Nvme && nvme::max_sectors() > 0 {
+        let step = nvme::max_sectors();
+        let mut done = 0u32;
+        while done < sectors {
+            let count = (sectors - done).min(step);
+            if !nvme::read_phys(lba + done as u64, count, destination + done as u64 * 512) {
+                return false;
+            }
+            done += count;
+        }
+        return true;
     }
     let mut chunk = [0u8; 512 * 8];
     let mut done = 0u32;

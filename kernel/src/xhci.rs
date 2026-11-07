@@ -918,7 +918,9 @@ pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> XhciReport
             *byte = (index as u8).wrapping_mul(37).wrapping_add(11);
         }
         let mut readback = [0u8; 4096];
-        report.disk_write = report.disk_sectors > 16
+        // Only the test image (signature above) is written, never a real stick.
+        report.disk_write = report.disk_read
+            && report.disk_sectors > 16
             && storage_write(8, 8, &pattern)
             && storage_read(8, 8, &mut readback)
             && readback == pattern;

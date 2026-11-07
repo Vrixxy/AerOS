@@ -1,6 +1,6 @@
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::framebuffer::{FrameBufferInfo, PixelFormat};
 use crate::memory::BootMemoryMap;
@@ -12,6 +12,22 @@ const SUCCESS: Status = 0;
 const SYSTEM_TABLE_SIGNATURE: u64 = 0x5453_5953_2049_4249;
 const MAP_CAPACITY: usize = 256 * 1024;
 const EXIT_ATTEMPTS: usize = 8;
+
+const LOADED_IMAGE_GUID: Guid = Guid::new(
+    0x5b1b31a1,
+    0x9562,
+    0x11d2,
+    [0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+);
+const DEVICE_PATH_GUID: Guid = Guid::new(
+    0x09576e91,
+    0x6d3f,
+    0x11d2,
+    [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+);
+/// First LBA of the partition the firmware loaded this image from (0 = not
+/// known), so AerOS uses its own volume on a disk shared with Windows.
+static BOOT_PARTITION_START: AtomicU64 = AtomicU64::new(0);
 
 static GOP_GUID: Guid = Guid::new(
     0x9042a9de,
@@ -251,6 +267,7 @@ pub unsafe fn take_control(
         return Err(failure(BootStage::BootServices, 2));
     }
     let framebuffer = unsafe { locate_framebuffer(services) }?;
+    unsafe { record_boot_partition(services, image) };
     let rsdp = unsafe { find_rsdp(system_table) };
     let mut ap_trampoline = 0x000f_f000u64;
     let trampoline_status = unsafe { ((*services).allocate_pages)(1, 2, 1, &mut ap_trampoline) };
@@ -310,6 +327,49 @@ pub unsafe fn take_control(
         stage: BootStage::ExitBootServices,
         status: last_exit_status,
     })
+}
+
+pub fn boot_partition_start() -> Option<u64> {
+    match BOOT_PARTITION_START.load(Ordering::Acquire) {
+        0 => None,
+        start => Some(start),
+    }
+}
+
+/// Finds the hard-drive node of the loaded image's device path.
+unsafe fn record_boot_partition(services: *mut BootServices, image: Handle) {
+    type HandleProtocol =
+        unsafe extern "efiapi" fn(Handle, *const Guid, *mut *mut c_void) -> Status;
+    let handle_protocol: HandleProtocol =
+        unsafe { core::mem::transmute::<usize, HandleProtocol>((*services).handle_protocol) };
+    let mut loaded: *mut c_void = core::ptr::null_mut();
+    if unsafe { handle_protocol(image, &LOADED_IMAGE_GUID, &mut loaded) } != SUCCESS
+        || loaded.is_null()
+    {
+        return;
+    }
+    let device = unsafe { core::ptr::read_unaligned(loaded.cast::<u8>().add(24).cast::<Handle>()) };
+    let mut path: *mut c_void = core::ptr::null_mut();
+    if device.is_null()
+        || unsafe { handle_protocol(device, &DEVICE_PATH_GUID, &mut path) } != SUCCESS
+        || path.is_null()
+    {
+        return;
+    }
+    let mut node = path.cast::<u8>();
+    for _ in 0..32 {
+        let (kind, subtype) = unsafe { (*node, *node.add(1)) };
+        let length = unsafe { core::ptr::read_unaligned(node.add(2).cast::<u16>()) } as usize;
+        if kind == 0x7f && subtype == 0xff || length < 4 {
+            return;
+        }
+        if kind == 4 && subtype == 1 && length >= 42 {
+            let start = unsafe { core::ptr::read_unaligned(node.add(8).cast::<u64>()) };
+            BOOT_PARTITION_START.store(start, Ordering::Release);
+            return;
+        }
+        node = unsafe { node.add(length) };
+    }
 }
 
 unsafe fn locate_framebuffer(services: *mut BootServices) -> Result<FrameBufferInfo, BootError> {
