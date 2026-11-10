@@ -19,6 +19,8 @@ linux-headless = ["linux-guest"]
 # Two virtual CPUs (local APIC, MP table, INIT/SIPI) instead of the
 # single-CPU guest that runs with the local APIC and SMP switched off.
 linux-smp = ["linux-guest"]
+# Linux drivers through the adapter in kernel/linux (needs Zig; see build.rs).
+linux-drivers = []
 
 [[bin]]
 name = "aeros-kernel"

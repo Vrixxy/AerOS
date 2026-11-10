@@ -32,6 +32,8 @@ mod shellui;
 mod switcher;
 #[path = "desktop_vt.rs"]
 mod vt;
+#[path = "desktop_wallpaper.rs"]
+mod wallpaper;
 
 /// The Terminal's screen emulator on its own (`desktop_vt.rs`).
 #[cfg(feature = "boot-test")]
@@ -1051,6 +1053,9 @@ struct DesktopState {
     power_action: shellui::PowerAction,
     power_action_at_ns: u64,
     menu_open: bool,
+    bg_open: bool,
+    bg_pick_file: bool,
+    bg_failed: bool,
     menu_at_ns: u64,
     menu_focus: usize,
     parcel_open: bool,
@@ -1293,6 +1298,9 @@ impl DesktopState {
             power_action: shellui::PowerAction::None,
             power_action_at_ns: 0,
             menu_open: false,
+            bg_open: false,
+            bg_pick_file: false,
+            bg_failed: false,
             menu_at_ns: 0,
             menu_focus: 0,
             parcel_open: false,
@@ -1412,6 +1420,9 @@ impl DesktopState {
     fn set_app(&mut self, target: DesktopApp) {
         if target != self.app {
             MAXIMIZED_APP.store(0, Ordering::Relaxed);
+        }
+        if target != DesktopApp::Files {
+            self.bg_pick_file = false;
         }
         if target != DesktopApp::None && self.app != target {
             let now = crate::time::monotonic_nanoseconds();
@@ -1601,6 +1612,9 @@ impl DesktopState {
             return action;
         }
         if self.screen == Screen::Desktop {
+            if let Some(action) = self.backgrounds_key(key) {
+                return action;
+            }
             if let Some(action) = self.search_key(key) {
                 return action;
             }
@@ -2141,6 +2155,9 @@ impl DesktopState {
             return action;
         }
         if self.screen == Screen::Desktop {
+            if let Some(action) = self.backgrounds_click(point) {
+                return action;
+            }
             if let Some(action) = self.switcher_click(point) {
                 return action;
             }
@@ -4254,6 +4271,7 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
     #[cfg(not(feature = "boot-test"))]
     {
         state.persist_account = true;
+        wallpaper::load_choice();
         if state.load_account() {
             state.screen = Screen::Lock;
         }
@@ -5200,6 +5218,8 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
         }
         crate::audio::pump();
         crate::xhci::poll();
+        #[cfg(feature = "linux-drivers")]
+        crate::linux::poll();
         crate::datafs::poll();
         crate::ntp::tick(crate::time::monotonic_nanoseconds());
         crate::keymap::sync_guest();
@@ -5208,6 +5228,9 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
             redraw = true;
         }
         motion_animating = motion_animating_now;
+        if crate::mouse::ready() && live_wallpaper_tick(frame, &mut state) {
+            redraw = true;
+        }
         if matches!(
             state.screen,
             Screen::Keyboard | Screen::Username | Screen::Password | Screen::Confirm
@@ -6520,6 +6543,15 @@ fn present_desktop_mode(
 
 fn draw_desktop(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &DesktopState) -> bool {
     let now = crate::time::monotonic_nanoseconds();
+    if state.screen == Screen::Desktop && state.bg_open {
+        draw_wallpaper(frame, None);
+        if let Some(ui_font) = fonts.ui() {
+            let layout = Layout::new(frame);
+            let mut painter = Painter::new(frame);
+            wallpaper::draw_backgrounds(&mut painter, layout, ui_font, state);
+        }
+        return wallpaper_valid();
+    }
     let acting = state.power_action != shellui::PowerAction::None;
     let covered = acting
         && now.saturating_sub(state.power_action_at_ns) >= 560_000_000
@@ -10951,8 +10983,8 @@ fn dock_style() -> FrostStyle {
         border_width: 1,
         inner_highlight: Rgba::new(255, 255, 255, 34),
         inner_shadow: Rgba::new(0, 0, 0, 64),
-        inner_shadow_offset: Point::new(0, 4),
-        inner_shadow_softness: 4,
+        inner_shadow_offset: Point::new(5, 5),
+        inner_shadow_softness: 6,
         shadow: Rgba::transparent(),
         shadow_offset: Point::new(0, 0),
         shadow_spread: 0,
@@ -11015,8 +11047,11 @@ fn draw_wallpaper(frame: &mut FrameBuffer, region: Option<Rect>) {
     let info = frame.info();
     let required = info.stride.saturating_mul(info.height);
     if required <= screen_capacity() {
-        let key =
-            ((info.width as u64) << 40) ^ ((info.height as u64) << 20) ^ info.stride as u64 ^ 1;
+        let key = ((info.width as u64) << 40)
+            ^ ((info.height as u64) << 20)
+            ^ info.stride as u64
+            ^ (wallpaper::frame_generation() << 52)
+            ^ 1;
         let cache = wallpaper_buffer();
         let was_cached = WALLPAPER_CACHE_KEY.load(Ordering::Acquire) == key;
         if !was_cached {
@@ -11044,24 +11079,252 @@ fn draw_wallpaper(frame: &mut FrameBuffer, region: Option<Rect>) {
 
 fn render_wallpaper_into(frame: &FrameBuffer, cache: &mut [u32]) {
     let info = frame.info();
+    let source = wallpaper::source();
     let (start_x, start_y, visible_width, visible_height, width_divisor, height_divisor) =
-        wallpaper_projection(info.width, info.height);
+        wallpaper_projection(&source, info.width, info.height);
+    if let (Some(warp), wallpaper::Source::Picture(rgba, width, height)) =
+        (wallpaper::warp(&source), &source)
+        && info.width / LIVE_STEP + 2 <= wallpaper::LIVE_COLUMNS
+    {
+        let (picture, halved) = match wallpaper::half_picture() {
+            Some(half) => (half, true),
+            None => ((*rgba, *width, *height), false),
+        };
+        render_live_wallpaper(
+            frame,
+            cache,
+            warp,
+            picture,
+            halved,
+            (
+                start_x,
+                start_y,
+                visible_width,
+                visible_height,
+                width_divisor,
+                height_divisor,
+            ),
+        );
+        return;
+    }
     for y in 0..info.height {
         let source_y = start_y + visible_height * y as u64 / height_divisor;
         let row = y * info.stride;
         for x in 0..info.width {
             let source_x = start_x + visible_width * x as u64 / width_divisor;
             let index = row + x;
-            if index < cache.len() {
-                cache[index] = frame.pack_color(sample_wallpaper(source_x, source_y));
+            if index >= cache.len() {
+                continue;
             }
+            cache[index] = frame.pack_color(sample_wallpaper(&source, source_x, source_y));
         }
     }
 }
 
-fn wallpaper_projection(width: usize, height: usize) -> (u64, u64, u64, u64, u64, u64) {
-    let source_width = WALLPAPER_WIDTH as u64;
-    let source_height = WALLPAPER_HEIGHT as u64;
+const LIVE_STEP: usize = 8;
+const LIVE_SHIFT: u32 = LIVE_STEP.trailing_zeros();
+
+/// The live Silk wallpaper. The warp is worked out every `LIVE_STEP` pixels
+/// and interpolated between; the picture is sampled at every other pixel of
+/// every other row and smoothly doubled (Silk has no sharp detail to lose).
+fn render_live_wallpaper(
+    frame: &FrameBuffer,
+    cache: &mut [u32],
+    warp: wallpaper::Warp,
+    (rgba, picture_width, picture_height): (&[u8], usize, usize),
+    halved: bool,
+    projection: (u64, u64, u64, u64, u64, u64),
+) {
+    let place = |value: i64| {
+        if halved {
+            ((value - 32_768) >> 1).max(0) as u64
+        } else {
+            value.max(0) as u64
+        }
+    };
+    let (start_x, start_y, visible_width, visible_height, width_divisor, height_divisor) =
+        projection;
+    let info = frame.info();
+    let (width, height, stride) = (info.width, info.height, info.stride);
+    if height == 0 || (height - 1) * stride + width > cache.len() {
+        return;
+    }
+    let columns = width / LIVE_STEP + 2;
+    let half_width = width.div_ceil(2);
+    let rows = wallpaper::live_rows();
+    let (top, rest) = rows.split_at_mut(wallpaper::LIVE_COLUMNS);
+    let (bottom, line) = rest.split_at_mut(wallpaper::LIVE_COLUMNS);
+    let (mut previous, mut current) = {
+        let halves = wallpaper::live_half();
+        let (a, b) = halves.split_at_mut(wallpaper::LIVE_HALF);
+        (a, b)
+    };
+    let evaluate = |out: &mut [[i64; 3]], y: usize| {
+        let source_y = start_y + visible_height * y as u64 / height_divisor;
+        for (column, slot) in out.iter_mut().enumerate().take(columns) {
+            let source_x = start_x + visible_width * (column * LIVE_STEP) as u64 / width_divisor;
+            let (x, y, light) = warp.apply(source_x, source_y);
+            *slot = [x as i64, y as i64, (light as i64) << 16];
+        }
+    };
+    let mut written = 0;
+    let mut block_top = 0;
+    while block_top < height {
+        evaluate(top, block_top);
+        evaluate(bottom, block_top + LIVE_STEP);
+        let mut y = block_top;
+        while y < (block_top + LIVE_STEP).min(height) {
+            let t = (y - block_top) as i64;
+            for column in 0..columns {
+                for k in 0..3 {
+                    line[column][k] =
+                        top[column][k] + (((bottom[column][k] - top[column][k]) * t) >> LIVE_SHIFT);
+                }
+            }
+            for (half, slot) in current.iter_mut().enumerate().take(half_width) {
+                let x = half * 2;
+                let (left, right) = (line[x >> LIVE_SHIFT], line[(x >> LIVE_SHIFT) + 1]);
+                let u = (x & (LIVE_STEP - 1)) as i64;
+                let at = |k: usize| left[k] + (((right[k] - left[k]) * u) >> LIVE_SHIFT);
+                let packed = sample_rgba(
+                    rgba,
+                    picture_width,
+                    picture_height,
+                    place(at(0)),
+                    place(at(1)),
+                );
+                let light = (at(2) >> 16).clamp(0, 255) as u32;
+                let lift = |shift: u32| (((packed >> shift) & 0xff) + light).min(255) << shift;
+                *slot = lift(0) | lift(8) | lift(16);
+            }
+            current[half_width] = current[half_width - 1];
+            live_row(
+                frame,
+                &mut cache[y * stride..y * stride + width],
+                current,
+                None,
+            );
+            if y > 0 {
+                let row = (y - 1) * stride;
+                live_row(frame, &mut cache[row..row + width], previous, Some(current));
+            }
+            written = y;
+            core::mem::swap(&mut previous, &mut current);
+            y += 2;
+        }
+        block_top += LIVE_STEP;
+    }
+    if written + 1 < height {
+        let row = (height - 1) * stride;
+        live_row(frame, &mut cache[row..row + width], previous, None);
+    }
+}
+
+/// One screen row from a half-width row of samples (or the blend of two).
+fn live_row(frame: &FrameBuffer, out: &mut [u32], first: &[u32], second: Option<&[u32]>) {
+    let average = |a: u32, b: u32| (a & b) + (((a ^ b) & 0x00fe_fefe) >> 1);
+    let at = |half: usize, odd: bool| {
+        let pick = |row: &[u32]| {
+            if odd {
+                average(row[half], row[half + 1])
+            } else {
+                row[half]
+            }
+        };
+        match second {
+            Some(other) => average(pick(first), pick(other)),
+            None => pick(first),
+        }
+    };
+    for (x, pixel) in out.iter_mut().enumerate() {
+        let value = at(x / 2, x & 1 == 1);
+        *pixel = frame.pack_color(Color::rgb(
+            value as u8,
+            (value >> 8) as u8,
+            (value >> 16) as u8,
+        ));
+    }
+}
+
+/// Bilinear sample of an RGBA picture at 16.16 coordinates, as 0x00BBGGRR.
+#[inline]
+fn sample_rgba(rgba: &[u8], width: usize, height: usize, x: u64, y: u64) -> u32 {
+    let x0 = ((x >> 16) as usize).min(width - 1);
+    let y0 = ((y >> 16) as usize).min(height - 1);
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
+    let fx = ((x >> 8) & 0xff) as u32;
+    let fy = ((y >> 8) & 0xff) as u32;
+    let pixel = |x: usize, y: usize| {
+        let at = (y * width + x) * 4;
+        match rgba.get(at..at + 3) {
+            Some(bytes) => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]),
+            None => 0,
+        }
+    };
+    let mix = |a: u32, b: u32, f: u32| {
+        let inverse = 256 - f;
+        let red_blue = (((a & 0xff_00ff) * inverse + (b & 0xff_00ff) * f) >> 8) & 0xff_00ff;
+        let green = (((a & 0xff00) * inverse + (b & 0xff00) * f) >> 8) & 0xff00;
+        red_blue | green
+    };
+    let top = mix(pixel(x0, y0), pixel(x1, y0), fx);
+    let bottom = mix(pixel(x0, y1), pixel(x1, y1), fx);
+    mix(top, bottom, fy)
+}
+
+/// Moves the live Silk wallpaper on towards the pointer. True when it moved
+/// and the desktop needs presenting again.
+fn live_wallpaper_tick(frame: &FrameBuffer, state: &mut DesktopState) -> bool {
+    let source = wallpaper::source();
+    let wallpaper::Source::Picture(_, _, picture_height) = source else {
+        return false;
+    };
+    let info = frame.info();
+    let (width, height) = (info.width.max(1) as i64, info.height.max(1) as i64);
+    let pointer = crate::mouse::state();
+    let (px, py) = (
+        (pointer.x as i64).clamp(0, width - 1),
+        (pointer.y as i64).clamp(0, height - 1),
+    );
+    let (start_x, start_y, visible_width, visible_height, width_divisor, height_divisor) =
+        wallpaper_projection(&source, info.width, info.height);
+    let mouse = (
+        (start_x + visible_width * px as u64 / width_divisor) as i64,
+        (start_y + visible_height * py as u64 / height_divisor) as i64,
+    );
+    let par = (
+        ((px << 17) / width) - 65_536,
+        ((py << 17) / height) - 65_536,
+    );
+    let active = state.screen == Screen::Desktop
+        && state.app == DesktopApp::None
+        && state.overlay == Overlay::None
+        && !state.bg_open
+        && wallpaper::current() < wallpaper::VALLEY;
+    let now = crate::time::monotonic_nanoseconds();
+    let moved = wallpaper::live_step(active, mouse, par, now, picture_height as i64);
+    if moved {
+        state.motion_until_ns = state.motion_until_ns.max(now + 120_000_000);
+    }
+    moved
+}
+
+fn wallpaper_size(source: &wallpaper::Source) -> (usize, usize) {
+    match *source {
+        wallpaper::Source::Valley => (WALLPAPER_WIDTH, WALLPAPER_HEIGHT),
+        wallpaper::Source::Picture(_, width, height) => (width, height),
+    }
+}
+
+fn wallpaper_projection(
+    source: &wallpaper::Source,
+    width: usize,
+    height: usize,
+) -> (u64, u64, u64, u64, u64, u64) {
+    let (source_width, source_height) = wallpaper_size(source);
+    let source_width = source_width as u64;
+    let source_height = source_height as u64;
     let destination_width_u64 = width as u64;
     let destination_height_u64 = height as u64;
     let full_width = (source_width.saturating_sub(1)) << 16;
@@ -11097,26 +11360,39 @@ fn wallpaper_projection(width: usize, height: usize) -> (u64, u64, u64, u64, u64
 fn render_wallpaper_direct(frame: &mut FrameBuffer) {
     let destination_width = frame.width();
     let destination_height = frame.height();
+    let source = wallpaper::source();
     let (start_x, start_y, visible_width, visible_height, width_divisor, height_divisor) =
-        wallpaper_projection(destination_width, destination_height);
+        wallpaper_projection(&source, destination_width, destination_height);
     for y in 0..destination_height {
         let source_y = start_y + visible_height * y as u64 / height_divisor;
         for x in 0..destination_width {
             let source_x = start_x + visible_width * x as u64 / width_divisor;
-            frame.pixel(x as i32, y as i32, sample_wallpaper(source_x, source_y));
+            frame.pixel(
+                x as i32,
+                y as i32,
+                sample_wallpaper(&source, source_x, source_y),
+            );
         }
     }
 }
 
-fn sample_wallpaper(x: u64, y: u64) -> Color {
-    let x0 = ((x >> 16) as usize).min(WALLPAPER_WIDTH - 1);
-    let y0 = ((y >> 16) as usize).min(WALLPAPER_HEIGHT - 1);
-    let x1 = (x0 + 1).min(WALLPAPER_WIDTH - 1);
-    let y1 = (y0 + 1).min(WALLPAPER_HEIGHT - 1);
+fn sample_wallpaper(source: &wallpaper::Source, x: u64, y: u64) -> Color {
+    let (width, height) = wallpaper_size(source);
+    let x0 = ((x >> 16) as usize).min(width - 1);
+    let y0 = ((y >> 16) as usize).min(height - 1);
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
     let fx = (x & 0xffff) as u32;
     let fy = (y & 0xffff) as u32;
-    let top = blend_color(source_color(x0, y0), source_color(x1, y0), fx);
-    let bottom = blend_color(source_color(x0, y1), source_color(x1, y1), fx);
+    let pick = |x: usize, y: usize| match *source {
+        wallpaper::Source::Valley => source_color(x, y),
+        wallpaper::Source::Picture(rgba, width, _) => {
+            let at = (y * width + x) * 4;
+            Color::rgb(rgba[at], rgba[at + 1], rgba[at + 2])
+        }
+    };
+    let top = blend_color(pick(x0, y0), pick(x1, y0), fx);
+    let bottom = blend_color(pick(x0, y1), pick(x1, y1), fx);
     blend_color(top, bottom, fy)
 }
 
@@ -11140,6 +11416,9 @@ fn source_color(x: usize, y: usize) -> Color {
 }
 
 fn wallpaper_valid() -> bool {
+    if let wallpaper::Source::Picture(rgba, width, height) = wallpaper::source() {
+        return rgba.len() >= width * height * 4;
+    }
     WALLPAPER.len() == WALLPAPER_WIDTH * WALLPAPER_HEIGHT * 2
         && source_color(0, 0) != source_color(0, WALLPAPER_HEIGHT - 1)
         && source_color(WALLPAPER_WIDTH / 2, 0)
@@ -12614,6 +12893,7 @@ fn dock_cache_key(layout: Layout, region: Rect) -> u64 {
     mix(layout.offset.x as u64);
     mix(layout.offset.y as u64);
     mix(wallpaper_valid() as u64);
+    mix(wallpaper::generation());
     key | 1
 }
 

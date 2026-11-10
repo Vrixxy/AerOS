@@ -54,6 +54,9 @@ impl DesktopState {
         };
         if row.is_dir {
             self.files_navigate(row.name_str());
+        } else if self.bg_pick_file && wallpaper::is_picture(row.name_str()) {
+            let path = self.files_child_path(row.name_str());
+            self.background_from_file(path.as_str());
         } else {
             self.files_open_text(row.name_str());
         }

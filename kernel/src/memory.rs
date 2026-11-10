@@ -706,7 +706,7 @@ impl PageBuffer {
         self.bytes
     }
 
-    #[cfg(feature = "boot-test")]
+    #[cfg(any(feature = "boot-test", feature = "linux-drivers"))]
     pub fn physical(&self) -> u64 {
         self.address
     }
@@ -719,6 +719,27 @@ impl PageBuffer {
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: owned, allocated pages.
         unsafe { core::slice::from_raw_parts_mut(self.address as usize as *mut u8, self.bytes) }
+    }
+}
+
+#[cfg(feature = "linux-drivers")]
+impl PageBuffer {
+    /// Gives up ownership without freeing; `from_raw` takes it back.
+    pub fn into_raw(self) -> (u64, u64, bool) {
+        let parts = (self.address, self.pages, self.from_primary);
+        core::mem::forget(self);
+        parts
+    }
+
+    /// # Safety
+    /// The parts must come from one `into_raw` and be used only once.
+    pub unsafe fn from_raw(address: u64, pages: u64, from_primary: bool) -> Self {
+        Self {
+            address,
+            pages,
+            bytes: (pages * PAGE_SIZE) as usize,
+            from_primary,
+        }
     }
 }
 

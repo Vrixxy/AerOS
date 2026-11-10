@@ -21,6 +21,13 @@ namespace AerOSSetup
                     return WritePlan(args[1], args.Skip(2).ToArray());
                 if (args.Length >= 3 && args[0] == "--silent")
                     return Silent(args[1], long.Parse(args[2]) * Engine.GiB, args.Contains("--reboot"), args.Contains("--uninstall"));
+                if (args.Contains("--preview"))
+                {
+                    // The install screens with every change skipped (no administrator rights needed).
+                    Engine.DryRun = true;
+                    Application.Run(new SetupForm(SetupForm.Mode.Install, args.SkipWhile(a => a != "--preview").Skip(1).FirstOrDefault()));
+                    return 0;
+                }
                 bool restart = args.Contains("--restart");
                 bool uninstall = args.Contains("--uninstall");
                 if (!Engine.IsElevated())

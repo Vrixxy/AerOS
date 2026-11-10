@@ -153,15 +153,12 @@ pub(super) fn draw_search(
     );
     pill.y = pill.y.max(-30);
     let mut style = setup_field_style();
-    style.tint = Rgba::new(210, 226, 236, 70);
-    style.border = Rgba::new(255, 255, 255, 150);
+    style.tint = Rgba::new(0, 0, 0, 51);
+    style.border = Rgba::new(0, 0, 0, 255);
+    style.border_width = 1;
+    style.inner_highlight = Rgba::new(255, 255, 255, 30);
     let radii = CornerRadii::all(pill.height / 2);
     let _ = frost_mode(painter, layout, pill, radii, style, 0xae72_0001, true);
-    painter.fill_rounded_rect(
-        layout.rect(pill),
-        layout.radii(radii),
-        Rgba::new(255, 255, 255, 46),
-    );
     let mut line = ClockBuffer::new();
     let query = core::str::from_utf8(&state.search_input[..state.search_len]).unwrap_or("");
     if state.search_len == 0 {
@@ -181,9 +178,9 @@ pub(super) fn draw_search(
         line.as_str(),
         18,
         if state.search_len == 0 {
-            Color::rgb(46, 60, 72)
+            Color::rgb(232, 232, 236)
         } else {
-            Color::rgb(14, 20, 26)
+            Color::rgb(255, 255, 255)
         },
     );
     let since_typed = now.saturating_sub(state.search_typed_ns);

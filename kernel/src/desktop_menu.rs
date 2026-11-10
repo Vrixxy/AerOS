@@ -12,8 +12,9 @@ pub(super) const GEAR: Rect = Rect::new(DESIGN_WIDTH - 44, 2, 42, 40);
 const GEAR_ART: Rect = Rect::new(712, 6, 28, 28);
 
 pub(super) const MENU_PANEL: Rect = Rect::new(21, 35, 113, 147);
-const MENU_ROWS: [(&str, bool); 8] = [
+const MENU_ROWS: [(&str, bool); 9] = [
     ("Parcel", false),
+    ("Change Background", false),
     ("Settings", true),
     ("Store", false),
     ("Recent Apps", true),
@@ -28,15 +29,16 @@ const PEOPLE: usize = 4;
 const UPLOAD_SLOT: usize = PEOPLE;
 
 /// Each row's top and height, from the Figma menu.
-const MENU_ROW_SPANS: [(i32, i32); 8] = [
+const MENU_ROW_SPANS: [(i32, i32); 9] = [
     (45, 14),
-    (64, 14),
-    (78, 14),
-    (96, 14),
-    (114, 14),
-    (132, 12),
-    (144, 11),
-    (155, 13),
+    (63, 13),
+    (79, 13),
+    (92, 13),
+    (107, 13),
+    (123, 13),
+    (139, 12),
+    (152, 12),
+    (165, 12),
 ];
 
 fn menu_row(index: usize) -> Rect {
@@ -129,20 +131,21 @@ impl DesktopState {
         self.menu_open = false;
         match index {
             0 => self.open_parcel(),
-            1 => {
+            1 => self.open_backgrounds(),
+            2 => {
                 self.set_overlay(Overlay::None);
                 self.set_app(DesktopApp::Settings);
             }
-            2 => {
+            3 => {
                 self.set_overlay(Overlay::None);
                 self.open_store();
             }
-            3 => {
+            4 => {
                 self.switcher_step(false);
             }
-            4 => self.quit_all_apps(),
-            5 => self.start_power_action(shellui::PowerAction::Shutdown),
-            6 => self.start_power_action(shellui::PowerAction::Restart),
+            5 => self.quit_all_apps(),
+            6 => self.start_power_action(shellui::PowerAction::Shutdown),
+            7 => self.start_power_action(shellui::PowerAction::Restart),
             _ => self.start_power_action(shellui::PowerAction::Sleep),
         }
     }
@@ -265,15 +268,32 @@ pub(super) fn draw_corners(painter: &mut Painter<'_>, layout: Layout, state: &De
         },
     );
 }
+/// The menu's dark glass: the wallpaper frosted under a 10% white fill.
 fn panel_glass(painter: &mut Painter<'_>, layout: Layout, panel: Rect, radius: i32) {
-    let radii = layout.radii(CornerRadii::all(radius));
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(panel.x, panel.y + 4, panel.width, panel.height)),
-        radii,
-        Rgba::new(0, 0, 0, 40),
+    let _ = frost(
+        painter,
+        layout,
+        panel,
+        CornerRadii::all(radius),
+        FrostStyle {
+            blur_radius: 14,
+            saturation_percent: 100,
+            brightness_percent: 100,
+            tint: Rgba::new(255, 255, 255, 26),
+            border: Rgba::new(255, 255, 255, 64),
+            border_width: 1,
+            inner_highlight: Rgba::new(255, 255, 255, 30),
+            inner_shadow: Rgba::transparent(),
+            inner_shadow_offset: Point::new(0, 0),
+            inner_shadow_softness: 0,
+            shadow: Rgba::new(0, 0, 0, 50),
+            shadow_offset: Point::new(0, 4),
+            shadow_spread: 0,
+            shadow_softness: 8,
+            noise_alpha: 3,
+        },
+        0x3e_0001,
     );
-    painter.fill_rounded_rect(layout.rect(panel), radii, Rgba::new(150, 180, 188, 214));
-    painter.stroke_rounded_rect(layout.rect(panel), radii, 1, Rgba::new(20, 30, 34, 150));
 }
 
 pub(super) fn draw_menu(
@@ -293,12 +313,12 @@ pub(super) fn draw_menu(
         painter,
         layout,
         Rect::new(MENU_PANEL.x, MENU_PANEL.y, width, height),
-        14,
+        18,
     );
     if pop < 800 {
         return;
     }
-    let dark = Color::rgb(16, 22, 26);
+    let ink = Color::rgb(255, 255, 255);
     for (index, (label, gap)) in MENU_ROWS.iter().enumerate() {
         let row = menu_row(index);
         let focused = state.menu_focus == index;
@@ -306,7 +326,7 @@ pub(super) fn draw_menu(
             painter.fill_rounded_rect(
                 layout.rect(Rect::new(32, row.y - 2, 86, 1)),
                 layout.radii(CornerRadii::all(0)),
-                Rgba::new(20, 30, 34, 130),
+                Rgba::new(255, 255, 255, 110),
             );
         }
         if index == 0 {
@@ -319,7 +339,7 @@ pub(super) fn draw_menu(
             painter.fill_rounded_rect(
                 layout.rect(row),
                 layout.radii(CornerRadii::all(row.height / 2)),
-                Rgba::new(255, 255, 255, 130),
+                Rgba::new(255, 255, 255, 46),
             );
         }
         if focused {
@@ -338,13 +358,9 @@ pub(super) fn draw_menu(
             Point::new(row.x + 11, row.y + (row.height - size) / 2),
             label,
             size,
-            if index == 0 {
-                Color::rgb(255, 255, 255)
-            } else {
-                dark
-            },
+            ink,
         );
-        if index == 3 {
+        if index == 4 {
             text(
                 painter,
                 layout,
@@ -352,7 +368,7 @@ pub(super) fn draw_menu(
                 Point::new(row.right() - 12, row.y + (row.height - size) / 2),
                 ">",
                 size,
-                dark,
+                ink,
             );
         }
     }

@@ -1,0 +1,13 @@
+[package]
+name = "animated-wallpapers"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = "1.25.2"
+png = "0.18.1"
+pollster = "1.0.1"
+tray-icon = "0.26.1"
+wgpu = "24"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_Power", "Win32_System_Registry", "Win32_UI_Shell"] }
+winit = "0.30.13"

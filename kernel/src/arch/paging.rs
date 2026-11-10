@@ -355,6 +355,101 @@ pub fn kernel_range_mapped(address: u64, length: u64) -> bool {
     true
 }
 
+/// Lets the CPU run code in `start..end` of the kernel's identity map (the
+/// Linux driver module is loaded there). A 1 GiB page in the way is split
+/// into 2 MiB ones first, so only `start..end` (rounded out to 2 MiB) opens
+/// up. Returns the largest page whose no-execute bit had to be cleared (0
+/// when none was set), or None if the range isn't mapped or a split failed.
+#[cfg_attr(not(feature = "linux-drivers"), allow(dead_code))]
+pub fn make_kernel_executable(frames: &mut FrameAllocator, start: u64, end: u64) -> Option<u64> {
+    // The firmware's own table pages are read-only; lift CR0.WP meanwhile.
+    let cr0: u64;
+    // SAFETY: only the write-protect bit changes, and it is put back below.
+    unsafe {
+        asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+        asm!("mov cr0, {}", in(reg) cr0 & !CR0_WRITE_PROTECT, options(nostack, preserves_flags));
+    }
+    let opened = open_kernel_range(frames, start, end);
+    // SAFETY: restores CR0 as it was.
+    unsafe { asm!("mov cr0, {}", in(reg) cr0, options(nostack, preserves_flags)) };
+    opened
+}
+
+fn open_kernel_range(frames: &mut FrameAllocator, start: u64, end: u64) -> Option<u64> {
+    const HUGE: u64 = 1 << 7;
+    let root = read_cr3() & ADDRESS_MASK;
+    let mut largest = 0;
+    let mut address = start & !(PAGE_SIZE - 1);
+    while address < end {
+        let indices = [
+            ((address >> 39) & 0x1ff) as usize,
+            ((address >> 30) & 0x1ff) as usize,
+            ((address >> 21) & 0x1ff) as usize,
+            ((address >> 12) & 0x1ff) as usize,
+        ];
+        let mut table = root;
+        let mut step = PAGE_SIZE;
+        for (level, index) in indices.iter().enumerate() {
+            // SAFETY: page-table pages reached from CR3 are identity-mapped.
+            let slot = unsafe { (table as usize as *mut u64).add(*index) };
+            let mut entry = unsafe { core::ptr::read_volatile(slot) };
+            if entry & PRESENT == 0 {
+                return None;
+            }
+            if level == 1 && entry & HUGE != 0 && entry & NO_EXECUTE != 0 {
+                let directory = frames.allocate()?.address();
+                let gigabyte = entry & 0x000f_ffff_c000_0000;
+                let flags = entry & !0x000f_ffff_c000_0000;
+                // SAFETY: a fresh, identity-mapped frame becomes the directory
+                // that maps the same gigabyte with the same flags.
+                unsafe {
+                    for slot_index in 0..ENTRY_COUNT as u64 {
+                        core::ptr::write_volatile(
+                            (directory as usize as *mut u64).add(slot_index as usize),
+                            (gigabyte + slot_index * 0x20_0000) | flags,
+                        );
+                    }
+                    entry = directory | (entry & (PRESENT | WRITABLE | USER));
+                    core::ptr::write_volatile(slot, entry);
+                }
+            }
+            let leaf = level == 3 || (level > 0 && entry & HUGE != 0);
+            if entry & NO_EXECUTE != 0 {
+                // SAFETY: as above; only the NX bit changes.
+                unsafe { core::ptr::write_volatile(slot, entry & !NO_EXECUTE) };
+                if leaf {
+                    largest = largest.max(match level {
+                        1 => 1 << 30,
+                        2 => 1 << 21,
+                        _ => PAGE_SIZE,
+                    });
+                }
+            }
+            if leaf {
+                step = match level {
+                    1 => 1 << 30,
+                    2 => 1 << 21,
+                    _ => PAGE_SIZE,
+                };
+                break;
+            }
+            table = entry & ADDRESS_MASK;
+        }
+        address = (address & !(step - 1)).saturating_add(step);
+    }
+    // SAFETY: reloading CR3 with its own value flushes the TLB; `invlpg`
+    // also drops any global entries for the range.
+    unsafe {
+        write_cr3(read_cr3());
+        let mut page = start & !0x1f_ffff;
+        while page < end {
+            asm!("invlpg [{}]", in(reg) page, options(nostack, preserves_flags));
+            page += 0x20_0000;
+        }
+    }
+    Some(largest)
+}
+
 fn make_range_writable(root: u64, start: u64, end: u64) {
     const HUGE: u64 = 1 << 7;
     const TWO_MIB: u64 = 2 * 1024 * 1024;

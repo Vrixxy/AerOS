@@ -460,6 +460,65 @@ namespace AerOSSetup
             }
             progress(100, "AerOS has been removed");
         }
+
+        // ---- Bootable USB -----------------------------------------------------
+
+        /// USB disks that aren't holding Windows.
+        public static List<UsbDrive> UsbDrives()
+        {
+            var drives = new List<UsbDrive>();
+            string output = PowerShell(
+                "Get-Disk | Where-Object { $_.BusType -eq 'USB' -and -not $_.IsSystem -and -not $_.IsBoot } | ForEach-Object { " +
+                "'drive=' + $_.Number + '|' + $_.Size + '|' + $_.FriendlyName }", changes: false);
+            foreach (var line in output.Split('\n'))
+            {
+                if (!line.StartsWith("drive="))
+                    continue;
+                var parts = line.Substring(6).Trim().Split(new[] { '|' }, 3);
+                if (parts.Length == 3 && int.TryParse(parts[0], out int number) && long.TryParse(parts[1], out long size))
+                    drives.Add(new UsbDrive { Number = number, Size = size, Name = parts[2] });
+            }
+            return drives;
+        }
+
+        /// Erases the stick and writes AerOS to it so any UEFI PC can start it.
+        public static void MakeUsb(UsbDrive drive, Action<int, string> progress)
+        {
+            Log("usb disk " + drive.Number + " " + drive.Name + " " + drive.Size);
+            progress(3, "Erasing " + drive.Name);
+            long size = Math.Min(drive.Size - 4 * MiB, 32 * GiB) / MiB * MiB;
+            var fields = Fields(PowerShell(
+                "$d = Get-Disk -Number " + drive.Number + "; if ($d.BusType -ne 'USB' -or $d.IsSystem -or $d.IsBoot) { throw 'not a USB stick' }; " +
+                "if ($d.PartitionStyle -ne 'RAW') { Clear-Disk -Number " + drive.Number + " -RemoveData -RemoveOEM -Confirm:$false }; " +
+                "Initialize-Disk -Number " + drive.Number + " -PartitionStyle GPT; " +
+                "$p = New-Partition -DiskNumber " + drive.Number + " -Size " + size + " -GptType '" + BasicDataGuid + "' -AssignDriveLetter; " +
+                "Format-Volume -Partition $p -FileSystem FAT32 -NewFileSystemLabel AEROS -Confirm:$false -Force | Out-Null; " +
+                "$p = Get-Partition -DiskNumber " + drive.Number + " -PartitionNumber $p.PartitionNumber; 'letter=' + $p.DriveLetter"));
+            string letter = DryRun ? "U" : fields.TryGetValue("letter", out var found) ? found : "";
+            if (string.IsNullOrEmpty(letter))
+                throw new SetupException("Windows didn't give the USB stick a drive letter.");
+
+            progress(12, "Copying AerOS");
+            if (DryRun)
+                Plan.Add("extract the AerOS files to " + letter + ":\\");
+            else
+                Payload.Extract(letter + ":\\", (done, total, name) =>
+                    progress(12 + (int)(78 * done / Math.Max(1, total)), "Copying AerOS (" + Gb(done) + " of " + Gb(total) + ")"));
+
+            progress(92, "Making room for your files");
+            if (DryRun)
+                Plan.Add("create " + letter + ":\\HOME");
+            else
+                CreateHome(letter + ":\\");
+            progress(100, "Your AerOS USB stick is ready");
+        }
+    }
+
+    sealed class UsbDrive
+    {
+        public int Number;
+        public long Size;
+        public string Name;
     }
 
     sealed class SetupException : Exception

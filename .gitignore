@@ -4,6 +4,7 @@
 *.log
 *.png
 !/assets/wallpapers/aeros-mountains.png
+!/assets/wallpapers/silk-*.png
 *.ppm
 /tools/aml-host/target/
 /tools/tls-host/target/

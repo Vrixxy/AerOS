@@ -201,10 +201,24 @@ pub(super) fn draw_quick(
     now: u64,
 ) -> bool {
     let dark = Color::rgb(14, 24, 30);
-    let glass = |painter: &mut Painter<'_>, bounds: Rect, alpha: u8| {
-        let radii = layout.radii(CornerRadii::all(bounds.height.min(bounds.width) / 2));
-        painter.fill_rounded_rect(layout.rect(bounds), radii, Rgba::new(40, 70, 80, alpha));
-        painter.stroke_rounded_rect(layout.rect(bounds), radii, 1, Rgba::new(255, 255, 255, 96));
+    // Dark glass: the wallpaper frosted under a 20% black fill.
+    let glass = |painter: &mut Painter<'_>, bounds: Rect, _alpha: u8| {
+        let mut style = FrostStyle::CLEAR;
+        style.blur_radius = 14;
+        style.tint = Rgba::new(0, 0, 0, 51);
+        style.border = Rgba::new(255, 255, 255, 46);
+        style.border_width = 1;
+        style.inner_highlight = Rgba::new(255, 255, 255, 30);
+        style.noise_alpha = 3;
+        let radii = CornerRadii::all(bounds.height.min(bounds.width) / 2);
+        let _ = frost(
+            painter,
+            layout,
+            bounds,
+            radii,
+            style,
+            0x9c00_0000 ^ bounds.x as u32,
+        );
     };
     let ring = |painter: &mut Painter<'_>, bounds: Rect, index: usize| {
         if state.focus_visible && state.quick_focus == index {

@@ -67,6 +67,8 @@ mod jpeg;
 mod kernel_lock;
 mod keyboard;
 mod keymap;
+#[cfg(feature = "linux-drivers")]
+mod linux;
 mod loading;
 mod logo;
 mod measure;
@@ -711,6 +713,8 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     let rtl8139_nic = rtl8139::initialize(&pci, &mut frames);
     let rtl8168_nic = rtl8168::initialize(&pci, &mut frames);
     let _ = mt7921::initialize(&pci, &mut frames);
+    #[cfg(feature = "linux-drivers")]
+    let _ = linux::initialize(&acpi, &pci, &mut frames, boot.framebuffer);
     nic::select_primary(network.verified, &rtl8139_nic, &rtl8168_nic);
     let iommu_active = enable_iommu();
     #[cfg(feature = "boot-test")]

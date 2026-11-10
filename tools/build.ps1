@@ -1,4 +1,4 @@
-param([switch]$BootTest)
+param([switch]$BootTest, [switch]$LinuxDrivers)
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -38,8 +38,13 @@ try {
     & $fontBuilder | Out-Host
     & $userspaceBuilder | Out-Host
     & (Join-Path $PSScriptRoot "build-store-icons.ps1") | Out-Host
-    if ($BootTest) {
-        cargo build --release --target x86_64-unknown-uefi --features boot-test
+    # -LinuxDrivers adds the Linux driver adapter (kernel/linux, needs Zig);
+    # it writes what its drivers found to LINUX.LOG on the boot partition.
+    $features = @()
+    if ($BootTest) { $features += "boot-test" }
+    if ($LinuxDrivers) { $features += "linux-drivers" }
+    if ($features.Count -gt 0) {
+        cargo build --release --target x86_64-unknown-uefi --features ($features -join ",")
     } else {
         cargo build --release --target x86_64-unknown-uefi
     }
