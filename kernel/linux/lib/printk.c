@@ -1,3 +1,6 @@
+#include <linux/seq_buf.h>
+#include <linux/sysfs.h>
+#include <linux/mm.h>
 #include <linux/kernel.h>
 #include <linux/device.h>
 #include <linux/string.h>
@@ -194,13 +197,16 @@ int scnprintf(char *buffer, size_t size, const char *format, ...)
 int vprintk(const char *format, va_list args)
 {
 	char line[512];
+	char *text = line;
 
-	if (format[0] == KERN_SOH[0] && format[1])
-		format += 2;
 	int length = vsnprintf(line, sizeof(line), format, args);
 	if (length >= (int)sizeof(line))
 		length = sizeof(line) - 1;
-	aeros->log(line, (unsigned long)length);
+	while (length >= 2 && text[0] == KERN_SOH[0] && text[1]) {
+		text += 2;
+		length -= 2;
+	}
+	aeros->log(text, (unsigned long)length);
 	return length;
 }
 
@@ -256,4 +262,90 @@ char *kasprintf(gfp_t gfp, const char *format, ...)
 	text = kvasprintf(gfp, format, args);
 	va_end(args);
 	return text;
+}
+
+int seq_buf_printf(struct seq_buf *s, const char *fmt, ...)
+{
+	va_list args;
+	int written;
+
+	if (s->len >= s->size) {
+		s->len = s->size + 1;
+		return -1;
+	}
+	va_start(args, fmt);
+	written = vsnprintf(s->buffer + s->len, s->size - s->len, fmt, args);
+	va_end(args);
+	s->len += (size_t)written;
+	if (s->len >= s->size) {
+		s->len = s->size + 1;
+		return -1;
+	}
+	return 0;
+}
+
+int seq_buf_puts(struct seq_buf *s, const char *str)
+{
+	return seq_buf_printf(s, "%s", str);
+}
+
+int sprintf(char *buffer, const char *format, ...)
+{
+	va_list args;
+	int written;
+
+	va_start(args, format);
+	written = vsnprintf(buffer, (size_t)INT_MAX, format, args);
+	va_end(args);
+	return written;
+}
+
+void print_hex_dump(const char *level, const char *prefix, int prefix_type, int rowsize, int groupsize,
+		    const void *buffer, size_t length, bool ascii)
+{
+	const u8 *bytes = buffer;
+	size_t row, i;
+
+	(void)groupsize;
+	(void)ascii;
+	if (rowsize != 16 && rowsize != 32)
+		rowsize = 16;
+	for (row = 0; row < length; row += (size_t)rowsize) {
+		char line[3 * 32 + 1];
+		size_t n = length - row < (size_t)rowsize ? length - row : (size_t)rowsize;
+
+		for (i = 0; i < n; i++)
+			snprintf(line + 3 * i, sizeof(line) - 3 * i, "%02x ", bytes[row + i]);
+		line[n ? 3 * n - 1 : 0] = 0;
+		if (prefix_type == DUMP_PREFIX_OFFSET)
+			printk("%s%s%.8zx: %s\n", level, prefix, row, line);
+		else if (prefix_type == DUMP_PREFIX_ADDRESS)
+			printk("%s%s%p: %s\n", level, prefix, bytes + row, line);
+		else
+			printk("%s%s%s\n", level, prefix, line);
+	}
+}
+
+int sysfs_emit(char *buf, const char *fmt, ...)
+{
+	va_list args;
+	int len;
+
+	va_start(args, fmt);
+	len = vsnprintf(buf, PAGE_SIZE, fmt, args);
+	va_end(args);
+	return len < (int)PAGE_SIZE ? len : (int)PAGE_SIZE - 1;
+}
+
+int sysfs_emit_at(char *buf, int at, const char *fmt, ...)
+{
+	va_list args;
+	int len;
+
+	if (at < 0 || at >= (int)PAGE_SIZE)
+		return 0;
+	va_start(args, fmt);
+	len = vsnprintf(buf + at, PAGE_SIZE - (size_t)at, fmt, args);
+	va_end(args);
+	return len < (int)PAGE_SIZE - at ? len : (int)PAGE_SIZE - at - 1;
 }

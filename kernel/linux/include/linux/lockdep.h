@@ -18,6 +18,12 @@ struct lockdep_map {
 #define lock_map_acquire(map) do { } while (0)
 #define lock_map_release(map) do { } while (0)
 #define might_lock(lock) do { } while (0)
+#define lock_acquire(...) do { } while (0)
+#define lock_acquire_shared_recursive(...) do { } while (0)
+#define lock_acquire_exclusive(...) do { } while (0)
+#define lock_release(...) do { } while (0)
+#define lock_map_acquire_read(map) do { } while (0)
+#define lockdep_assert_irqs_disabled() do { } while (0)
 #define lockdep_init_map(map, name, key, sub) do { } while (0)
 #define STATIC_LOCKDEP_MAP_INIT(name, key) { (name) }
 

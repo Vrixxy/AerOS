@@ -2,6 +2,7 @@
 /* The file-side pieces the DRM core expects: anonymous-inode files,
  * kthread workers on the shared work queue, and fence unwrapping. File
  * descriptors don't exist on the Linux side yet. */
+#include <linux/kobject.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
 #include <linux/file.h>
@@ -146,3 +147,22 @@ struct dma_fence *__dma_fence_unwrap_merge(unsigned int count, struct dma_fence 
 }
 
 struct vfsmount aeros_pseudo_mount;
+
+static ssize_t kobj_attr_show(struct kobject *kobj, struct attribute *attr, char *buf)
+{
+	struct kobj_attribute *kattr = container_of(attr, struct kobj_attribute, attr);
+
+	return kattr->show ? kattr->show(kobj, kattr, buf) : -EIO;
+}
+
+static ssize_t kobj_attr_store(struct kobject *kobj, struct attribute *attr, const char *buf, size_t count)
+{
+	struct kobj_attribute *kattr = container_of(attr, struct kobj_attribute, attr);
+
+	return kattr->store ? kattr->store(kobj, kattr, buf, count) : -EIO;
+}
+
+const struct sysfs_ops kobj_sysfs_ops = {
+	.show = kobj_attr_show,
+	.store = kobj_attr_store,
+};

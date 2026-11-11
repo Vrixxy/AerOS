@@ -117,4 +117,11 @@ struct list_head {
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
+typedef struct {
+	__u8 b[16];
+} guid_t;
+typedef struct {
+	__u8 b[16];
+} uuid_t;
+#include <linux/compiler.h>
 #endif

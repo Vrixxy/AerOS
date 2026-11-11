@@ -27,4 +27,6 @@ static inline bool resource_contains(const struct resource *a, const struct reso
 #define request_mem_region(start, n, name) ((struct resource *)1)
 #define release_mem_region(start, n) do { } while (0)
 
+#define IORESOURCE_ROM_SHADOW (1 << 1)
+
 #endif

@@ -3,7 +3,7 @@
 #ifndef AEROS_OPS_H
 #define AEROS_OPS_H
 
-#define AEROS_OPS_VERSION 5
+#define AEROS_OPS_VERSION 6
 
 struct aeros_pci_info {
 	unsigned char bus, slot, function, revision;
@@ -38,6 +38,7 @@ struct aeros_ops {
 	/* Zeroed pages the GPU may reach; returns a token (0 on failure). */
 	unsigned long long (*page_alloc)(unsigned long long pages);
 	void (*page_free)(unsigned long long token, unsigned long long pages);
+	unsigned long long (*options)(void);
 };
 
 /* What the module reports back to AerOS. */

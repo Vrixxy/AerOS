@@ -54,4 +54,16 @@ int scnprintf(char *buffer, size_t size, const char *format, ...)
 char *kasprintf(gfp_t gfp, const char *format, ...) __attribute__((format(printf, 2, 3)));
 char *kvasprintf(gfp_t gfp, const char *format, va_list args);
 
+int sprintf(char *buffer, const char *format, ...) __attribute__((format(printf, 2, 3)));
+enum { DUMP_PREFIX_NONE, DUMP_PREFIX_ADDRESS, DUMP_PREFIX_OFFSET };
+void print_hex_dump(const char *level, const char *prefix, int prefix_type, int rowsize, int groupsize,
+		    const void *buffer, size_t length, bool ascii);
+#define print_hex_dump_debug(prefix, type, rowsize, groupsize, buffer, length, ascii) do { } while (0)
+#define print_hex_dump_bytes(prefix, type, buffer, length) print_hex_dump(KERN_DEBUG, prefix, type, 16, 1, buffer, length, true)
+
+#define HW_ERR "[Hardware Error]: "
+#define FW_BUG "[Firmware Bug]: "
+#define FW_WARN "[Firmware Warn]: "
+#define FW_INFO "[Firmware Info]: "
+
 #endif

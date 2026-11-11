@@ -5,6 +5,7 @@
 #include <linux/list.h>
 #include <linux/dma-mapping.h>
 #include <linux/dma-fence.h>
+#include <linux/file.h>
 
 /* Buffer sharing between drivers. AerOS has one GPU driver and no other
  * importers yet, so this is the shape amdgpu/DRM PRIME compile against;
@@ -105,5 +106,7 @@ void dma_buf_vunmap(struct dma_buf *dmabuf, struct iosys_map *map);
 int dma_buf_vmap_unlocked(struct dma_buf *dmabuf, struct iosys_map *map);
 void dma_buf_vunmap_unlocked(struct dma_buf *dmabuf, struct iosys_map *map);
 int dma_buf_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma, unsigned long pgoff);
+
+static inline void get_dma_buf(struct dma_buf *dmabuf) { get_file(dmabuf->file); }
 
 #endif

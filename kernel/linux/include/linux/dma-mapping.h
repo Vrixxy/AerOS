@@ -59,4 +59,17 @@ dma_addr_t dma_map_page_attrs(struct device *dev, struct page *page, size_t offs
 static inline bool dma_addressing_limited(struct device *dev) { (void)dev; return false; }
 static inline size_t dma_max_mapping_size(struct device *dev) { (void)dev; return ~(size_t)0; }
 
+static inline dma_addr_t dma_map_resource(struct device *dev, phys_addr_t phys_addr, size_t size,
+					  enum dma_data_direction dir, unsigned long attrs)
+{
+	(void)dev; (void)size; (void)dir; (void)attrs;
+	return (dma_addr_t)phys_addr;
+}
+static inline void dma_unmap_resource(struct device *dev, dma_addr_t addr, size_t size, enum dma_data_direction dir,
+				      unsigned long attrs)
+{
+	(void)dev; (void)addr; (void)size; (void)dir; (void)attrs;
+}
+static inline int dma_set_max_seg_size(struct device *dev, unsigned int size) { (void)dev; (void)size; return 0; }
+
 #endif

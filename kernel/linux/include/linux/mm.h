@@ -62,6 +62,9 @@ struct sysinfo {
 	unsigned long totalram;
 	unsigned long freeram;
 	unsigned long totalhigh;
+	unsigned long freehigh;
+	unsigned long totalswap;
+	unsigned long freeswap;
 	unsigned int mem_unit;
 };
 void si_meminfo(struct sysinfo *info);
@@ -80,6 +83,8 @@ struct vm_area_struct {
 	void *vm_private_data;
 	const struct vm_operations_struct *vm_ops;
 	struct file *vm_file;
+	struct mm_struct *vm_mm;
+	void *vm_obj;
 };
 struct vm_fault {
 	struct vm_area_struct *vma;
@@ -144,4 +149,30 @@ static inline bool want_init_on_alloc(gfp_t gfp) { (void)gfp; return false; }
 static inline bool is_vmalloc_addr(const void *address) { (void)address; return false; }
 #include <linux/highmem.h>
 
+#define FAULT_FLAG_WRITE 0x01
+#define FAULT_FLAG_ALLOW_RETRY 0x04
+#define FAULT_FLAG_RETRY_NOWAIT 0x08
+#define page_to_virt(page) page_address(page)
+
+#define VM_ACCESS_FLAGS (VM_READ | VM_WRITE | VM_EXEC)
+static inline bool is_cow_mapping(unsigned long flags) { return (flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE; }
+#define pfn_to_nid(pfn) 0
+static inline int page_is_ram(unsigned long pfn) { (void)pfn; return 1; }
+
+static inline bool fault_flag_allow_retry_first(unsigned int flags) { return (flags & FAULT_FLAG_ALLOW_RETRY) != 0; }
+struct mm_struct;
+static inline void mmap_read_lock(struct mm_struct *mm) { (void)mm; }
+static inline void mmap_read_unlock(struct mm_struct *mm) { (void)mm; }
+static inline int mmap_read_trylock(struct mm_struct *mm) { (void)mm; return 1; }
+
+#define VM_FAULT_HWPOISON 0x10u
+#define VM_FAULT_ERROR (VM_FAULT_OOM | VM_FAULT_SIGBUS | VM_FAULT_HWPOISON)
+typedef unsigned int vm_fault_t;
+/* No user address spaces on the Linux side: CPU mappings of buffers fail. */
+static inline vm_fault_t vmf_insert_pfn_prot(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn,
+					     pgprot_t pgprot)
+{
+	(void)vma; (void)addr; (void)pfn; (void)pgprot;
+	return VM_FAULT_SIGBUS;
+}
 #endif

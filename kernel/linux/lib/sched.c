@@ -3,6 +3,7 @@
  * a work item or timer never runs while another is running. */
 #include <linux/interrupt.h>
 #include <linux/workqueue.h>
+#include <linux/hrtimer.h>
 #include <linux/slab.h>
 #include <linux/errno.h>
 #include <linux/wait.h>
@@ -157,6 +158,12 @@ bool flush_work(struct work_struct *work)
 }
 
 static int work_depth;
+static struct work_struct *running_work;
+
+struct work_struct *current_work(void)
+{
+	return running_work;
+}
 
 static void run_work(void)
 {
@@ -172,8 +179,12 @@ static void run_work(void)
 		if (!work_head)
 			work_tail = 0;
 		work->pending = false;
+		struct work_struct *outer = running_work;
+
 		work_depth++;
+		running_work = work;
 		work->func(work);
+		running_work = outer;
 		work_depth--;
 		if (final)
 			break;
@@ -337,4 +348,53 @@ void aeros_linux_poll(void)
 	run_timers();
 	run_work();
 	run_rcu();
+}
+
+static void hrtimer_fire(struct timer_list *list)
+{
+	struct hrtimer *timer = container_of(list, struct hrtimer, timer);
+
+	if (timer->function && timer->function(timer) == HRTIMER_RESTART)
+		mod_timer(&timer->timer, jiffies + nsecs_to_jiffies(timer->expires > ktime_get() ?
+								     timer->expires - ktime_get() : 0));
+}
+
+void hrtimer_init(struct hrtimer *timer, int clock_id, enum hrtimer_mode mode)
+{
+	(void)clock_id;
+	(void)mode;
+	timer->expires = 0;
+	timer->function = NULL;
+	timer_setup(&timer->timer, hrtimer_fire, 0);
+}
+
+void hrtimer_setup(struct hrtimer *timer, enum hrtimer_restart (*function)(struct hrtimer *), int clock_id,
+		   enum hrtimer_mode mode)
+{
+	hrtimer_init(timer, clock_id, mode);
+	timer->function = function;
+}
+
+void hrtimer_start(struct hrtimer *timer, ktime_t time, enum hrtimer_mode mode)
+{
+	ktime_t now = ktime_get();
+
+	timer->expires = (mode & HRTIMER_MODE_REL) ? now + time : time;
+	mod_timer(&timer->timer, jiffies + nsecs_to_jiffies(timer->expires > now ? timer->expires - now : 0));
+}
+
+int hrtimer_cancel(struct hrtimer *timer)
+{
+	return del_timer(&timer->timer);
+}
+
+u64 hrtimer_forward(struct hrtimer *timer, ktime_t now, ktime_t interval)
+{
+	u64 overruns = 0;
+
+	if (interval <= 0 || timer->expires > now)
+		return 0;
+	overruns = (u64)((now - timer->expires) / interval) + 1;
+	timer->expires += (ktime_t)overruns * interval;
+	return overruns;
 }

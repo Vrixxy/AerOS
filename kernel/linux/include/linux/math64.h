@@ -21,4 +21,10 @@ static inline s64 div64_s64(s64 dividend, s64 divisor) { return dividend / divis
 #define DIV_ROUND_UP_ULL(ll, d) div64_u64((ll) + (d) - 1, (d))
 #define mul_u32_u32(a, b) ((u64)(a) * (b))
 
+#define div64_ul(x, y) ((x) / (y))
+#define div64_long(x, y) ((x) / (y))
+
+#define DIV64_U64_ROUND_UP(ll, d) ({ u64 __d = (d); ((ll) + __d - 1) / __d; })
+#define DIV64_U64_ROUND_CLOSEST(dividend, divisor) ({ u64 __d = (divisor); ((dividend) + __d / 2) / __d; })
+
 #endif

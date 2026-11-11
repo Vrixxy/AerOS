@@ -6,6 +6,10 @@
 
 /* No debugfs: creation succeeds with a NULL dentry and nothing is shown. */
 struct dentry;
+struct debugfs_blob_wrapper {
+	void *data;
+	unsigned long size;
+};
 struct file_operations;
 struct device;
 struct debugfs_reg32 {

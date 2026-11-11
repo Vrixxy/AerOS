@@ -18,6 +18,7 @@
 #define LONG_MIN (-LONG_MAX - 1)
 #define ULONG_MAX (~0UL)
 #define LLONG_MAX ((long long)(~0ULL >> 1))
+#define LLONG_MIN (-LLONG_MAX - 1)
 #define ULLONG_MAX (~0ULL)
 #define SIZE_MAX (~(size_t)0)
 #define PHYS_ADDR_MAX (~(phys_addr_t)0)

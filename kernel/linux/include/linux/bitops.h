@@ -58,4 +58,10 @@ unsigned long find_next_zero_bit(const unsigned long *addr, unsigned long size, 
 	for ((bit) = find_first_bit((addr), (size)); (bit) < (size); \
 	     (bit) = find_next_bit((addr), (size), (bit) + 1))
 
+#define hweight8(w) __builtin_popcount((u8)(w))
+#define hweight16(w) __builtin_popcount((u16)(w))
+#define order_base_2(n) ((n) > 1 ? ilog2((n) - 1) + 1 : 0)
+
+#define ffz(x) __ffs(~(unsigned long)(x))
+
 #endif

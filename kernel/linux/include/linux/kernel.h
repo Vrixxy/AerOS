@@ -16,6 +16,18 @@
 #include <linux/sizes.h>
 #include <linux/stringify.h>
 #include <linux/rcupdate.h>
+#include <linux/byteorder/generic.h>
+#include <linux/ktime.h>
+#include <linux/math.h>
+#include <linux/bitmap.h>
+#include <linux/string_helpers.h>
+#include <linux/ratelimit.h>
+#define MAX_T(type, a, b) ((type)(a) > (type)(b) ? (type)(a) : (type)(b))
+#define MIN_T(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
+#define DIV_ROUND_DOWN_ULL(ll, d) ((unsigned long long)(ll) / (d))
+#define oops_in_progress 0
+#define might_fault() do { } while (0)
+#define might_sleep_if(cond) do { } while (0)
 
 #define _THIS_IP_ ({ __label__ __here; __here: (unsigned long)&&__here; })
 #define _RET_IP_ ((unsigned long)__builtin_return_address(0))
@@ -53,12 +65,41 @@
 #endif
 #define container_of(ptr, type, member) \
 	((type *)((char *)(ptr) - offsetof(type, member)))
-#define BUILD_BUG_ON(c) _Static_assert(!(c), #c)
-#define WARN_ON(c) ({ int __w = !!(c); if (__w) pr_warn("WARN_ON(%s) at %s:%d\n", #c, __FILE__, __LINE__); __w; })
+/* Like Linux: the condition only has to fold to a constant once optimised. */
+extern void __aeros_build_bug(void) __attribute__((error("BUILD_BUG_ON failed")));
+#define BUILD_BUG_ON(c) do { if (c) __aeros_build_bug(); } while (0)
+#define WARN_ON(c) ({ int __w = !!(c); if (__w) printk(KERN_WARNING "WARN_ON(%s) at %s:%d\n", #c, __FILE__, __LINE__); __w; })
 #define WARN_ON_ONCE(c) WARN_ON(c)
 #define BUG_ON(c) do { if (c) aeros_bug(__FILE__, __LINE__); } while (0)
 #define BUG() aeros_bug(__FILE__, __LINE__)
 
 void aeros_bug(const char *file, int line) __attribute__((noreturn));
+
+#ifndef TRUE
+#define TRUE 1
+#endif
+#ifndef FALSE
+#define FALSE 0
+#endif
+#define min_not_zero(x, y) ({ __typeof__(x) __x = (x); __typeof__(y) __y = (y); \
+	__x == 0 ? __y : ((__y == 0) ? __x : min(__x, __y)); })
+enum system_states { SYSTEM_BOOTING, SYSTEM_SCHEDULING, SYSTEM_FREEING_INITMEM, SYSTEM_RUNNING, SYSTEM_HALT,
+		     SYSTEM_POWER_OFF, SYSTEM_RESTART, SYSTEM_SUSPEND };
+#define system_state SYSTEM_RUNNING
+#define TAINT_WARN 9
+#define TAINT_SOFTLOCKUP 14
+#define LOCKDEP_STILL_OK 0
+#define LOCKDEP_NOW_UNRELIABLE 1
+static inline void add_taint(unsigned int flag, int lockdep_ok) { (void)flag; (void)lockdep_ok; }
+#include <linux/syscalls.h>
+
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define typecheck(type, x) ({ type __dummy; __typeof__(x) __dummy2; (void)(&__dummy == &__dummy2); 1; })
+#ifndef offsetofend
+#define offsetofend(TYPE, MEMBER) (offsetof(TYPE, MEMBER) + sizeof(((TYPE *)0)->MEMBER))
+#endif
+
+#include <linux/uuid.h>
 
 #endif

@@ -23,10 +23,19 @@ struct workqueue_struct {
 };
 
 extern struct workqueue_struct *system_wq;
+#define system_unbound_wq system_wq
+#define system_highpri_wq system_wq
+#define system_long_wq system_wq
+#define system_freezable_wq system_wq
+#define system_power_efficient_wq system_wq
 
 void aeros_delayed_fire(struct timer_list *timer);
 #define DECLARE_DELAYED_WORK_AEROS(name, f) 	struct delayed_work name = { .work = { .func = (f) }, .timer = { .function = aeros_delayed_fire } }
 #define DECLARE_DELAYED_WORK(name, f) DECLARE_DELAYED_WORK_AEROS(name, f)
+#define __WORK_INITIALIZER(n, f) { .func = (f) }
+void aeros_delayed_fire(struct timer_list *timer);
+#define __DELAYED_WORK_INITIALIZER(n, f, tflags) \
+	{ .work = __WORK_INITIALIZER((n).work, (f)), .timer = { .function = aeros_delayed_fire } }
 #define DECLARE_WORK(name, f) struct work_struct name = { .func = (f) }
 
 #define INIT_WORK(w, f) do { (w)->next = 0; (w)->func = (f); (w)->pending = false; } while (0)
@@ -45,6 +54,11 @@ static inline bool schedule_delayed_work(struct delayed_work *work, unsigned lon
 	return queue_delayed_work(system_wq, work, delay);
 }
 bool cancel_work_sync(struct work_struct *work);
+#define INIT_WORK_ONSTACK INIT_WORK
+#define INIT_DELAYED_WORK_ONSTACK INIT_DELAYED_WORK
+#define destroy_work_on_stack(work) do { (void)(work); } while (0)
+#define destroy_delayed_work_on_stack(work) do { (void)(work); } while (0)
+struct work_struct *current_work(void);
 #define queue_work_node(node, queue, work) queue_work((queue), (work))
 #define queue_work_on(cpu, queue, work) queue_work((queue), (work))
 #define drain_workqueue flush_workqueue
@@ -72,5 +86,10 @@ struct workqueue_struct *alloc_workqueue(const char *name, unsigned int flags, i
 #define alloc_ordered_workqueue(name, flags, ...) alloc_workqueue(name, flags, 1)
 static inline void destroy_workqueue(struct workqueue_struct *queue) { (void)queue; }
 void flush_workqueue(struct workqueue_struct *queue);
+
+#define create_singlethread_workqueue(name) alloc_ordered_workqueue("%s", 0, (name))
+#define work_pending(work) ((work)->pending)
+#define delayed_work_pending(w) work_pending(&(w)->work)
+static inline bool cancel_work(struct work_struct *work) { return cancel_work_sync(work); }
 
 #endif

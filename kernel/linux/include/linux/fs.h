@@ -2,6 +2,7 @@
 #define _LINUX_FS_H
 
 #include <linux/types.h>
+#include <linux/stat.h>
 #include <linux/pagemap.h>
 #include <linux/file.h>
 #include <linux/mount.h>
@@ -15,6 +16,7 @@ struct super_block;
 struct kiocb;
 
 struct inode {
+	loff_t i_size;
 	unsigned long i_ino;
 	dev_t i_rdev;
 	struct address_space *i_mapping;
@@ -99,5 +101,19 @@ static inline void simple_release_fs(struct vfsmount **mount, int *count) { (voi
 static inline bool capable(int cap) { (void)cap; return true; }
 #define CAP_SYS_ADMIN 21
 #define CAP_SYS_NICE 23
+
+struct dentry {
+	struct inode *d_inode;
+};
+static inline struct inode *d_inode(const struct dentry *dentry) { return dentry->d_inode; }
+static inline loff_t default_llseek(struct file *file, loff_t offset, int whence)
+{
+	(void)file; (void)whence;
+	return offset;
+}
+#define no_llseek NULL
+#define noop_llseek default_llseek
+
+typedef void *fl_owner_t;
 
 #endif

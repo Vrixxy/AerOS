@@ -7,4 +7,7 @@ struct linux_fb_info;
 struct fb_var_screeninfo;
 struct fb_fix_screeninfo;
 
+#define KHZ2PICOS(a) (1000000000UL / (a))
+#define PICOS2KHZ(a) (1000000000UL / (a))
+
 #endif

@@ -25,6 +25,10 @@ typedef int (*initcall_t)(void);
 #define MODULE_FIRMWARE(x)
 #define MODULE_DEVICE_TABLE(type, name)
 #define THIS_MODULE ((struct module *)0)
+#define MODULE_IMPORT_NS(ns)
+#define MODULE_SOFTDEP(text)
+#define MODULE_ALIAS(name)
+#define MODULE_INFO(tag, info)
 
 struct module;
 

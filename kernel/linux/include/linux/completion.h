@@ -28,4 +28,20 @@ static inline unsigned long wait_for_completion_timeout(struct completion *x, un
 	return (unsigned long)left;
 }
 
+static inline bool try_wait_for_completion(struct completion *x)
+{
+	if (!x->done)
+		return false;
+	x->done--;
+	return true;
+}
+static inline int wait_for_completion_interruptible(struct completion *x)
+{
+	wait_for_completion(x);
+	return 0;
+}
+#define wait_for_completion_killable wait_for_completion_interruptible
+#define wait_for_completion_interruptible_timeout(x, timeout) ((long)wait_for_completion_timeout((x), (timeout)))
+#define wait_for_completion_killable_timeout wait_for_completion_interruptible_timeout
+
 #endif

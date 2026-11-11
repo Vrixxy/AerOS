@@ -59,6 +59,9 @@ static inline bool fatal_signal_pending(struct task_struct *task) { (void)task; 
 static inline bool need_resched(void) { return false; }
 static inline pid_t task_pid_nr(struct task_struct *task) { return task->pid; }
 long schedule_timeout(long timeout);
+static inline void sched_set_fifo(struct task_struct *task) { (void)task; }
+static inline void sched_set_fifo_low(struct task_struct *task) { (void)task; }
+static inline void sched_set_normal(struct task_struct *task, int nice) { (void)task; (void)nice; }
 static inline int wake_up_state(struct task_struct *task, unsigned int state) { (void)task; (void)state; return 1; }
 static inline int wake_up_process(struct task_struct *task) { (void)task; return 1; }
 #define schedule_timeout_interruptible schedule_timeout

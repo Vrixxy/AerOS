@@ -25,6 +25,7 @@ struct kthread_work {
 };
 struct kthread_worker {
 	const char *name;
+	struct task_struct *task;
 };
 void aeros_kthread_work_run(struct work_struct *work);
 static inline void kthread_init_work(struct kthread_work *work, kthread_work_func_t func)

@@ -63,4 +63,10 @@ enum {
 #define memremap(physical, length, flags) ((void *)ioremap((physical), (length)))
 #define memunmap(address) iounmap(address)
 
+/* Memory types come from AerOS's page tables; MTRR/PAT hooks report success. */
+static inline int arch_phys_wc_add(unsigned long base, unsigned long size) { (void)base; (void)size; return 0; }
+static inline void arch_phys_wc_del(int handle) { (void)handle; }
+static inline int arch_io_reserve_memtype_wc(resource_size_t start, resource_size_t size) { (void)start; (void)size; return 0; }
+static inline void arch_io_free_memtype_wc(resource_size_t start, resource_size_t size) { (void)start; (void)size; }
+
 #endif

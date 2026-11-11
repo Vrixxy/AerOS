@@ -12,7 +12,7 @@ use crate::serial;
 
 static MODULE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/aeros-linux.elf"));
 
-const OPS_VERSION: usize = 5;
+const OPS_VERSION: usize = 6;
 const MAX_DMA_BUFFERS: usize = 256;
 const LOG_BYTES: usize = 16 * 1024;
 const MAX_DEVICES: usize = 64;
@@ -38,6 +38,7 @@ struct LinuxOps {
     firmware: extern "sysv64" fn(*const u8, *mut usize) -> *const u8,
     page_alloc: extern "sysv64" fn(u64) -> u64,
     page_free: extern "sysv64" fn(u64, u64),
+    options: extern "sysv64" fn() -> u64,
 }
 
 #[repr(C)]
@@ -408,6 +409,17 @@ extern "sysv64" fn firmware(name: *const u8, size: *mut usize) -> *const u8 {
     core::ptr::null()
 }
 
+/// Bit 0: amdgpu may drive the GPU (an `AMDGPU.ON` file on the boot partition).
+extern "sysv64" fn options() -> u64 {
+    let mut files = [crate::fat::FatFileEntry::EMPTY; 64];
+    let count = crate::fat::list_root_files(&mut files);
+    u64::from(
+        files[..count]
+            .iter()
+            .any(|file| &file.name == b"AMDGPU  ON "),
+    )
+}
+
 static OPS: LinuxOps = LinuxOps {
     version: OPS_VERSION,
     log,
@@ -428,6 +440,7 @@ static OPS: LinuxOps = LinuxOps {
     firmware,
     page_alloc,
     page_free,
+    options,
 };
 
 /// A BAR's size, found the way the PCI spec says (write all ones, read the

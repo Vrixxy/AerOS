@@ -32,6 +32,39 @@ static const struct pci_device_id *match_table(const struct pci_driver *driver,
 	return 0;
 }
 
+/* The firmware's copy of a GPU's video BIOS (ACPI VFCT), which Linux
+ * drivers read as the device's platform ROM. */
+struct vfct_image {
+	u32 bus, device, function;
+	u16 vendor_id, device_id, ssvid, ssid;
+	u32 revision, length;
+} __packed;
+
+static void attach_platform_rom(struct pci_dev *dev)
+{
+	unsigned long length = 0;
+	const u8 *vfct = aeros->acpi_table("VFCT", &length);
+	u32 offset;
+
+	if (!vfct || length < 0x4c)
+		return;
+	offset = *(const u32 *)(vfct + 0x34);
+	while (offset + sizeof(struct vfct_image) <= length) {
+		const struct vfct_image *image = (const void *)(vfct + offset);
+
+		if (!image->length || offset + sizeof(*image) + image->length > length)
+			return;
+		if (image->vendor_id == dev->vendor && image->device_id == dev->device &&
+		    image->bus == dev->bus->number && image->device == PCI_SLOT(dev->devfn) &&
+		    image->function == PCI_FUNC(dev->devfn)) {
+			dev->rom = virt_to_phys(image + 1);
+			dev->romlen = image->length;
+			return;
+		}
+		offset += sizeof(*image) + image->length;
+	}
+}
+
 static struct pci_dev *make_device(const struct aeros_pci_info *info)
 {
 	struct pci_dev *dev = kzalloc(sizeof(*dev), GFP_KERNEL);
@@ -61,10 +94,14 @@ static struct pci_dev *make_device(const struct aeros_pci_info *info)
 			resource->flags |= IORESOURCE_PREFETCH;
 	}
 	dev->dev.is_pci = true;
+	if ((dev->class >> 16) == PCI_BASE_CLASS_DISPLAY)
+		attach_platform_rom(dev);
 	snprintf(dev->dev.name, sizeof(dev->dev.name), "0000:%02x:%02x.%u", info->bus, info->slot,
 		 info->function);
 	return dev;
 }
+
+bool aeros_amdgpu_enabled;
 
 int pci_register_driver(struct pci_driver *driver)
 {
@@ -81,6 +118,12 @@ int pci_register_driver(struct pci_driver *driver)
 			return -ENOMEM;
 		const struct pci_device_id *id = match_table(driver, dev);
 		if (!id) {
+			kfree(dev);
+			continue;
+		}
+		/* The real GPU driver drives the hardware: only when switched on. */
+		if (!strcmp(driver->name, "amdgpu") && !aeros_amdgpu_enabled) {
+			dev_info(&dev->dev, "amdgpu matches this GPU but is switched off; not binding\n");
 			kfree(dev);
 			continue;
 		}
@@ -221,4 +264,108 @@ int pci_find_ext_capability(struct pci_dev *dev, int cap)
 			return 0;
 	}
 	return 0;
+}
+
+static int pcie_cap(struct pci_dev *dev)
+{
+	if (!dev->pcie_cap)
+		dev->pcie_cap = (u8)pci_find_capability(dev, PCI_CAP_ID_EXP);
+	return dev->pcie_cap;
+}
+
+int pcie_capability_read_word(struct pci_dev *dev, int pos, u16 *val)
+{
+	int cap = pcie_cap(dev);
+
+	*val = 0;
+	return cap ? pci_read_config_word(dev, cap + pos, val) : -EINVAL;
+}
+
+int pcie_capability_read_dword(struct pci_dev *dev, int pos, u32 *val)
+{
+	int cap = pcie_cap(dev);
+
+	*val = 0;
+	return cap ? pci_read_config_dword(dev, cap + pos, val) : -EINVAL;
+}
+
+int pcie_capability_write_word(struct pci_dev *dev, int pos, u16 val)
+{
+	int cap = pcie_cap(dev);
+
+	return cap ? pci_write_config_word(dev, cap + pos, val) : -EINVAL;
+}
+
+int pcie_capability_clear_and_set_word(struct pci_dev *dev, int pos, u16 clear, u16 set)
+{
+	u16 val;
+	int ret = pcie_capability_read_word(dev, pos, &val);
+
+	if (ret)
+		return ret;
+	return pcie_capability_write_word(dev, pos, (u16)((val & ~clear) | set));
+}
+
+int pcie_set_readrq(struct pci_dev *dev, int rq)
+{
+	u16 v = (u16)((ffs(rq) - 8) << 12);
+
+	if (rq < 128 || rq > 4096 || (rq & (rq - 1)))
+		return -EINVAL;
+	return pcie_capability_clear_and_set_word(dev, PCI_EXP_DEVCTL, PCI_EXP_DEVCTL_READRQ, v);
+}
+
+enum pci_bus_speed pcie_get_speed_cap(struct pci_dev *dev)
+{
+	static const enum pci_bus_speed speeds[] = { PCI_SPEED_UNKNOWN, PCIE_SPEED_2_5GT, PCIE_SPEED_5_0GT,
+						     PCIE_SPEED_8_0GT, PCIE_SPEED_16_0GT, PCIE_SPEED_32_0GT,
+						     PCIE_SPEED_64_0GT };
+	u32 cap = 0;
+
+	pcie_capability_read_dword(dev, PCI_EXP_LNKCAP, &cap);
+	cap &= PCI_EXP_LNKCAP_SLS;
+	return cap < ARRAY_SIZE(speeds) ? speeds[cap] : PCI_SPEED_UNKNOWN;
+}
+
+enum pcie_link_width pcie_get_width_cap(struct pci_dev *dev)
+{
+	u32 cap = 0;
+
+	pcie_capability_read_dword(dev, PCI_EXP_LNKCAP, &cap);
+	return cap ? (enum pcie_link_width)((cap & PCI_EXP_LNKCAP_MLW) >> 4) : PCIE_LNK_WIDTH_UNKNOWN;
+}
+
+u32 pcie_bandwidth_available(struct pci_dev *dev, struct pci_dev **limiting_dev, enum pci_bus_speed *speed,
+			     enum pcie_link_width *width)
+{
+	static const u32 mbps[] = { 0, 2000, 4000, 7877, 15754, 31508, 63015 };
+	u16 status = 0;
+	unsigned int gen, lanes;
+
+	pcie_capability_read_word(dev, 0x12, &status);
+	gen = status & PCI_EXP_LNKSTA_CLS;
+	lanes = (status & PCI_EXP_LNKSTA_NLW) >> 4;
+	if (limiting_dev)
+		*limiting_dev = dev;
+	if (speed)
+		*speed = gen && gen < 7 ? (enum pci_bus_speed)(PCIE_SPEED_2_5GT + gen - 1) : PCI_SPEED_UNKNOWN;
+	if (width)
+		*width = lanes ? (enum pcie_link_width)lanes : PCIE_LNK_WIDTH_UNKNOWN;
+	return gen < ARRAY_SIZE(mbps) ? mbps[gen] * lanes : 0;
+}
+
+void pci_clear_master(struct pci_dev *dev)
+{
+	u16 command;
+
+	pci_read_config_word(dev, PCI_COMMAND, &command);
+	pci_write_config_word(dev, PCI_COMMAND, command & (u16)~PCI_COMMAND_MASTER);
+}
+
+int pci_alloc_irq_vectors(struct pci_dev *dev, unsigned int min_vecs, unsigned int max_vecs, unsigned int flags)
+{
+	(void)max_vecs;
+	if (min_vecs > 1 || !(flags & PCI_IRQ_INTX))
+		return -ENOSPC;
+	return 1;
 }

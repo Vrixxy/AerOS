@@ -188,8 +188,11 @@ int sg_alloc_table_from_pages_segment(struct sg_table *table, struct page **page
 
 void fput(struct file *file)
 {
-	if (file && atomic_long_dec_return(&file->f_count) == 0)
-		kfree(file);
+	if (!file || atomic_long_dec_return(&file->f_count) != 0)
+		return;
+	if (file->f_op && file->f_op->release)
+		file->f_op->release(file->f_inode, file);
+	kfree(file);
 }
 
 void *dma_alloc_attrs(struct device *dev, size_t size, dma_addr_t *handle, gfp_t gfp, unsigned long attrs)

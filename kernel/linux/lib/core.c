@@ -113,6 +113,8 @@ void aeros_pci_report(struct aeros_linux_report *report);
 void aeros_linux_poll(void);
 
 /* AerOS calls this once, right after loading the module. */
+extern bool aeros_amdgpu_enabled;
+
 int aeros_linux_entry(const struct aeros_ops *ops, struct aeros_linux_report *report)
 {
 	aeros = ops;
@@ -120,6 +122,7 @@ int aeros_linux_entry(const struct aeros_ops *ops, struct aeros_linux_report *re
 	if (ops->version != AEROS_OPS_VERSION)
 		return -EINVAL;
 	report->poll = aeros_linux_poll;
+	aeros_amdgpu_enabled = ops->options() & 1;
 	for (initcall_t *call = __start_aeros_initcalls; call < __stop_aeros_initcalls; call++) {
 		report->initcalls++;
 		if ((*call)() != 0)

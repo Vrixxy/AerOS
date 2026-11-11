@@ -92,4 +92,6 @@ static inline long atomic_long_cmpxchg(atomic_long_t *v, long old, long new_valu
 #define wmb() __asm__ volatile("sfence" ::: "memory")
 #define barrier() __asm__ volatile("" ::: "memory")
 
+#include <linux/refcount.h>
+
 #endif

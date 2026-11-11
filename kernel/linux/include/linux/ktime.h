@@ -44,4 +44,31 @@ static inline s64 ktime_us_delta(ktime_t later, ktime_t earlier) { return ktime_
 static inline s64 ktime_ms_delta(ktime_t later, ktime_t earlier) { return ktime_to_ms(later - earlier); }
 #define ktime_is_after ktime_after
 
+struct timespec64 {
+	time64_t tv_sec;
+	long tv_nsec;
+};
+struct timeval {
+	long tv_sec;
+	long tv_usec;
+};
+static inline struct timespec64 ns_to_timespec64(s64 nanoseconds)
+{
+	struct timespec64 ts = { nanoseconds / NSEC_PER_SEC, (long)(nanoseconds % NSEC_PER_SEC) };
+
+	return ts;
+}
+#define ktime_to_timespec64(kt) ns_to_timespec64(kt)
+static inline ktime_t timespec64_to_ktime(struct timespec64 ts) { return ktime_set(ts.tv_sec, (unsigned long)ts.tv_nsec); }
+static inline s64 timespec64_to_ns(const struct timespec64 *ts) { return ts->tv_sec * NSEC_PER_SEC + ts->tv_nsec; }
+static inline void ktime_get_ts64(struct timespec64 *ts) { *ts = ns_to_timespec64(ktime_get_ns()); }
+#define ktime_get_real_ts64 ktime_get_ts64
+#define ktime_get_raw_ts64 ktime_get_ts64
+
+/* As in Linux, where ktime.h reaches mutex.h and idr.h through jiffies and seqlock. */
+#include <linux/mutex.h>
+#include <linux/idr.h>
+#include <linux/wait.h>
+#include <linux/workqueue.h>
+
 #endif

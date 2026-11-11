@@ -47,4 +47,6 @@ static inline void downgrade_write(struct rw_semaphore *sem) { sem->writer = 0; 
 #define lockdep_assert_held_write(lock) do { (void)(lock); } while (0)
 #define lockdep_assert_held_read(lock) do { (void)(lock); } while (0)
 
+#define rwsem_is_contended(sem) 0
+
 #endif

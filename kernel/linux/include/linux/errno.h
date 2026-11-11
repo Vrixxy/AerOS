@@ -113,4 +113,8 @@ static inline int IS_ERR_OR_NULL(const void *pointer) { return !pointer || IS_ER
 static inline void *ERR_CAST(const void *pointer) { return (void *)pointer; }
 static inline int PTR_ERR_OR_ZERO(const void *pointer) { return IS_ERR(pointer) ? (int)PTR_ERR(pointer) : 0; }
 
+#ifndef EBADSLT
+#define EBADSLT 57
+#endif
+
 #endif

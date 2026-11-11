@@ -12,6 +12,7 @@
 #define GFP_DMA32 0x20u
 #define GFP_NOFS 0x40u
 #define GFP_NOIO 0x80u
+#define GFP_KERNEL_ACCOUNT GFP_KERNEL
 #define __GFP_ZERO 0x100u
 #define __GFP_NOWARN 0x200u
 #define __GFP_NORETRY 0x400u
