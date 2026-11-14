@@ -14,6 +14,8 @@ use crate::serial;
 use crate::shell;
 use crate::vfs;
 
+#[path = "desktop_avatar.rs"]
+mod avatarui;
 #[path = "desktop_files.rs"]
 mod files_ui;
 #[path = "desktop_flow.rs"]
@@ -175,6 +177,117 @@ fn trash_directory() -> &'static str {
     }
 }
 
+/// Where restored items go when the folder they came from is gone.
+fn home_directory() -> &'static str {
+    if crate::datafs::route("/home").is_some() {
+        "/home"
+    } else {
+        "/data"
+    }
+}
+
+const TRASH_ORIGINS_BYTES: usize = 4096;
+
+fn trash_origins_path() -> shell::Text<256> {
+    let mut path: shell::Text<256> = shell::Text::new();
+    let _ = shell::normalize_path(trash_directory(), ".origins", &mut path);
+    path
+}
+
+/// `name` on the first try, then `stem (2).ext`, `stem (3).ext` and so on.
+fn numbered_name(name: &str, attempt: u32, out: &mut shell::Text<64>) -> bool {
+    out.clear();
+    if attempt <= 1 {
+        return out.push_str_checked(name);
+    }
+    let (stem, extension) = match name.rfind('.') {
+        Some(dot) if dot > 0 => (&name[..dot], &name[dot..]),
+        _ => (name, ""),
+    };
+    write!(out, "{stem} ({attempt}){extension}").is_ok()
+}
+
+/// Moves `source` to a free name made from `name` in `directory`; returns
+/// the name it got.
+fn move_unique(
+    source: &str,
+    directory: &str,
+    name: &str,
+) -> Result<shell::Text<64>, vfs::VfsError> {
+    let mut candidate: shell::Text<64> = shell::Text::new();
+    let mut target: shell::Text<256> = shell::Text::new();
+    for attempt in 1..100 {
+        if !numbered_name(name, attempt, &mut candidate) {
+            return Err(vfs::VfsError::NameTooLong);
+        }
+        target.clear();
+        shell::normalize_path(directory, candidate.as_str(), &mut target)
+            .map_err(|_| vfs::VfsError::NameTooLong)?;
+        match vfs::rename_noreplace(source, target.as_str()) {
+            Ok(()) => return Ok(candidate),
+            Err(vfs::VfsError::Exists) => {}
+            Err(failure) => return Err(failure),
+        }
+    }
+    Err(vfs::VfsError::Exists)
+}
+
+/// The folder an item in Trash was deleted from (one `name<TAB>path` line
+/// per item in the hidden `.origins` file).
+fn trash_origin(name: &str) -> Option<shell::Text<256>> {
+    let mut buffer = [0u8; TRASH_ORIGINS_BYTES];
+    let length = shell::read_file(trash_origins_path().as_str(), &mut buffer).ok()?;
+    let text = core::str::from_utf8(&buffer[..length]).ok()?;
+    let path = text
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix('\t'))?;
+    let mut origin: shell::Text<256> = shell::Text::new();
+    origin.push_str_checked(path).then_some(origin)
+}
+
+/// Records (or with `None` forgets) where an item in Trash came from; the
+/// oldest records go first when the file is full.
+fn set_trash_origin(name: &str, origin: Option<&str>) {
+    let path = trash_origins_path();
+    let mut old = [0u8; TRASH_ORIGINS_BYTES];
+    let length = shell::read_file(path.as_str(), &mut old).unwrap_or(0);
+    let text = core::str::from_utf8(&old[..length]).unwrap_or("");
+    let mut fresh = [0u8; TRASH_ORIGINS_BYTES];
+    let mut used = 0;
+    let mut line: shell::Text<320> = shell::Text::new();
+    if let Some(origin) = origin
+        && writeln!(line, "{name}\t{origin}").is_ok()
+    {
+        fresh[..line.as_str().len()].copy_from_slice(line.as_str().as_bytes());
+        used = line.as_str().len();
+    }
+    // Newest first, so trimming the end drops the oldest.
+    for kept in text.lines() {
+        let same = kept
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with('\t'));
+        if same || kept.is_empty() || used + kept.len() + 1 > fresh.len() {
+            continue;
+        }
+        fresh[used..used + kept.len()].copy_from_slice(kept.as_bytes());
+        fresh[used + kept.len()] = b'\n';
+        used += kept.len() + 1;
+    }
+    if let Ok(descriptor) = vfs::open_file(path.as_str(), true, false, true, 0o600, true) {
+        let _ = vfs::write(descriptor, &fresh[..used], false);
+        let _ = vfs::close(descriptor);
+    }
+}
+
+/// Moves a file or folder into Trash (under a numbered name when Trash
+/// already holds one of that name) and remembers where it was.
+fn move_to_trash(path: &str, name: &str) -> Result<(), vfs::VfsError> {
+    let _ = vfs::create_directory(trash_directory(), 0o777);
+    let given = move_unique(path, trash_directory(), name)?;
+    set_trash_origin(given.as_str(), Some(path));
+    Ok(())
+}
+
 fn notes_directory() -> &'static str {
     if crate::datafs::route("/home").is_some() {
         "/home/Notes"
@@ -299,7 +412,7 @@ const DOCK_NAMES: [&str; 9] = [
 /// The `draw_icon` kind each dock slot shows.
 const DOCK_KINDS: [usize; 9] = [0, 1, 2, 3, 4, 5, 8, 9, 6];
 /// The launcher's built-in apps: name and `draw_icon` kind.
-const LAUNCHER_BUILTINS: [(&str, usize); 8] = [
+const LAUNCHER_BUILTINS: [(&str, usize); 9] = [
     ("Terminal", 1),
     ("Files", 7),
     ("Browser", 4),
@@ -308,6 +421,7 @@ const LAUNCHER_BUILTINS: [(&str, usize); 8] = [
     ("Store", 8),
     ("Trash", 6),
     ("Linux desktop", 9),
+    ("Avatar", 10),
 ];
 
 /// The four full-screen buffers (the composed desktop, its shadow copy, the
@@ -399,6 +513,7 @@ enum DesktopApp {
     Terminal,
     Linux,
     Store,
+    Avatar,
 }
 
 impl DesktopApp {
@@ -413,6 +528,7 @@ impl DesktopApp {
             Self::Trash => "trash",
             Self::Terminal => "terminal",
             Self::Store => "store",
+            Self::Avatar => "avatar",
         }
     }
 }
@@ -980,6 +1096,19 @@ struct DesktopState {
     wifi_reveal: bool,
     wifi_pending: bool,
     wifi_signature: u64,
+    /// Joining a remembered network by itself: when the next scan or attempt
+    /// may start, how many attempts in a row failed, whether the pending
+    /// connection is such an attempt, and since when one has been possible.
+    wifi_auto_next_ns: u64,
+    wifi_auto_failures: u8,
+    /// The lowest battery warning shown since the charger was last in.
+    battery_warned: u8,
+    wifi_auto_attempt: bool,
+    wifi_auto_ready_ns: u64,
+    /// The preferences last written to disk, and a change waiting to settle.
+    prefs_saved: Option<crate::settings::Prefs>,
+    prefs_pending: Option<crate::settings::Prefs>,
+    prefs_changed_ns: u64,
     bluetooth: bool,
     airplane: bool,
     battery_saver: bool,
@@ -1180,6 +1309,9 @@ struct DesktopState {
     notes_selected: usize,
     /// Full path of a file opened from Files; empty for ordinary notes.
     notes_target: shell::Text<256>,
+    /// Fingerprint of the note as last opened or saved; a different one
+    /// means unsaved typing.
+    notes_clean: u64,
     trash_entries: [DirEntryRow; TRASH_MAX_ENTRIES],
     trash_entry_count: usize,
     trash_overflow: bool,
@@ -1228,6 +1360,14 @@ impl DesktopState {
             wifi_reveal: false,
             wifi_pending: false,
             wifi_signature: 0,
+            wifi_auto_next_ns: 0,
+            wifi_auto_failures: 0,
+            battery_warned: 100,
+            wifi_auto_attempt: false,
+            wifi_auto_ready_ns: 0,
+            prefs_saved: None,
+            prefs_pending: None,
+            prefs_changed_ns: 0,
             bluetooth: true,
             airplane: false,
             battery_saver: false,
@@ -1393,6 +1533,7 @@ impl DesktopState {
             notes_status: shell::Text::new(),
             notes_selected: usize::MAX,
             notes_target: shell::Text::new(),
+            notes_clean: 0,
             trash_entries: [DirEntryRow::EMPTY; TRASH_MAX_ENTRIES],
             trash_entry_count: 0,
             trash_overflow: false,
@@ -1418,6 +1559,9 @@ impl DesktopState {
     }
 
     fn set_app(&mut self, target: DesktopApp) {
+        if self.app == DesktopApp::Notes && target != DesktopApp::Notes {
+            self.notes_autosave();
+        }
         if target != self.app {
             MAXIMIZED_APP.store(0, Ordering::Relaxed);
         }
@@ -2111,6 +2255,7 @@ impl DesktopState {
             5 => self.open_store(),
             6 => self.open_trash(),
             7 => self.open_linux_desktop(),
+            8 => self.open_avatar(),
             _ => {
                 if crate::store::get().launch(index - LAUNCHER_BUILTINS.len()) {
                     self.show_linux_apps();
@@ -2341,6 +2486,9 @@ impl DesktopState {
                     }
                 }
             }
+        }
+        if let Some(action) = self.avatar_click(point) {
+            return action;
         }
         if self.app == DesktopApp::Trash && self.overlay == Overlay::None {
             let base = window_base_rect(DesktopApp::Trash);
@@ -2793,38 +2941,9 @@ impl DesktopState {
             return;
         };
         let target = self.files_child_path(row.name_str());
-        if row.is_dir {
-            match vfs::remove(target.as_str(), true) {
-                Ok(()) => self.files_set_status("folder removed"),
-                Err(failure) => self.files_set_status(shell::vfs_error(failure)),
-            }
-        } else {
-            let mut buffer = [0u8; NOTE_MAX_BYTES];
-            match shell::read_file(target.as_str(), &mut buffer) {
-                Ok(length) => {
-                    let _ = vfs::create_directory(trash_directory(), 0o777);
-                    let mut trash_path: shell::Text<256> = shell::Text::new();
-                    let _ =
-                        shell::normalize_path(trash_directory(), row.name_str(), &mut trash_path);
-                    match vfs::open_file(trash_path.as_str(), true, false, true, 0o644, true) {
-                        Ok(descriptor) => {
-                            let write_result = vfs::write(descriptor, &buffer[..length], false);
-                            let _ = vfs::close(descriptor);
-                            match write_result {
-                                Ok(_) => match vfs::remove(target.as_str(), false) {
-                                    Ok(()) => self.files_set_status("moved to trash"),
-                                    Err(failure) => {
-                                        self.files_set_status(shell::vfs_error(failure))
-                                    }
-                                },
-                                Err(failure) => self.files_set_status(shell::vfs_error(failure)),
-                            }
-                        }
-                        Err(failure) => self.files_set_status(shell::vfs_error(failure)),
-                    }
-                }
-                Err(failure) => self.files_set_status(shell::vfs_error(failure)),
-            }
+        match move_to_trash(target.as_str(), row.name_str()) {
+            Ok(()) => self.files_set_status("moved to trash"),
+            Err(failure) => self.files_set_status(shell::vfs_error(failure)),
         }
         self.files_selected = usize::MAX;
         self.files_reload();
@@ -2856,6 +2975,7 @@ impl DesktopState {
     }
 
     fn open_notes(&mut self) {
+        self.notes_autosave();
         self.notes_target.clear();
         self.set_overlay(Overlay::None);
         self.set_app(DesktopApp::Notes);
@@ -2897,8 +3017,62 @@ impl DesktopState {
                 let _ = self.notes_current_name.push_str_checked(name);
                 self.notes_mode = NotesMode::Editing;
                 self.notes_set_status("");
+                self.notes_clean = self.notes_fingerprint();
             }
             Err(failure) => self.notes_set_status(shell::vfs_error(failure)),
+        }
+    }
+
+    fn notes_fingerprint(&self) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in self.notes_current_name.as_str().bytes().chain([0]).chain(
+            self.notes_content
+                .as_str()
+                .bytes()
+                .chain(self.notes_target.as_str().bytes()),
+        ) {
+            hash = (hash ^ byte as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+        hash
+    }
+
+    fn notes_write(&mut self) -> bool {
+        let _ = vfs::create_directory(notes_directory(), 0o777);
+        let path = if self.notes_target.as_str().is_empty() {
+            self.notes_path_for(self.notes_current_name.as_str())
+        } else {
+            self.notes_target
+        };
+        let result =
+            vfs::open_file(path.as_str(), true, false, true, 0o644, true).and_then(|descriptor| {
+                let result = vfs::write(descriptor, self.notes_content.as_str().as_bytes(), false);
+                let _ = vfs::close(descriptor);
+                result
+            });
+        match result {
+            Ok(_) => {
+                self.notes_clean = self.notes_fingerprint();
+                true
+            }
+            Err(failure) => {
+                self.notes_set_status(shell::vfs_error(failure));
+                false
+            }
+        }
+    }
+
+    /// Keeps typing that would otherwise be lost: called when the note
+    /// window closes, another file replaces it, or the session locks or
+    /// powers off. The editor stays where it was.
+    pub(super) fn notes_autosave(&mut self) {
+        if self.notes_mode != NotesMode::Editing
+            || self.notes_current_name.as_str().is_empty()
+            || self.notes_fingerprint() == self.notes_clean
+        {
+            return;
+        }
+        if self.notes_write() {
+            self.notes_set_status("saved automatically");
         }
     }
 
@@ -2915,32 +3089,18 @@ impl DesktopState {
     }
 
     fn notes_save(&mut self) {
-        let _ = vfs::create_directory(notes_directory(), 0o777);
-        let path = if self.notes_target.as_str().is_empty() {
-            self.notes_path_for(self.notes_current_name.as_str())
-        } else {
-            self.notes_target
-        };
-        self.notes_target.clear();
-        match vfs::open_file(path.as_str(), true, false, true, 0o644, true) {
-            Ok(descriptor) => {
-                let result = vfs::write(descriptor, self.notes_content.as_str().as_bytes(), false);
-                let _ = vfs::close(descriptor);
-                match result {
-                    Ok(_) => self.notes_set_status("saved"),
-                    Err(failure) => self.notes_set_status(shell::vfs_error(failure)),
-                }
-            }
-            Err(failure) => self.notes_set_status(shell::vfs_error(failure)),
+        if self.notes_write() {
+            self.notes_set_status("saved");
         }
+        self.notes_target.clear();
         self.notes_mode = NotesMode::List;
         self.notes_reload();
     }
 
     fn notes_delete(&mut self, name: &str) {
         let path = self.notes_path_for(name);
-        match vfs::remove(path.as_str(), false) {
-            Ok(()) => self.notes_set_status("note deleted"),
+        match move_to_trash(path.as_str(), name) {
+            Ok(()) => self.notes_set_status("note moved to trash"),
             Err(failure) => self.notes_set_status(shell::vfs_error(failure)),
         }
         self.notes_reload();
@@ -2987,25 +3147,28 @@ impl DesktopState {
             return;
         };
         let source = self.trash_path_for(row.name_str());
-        let mut buffer = [0u8; NOTE_MAX_BYTES];
-        match shell::read_file(source.as_str(), &mut buffer) {
-            Ok(length) => {
-                let mut destination: shell::Text<256> = shell::Text::new();
-                let _ = shell::normalize_path("/data", row.name_str(), &mut destination);
-                match vfs::open_file(destination.as_str(), true, false, true, 0o644, true) {
-                    Ok(descriptor) => {
-                        let result = vfs::write(descriptor, &buffer[..length], false);
-                        let _ = vfs::close(descriptor);
-                        match result {
-                            Ok(_) => match vfs::remove(source.as_str(), false) {
-                                Ok(()) => self.trash_set_status("restored to /data"),
-                                Err(failure) => self.trash_set_status(shell::vfs_error(failure)),
-                            },
-                            Err(failure) => self.trash_set_status(shell::vfs_error(failure)),
-                        }
-                    }
-                    Err(failure) => self.trash_set_status(shell::vfs_error(failure)),
-                }
+        // Back to the folder it was deleted from, under its old name, when
+        // that folder is still there.
+        let origin = trash_origin(row.name_str());
+        let (mut directory, mut name) = (home_directory(), row.name_str());
+        if let Some(origin) = origin.as_ref()
+            && let Some(slash) = origin.as_str().rfind('/')
+        {
+            let parent = if slash == 0 {
+                "/"
+            } else {
+                &origin.as_str()[..slash]
+            };
+            if vfs::metadata(parent).is_ok() {
+                directory = parent;
+                name = &origin.as_str()[slash + 1..];
+            }
+        }
+        match move_unique(source.as_str(), directory, name) {
+            Ok(_) => {
+                set_trash_origin(row.name_str(), None);
+                self.trash_status.clear();
+                let _ = write!(self.trash_status, "restored to {directory}");
             }
             Err(failure) => self.trash_set_status(shell::vfs_error(failure)),
         }
@@ -3020,7 +3183,10 @@ impl DesktopState {
         };
         let target = self.trash_path_for(row.name_str());
         match vfs::remove(target.as_str(), row.is_dir) {
-            Ok(()) => self.trash_set_status("deleted forever"),
+            Ok(()) => {
+                set_trash_origin(row.name_str(), None);
+                self.trash_set_status("deleted forever");
+            }
             Err(failure) => self.trash_set_status(shell::vfs_error(failure)),
         }
         self.trash_selected = usize::MAX;
@@ -3032,6 +3198,10 @@ impl DesktopState {
             let row = self.trash_entries[index];
             let target = self.trash_path_for(row.name_str());
             let _ = vfs::remove(target.as_str(), row.is_dir);
+        }
+        let mut probe = [DirEntryRow::EMPTY; 1];
+        if list_directory(trash_directory(), &mut probe) == (0, false) {
+            let _ = vfs::remove(trash_origins_path().as_str(), false);
         }
         self.trash_set_status("trash emptied");
         self.trash_selected = usize::MAX;
@@ -3282,6 +3452,8 @@ impl DesktopState {
         if self.screen != Screen::Desktop || self.credential.is_none() {
             return false;
         }
+        self.prefs_flush();
+        self.notes_autosave();
         self.wipe_login();
         self.clip_open = false;
         self.switcher_open = false;
@@ -4272,6 +4444,7 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
     {
         state.persist_account = true;
         wallpaper::load_choice();
+        state.apply_saved_prefs();
         if state.load_account() {
             state.screen = Screen::Lock;
         }
@@ -5403,7 +5576,13 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 verified
             ));
         }
+        state.prefs_tick(crate::time::monotonic_nanoseconds());
+        if state.screen == Screen::Desktop {
+            state.battery_tick(crate::time::monotonic_nanoseconds());
+        }
         if crate::mt7921::present() && state.screen == Screen::Desktop {
+            let now = crate::time::monotonic_nanoseconds();
+            state.wifi_auto(now, now.saturating_sub(last_input_ns));
             if state.wifi_tick() {
                 present_desktop(frame, fonts, &state);
                 cursor.erase(frame);
@@ -7478,6 +7657,19 @@ fn draw_icon(painter: &mut Painter<'_>, layout: Layout, kind: usize, bounds: Rec
             );
             return;
         }
+        10 => {
+            painter.fill_rounded_rect(
+                part(-6, -12, 12, 12),
+                layout.radii(CornerRadii::all(6)),
+                ink,
+            );
+            painter.fill_rounded_rect(
+                part(-11, 3, 22, 10),
+                layout.radii(CornerRadii::new(10, 10, 3, 3)),
+                ink,
+            );
+            return;
+        }
         _ => {}
     }
     let x = centre.x - 12;
@@ -7607,6 +7799,7 @@ fn window_base_rect(app: DesktopApp) -> Rect {
         // 602x320 of content: the guest screen is scaled down to fit.
         DesktopApp::Linux => Rect::new(65, 10, 622, 364),
         DesktopApp::Store => Rect::new(80, 18, 592, 346),
+        DesktopApp::Avatar => Rect::new(106, 16, 540, 348),
         DesktopApp::Settings => Rect::new(91, 29, 570, 330),
         _ => Rect::new(113, 32, 531, 303),
     }
@@ -7815,6 +8008,7 @@ fn draw_window(
             DesktopApp::Terminal => "",
             DesktopApp::Linux => "Linux",
             DesktopApp::Store => "App Store",
+            DesktopApp::Avatar => "Avatar",
             DesktopApp::None => "AerOS",
         },
         13,
@@ -7823,6 +8017,10 @@ fn draw_window(
     draw_window_controls(painter, layout, state.app, outer);
     if state.app == DesktopApp::Store {
         draw_store(painter, layout, ui_font, mono_font, state);
+        return captured;
+    }
+    if state.app == DesktopApp::Avatar {
+        avatarui::draw_avatar(painter, layout, ui_font, outer);
         return captured;
     }
     if state.app == DesktopApp::Settings {
@@ -11561,7 +11759,12 @@ fn pointer_self_test() -> bool {
         && wake.screen == Screen::Keyboard;
     let scale = Scale::from_milli(1_700).unwrap_or(Scale::ONE);
     let round_trip = (scale.invert(scale.logical(200)) - 200).abs() <= 1;
-    terminal && opened && ignored && advanced && round_trip && corner_self_test()
+    let corner = corner_self_test();
+    let flags = [terminal, opened, ignored, advanced, round_trip, corner];
+    if flags.contains(&false) {
+        serial::format(format_args!("AEROS_DESKTOP_POINTER_FAILED {flags:?}\n"));
+    }
+    !flags.contains(&false)
 }
 
 /// The feather menu, the Parcel panel and the gear.
@@ -11585,21 +11788,29 @@ fn corner_self_test() -> bool {
     state.set_app(DesktopApp::Notes);
     let hidden_under_window = state.click(feather) != DesktopAction::Redraw || !state.menu_open;
     state.set_app(DesktopApp::None);
+    // "Quit all apps" is the sixth row; Notes is still open behind the desktop.
+    let still_open = state.open_apps != 0;
     state.handle(DesktopKey::Menu);
-    for _ in 0..4 {
+    for _ in 0..5 {
         state.handle(DesktopKey::Down);
     }
     state.handle(DesktopKey::Activate);
-    let quits = state.open_apps == 0 && state.app == DesktopApp::None;
-    opens
-        && closes
-        && by_key
-        && parcel
-        && parcel_closes
-        && gear
-        && gear_toggles
-        && hidden_under_window
-        && quits
+    let quits = still_open && state.open_apps == 0 && state.app == DesktopApp::None;
+    let flags = [
+        opens,
+        closes,
+        by_key,
+        parcel,
+        parcel_closes,
+        gear,
+        gear_toggles,
+        hidden_under_window,
+        quits,
+    ];
+    if flags.contains(&false) {
+        serial::format(format_args!("AEROS_DESKTOP_CORNER_FAILED {flags:?}\n"));
+    }
+    !flags.contains(&false)
 }
 
 #[cfg_attr(not(feature = "boot-test"), allow(dead_code))]

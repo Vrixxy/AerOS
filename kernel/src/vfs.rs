@@ -245,8 +245,9 @@ enum Protection {
 
 /// The system's own files directly in `/data` (a directory covers what is
 /// inside it).
-const PROTECTED: [(&str, Protection); 6] = [
+const PROTECTED: [(&str, Protection); 7] = [
     ("ACCOUNT.DAT", Protection::Secret),
+    ("WIFI.DAT", Protection::Secret),
     ("LOCKOUT.DAT", Protection::Changes),
     ("QUAR", Protection::Secret),
     ("AVSIG.DAT", Protection::Changes),

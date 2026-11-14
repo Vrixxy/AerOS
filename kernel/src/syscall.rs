@@ -2387,6 +2387,10 @@ fn clone_task(
                 return error(14);
             }
         }
+        // A base outside the user half would fault in the kernel when loaded.
+        if flags & CLONE_SETTLS != 0 && tls > 0x0000_7fff_ffff_ffff {
+            return error(1);
+        }
         let request = crate::scheduler::ThreadRequest {
             stack,
             tls: (flags & CLONE_SETTLS != 0).then_some(tls),
@@ -7684,9 +7688,10 @@ fn push_signal_frame(
     let mut user_rsp = user_rsp;
     if action.flags & SA_ONSTACK != 0 {
         let alternate = *ALTERNATE_STACK.lock();
-        let on_it = user_rsp > alternate.pointer && user_rsp <= alternate.pointer + alternate.size;
+        let top = alternate.pointer.saturating_add(alternate.size);
+        let on_it = user_rsp > alternate.pointer && user_rsp <= top;
         if alternate.flags & 2 == 0 && alternate.size != 0 && !on_it {
-            user_rsp = alternate.pointer + alternate.size;
+            user_rsp = top;
         }
     }
     // Handler entry needs rsp = 8 (mod 16), as right after a `call`.
@@ -8673,7 +8678,11 @@ fn linux_sigaltstack(stack: u64, old_stack: u64) -> u64 {
         {
             return error(12);
         }
-        *ALTERNATE_STACK.lock() = configured;
+        *ALTERNATE_STACK.lock() = if configured.flags == 2 {
+            AlternateStack::EMPTY
+        } else {
+            configured
+        };
     }
     SIGNAL_CALLS.fetch_add(1, Ordering::Relaxed);
     COMPAT_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -9270,6 +9279,13 @@ pub(crate) fn tcp_net_echo_self_test(port: u16, timeout_ns: u64) -> (bool, usize
 
 pub(crate) fn proc_capabilities() -> crate::capability::Capabilities {
     current_capabilities()
+}
+
+/// Whether the running task may look inside process `pid` (its environment
+/// and memory layout in `/proc`): its own descendants, or any process with
+/// the capability `ptrace` asks for.
+pub(crate) fn may_inspect(pid: u64) -> bool {
+    crate::scheduler::may_signal(pid, has_capability(crate::capability::CAP_SYS_PTRACE))
 }
 
 /// 0 none, 1 strict, 2 filter - the value `/proc/self/status` reports.

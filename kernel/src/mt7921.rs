@@ -851,6 +851,9 @@ impl Wifi {
         if rxd1 & ((1 << 27) | (1 << 25)) != 0 {
             return;
         }
+        // Decrypted by the hardware with the installed key: a cipher was
+        // applied and neither its kind nor its length was off.
+        let decrypted = (rxd1 >> 16) & 0x1f != 0 && rxd1 & ((1 << 23) | (1 << 24)) == 0;
         let total = ((le32(data, 0) & 0xffff) as usize).clamp(24, data.len());
         let data = &data[..total];
         let mut at = 24;
@@ -886,7 +889,7 @@ impl Wifi {
         if rxd2 & (1 << 13) != 0 {
             if body.len() >= 14 {
                 let ethertype = u16::from_be_bytes([body[12], body[13]]);
-                self.deliver(&body[..6], &body[6..12], ethertype, &body[14..]);
+                self.deliver(&body[..6], &body[6..12], ethertype, &body[14..], decrypted);
             }
             return;
         }
@@ -950,13 +953,20 @@ impl Wifi {
                 let ethertype = u16::from_be_bytes([payload[6], payload[7]]);
                 let destination: [u8; 6] = body[4..10].try_into().unwrap_or([0; 6]);
                 let source: [u8; 6] = body[16..22].try_into().unwrap_or([0; 6]);
-                self.deliver(&destination, &source, ethertype, &payload[8..]);
+                self.deliver(&destination, &source, ethertype, &payload[8..], decrypted);
             }
             _ => {}
         }
     }
 
-    fn deliver(&mut self, destination: &[u8], source: &[u8], ethertype: u16, payload: &[u8]) {
+    fn deliver(
+        &mut self,
+        destination: &[u8],
+        source: &[u8],
+        ethertype: u16,
+        payload: &[u8],
+        decrypted: bool,
+    ) {
         if ethertype == 0x888e {
             let len = payload.len().min(self.eapol.len());
             self.eapol[..len].copy_from_slice(&payload[..len]);
@@ -964,6 +974,10 @@ impl Wifi {
             return;
         }
         if self.link != Link::Connected || payload.len() + 14 > FRAME_MAX {
+            return;
+        }
+        // On a protected network a plain frame is someone else's forgery.
+        if self.bss.security != Security::Open && !decrypted {
             return;
         }
         if self.queue_count == QUEUE {

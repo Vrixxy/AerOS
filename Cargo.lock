@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "aeros-kernel"
 version = "0.1.0"
+dependencies = [
+ "avatar-core",
+]
+
+[[package]]
+name = "avatar-core"
+version = "0.1.0"

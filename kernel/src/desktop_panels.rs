@@ -454,7 +454,7 @@ impl DesktopState {
     /// Battery saver: every processor at its slowest performance state (where
     /// the OS sets the clock; under a hypervisor the host does), and back to
     /// the fastest allowed one when it is switched off.
-    fn set_battery_saver(&mut self, on: bool) {
+    pub(super) fn set_battery_saver(&mut self, on: bool) {
         self.battery_saver = on;
         if !crate::acpi_ns::report().loaded {
             return;

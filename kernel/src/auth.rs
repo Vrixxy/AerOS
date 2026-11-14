@@ -253,7 +253,9 @@ impl Credential {
         salt.copy_from_slice(&bytes[..SALT_LEN]);
         key.copy_from_slice(&bytes[SALT_LEN..SALT_LEN + KEY_LEN]);
         let iterations = u32::from_le_bytes(bytes[SALT_LEN + KEY_LEN..].try_into().ok()?);
-        (iterations != 0).then_some(Self {
+        // A stored count far below what this system writes would make the
+        // password cheap to guess, a huge one would hang every sign-in.
+        (10_000..=10_000_000).contains(&iterations).then_some(Self {
             salt,
             key,
             iterations,

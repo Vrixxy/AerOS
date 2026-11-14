@@ -1,5 +1,5 @@
 [workspace]
-members = ["kernel"]
+members = ["kernel", "avatar"]
 exclude = ["userspace/init", "userspace/std-smoke", "userspace/fork-probe", "userspace/threads", "userspace/ptrace", "userspace/swap", "userspace/bench", "userspace/parallel", "userspace/sysx", "userspace/apps", "tools/aml-host", "compat/agent"]
 resolver = "3"
 

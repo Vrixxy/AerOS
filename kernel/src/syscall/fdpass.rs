@@ -58,7 +58,7 @@ pub(super) fn collect(process_fd: &ProcessFd, control: u64, length: u64) -> Resu
     let mut offset = 0;
     while offset + 16 <= length {
         let mut header = [0u8; 16];
-        if !user::copy_from_user(control + offset, &mut header) {
+        if !user::copy_from_user(control.wrapping_add(offset), &mut header) {
             return Err(14);
         }
         let message_length = read_array_u64(&header, 0);
@@ -74,7 +74,8 @@ pub(super) fn collect(process_fd: &ProcessFd, control: u64, length: u64) -> Resu
             }
             for index in 0..count {
                 let mut number = [0u8; 4];
-                if !user::copy_from_user(control + offset + 16 + index as u64 * 4, &mut number) {
+                let at = control.wrapping_add(offset + 16 + index as u64 * 4);
+                if !user::copy_from_user(at, &mut number) {
                     return Err(14);
                 }
                 let descriptor = u64::from(u32::from_le_bytes(number));
@@ -162,7 +163,10 @@ pub(super) fn deliver(
     header[12..16].copy_from_slice(&SCM_RIGHTS.to_le_bytes());
     let mut written = user::copy_to_user(control, &header);
     for (index, descriptor) in installed[..count].iter().enumerate() {
-        written &= user::copy_to_user(control + 16 + index as u64 * 4, &descriptor.to_le_bytes());
+        written &= user::copy_to_user(
+            control.wrapping_add(16 + index as u64 * 4),
+            &descriptor.to_le_bytes(),
+        );
     }
     if !written {
         return (0, MSG_CTRUNC);

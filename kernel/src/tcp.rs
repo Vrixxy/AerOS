@@ -1327,7 +1327,7 @@ impl Tcp {
             let port = self.allocate_port();
             self.tcbs[index].local_port = port;
         }
-        let iss = initial_sequence(now, self.tcbs[index].local_port, remote_port);
+        let iss = initial_sequence(now, &remote, self.tcbs[index].local_port, remote_port);
         let tcb = &mut self.tcbs[index];
         tcb.remote = remote;
         tcb.remote_port = remote_port;
@@ -1571,7 +1571,12 @@ impl Tcp {
             let Some(child) = self.tcbs.iter().position(|tcb| !tcb.used) else {
                 return;
             };
-            let iss = initial_sequence(now, segment.local_port, segment.remote_port);
+            let iss = initial_sequence(
+                now,
+                &segment.remote,
+                segment.local_port,
+                segment.remote_port,
+            );
             let (local_mss, sack) = (self.local_mss, self.sack);
             let tcb = &mut self.tcbs[child];
             tcb.clear();
@@ -1656,9 +1661,30 @@ fn no_data(tcb: &mut Tcb) -> Result<usize, u64> {
     }
 }
 
-fn initial_sequence(now: u64, local_port: u16, remote_port: u16) -> u32 {
-    let mixed = now / 4_000 + ((local_port as u64) << 16) + remote_port as u64;
-    (mixed as u32).wrapping_mul(0x9e37_79b9) ^ 0x5bd1_e995
+static ISN_KEY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// RFC 6528: a 4-microsecond clock plus a keyed hash of the connection, so
+/// an off-path sender cannot guess the sequence numbers of a connection.
+fn initial_sequence(now: u64, remote: &Address, local_port: u16, remote_port: u16) -> u32 {
+    use core::sync::atomic::Ordering;
+    let mut key = ISN_KEY.load(Ordering::Relaxed);
+    if key == 0 {
+        key = crate::random::next_u64() | 1;
+        key = match ISN_KEY.compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => key,
+            Err(current) => current,
+        };
+    }
+    let mix = |mut value: u64| {
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    };
+    let high = u64::from_le_bytes(remote[..8].try_into().unwrap_or([0; 8]));
+    let low = u64::from_le_bytes(remote[8..].try_into().unwrap_or([0; 8]));
+    let ports = ((local_port as u64) << 16) | remote_port as u64;
+    let hash = mix(mix(mix(key ^ high) ^ low) ^ ports ^ key.rotate_left(29));
+    (hash as u32).wrapping_add((now / 4_000) as u32)
 }
 
 #[cfg(feature = "boot-test")]

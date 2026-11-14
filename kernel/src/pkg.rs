@@ -352,31 +352,38 @@ fn write_hex(out: &mut impl Write, bytes: &[u8]) {
     }
 }
 
+/// Checks `signature` over the file against the trusted keys. A valid one
+/// gives the SHA-256 of the bytes that were checked, so the caller can tell
+/// that what it installs afterwards is still that content.
 pub(crate) fn signature_valid(
     package: &str,
     signature: &[u8; 64],
     keys: &[[u8; 32]],
-) -> Result<bool, Failure> {
+) -> Result<Option<[u8; 32]>, Failure> {
     for key in keys {
         let Some(mut verifier) = Verifier::new(key, signature) else {
             continue;
         };
         let handle = vfs::open_file(package, false, false, false, 0, false)?;
+        let mut hasher = Sha256::new();
         let mut chunk = [0u8; 1024];
         let outcome = loop {
             match vfs::read(handle, &mut chunk) {
                 Ok(0) => break Ok(()),
-                Ok(count) => verifier.update(&chunk[..count]),
+                Ok(count) => {
+                    verifier.update(&chunk[..count]);
+                    hasher.update(&chunk[..count]);
+                }
                 Err(error) => break Err(Failure::Storage(error)),
             }
         };
         let _ = vfs::close(handle);
         outcome?;
         if verifier.finish() {
-            return Ok(true);
+            return Ok(Some(hasher.finish()));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 struct Db {
@@ -491,13 +498,17 @@ pub fn install(root: &str, package: &str, signature_path: &str) -> Result<Instal
         return Err(Failure::BadSignature);
     }
     signature.copy_from_slice(&raw_signature[..64]);
-    if !signature_valid(package, &signature, &keys[..key_count])? {
+    let Some(signed) = signature_valid(package, &signature, &keys[..key_count])? else {
         return Err(Failure::BadSignature);
-    }
+    };
 
     let mut raw = [0u8; MAX_HEADER];
     let length = read_all(package, &mut raw)?;
     let header = parse_header(&raw, length)?;
+    // Everything read from here on is hashed again: the file must still be
+    // what the signature covered when the install is committed.
+    let mut reread = Sha256::new();
+    reread.update(&raw[..header.data_start as usize]);
     let entries = &header.entries[..header.count];
     let total: u64 = entries.iter().map(|entry| entry.size).sum();
     if vfs::metadata(package)?.size != header.data_start + total {
@@ -518,7 +529,14 @@ pub fn install(root: &str, package: &str, signature_path: &str) -> Result<Instal
 
     let directory = version_directory(root, name, version);
     let mut written = 0;
-    let result = copy_files(package, &header, &directory, &mut written);
+    let result =
+        copy_files(package, &header, &directory, &mut written, &mut reread).and_then(|()| {
+            if reread.finish() == signed {
+                Ok(())
+            } else {
+                Err(Failure::BadSignature)
+            }
+        });
     if let Err(failure) = result {
         remove_entries(&directory, &entries[..written]);
         let name_directory = join(&[root, "/apps/", name]);
@@ -561,13 +579,14 @@ fn copy_files(
     header: &Header,
     directory: &Path,
     written: &mut usize,
+    reread: &mut Sha256,
 ) -> Result<(), Failure> {
     make_directories(directory.as_str())?;
     let source = vfs::open_file(package, false, false, false, 0, false)?;
     let mut offset = header.data_start;
     let mut outcome = Ok(());
     for entry in &header.entries[..header.count] {
-        outcome = copy_one(source, offset, entry, directory);
+        outcome = copy_one(source, offset, entry, directory, reread);
         *written += 1;
         if outcome.is_err() {
             break;
@@ -578,7 +597,13 @@ fn copy_files(
     outcome
 }
 
-fn copy_one(source: u32, offset: u64, entry: &Entry, directory: &Path) -> Result<(), Failure> {
+fn copy_one(
+    source: u32,
+    offset: u64,
+    entry: &Entry,
+    directory: &Path,
+    reread: &mut Sha256,
+) -> Result<(), Failure> {
     let path = join(&[directory.as_str(), "/", entry.path.as_str()]);
     if let Some(slash) = path.as_str().rfind('/') {
         make_directories(&path.as_str()[..slash])?;
@@ -596,6 +621,7 @@ fn copy_one(source: u32, offset: u64, entry: &Entry, directory: &Path) -> Result
             Ok(0) => break Err(Failure::Malformed),
             Ok(count) => {
                 hasher.update(&chunk[..count]);
+                reread.update(&chunk[..count]);
                 if let Err(error) = vfs::write(output, &chunk[..count], false) {
                     break Err(Failure::Storage(error));
                 }

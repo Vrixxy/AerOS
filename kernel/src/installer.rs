@@ -9,7 +9,10 @@ const ESP_TYPE_GUID: [u8; 16] = [
 const MIN_TARGET_SECTORS: u64 = 131_072;
 /// The smallest partition that can hold a FAT32 volume with 65,525 clusters.
 pub const MIN_PARTITION_SECTORS: u64 = 590_000;
-const MAX_IMAGE_BYTES: u64 = 48 * 1024 * 1024;
+const MAX_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+/// The boot image is copied this much at a time, so installing does not
+/// need memory for all of it at once.
+const COPY_CHUNK: u64 = 8 * 1024 * 1024;
 const RESERVED: u64 = 32;
 const NUM_FATS: u64 = 2;
 const SPC: u64 = 8;
@@ -250,6 +253,8 @@ struct Table {
     entries: usize,
     first_usable: u64,
     last_usable: u64,
+    /// Where the backup copy of the entry array is.
+    backup_array: u64,
 }
 
 fn read_u32(bytes: &[u8], at: usize) -> u32 {
@@ -287,6 +292,12 @@ fn read_array(target: Target, header: &[u8; 512]) -> Result<[u8; ARRAY_BYTES], R
     let first = read_u64(header, 72);
     let mut array = [0u8; ARRAY_BYTES];
     let used = (entries * ENTRY_BYTES).div_ceil(512) as u64;
+    if first
+        .checked_add(used)
+        .is_none_or(|end| end > target.sectors())
+    {
+        return Err(Refusal::Damaged);
+    }
     for sector in 0..used {
         let mut buffer = [0u8; 512];
         if !target.read(first + sector, &mut buffer) {
@@ -346,7 +357,19 @@ fn read_table(target: Target) -> Result<Table, Refusal> {
         entries,
         first_usable: read_u64(&header, 40),
         last_usable: read_u64(&header, 48),
+        backup_array: read_u64(&backup, 72),
     };
+    // Both copies of the entry array are rewritten where they are, so they
+    // must lie outside everything a partition may occupy.
+    let used = (entries * ENTRY_BYTES).div_ceil(512) as u64;
+    let primary_array = read_u64(&header, 72);
+    if primary_array < 2
+        || primary_array + used > table.first_usable
+        || table.backup_array <= table.last_usable
+        || table.backup_array + used > backup_lba
+    {
+        return Err(Refusal::Unsupported);
+    }
     table.valid_layout()?;
     Ok(table)
 }
@@ -471,7 +494,7 @@ impl Table {
         let backup_lba = self.sectors - 1;
         let mut backup = self.header;
         let primary_array = read_u64(&self.header, 72);
-        let backup_array = self.sectors - 1 - ARRAY_SECTORS;
+        let backup_array = self.backup_array;
         put64(&mut backup, 24, backup_lba);
         put64(&mut backup, 32, 1);
         put64(&mut backup, 72, backup_array);
@@ -535,19 +558,31 @@ pub fn inspect(target: Target) -> Inspection {
     inspection
 }
 
+/// How much of the start and of the end of a disk has to be empty for the
+/// disk to count as blank.
+const BLANK_EDGE_SECTORS: u64 = 2048;
+/// Where btrfs keeps its second superblock (64 MiB).
+const BLANK_PROBE_LBA: u64 = 131_072;
+
+/// Whether nothing is on the disk: its first and last mebibyte and the
+/// places filesystems written straight onto a disk keep their superblocks
+/// are all zero. The first sectors alone are not enough: ext4 starts with
+/// 1024 zero bytes, btrfs with 64 KiB of them, and software RAID keeps its
+/// superblock at the end.
 fn is_blank(target: Target) -> bool {
-    let mut head = [0u8; 512];
-    let mut tail = [0u8; 512];
-    // Sector 2 matters: an ext4 filesystem (e.g. the Linux guest's root disk)
-    // starts with 1024 zero bytes, so sectors 0-1 alone would make it look
-    // blank; its superblock sits in sector 2.
-    let mut superblock = [0u8; 512];
-    target.read(0, &mut head)
-        && target.read(1, &mut tail)
-        && target.read(2, &mut superblock)
-        && head.iter().all(|byte| *byte == 0)
-        && tail.iter().all(|byte| *byte == 0)
-        && superblock.iter().all(|byte| *byte == 0)
+    let sectors = target.sectors();
+    let zero = |first: u64, count: u64| {
+        let mut buffer = [0u8; 512];
+        (first..first.saturating_add(count).min(sectors))
+            .all(|lba| target.read(lba, &mut buffer) && buffer.iter().all(|byte| *byte == 0))
+    };
+    sectors != 0
+        && zero(0, BLANK_EDGE_SECTORS)
+        && zero(BLANK_PROBE_LBA, 16)
+        && zero(
+            sectors.saturating_sub(BLANK_EDGE_SECTORS),
+            BLANK_EDGE_SECTORS,
+        )
 }
 
 /// The installer's own decision about a disk, applied to a table and an
@@ -575,16 +610,28 @@ pub fn plan(target: Target, allow_free_space: bool, minimum: u64) -> Plan {
     }
 }
 
-/// Whether the boot disk carries an `INSTALL.CFG` asking for an unattended
-/// installation into the free space of a disk that already has a table.
-pub fn unattended_allowed() -> bool {
+/// What the boot disk's `INSTALL.CFG` asks for: an unattended installation
+/// onto a blank disk (`blank-disk`), or also into the free space of a disk
+/// that already has a table (`free-space`, the value is whether that is
+/// allowed). Without the file nothing is installed at boot: a disk is never
+/// written to because it merely looks empty.
+pub fn unattended_request() -> Option<bool> {
     let mut buffer = [0u8; 32];
-    fat::read_root_file(b"INSTALL CFG", &mut buffer)
-        .is_some_and(|length| buffer[..length].starts_with(b"free-space"))
+    let length = fat::read_root_file(b"INSTALL CFG", &mut buffer)?;
+    if buffer[..length].starts_with(b"free-space") {
+        Some(true)
+    } else if buffer[..length].starts_with(b"blank-disk") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
-pub fn install(allow_free_space: bool, frames: &mut FrameAllocator) -> InstallReport {
+pub fn install(request: Option<bool>, frames: &mut FrameAllocator) -> InstallReport {
     let report = InstallReport::EMPTY;
+    let Some(allow_free_space) = request else {
+        return report;
+    };
     let disk_count = ahci::disk_count();
     if disk_count < 2 {
         return report;
@@ -651,7 +698,7 @@ pub fn install_to(
         return report;
     }
 
-    let image_pages = (source_bytes.div_ceil(4096) + 2).max(4);
+    let image_pages = (source_bytes.min(COPY_CHUNK).div_ceil(4096) + 2).max(4);
     let mut scratch_buffer = None;
     let scratch = match frames {
         Some(frames) => match frames.allocate_contiguous(image_pages, 1) {
@@ -666,10 +713,19 @@ pub fn install_to(
             None => return report,
         },
     };
-    if fat::stream_clusters(source_cluster, source_bytes, scratch, source_bytes)
-        != Some(source_bytes)
+    // The first piece is read before anything on the target changes.
+    let first_piece = source_bytes.min(COPY_CHUNK);
+    if fat::stream_clusters(source_cluster, source_bytes, scratch, first_piece) != Some(first_piece)
     {
         return report;
+    }
+    let mut kernel_head = [0u8; 512];
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            scratch as usize as *const u8,
+            kernel_head.as_mut_ptr(),
+            512,
+        );
     }
 
     report.stage = "layout";
@@ -730,21 +786,25 @@ pub fn install_to(
         return report;
     }
 
-    if !layout.write_cluster_data(kernel_first, scratch, source_bytes)
-        || !layout.write_chain(kernel_first, kernel_clusters)
-    {
+    let mut offset = 0u64;
+    while offset < source_bytes {
+        let piece = (source_bytes - offset).min(COPY_CHUNK);
+        if offset != 0
+            && fat::stream_clusters_from(source_cluster, source_bytes, offset, scratch, piece)
+                != Some(piece)
+        {
+            return report;
+        }
+        let cluster = kernel_first + (offset / (SPC * SECTOR)) as u32;
+        if !layout.write_cluster_data(cluster, scratch, piece) {
+            return report;
+        }
+        offset += piece;
+    }
+    if !layout.write_chain(kernel_first, kernel_clusters) {
         return report;
     }
     report.kernel_written = true;
-
-    let mut kernel_head = [0u8; 512];
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            scratch as usize as *const u8,
-            kernel_head.as_mut_ptr(),
-            512,
-        );
-    }
 
     zero_phys(scratch, (marker_clusters as u64) * SPC * SECTOR);
     write_phys(scratch, MARKER);
@@ -1120,9 +1180,20 @@ pub fn self_test() -> bool {
     let sectors = blockdev::RAM_DISK_SECTORS;
     let minimum = 1024;
 
-    let whole = (0..80).all(|lba| Target::Ram.write(lba, &[0; 512]))
+    let whole = (0..sectors).all(|lba| Target::Ram.write(lba, &[0; 512]))
         && plan(Target::Ram, false, minimum) == Plan::WholeDisk
         && plan(Target::Ram, true, minimum) == Plan::WholeDisk;
+    // A filesystem written straight onto the disk leaves the first sectors
+    // empty (btrfs: superblock at 64 KiB; software RAID: at the end).
+    let holds_data = |lba: u64| {
+        let mut sector = [0u8; 512];
+        sector[64] = 0x5f;
+        let refused = Target::Ram.write(lba, &sector)
+            && plan(Target::Ram, false, minimum) == Plan::Refuse(Refusal::NotAllowed)
+            && plan(Target::Ram, true, minimum) == Plan::Refuse(Refusal::NoTable);
+        refused && Target::Ram.write(lba, &[0; 512])
+    };
+    let whole = whole && holds_data(128) && holds_data(sectors - 16);
 
     let table_ok = build(&[(2048, 4095), (8192, 10239)], 128);
     let reading = read_table(Target::Ram).is_ok_and(|table| {

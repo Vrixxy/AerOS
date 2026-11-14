@@ -124,9 +124,12 @@ static TTYS: TicketLock<[Tty; TTY_COUNT]> = TicketLock::new([Tty::EMPTY; TTY_COU
 /// Makes a terminal of an input and an output pipe (see `input_create` and
 /// `capture_create`).
 pub fn create(input: usize, output: usize) -> Option<usize> {
+    // A slot some process still holds a descriptor of (a closed
+    // pseudo-terminal's slave) is not handed out again.
+    let free = (0..TTY_COUNT).find(|&index| !TTYS.lock()[index].used && !slave_open(index))?;
     let index = {
         let mut ttys = TTYS.lock();
-        let index = ttys.iter().position(|tty| !tty.used)?;
+        let index = free;
         ttys[index] = Tty {
             used: true,
             input,
@@ -609,6 +612,10 @@ pub(super) fn ready_events(process_fd: &ProcessFd) -> u32 {
 /// The terminal ioctls on a terminal's pipe; `None` for any other descriptor.
 pub(super) fn ioctl(process_fd: &ProcessFd, request: u64, address: u64) -> Option<u64> {
     let index = tty_of(process_fd)?;
+    // The terminal is gone (its master closed): nothing to configure.
+    if !TTYS.lock().get(index).is_some_and(|tty| tty.used) {
+        return Some(error(5));
+    }
     let copy_out = |bytes: &[u8]| {
         if user::copy_to_user(address, bytes) {
             0

@@ -1,6 +1,7 @@
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::UI::Controls::Dialogs::{CC_ANYCOLOR, CC_ENABLEHOOK, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, ChooseColorW};
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::Registry::*;
@@ -98,13 +99,25 @@ fn wallpaper_host() -> Option<(HWND, Option<HWND>)> {
     }
 }
 
+static EMBEDDED: AtomicBool = AtomicBool::new(false);
+
+/// True when the wallpaper window lives inside the desktop (like Lively), false when it is the plain top-level fallback.
+pub fn embedded() -> bool {
+    EMBEDDED.load(Ordering::SeqCst)
+}
+
 pub fn attach_behind_icons(window: &Window, m: Monitor) -> bool {
     let Ok(handle) = window.window_handle() else { return false };
     let RawWindowHandle::Win32(h) = handle.as_raw() else { return false };
     let hwnd = HWND(h.hwnd.get() as *mut _);
-    if !matches!(std::env::var("AW_MODE").as_deref(), Ok("embed" | "workerw" | "bottom" | "top")) {
-        return attach_toplevel(hwnd, m);
+    if std::env::var("AW_MODE").as_deref() != Ok("toplevel") && attach_embedded(hwnd, m) {
+        EMBEDDED.store(true, Ordering::SeqCst);
+        return true;
     }
+    attach_toplevel(hwnd, m)
+}
+
+fn attach_embedded(hwnd: HWND, m: Monitor) -> bool {
     let Some((host, below)) = wallpaper_host() else { return false };
     unsafe {
         let mut r = RECT::default();
@@ -196,6 +209,62 @@ pub fn set_startup(on: bool) {
     }
 }
 
+static PREVIEW: AtomicU32 = AtomicU32::new(0);
+
+/// The colour currently shown in the open colour dialog, updated while the user drags.
+pub fn preview() -> Option<[u8; 3]> {
+    let v = PREVIEW.load(Ordering::SeqCst);
+    (v != 0).then(|| [((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8])
+}
+
+unsafe extern "system" fn colour_hook(hdlg: HWND, msg: u32, wp: WPARAM, _lp: LPARAM) -> usize {
+    unsafe {
+        match msg {
+            WM_INITDIALOG => {
+                SetTimer(Some(hdlg), 1, 40, None);
+            }
+            WM_TIMER if wp.0 == 1 => {
+                // the dialog's Red, Green and Blue boxes (ids 706 to 708) follow the picker as it moves
+                let mut v = [0u32; 3];
+                for (i, id) in [706, 707, 708].into_iter().enumerate() {
+                    let mut ok = BOOL(0);
+                    v[i] = GetDlgItemInt(hdlg, id, Some(&mut ok), false);
+                    if !ok.as_bool() || v[i] > 255 {
+                        return 0;
+                    }
+                }
+                PREVIEW.store(0x0100_0000 | v[0] << 16 | v[1] << 8 | v[2], Ordering::SeqCst);
+            }
+            WM_DESTROY => {
+                let _ = KillTimer(Some(hdlg), 1);
+            }
+            _ => {}
+        }
+        0
+    }
+}
+
+/// Windows colour dialog with the full palette open. Blocks until closed, so call it off the main thread.
+pub fn pick_colour(initial: [u8; 3]) -> Option<[u8; 3]> {
+    PREVIEW.store(0, Ordering::SeqCst);
+    let mut custom = [COLORREF(0x00FF_FFFF); 16];
+    let mut cc = CHOOSECOLORW {
+        lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
+        rgbResult: COLORREF(initial[0] as u32 | (initial[1] as u32) << 8 | (initial[2] as u32) << 16),
+        lpCustColors: custom.as_mut_ptr(),
+        Flags: CC_FULLOPEN | CC_RGBINIT | CC_ANYCOLOR | CC_ENABLEHOOK,
+        lpfnHook: Some(colour_hook),
+        ..Default::default()
+    };
+    let ok = unsafe { ChooseColorW(&mut cc).as_bool() };
+    PREVIEW.store(0, Ordering::SeqCst);
+    if !ok {
+        return None;
+    }
+    let c = cc.rgbResult.0;
+    Some([(c & 0xFF) as u8, ((c >> 8) & 0xFF) as u8, ((c >> 16) & 0xFF) as u8])
+}
+
 pub fn open_folder(path: &std::path::Path) {
     unsafe {
         ShellExecuteW(None, w!("open"), &HSTRING::from(path.as_os_str()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
@@ -233,6 +302,55 @@ unsafe fn close_if_ours(hwnd: HWND, l: LPARAM) {
 pub fn close_others() {
     unsafe {
         let _ = EnumWindows(Some(close_cb), LPARAM(std::process::id() as isize));
+    }
+}
+
+/// Show Desktop and "minimize all" shrink this window into a small stub at the bottom-left. Put it straight back.
+fn hwnd_of(window: &Window) -> Option<HWND> {
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::Win32(h) = handle.as_raw() else { return None };
+    Some(HWND(h.hwnd.get() as *mut _))
+}
+
+pub fn is_minimized(window: &Window) -> bool {
+    hwnd_of(window).is_some_and(|h| unsafe { IsIconic(h).as_bool() })
+}
+
+/// Only call this once the window has stayed minimized for a moment, so the minimize has finished first.
+pub fn restore_minimized(window: &Window, m: Monitor) {
+    let Some(hwnd) = hwnd_of(window) else { return };
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        attach_toplevel(hwnd, m);
+    }
+}
+
+/// Show Desktop raises the desktop window above this one. Keep this window directly above the desktop window
+/// (so it hides the plain wallpaper but stays under every app).
+pub fn keep_above_desktop(windows: &[&Window]) {
+    let ours: Vec<HWND> = windows.iter().filter_map(|w| hwnd_of(w)).collect();
+    if ours.is_empty() {
+        return;
+    }
+    unsafe {
+        let Ok(progman) = FindWindowW(w!("Progman"), PCWSTR::null()) else { return };
+        let mut run = 0;
+        let mut cur = GetWindow(progman, GW_HWNDPREV).ok();
+        while let Some(c) = cur {
+            if !ours.contains(&c) {
+                break;
+            }
+            run += 1;
+            cur = GetWindow(c, GW_HWNDPREV).ok();
+        }
+        if run == ours.len() {
+            return;
+        }
+        let mut prev = cur.unwrap_or(HWND_TOP);
+        for w in &ours {
+            let _ = SetWindowPos(*w, Some(prev), 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+            prev = *w;
+        }
     }
 }
 

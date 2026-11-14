@@ -21,7 +21,7 @@ const IMAGE: &[u8] = b"BOOTX64.EFI";
 const STAGED: &[u8] = b"BOOTX64.NEW";
 const PREVIOUS: &[u8] = b"BOOTX64.OLD";
 const DIRECTORY: &[u8] = b"/EFI/BOOT";
-const MAX_IMAGE: u64 = 64 << 20;
+const MAX_IMAGE: u64 = 256 << 20;
 const CHUNK: usize = 64 * 1024;
 
 pub struct Applied {
@@ -107,18 +107,18 @@ pub fn apply_to_volume(
     if key_count == 0 {
         return Err(Failure::NoTrustedKeys);
     }
+    if vfs::metadata(image)?.size > MAX_IMAGE {
+        return Err(Failure::TooLarge);
+    }
     let mut raw = [0u8; 65];
     if pkg::read_all(signature, &mut raw)? != 64 {
         return Err(Failure::BadSignature);
     }
     let mut signature_bytes = [0u8; 64];
     signature_bytes.copy_from_slice(&raw[..64]);
-    if !pkg::signature_valid(image, &signature_bytes, &keys[..key_count])? {
+    let Some(signed) = pkg::signature_valid(image, &signature_bytes, &keys[..key_count])? else {
         return Err(Failure::BadSignature);
-    }
-    if vfs::metadata(image)?.size > MAX_IMAGE {
-        return Err(Failure::TooLarge);
-    }
+    };
     let directory = fs.resolve(DIRECTORY).map_err(storage)?;
     if !directory.is_directory() {
         return Err(Failure::Missing);
@@ -135,6 +135,12 @@ pub fn apply_to_volume(
     );
     let _ = vfs::close(source);
     let (mut staged, bytes, digest) = staged?;
+    // What was copied must be what the signature covered (the file could
+    // have been swapped in between).
+    if digest != signed {
+        let _ = fs.remove(&staged);
+        return Err(Failure::BadSignature);
+    }
     if hash_node(fs, &mut staged, buffer.as_mut_slice())? != digest {
         let _ = fs.remove(&staged);
         return Err(Failure::HashMismatch);

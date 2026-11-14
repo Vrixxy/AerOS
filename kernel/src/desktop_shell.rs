@@ -73,6 +73,8 @@ impl DesktopState {
 
     pub(super) fn start_power_action(&mut self, action: PowerAction) {
         let now = crate::time::monotonic_nanoseconds();
+        self.prefs_flush();
+        self.notes_autosave();
         self.power_open = false;
         self.power_flyout = false;
         self.power_at_ns = 0;

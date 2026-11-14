@@ -696,6 +696,26 @@ pub(super) fn draw_settings(
             }
         }
         PAGE_POWER => {
+            let mut charge = ClockBuffer::new();
+            crate::battery::describe(
+                crate::battery::level(crate::time::monotonic_nanoseconds()),
+                &mut charge,
+            );
+            draw_info_box(
+                painter,
+                layout,
+                font,
+                Rect::new(
+                    pane.x + SETTING_ROW.width + 24,
+                    pane.y,
+                    INFO_BOX.width,
+                    INFO_BOX.height / 2,
+                ),
+                &[
+                    ("Battery", charge.as_str()),
+                    ("Saver", if state.battery_saver { "On" } else { "Off" }),
+                ],
+            );
             for (index, label) in ["Lock", "Sleep", "Restart", "Shut down"].iter().enumerate() {
                 let button = power_button(pane, index);
                 painter.stroke_rounded_rect(
@@ -740,6 +760,17 @@ pub(super) fn draw_settings(
                 uptime_s / 60 % 60,
                 uptime_s % 60
             );
+            let (total, used) = crate::sysmon::memory();
+            let mut memory = ClockBuffer::new();
+            let gib = |bytes: u64| (bytes / (1 << 20) * 10 / 1024) as u32;
+            let _ = write!(
+                memory,
+                "{}.{} of {}.{} GB",
+                gib(used) / 10,
+                gib(used) % 10,
+                gib(total) / 10,
+                gib(total) % 10
+            );
             let processor = if cpu.brand().is_empty() {
                 cpu.vendor()
             } else {
@@ -749,10 +780,11 @@ pub(super) fn draw_settings(
                 painter,
                 layout,
                 font,
-                Rect::new(pane.x, pane.y, SLIDER_ROW.width, INFO_BOX.height),
+                Rect::new(pane.x, pane.y, SLIDER_ROW.width, INFO_BOX.height + 17),
                 &[
                     ("System", "AerOS (x86-64, UEFI)"),
                     ("Processor", processor),
+                    ("Memory", memory.as_str()),
                     ("Uptime", up.as_str()),
                     (
                         "Time zone",
@@ -778,6 +810,28 @@ fn wifi_row(pane: Rect, slot: usize) -> Rect {
         WIFI_ROW_WIDTH,
         ROW,
     )
+}
+
+fn wifi_forget_button(row: Rect) -> Rect {
+    Rect::new(row.right() - 104, row.y + 4, 62, row.height - 8)
+}
+
+/// The saved password that would join `network`, if one fits it.
+fn wifi_saved(network: &crate::mt7921::Network) -> Option<crate::wifi_known::Known> {
+    let ssid = &network.ssid[..network.ssid_len.min(network.ssid.len())];
+    let saved = crate::wifi_known::lookup(ssid)?;
+    let fits = match network.security {
+        crate::mt7921::Security::Open => saved.passphrase().is_empty(),
+        crate::mt7921::Security::Wpa2 => saved.passphrase().len() >= 8,
+        crate::mt7921::Security::Unsupported => false,
+    };
+    fits.then_some(saved)
+}
+
+fn wifi_joined(status: &crate::mt7921::Status, network: &crate::mt7921::Network) -> bool {
+    status.link == crate::mt7921::Link::Connected
+        && status.ssid_len == network.ssid_len
+        && status.ssid == network.ssid
 }
 
 fn wifi_refresh_button(pane: Rect) -> Rect {
@@ -842,6 +896,170 @@ impl DesktopState {
         changed && visible
     }
 
+    /// Joins a network this machine has joined before, without being asked:
+    /// looks for one in the scan results (scanning now and then while there
+    /// is none) and queues the connection with its saved password. Joining
+    /// takes a few seconds in which nothing else moves, so it waits for a
+    /// pause in the input (`idle_ns`), though not forever; after a few failed
+    /// attempts it leaves the choice to the user.
+    pub(super) fn wifi_auto(&mut self, now: u64, idle_ns: u64) {
+        const RESCAN_NS: u64 = 20_000_000_000;
+        const RETRY_NS: u64 = 30_000_000_000;
+        const PAUSE_NS: u64 = 1_500_000_000;
+        const PATIENCE_NS: u64 = 15_000_000_000;
+        const ATTEMPTS: u8 = 3;
+        let status = crate::mt7921::status();
+        let wanted = self.wifi && !self.airplane && self.wifi_applied;
+        if !wanted
+            || status.link != crate::mt7921::Link::Idle
+            || status.scanning
+            || self.wifi_choice.is_some()
+            || self.wifi_pending
+            || self.wifi_auto_failures >= ATTEMPTS
+            || now < self.wifi_auto_next_ns
+            || !crate::wifi_known::any()
+        {
+            self.wifi_auto_ready_ns = 0;
+            return;
+        }
+        let mut found = [crate::mt7921::Network::EMPTY; crate::mt7921::MAX_NETWORKS];
+        let count = crate::mt7921::networks(&mut found);
+        let known = found[..count]
+            .iter()
+            .find_map(|network| Some((*network, wifi_saved(network)?)));
+        let Some((network, saved)) = known else {
+            let _ = crate::mt7921::scan();
+            self.wifi_auto_next_ns = now + RESCAN_NS;
+            self.wifi_auto_ready_ns = 0;
+            return;
+        };
+        if self.wifi_auto_ready_ns == 0 {
+            self.wifi_auto_ready_ns = now;
+        }
+        if idle_ns < PAUSE_NS && now.saturating_sub(self.wifi_auto_ready_ns) < PATIENCE_NS {
+            return;
+        }
+        let passphrase = saved.passphrase();
+        self.wifi_password.fill(0);
+        self.wifi_password[..passphrase.len()].copy_from_slice(passphrase);
+        self.wifi_password_len = passphrase.len();
+        self.wifi_choice = Some(network);
+        self.wifi_pending = true;
+        self.wifi_auto_attempt = true;
+        self.wifi_auto_ready_ns = 0;
+        self.wifi_auto_next_ns = now + RETRY_NS;
+    }
+
+    /// Warns once at 10% and once at 5% while the battery runs down; at 5%
+    /// it also turns on battery saver and saves open work.
+    pub(super) fn battery_tick(&mut self, now: u64) {
+        let Some(level) = crate::battery::level(now) else {
+            return;
+        };
+        if level.charging || level.percent > 15 {
+            self.battery_warned = 100;
+            return;
+        }
+        let mut body = ClockBuffer56::new();
+        if level.percent <= 5 && self.battery_warned > 5 {
+            self.battery_warned = 5;
+            if !self.battery_saver {
+                self.set_battery_saver(true);
+            }
+            self.notes_autosave();
+            self.prefs_flush();
+            let _ = write!(body, "{}% left. Plug in now.", level.percent);
+            crate::notify::push(0, "Battery very low", body.as_str());
+        } else if level.percent <= 10 && self.battery_warned > 10 {
+            self.battery_warned = 10;
+            let _ = write!(body, "{}% left. Plug in your charger soon.", level.percent);
+            crate::notify::push(0, "Battery low", body.as_str());
+        }
+    }
+
+    fn current_prefs(&self) -> crate::settings::Prefs {
+        crate::settings::Prefs {
+            volume: self.volume,
+            muted: self.muted,
+            brightness: self.brightness,
+            wifi: self.wifi,
+            bluetooth: self.bluetooth,
+            airplane: self.airplane,
+            battery_saver: self.battery_saver,
+            adblock_off: self.adblock_off,
+        }
+    }
+
+    /// Puts back the sound, brightness and switches of the last session.
+    #[cfg_attr(feature = "boot-test", allow(dead_code))]
+    pub(super) fn apply_saved_prefs(&mut self) {
+        let Some(prefs) = crate::settings::prefs() else {
+            return;
+        };
+        self.volume = prefs.volume;
+        self.volume_prev = prefs.volume;
+        self.muted = prefs.muted;
+        self.apply_volume();
+        self.brightness = prefs.brightness;
+        self.brightness_prev = prefs.brightness;
+        crate::framebuffer::set_brightness(prefs.brightness);
+        self.wifi = prefs.wifi;
+        self.bluetooth = prefs.bluetooth;
+        self.airplane = prefs.airplane;
+        self.adblock_off = prefs.adblock_off;
+        if prefs.battery_saver {
+            self.set_battery_saver(true);
+        }
+        self.prefs_saved = Some(prefs);
+        serial::format(format_args!(
+            "AEROS_PREFS restored=true volume={} muted={} brightness={} wifi={} bluetooth={} airplane={} battery_saver={}\n",
+            prefs.volume,
+            prefs.muted,
+            prefs.brightness,
+            prefs.wifi,
+            prefs.bluetooth,
+            prefs.airplane,
+            prefs.battery_saver
+        ));
+    }
+
+    /// Writes the preferences once a change has stood for a moment (a slider
+    /// being dragged changes many times a second).
+    pub(super) fn prefs_tick(&mut self, now: u64) {
+        const SETTLE_NS: u64 = 1_500_000_000;
+        if !self.persist_account || self.screen != Screen::Desktop {
+            return;
+        }
+        let current = self.current_prefs();
+        if self.prefs_saved == Some(current) {
+            self.prefs_pending = None;
+        } else if self.prefs_pending != Some(current) {
+            self.prefs_pending = Some(current);
+            self.prefs_changed_ns = now;
+        } else if now.saturating_sub(self.prefs_changed_ns) >= SETTLE_NS {
+            self.prefs_flush();
+        }
+    }
+
+    /// Writes the preferences now if they differ from what is on disk.
+    pub(super) fn prefs_flush(&mut self) {
+        if !self.persist_account || self.screen != Screen::Desktop {
+            return;
+        }
+        let current = self.current_prefs();
+        if self.prefs_saved != Some(current) {
+            let saved = crate::settings::set_prefs(current);
+            if saved {
+                self.prefs_saved = Some(current);
+            }
+            serial::format(format_args!(
+                "AEROS_PREFS saved={saved} volume={} brightness={}\n",
+                current.volume, current.brightness
+            ));
+        }
+        self.prefs_pending = None;
+    }
+
     /// Runs a connection the user asked for, after the "Connecting" frame is shown.
     pub(super) fn wifi_run_pending(&mut self) -> bool {
         if !self.wifi_pending {
@@ -853,7 +1071,17 @@ impl DesktopState {
         };
         let password =
             core::str::from_utf8(&self.wifi_password[..self.wifi_password_len]).unwrap_or("");
-        let _ = crate::mt7921::connect(&network, password);
+        let joined = crate::mt7921::connect(&network, password).is_ok();
+        let automatic = core::mem::take(&mut self.wifi_auto_attempt);
+        if joined {
+            self.wifi_auto_failures = 0;
+            if self.persist_account {
+                let ssid = &network.ssid[..network.ssid_len.min(network.ssid.len())];
+                crate::wifi_known::remember(ssid, password.as_bytes());
+            }
+        } else if automatic {
+            self.wifi_auto_failures = self.wifi_auto_failures.saturating_add(1);
+        }
         self.wifi_password.fill(0);
         self.wifi_password_len = 0;
         self.wifi_reveal = false;
@@ -862,16 +1090,21 @@ impl DesktopState {
 
     fn wifi_pick(&mut self, network: crate::mt7921::Network) {
         let status = crate::mt7921::status();
-        if status.link == crate::mt7921::Link::Connected
-            && status.ssid_len == network.ssid_len
-            && status.ssid == network.ssid
-        {
+        if wifi_joined(&status, &network) {
             crate::mt7921::disconnect();
+            // Left on purpose: not joined again behind the user's back.
+            self.wifi_auto_failures = u8::MAX;
             return;
         }
         self.wifi_choice = Some(network);
+        self.wifi_password.fill(0);
         self.wifi_password_len = 0;
-        if network.security != crate::mt7921::Security::Wpa2 {
+        if let Some(saved) = wifi_saved(&network) {
+            let passphrase = saved.passphrase();
+            self.wifi_password[..passphrase.len()].copy_from_slice(passphrase);
+            self.wifi_password_len = passphrase.len();
+            self.wifi_pending = true;
+        } else if network.security != crate::mt7921::Security::Wpa2 {
             self.wifi_pending = true;
         }
     }
@@ -906,9 +1139,19 @@ impl DesktopState {
             let _ = crate::mt7921::scan();
             return Some(DesktopAction::Redraw);
         }
+        let status = crate::mt7921::status();
         for slot in 0..self.wifi_row_count {
-            if wifi_row(pane, slot).contains(point) {
+            let row = wifi_row(pane, slot);
+            if row.contains(point) {
                 let network = self.wifi_rows[slot];
+                if !wifi_joined(&status, &network)
+                    && wifi_forget_button(row).contains(point)
+                    && wifi_saved(&network).is_some()
+                {
+                    let ssid = &network.ssid[..network.ssid_len.min(network.ssid.len())];
+                    crate::wifi_known::forget(ssid);
+                    return Some(DesktopAction::Redraw);
+                }
                 self.wifi_pick(network);
                 return Some(DesktopAction::Redraw);
             }
@@ -995,7 +1238,7 @@ fn draw_wifi(
     state: &DesktopState,
     pane: Rect,
 ) {
-    use crate::mt7921::{Link, Security};
+    use crate::mt7921::Security;
     let on = state.wifi && !state.airplane;
     draw_toggle_row(painter, layout, font, toggle_rect(pane, 0), "Wi-Fi", on);
     let mut line = ClockBuffer::new();
@@ -1107,9 +1350,8 @@ fn draw_wifi(
     for (slot, network) in state.wifi_rows[..state.wifi_row_count].iter().enumerate() {
         let row = wifi_row(pane, slot);
         let radii = layout.radii(CornerRadii::all(row.height / 2));
-        let joined = status.link == Link::Connected
-            && status.ssid_len == network.ssid_len
-            && status.ssid == network.ssid;
+        let joined = wifi_joined(&status, network);
+        let saved = !joined && wifi_saved(network).is_some();
         if joined {
             painter.fill_rounded_rect(layout.rect(row), radii, Rgba::new(255, 255, 255, 40));
         }
@@ -1130,6 +1372,7 @@ fn draw_wifi(
         );
         let note = match (joined, network.security) {
             (true, _) => "Connected - click to disconnect",
+            _ if saved => "Saved",
             (false, Security::Wpa2) => "Password",
             (false, Security::Open) => "Open",
             (false, Security::Unsupported) => "Not supported yet",
@@ -1143,6 +1386,16 @@ fn draw_wifi(
             9,
             INK_SOFT,
         );
+        if saved {
+            draw_button(
+                painter,
+                layout,
+                font,
+                wifi_forget_button(row),
+                "Forget",
+                false,
+            );
+        }
         draw_signal(
             painter,
             layout,

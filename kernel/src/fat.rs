@@ -373,6 +373,28 @@ pub fn stream_clusters(
     stream_entry(&volume, first_cluster, size, dest_phys, capacity)
 }
 
+/// Like [`stream_clusters`], from `skip` bytes into the file (a whole
+/// number of clusters), so a large file can be read a piece at a time.
+pub fn stream_clusters_from(
+    first_cluster: u32,
+    size: u64,
+    skip: u64,
+    dest_phys: u64,
+    capacity: u64,
+) -> Option<u64> {
+    let volume = (*MOUNTED.lock())?;
+    let cluster_bytes = volume.sectors_per_cluster as u64 * SECTOR_BYTES;
+    if cluster_bytes == 0 || !skip.is_multiple_of(cluster_bytes) || skip > size {
+        return None;
+    }
+    let mut cluster = first_cluster;
+    for _ in 0..skip / cluster_bytes {
+        cluster = next_cluster(&volume, cluster)?
+            .filter(|next| *next >= 2 && (*next as u64) < volume.clusters + 2)?;
+    }
+    stream_entry(&volume, cluster, size - skip, dest_phys, capacity)
+}
+
 fn stream_entry(
     volume: &Volume,
     first_cluster: u32,

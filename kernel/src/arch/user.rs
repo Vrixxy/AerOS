@@ -227,6 +227,12 @@ pub fn read_fs_base() -> u64 {
 
 /// Loads a task's saved FS base when it is switched in.
 pub fn write_fs_base(address: u64) {
+    // A non-canonical base would fault here, in the kernel.
+    let address = if address > 0x0000_7fff_ffff_ffff {
+        0
+    } else {
+        address
+    };
     // SAFETY: the FS base is user state; the kernel never uses FS.
     unsafe { write_msr(FS_BASE_MSR, address) };
 }

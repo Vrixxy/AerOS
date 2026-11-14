@@ -21,7 +21,8 @@ if ($Fresh -and (Test-Path -LiteralPath $stage)) {
     Remove-Item -Recurse -Force -LiteralPath $stage
 }
 if (Test-Path -LiteralPath $stage) {
-    Get-ChildItem -Recurse -File -Force -LiteralPath $stage | ForEach-Object {
+    # INSTALL.CFG makes AerOS install itself; only a test puts one on a copy.
+    Get-ChildItem -Recurse -File -Force -LiteralPath $stage | Where-Object { $_.Name -ne "INSTALL.CFG" } | ForEach-Object {
         $target = Join-Path $Esp $_.FullName.Substring($stage.Length + 1)
         $stale = -not (Test-Path -LiteralPath $target)
         if (-not $stale) {
@@ -34,7 +35,7 @@ if (Test-Path -LiteralPath $stage) {
     }
     Remove-Item -Recurse -Force -LiteralPath $stage
 }
-[string[]]$skip = if ($Fresh) { @("ROOTFS", "account.dat", "LOCKOUT.DAT") } else { @("ROOTFS") }
+[string[]]$skip = if ($Fresh) { @("ROOTFS", "account.dat", "LOCKOUT.DAT", "WIFI.DAT") } else { @("ROOTFS") }
 robocopy $Esp $stage /E /XF @skip /NFL /NDL /NJH /NJS /NP | Out-Null
 if ($LASTEXITCODE -ge 8) {
     throw "could not copy $Esp to $stage (robocopy $LASTEXITCODE)"

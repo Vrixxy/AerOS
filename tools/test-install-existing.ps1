@@ -2,6 +2,9 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $esp = [string]@(& (Join-Path $PSScriptRoot "build.ps1"))[-1]
 if (-not (Test-Path -LiteralPath $esp -PathType Container)) { throw "build.ps1 did not return the ESP directory (got: $esp)" }
+# A throwaway copy: build\esp is too big for QEMU's FAT drive, and INSTALL.CFG
+# must never be left on it.
+$esp = & (Join-Path $PSScriptRoot "esp-drive.ps1") -Esp $esp -Name esp-existing -Fresh
 $qemu = Join-Path $env:ProgramFiles "qemu\qemu-system-x86_64.exe"
 $firmware = Join-Path $env:ProgramFiles "qemu\share\edk2-x86_64-code.fd"
 $variablesTemplate = Join-Path $env:ProgramFiles "qemu\share\edk2-i386-vars.fd"
@@ -48,7 +51,7 @@ function Start-Install($label) {
 }
 
 Write-Host "== a disk with a partition table and no permission to install ==" -ForegroundColor Cyan
-if (Test-Path -LiteralPath $config) { Remove-Item -Force -LiteralPath $config -ErrorAction SilentlyContinue }
+Set-Content -LiteralPath $config -Value "blank-disk" -Encoding ascii
 $partitionHash = (python $maker make $target 640 96).Trim()
 $before = (Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash
 $output = Start-Install "without permission"

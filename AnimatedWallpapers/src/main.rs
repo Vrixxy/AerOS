@@ -16,7 +16,7 @@ use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Window, WindowButtons, WindowId};
 
 use library::{Config, Wallpaper};
 use sim::Sim;
@@ -32,9 +32,15 @@ struct Uniforms {
     pal: f32,
     srgb: f32,
     _p: [f32; 2],
+    custom: [f32; 4],
+}
+
+fn rgb_f32(c: [u8; 3]) -> [f32; 4] {
+    [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, 1.0]
 }
 
 struct Args {
+    rgb: Option<[u8; 3]>,
     window: bool,
     high_gpu: bool,
     quit: bool,
@@ -48,6 +54,7 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut a = Args {
+        rgb: None,
         window: false,
         high_gpu: false,
         quit: false,
@@ -86,6 +93,10 @@ fn parse_args() -> Args {
             "--time" => {
                 a.time = f(v.get(i + 1));
                 i += 1;
+            }
+            "--rgb" => {
+                a.rgb = Some([f(v.get(i + 1)) as u8, f(v.get(i + 2)) as u8, f(v.get(i + 3)) as u8]);
+                i += 3;
             }
             _ => {}
         }
@@ -228,7 +239,7 @@ fn snapshot(a: &Args, path: &str) {
     });
     let view = tex.create_view(&Default::default());
     let shift = 0.5 * (w as f32 / h as f32 - 1.7777778);
-    let mut u = Uniforms { res: [w as f32, h as f32], time: a.time, field: 0.0, mouse: [0.89, 0.5], par: [0.0, 0.0], pal: library::palette_index(&wp), srgb: 0.0, _p: [0.0; 2] };
+    let mut u = Uniforms { res: [w as f32, h as f32], time: a.time, field: 0.0, mouse: [0.89, 0.5], par: [0.0, 0.0], pal: library::palette_index(&wp), srgb: 0.0, _p: [0.0; 2], custom: rgb_f32(a.rgb.unwrap_or(library::load_config().custom)) };
     if let Some((cx, cy)) = a.cursor {
         u.field = 1.0;
         u.mouse = [cx / h as f32 - shift, cy / h as f32];
@@ -272,6 +283,7 @@ struct Screen {
     target: Target,
     covered: bool,
     halted: bool,
+    minimized_since: Option<Instant>,
     last_frame: Instant,
 }
 
@@ -282,6 +294,7 @@ enum Action {
     ToggleFullscreen,
     ToggleSaver,
     ToggleStartup,
+    PickColour,
     OpenFolder,
     Reload,
     Quit,
@@ -301,6 +314,8 @@ struct Running {
     last: Instant,
     last_check: Instant,
     saver: bool,
+    picker: Option<std::sync::mpsc::Receiver<Option<[u8; 3]>>>,
+    before: Option<(Wallpaper, [u8; 3])>,
 }
 
 struct App {
@@ -338,6 +353,9 @@ fn build_menu(list: &[Wallpaper], current: &str, cfg: &Config) -> (Menu, HashMap
         let _ = sub.append(&it);
     }
     let _ = menu.append(&sub);
+    let pick = MenuItem::new("Pick a colour\u{2026}", true, None);
+    map.insert(pick.id().clone(), Action::PickColour);
+    let _ = menu.append(&pick);
     let _ = menu.append(&PredefinedMenuItem::separator());
     let add_check = |text: &str, on: bool, a: Action, map: &mut HashMap<MenuId, Action>| {
         let it = CheckMenuItem::new(text, true, on, None);
@@ -379,7 +397,7 @@ impl App {
         for m in &mons {
             let mut attrs = Window::default_attributes().with_title(desktop::TITLE);
             if wallpaper_mode {
-                attrs = attrs.with_decorations(false).with_visible(false).with_active(false).with_inner_size(PhysicalSize::new(m.w, m.h)).with_position(PhysicalPosition::new(m.x, m.y));
+                attrs = attrs.with_decorations(false).with_enabled_buttons(WindowButtons::CLOSE).with_visible(false).with_active(false).with_inner_size(PhysicalSize::new(m.w, m.h)).with_position(PhysicalPosition::new(m.x, m.y));
             } else {
                 attrs = attrs.with_inner_size(PhysicalSize::new(m.w, m.h));
             }
@@ -393,7 +411,7 @@ impl App {
             windows.push(win);
         }
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor { backends: wgpu::Backends::from_env().unwrap_or_default(), ..Default::default() });
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor { backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::DX12), ..Default::default() });
         let surfaces: Vec<wgpu::Surface<'static>> = windows.iter().map(|w| instance.create_surface(w.clone()).expect("surface")).collect();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: power(self.args.high_gpu), compatible_surface: Some(&surfaces[0]), force_fallback_adapter: false })).expect("no GPU adapter");
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).expect("device");
@@ -422,14 +440,14 @@ impl App {
             };
             surface.configure(&gpu.device, &config);
             let target = gpu.target();
-            screens.push(Screen { window: win, surface, config, mon: m, sim: Sim::new(), target, covered: false, halted: false, last_frame: Instant::now() });
+            screens.push(Screen { window: win, surface, config, mon: m, sim: Sim::new(), target, covered: false, halted: false, minimized_since: None, last_frame: Instant::now() });
         }
 
         std::fs::write(library::root().join("alpha.txt"), format!("{:?} -> {:?} sizes={:?}", caps.alpha_modes, alpha, screens.iter().map(|s| (s.config.width, s.config.height, s.window.is_visible())).collect::<Vec<_>>())).ok();
         let (menu, actions) = build_menu(&list, &current.id, &cfg);
         let tray = TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("Animated Wallpapers").with_icon(tray_icon()).build().expect("tray icon");
         let now = Instant::now();
-        self.st = Some(Running { gpu, screens, srgb: format.is_srgb(), wallpaper_mode, tray, actions, list, current, cfg, start: now, last: now, last_check: now - Duration::from_secs(1), saver: false });
+        self.st = Some(Running { gpu, screens, srgb: format.is_srgb(), wallpaper_mode, tray, actions, list, current, cfg, start: now, last: now, last_check: now - Duration::from_secs(1), saver: false, picker: None, before: None });
     }
 }
 
@@ -466,6 +484,21 @@ impl Running {
             Action::ToggleFullscreen => self.cfg.pause_fullscreen = !self.cfg.pause_fullscreen,
             Action::ToggleSaver => self.cfg.pause_saver = !self.cfg.pause_saver,
             Action::ToggleStartup => desktop::set_startup(!desktop::startup_enabled()),
+            Action::PickColour => {
+                if self.picker.is_none() {
+                    let initial = self.cfg.custom;
+                    self.before = Some((self.current.clone(), initial));
+                    let custom = find_wallpaper(&self.list, "silk-custom");
+                    if self.current.id != custom.id {
+                        self.select(custom);
+                    }
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(desktop::pick_colour(initial));
+                    });
+                    self.picker = Some(rx);
+                }
+            }
             Action::OpenFolder => desktop::open_folder(&library::wallpapers_dir()),
             Action::Reload => {
                 self.list = library::scan();
@@ -491,6 +524,7 @@ impl Running {
             pal: library::palette_index(&self.current),
             srgb: if self.srgb { 1.0 } else { 0.0 },
             _p: [0.0; 2],
+            custom: rgb_f32(self.cfg.custom),
         }
     }
 
@@ -558,12 +592,62 @@ impl ApplicationHandler for App {
             }
         }
 
+        if st.picker.is_some() {
+            if let Some(c) = desktop::preview() {
+                if c != st.cfg.custom {
+                    st.cfg.custom = c;
+                    for s in &mut st.screens {
+                        s.sim.wake();
+                    }
+                }
+            }
+        }
+        let picked = st.picker.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some(res) = picked {
+            st.picker = None;
+            let before = st.before.take();
+            match res {
+                Some(c) => st.cfg.custom = c,
+                None => {
+                    if let Some((w, c)) = before {
+                        st.cfg.custom = c;
+                        if w.id != st.current.id {
+                            st.select(w);
+                        }
+                    }
+                }
+            }
+            for s in &mut st.screens {
+                s.sim.wake();
+            }
+            library::save_config(&st.cfg);
+            st.rebuild_menu();
+        }
+
         if now - st.last_check >= Duration::from_millis(300) {
             st.last_check = now;
             st.saver = st.cfg.pause_saver && desktop::battery_saver_on();
             let fs = st.cfg.pause_fullscreen && st.wallpaper_mode;
             for s in &mut st.screens {
                 s.covered = fs && desktop::covered_by_fullscreen(s.mon);
+            }
+        }
+
+        let mut minimized = false;
+        if st.wallpaper_mode && !desktop::embedded() {
+            desktop::keep_above_desktop(&st.screens.iter().map(|s| &*s.window).collect::<Vec<_>>());
+            for s in &mut st.screens {
+                if desktop::is_minimized(&s.window) {
+                    minimized = true;
+                    let since = *s.minimized_since.get_or_insert(now);
+                    if now - since >= Duration::from_millis(200) {
+                        desktop::restore_minimized(&s.window, s.mon);
+                        s.minimized_since = None;
+                        s.sim.wake();
+                    }
+                } else {
+                    s.minimized_since = None;
+                }
             }
         }
 
@@ -601,7 +685,9 @@ impl ApplicationHandler for App {
             animated |= st.current.animated;
         }
 
-        let wait = if !any_running {
+        let wait = if minimized {
+            40
+        } else if !any_running {
             400
         } else if moving {
             8

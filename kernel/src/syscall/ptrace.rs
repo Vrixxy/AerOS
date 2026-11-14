@@ -660,10 +660,14 @@ pub(super) fn ptrace(request: u64, pid: u64, address: u64, data: u64) -> u64 {
                 } else {
                     error(14)
                 }
-            } else if read_user(data, area) {
-                0
             } else {
-                error(14)
+                let mut image = [0u8; FPU_BYTES];
+                if !read_user(data, &mut image) {
+                    return error(14);
+                }
+                crate::arch::fpu::sanitize_legacy_image(&mut image);
+                area.copy_from_slice(&image);
+                0
             }
         }
         CONT => resume(Resume::Continue, false),

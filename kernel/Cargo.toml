@@ -22,6 +22,9 @@ linux-smp = ["linux-guest"]
 # Linux drivers through the adapter in kernel/linux (needs Zig; see build.rs).
 linux-drivers = []
 
+[dependencies]
+avatar-core = { path = "../avatar" }
+
 [[bin]]
 name = "aeros-kernel"
 path = "src/main.rs"

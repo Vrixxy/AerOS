@@ -193,7 +193,7 @@ fn find_ecam(acpi: &crate::acpi::AcpiInfo) -> Option<(u64, u8, u8)> {
         let base = read::<u64>(table, at)?;
         let segment = read::<u16>(table, at + 8)?;
         let (first, last) = (table[at + 10], table[at + 11]);
-        let size = ((last as u64 - first as u64) + 1) << 20;
+        let size = (u64::from(last.saturating_sub(first)) + 1) << 20;
         if segment == 0 && crate::arch::paging::kernel_range_mapped(base, size) {
             return Some((base, first, last));
         }

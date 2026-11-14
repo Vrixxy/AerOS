@@ -135,6 +135,13 @@ fn update_window(now: u64) -> (u32, u32) {
     (window.load_permille, window.guest_permille)
 }
 
+/// (total, in use) bytes of RAM.
+pub fn memory() -> (u64, u64) {
+    let free = crate::memory::TRACKED_FREE_PAGES.load(Ordering::Relaxed) * 4096;
+    let total = TOTAL_RAM.load(Ordering::Relaxed).max(free);
+    (total, total - free)
+}
+
 pub fn snapshot() -> Snapshot {
     let now = crate::time::monotonic_nanoseconds();
     let (load, guest_load) = update_window(now);

@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $esp = [string]@(& (Join-Path $PSScriptRoot "build.ps1"))[-1]
-$esp = & (Join-Path $PSScriptRoot "esp-drive.ps1") -Esp $esp -Name esp-install
+$esp = & (Join-Path $PSScriptRoot "esp-drive.ps1") -Esp $esp -Name esp-install -Fresh
 $qemu = Join-Path $env:ProgramFiles "qemu\qemu-system-x86_64.exe"
 $firmware = Join-Path $env:ProgramFiles "qemu\share\edk2-x86_64-code.fd"
 $variablesTemplate = Join-Path $env:ProgramFiles "qemu\share\edk2-i386-vars.fd"
@@ -33,6 +33,8 @@ function Invoke-Qemu($arguments, $timeoutSeconds) {
 }
 
 Write-Host "== stage 1: install AerOS onto a blank disk ==" -ForegroundColor Cyan
+# Nothing is installed at boot unless the boot disk asks for it.
+Set-Content -LiteralPath (Join-Path $esp "INSTALL.CFG") -Value "blank-disk" -Encoding ascii
 New-BlankImage $target (512MB)
 Copy-Item -Force -LiteralPath $variablesTemplate -Destination $installVars
 foreach ($p in @($installLog, $bootLog)) { if (Test-Path -LiteralPath $p) { Remove-Item -Force -LiteralPath $p } }

@@ -11,6 +11,7 @@ struct U {
     pal: f32,
     srgb: f32,
     _p: vec2<f32>,
+    custom: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -73,11 +74,12 @@ pub struct Config {
     pub pause_fullscreen: bool,
     pub pause_saver: bool,
     pub paused: bool,
+    pub custom: [u8; 3],
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { wallpaper: "silk-purple".into(), pause_fullscreen: true, pause_saver: true, paused: false }
+        Self { wallpaper: "silk-purple".into(), pause_fullscreen: true, pause_saver: true, paused: false, custom: [140, 90, 230] }
     }
 }
 
@@ -91,7 +93,7 @@ pub fn wallpapers_dir() -> PathBuf {
 }
 
 fn builtins() -> Vec<Wallpaper> {
-    ["black", "purple", "beige", "blue", "grey"]
+    ["black", "purple", "beige", "blue", "grey", "custom"]
         .iter()
         .enumerate()
         .map(|(i, n)| {
@@ -172,6 +174,12 @@ pub fn load_config() -> Config {
                     "pause_fullscreen" => c.pause_fullscreen = b,
                     "pause_saver" => c.pause_saver = b,
                     "paused" => c.paused = b,
+                    "custom" => {
+                        let p: Vec<u8> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                        if p.len() == 3 {
+                            c.custom = [p[0], p[1], p[2]];
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -183,8 +191,8 @@ pub fn load_config() -> Config {
 pub fn save_config(c: &Config) {
     let _ = fs::create_dir_all(root());
     let s = format!(
-        "wallpaper={}\npause_fullscreen={}\npause_saver={}\npaused={}\n",
-        c.wallpaper, c.pause_fullscreen as u8, c.pause_saver as u8, c.paused as u8
+        "wallpaper={}\npause_fullscreen={}\npause_saver={}\npaused={}\ncustom={},{},{}\n",
+        c.wallpaper, c.pause_fullscreen as u8, c.pause_saver as u8, c.paused as u8, c.custom[0], c.custom[1], c.custom[2]
     );
     let _ = fs::write(root().join("config.txt"), s);
 }

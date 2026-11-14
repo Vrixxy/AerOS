@@ -762,6 +762,9 @@ if ($output -notmatch "AEROS_BLOCK .* verified=true") {
 if ($output -notmatch "AEROS_INSTALLER verified=true") {
     throw "AerOS installer self-test failed`n$output"
 }
+if ($output -notmatch "AEROS_SAVED_SETTINGS prefs=true wifi=true verified=true") {
+    throw "AerOS saved settings self-test failed`n$output"
+}
 if ($output -notmatch "AEROS_PROCFS verified=true") {
     throw "AerOS /proc validation failed`n$output"
 }

@@ -369,8 +369,14 @@ fn lock_pi(group: u64, address: u64, timeout: u64, realtime: bool) -> u64 {
         if owner == me {
             return if waited { 0 } else { error(35) };
         }
+        // Only a thread of this process has its priority raised: the word is
+        // the program's, and could name any task.
         let my_nice = crate::scheduler::nice_of(u64::from(me)).unwrap_or(0);
-        let saved = crate::scheduler::boost_nice(u64::from(owner), my_nice).unwrap_or(0);
+        let saved = if crate::scheduler::group_of_tid(u64::from(owner)) == Some(group) {
+            crate::scheduler::boost_nice(u64::from(owner), my_nice).unwrap_or(0)
+        } else {
+            crate::scheduler::nice_of(u64::from(owner)).unwrap_or(0)
+        };
         if !write_word(address, word | WAITERS_BIT) {
             return error(14);
         }

@@ -48,6 +48,10 @@ try {
     } else {
         cargo build --release --target x86_64-unknown-uefi
     }
+    # A failed build must not hand the previous image on as if it were new.
+    if ($LASTEXITCODE -ne 0) {
+        throw "the kernel did not build (cargo exit code $LASTEXITCODE)"
+    }
     New-Item -ItemType Directory -Force -Path $boot | Out-Null
     Copy-Item -Force -LiteralPath $binary -Destination (Join-Path $boot "BOOTX64.EFI")
 } finally {

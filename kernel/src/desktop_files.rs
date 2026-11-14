@@ -78,6 +78,7 @@ impl DesktopState {
     }
 
     fn files_open_text(&mut self, name: &str) {
+        self.notes_autosave();
         let path = self.files_child_path(name);
         let mut buffer = [0u8; NOTE_MAX_BYTES];
         match shell::read_file(path.as_str(), &mut buffer) {
@@ -97,6 +98,7 @@ impl DesktopState {
                 self.notes_target = path;
                 self.notes_mode = NotesMode::Editing;
                 self.notes_set_status("");
+                self.notes_clean = self.notes_fingerprint();
                 self.set_app(DesktopApp::Notes);
             }
             Err(failure) => self.files_set_status(shell::vfs_error(failure)),

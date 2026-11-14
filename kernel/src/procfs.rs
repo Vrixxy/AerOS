@@ -893,6 +893,9 @@ fn render_other(name: &str, out: &mut Text) -> bool {
             let _ = writeln!(out, "{}", details.name());
         }
         "cmdline" => write_cmdline(out, Some(task.id)),
+        // Another process's environment and layout are for those who could
+        // debug it; everyone else reads them as empty.
+        "environ" | "maps" if !crate::syscall::may_inspect(task.id) => {}
         "environ" => write_environ(out, Some(task.id)),
         "maps" => {
             crate::scheduler::with_task_space(task.id, |space| {

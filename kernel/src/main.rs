@@ -20,6 +20,7 @@ mod aslr;
 mod audio;
 mod audit;
 mod auth;
+mod battery;
 mod bench;
 mod block;
 mod blockdev;
@@ -153,10 +154,33 @@ mod vmx;
 mod vmx_logic;
 mod volume;
 mod web;
+mod wifi_known;
 mod wpa;
 mod xhci;
 
 use core::panic::PanicInfo;
+
+extern crate alloc;
+
+/// Routes `alloc` (used by the avatar engine) to the kernel heap.
+struct KernelAllocator;
+
+unsafe impl core::alloc::GlobalAlloc for KernelAllocator {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        heap::HEAP
+            .allocate(layout)
+            .map_or(core::ptr::null_mut(), |pointer| pointer.as_ptr())
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, _layout: core::alloc::Layout) {
+        if let Some(pointer) = core::ptr::NonNull::new(pointer) {
+            let _ = heap::HEAP.deallocate(pointer);
+        }
+    }
+}
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: KernelAllocator = KernelAllocator;
 
 use arch::CpuInfo;
 use framebuffer::FrameBuffer;
@@ -708,7 +732,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         }
     }
     let fat = fat::inspect(&partitions);
-    let install = installer::install(installer::unattended_allowed(), &mut frames);
+    let install = installer::install(installer::unattended_request(), &mut frames);
     let mut network = e1000::initialize(&pci, &mut frames);
     let rtl8139_nic = rtl8139::initialize(&pci, &mut frames);
     let rtl8168_nic = rtl8168::initialize(&pci, &mut frames);
@@ -1538,6 +1562,18 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     if !clipboard_valid {
         serial::line("AEROS_CLIPBOARD_INVARIANT_FAILURE");
         arch::halt_forever();
+    }
+    #[cfg(feature = "boot-test")]
+    {
+        let (prefs, wifi) = (settings::self_test(), wifi_known::self_test());
+        serial::format(format_args!(
+            "AEROS_SAVED_SETTINGS prefs={prefs} wifi={wifi} verified={}\n",
+            prefs && wifi
+        ));
+        if !(prefs && wifi) {
+            serial::line("AEROS_SAVED_SETTINGS_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
     }
     serial::format(format_args!(
         "AEROS_VFS nodes={} directories={} files={} bytes={} handles={} mutable_files={} mutable_bytes={} readonly_root=true verified={}\n",

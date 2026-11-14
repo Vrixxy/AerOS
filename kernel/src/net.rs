@@ -923,6 +923,13 @@ pub fn ping(destination: [u8; 4]) -> PingReport {
     }
 }
 
+/// A random query id and source port, so an off-path sender has to guess
+/// both to slip in a forged answer.
+fn dns_identity() -> (u16, u16) {
+    let random = crate::random::next_u64();
+    (random as u16, 49_152 + ((random >> 16) % 16_000) as u16)
+}
+
 /// The first AAAA record for `name`, asked of the DHCP-supplied DNS server
 /// over IPv4.
 pub fn resolve6(name: &str) -> Option<crate::ip::Address> {
@@ -930,7 +937,7 @@ pub fn resolve6(name: &str) -> Option<crate::ip::Address> {
     if !config.ready {
         return None;
     }
-    let transaction = IPV4_ID.fetch_add(1, Ordering::Relaxed) as u16;
+    let (transaction, source_port) = dns_identity();
     let mut query = [0u8; 272];
     query[..2].copy_from_slice(&transaction.to_be_bytes());
     query[2..4].copy_from_slice(&0x0100u16.to_be_bytes());
@@ -942,7 +949,6 @@ pub fn resolve6(name: &str) -> Option<crate::ip::Address> {
     query[cursor..cursor + 2].copy_from_slice(&28u16.to_be_bytes());
     query[cursor + 2..cursor + 4].copy_from_slice(&1u16.to_be_bytes());
     cursor += 4;
-    let source_port = 49_152 + transaction % 16_000;
     if !send_udp(config.dns_ip, source_port, 53, &query[..cursor]) {
         return None;
     }
@@ -964,7 +970,7 @@ pub fn resolve(name: &str) -> DnsLookup {
     if !config.ready {
         return lookup;
     }
-    let transaction = IPV4_ID.fetch_add(1, Ordering::Relaxed) as u16;
+    let (transaction, source_port) = dns_identity();
     let mut query = [0u8; 272];
     query[..2].copy_from_slice(&transaction.to_be_bytes());
     query[2..4].copy_from_slice(&0x0100u16.to_be_bytes());
@@ -978,7 +984,6 @@ pub fn resolve(name: &str) -> DnsLookup {
     query[cursor..cursor + 2].copy_from_slice(&1u16.to_be_bytes());
     query[cursor + 2..cursor + 4].copy_from_slice(&1u16.to_be_bytes());
     cursor += 4;
-    let source_port = 49_152 + transaction % 16_000;
     if !send_udp(config.dns_ip, source_port, 53, &query[..cursor]) {
         return lookup;
     }
@@ -1026,6 +1031,7 @@ pub fn http_get_port(
     if !usable
         || host.is_empty()
         || host.len() > 128
+        || host.bytes().any(|byte| !byte.is_ascii_graphic())
         || path.is_empty()
         || path.len() > 96
         || !path.starts_with('/')

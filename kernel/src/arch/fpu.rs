@@ -18,6 +18,10 @@ const CONTEXT_ALIGNMENT: usize = 64;
 static CONTEXT_MODE: AtomicU8 = AtomicU8::new(MODE_DISABLED);
 static CONTEXT_BYTES: AtomicU32 = AtomicU32::new(0);
 static CONTEXT_MASK: AtomicU64 = AtomicU64::new(0);
+static MXCSR_MASK: AtomicU32 = AtomicU32::new(0xffbf);
+
+#[repr(C, align(64))]
+struct LegacyImage([u8; 512]);
 
 #[derive(Clone, Copy)]
 pub struct FpuReport {
@@ -77,6 +81,14 @@ pub fn initialize(cpu: &CpuInfo) -> FpuReport {
             && state_bytes >= 512;
     let verified = control_valid && xsave_valid && simd;
     if verified {
+        let mut image = LegacyImage([0; 512]);
+        unsafe {
+            asm!("fxsave64 [{}]", in(reg) image.0.as_mut_ptr(), options(nostack));
+        }
+        let mask = u32::from_le_bytes([image.0[28], image.0[29], image.0[30], image.0[31]]);
+        if mask != 0 {
+            MXCSR_MASK.store(mask, Ordering::Release);
+        }
         CONTEXT_BYTES.store(state_bytes, Ordering::Release);
         CONTEXT_MASK.store(if cpu.xsave { xcr0 } else { 0 }, Ordering::Release);
         CONTEXT_MODE.store(
@@ -162,6 +174,18 @@ pub unsafe fn restore_context(pointer: *const u8) -> bool {
         }
         _ => false,
     }
+}
+
+/// Clears the MXCSR bits this CPU does not have from an FXSAVE-format image
+/// a program supplied: restoring one with a reserved bit set faults in the
+/// kernel.
+pub fn sanitize_legacy_image(image: &mut [u8]) {
+    if image.len() < 32 {
+        return;
+    }
+    let mxcsr = u32::from_le_bytes([image[24], image[25], image[26], image[27]])
+        & MXCSR_MASK.load(Ordering::Acquire);
+    image[24..28].copy_from_slice(&mxcsr.to_le_bytes());
 }
 
 pub unsafe fn reset_context() -> bool {

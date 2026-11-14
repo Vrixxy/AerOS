@@ -7,7 +7,7 @@ const GAP: i32 = 70;
 const PADDING: i32 = 50;
 const TOP: i32 = 64;
 const BOTTOM: i32 = 33;
-const MAX_APPS: usize = 8;
+const MAX_APPS: usize = 9;
 
 const ALL_APPS: [DesktopApp; MAX_APPS] = [
     DesktopApp::Terminal,
@@ -18,6 +18,7 @@ const ALL_APPS: [DesktopApp; MAX_APPS] = [
     DesktopApp::Store,
     DesktopApp::Trash,
     DesktopApp::Linux,
+    DesktopApp::Avatar,
 ];
 
 fn app_bit(app: DesktopApp) -> u16 {
@@ -34,6 +35,7 @@ fn app_title(app: DesktopApp) -> &'static str {
         DesktopApp::Store => "Store",
         DesktopApp::Trash => "Trash",
         DesktopApp::Linux => "Linux",
+        DesktopApp::Avatar => "Avatar",
         DesktopApp::None => "",
     }
 }
