@@ -3,7 +3,7 @@
 #ifndef AEROS_OPS_H
 #define AEROS_OPS_H
 
-#define AEROS_OPS_VERSION 6
+#define AEROS_OPS_VERSION 8
 
 struct aeros_pci_info {
 	unsigned char bus, slot, function, revision;
@@ -39,6 +39,13 @@ struct aeros_ops {
 	unsigned long long (*page_alloc)(unsigned long long pages);
 	void (*page_free)(unsigned long long token, unsigned long long pages);
 	unsigned long long (*options)(void);
+	/* vmap: the pages at one kernel address (NULL when out of room). */
+	void *(*map_pages)(const unsigned long long *physical, unsigned long count, int uncached);
+	void (*unmap_pages)(void *address);
+	/* The firmware screen AerOS draws on, and handing it a new one
+	 * (XRGB8888) once a display driver has set a mode: 0 when taken. */
+	void (*screen_size)(unsigned int *width, unsigned int *height);
+	int (*display)(void *pixels, unsigned int width, unsigned int height, unsigned int pitch);
 };
 
 /* What the module reports back to AerOS. */

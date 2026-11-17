@@ -81,6 +81,15 @@ impl FrameBuffer {
         }
     }
 
+    /// Moves the screen to other memory, such as the framebuffer a display
+    /// driver set a mode on.
+    ///
+    /// # Safety
+    /// As for `new`.
+    pub unsafe fn retarget(&mut self, info: FrameBufferInfo) {
+        *self = unsafe { Self::new(info) };
+    }
+
     pub fn width(&self) -> usize {
         self.width
     }

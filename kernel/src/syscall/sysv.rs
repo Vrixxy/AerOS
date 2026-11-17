@@ -726,6 +726,7 @@ pub(super) fn linux_shmat(id: u64, address: u64, flags: u64) -> u64 {
         pages,
         protection,
         Some(&frames[..pages]),
+        protection & 2 != 0,
     );
     let mapped = match placed {
         Some(Some(address)) => address,

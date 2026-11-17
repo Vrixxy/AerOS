@@ -9,9 +9,10 @@ const PERSISTENT_BYTES: usize = 128 * 1024;
 const TEMPORARY_BYTES: usize = 64 * 1024;
 const PERSISTENT_VALUES: usize = 8192;
 const TEMPORARY_VALUES: usize = 2048;
-const MAX_TABLES: usize = 16;
+const MAX_TABLES: usize = 64;
 const MAX_DEPTH: usize = 24;
 const MAX_LOOPS: u32 = 4_000_000;
+const LOOP_TIMEOUT_NS: u64 = 5_000_000_000;
 const MAX_SEGMENTS: usize = 8;
 const ROOT: u16 = 0;
 const NO_NODE: u16 = 0xffff;
@@ -1575,6 +1576,7 @@ impl Aml {
         let end = f.pkg_end()?;
         let start = f.pos;
         let mut loops = 0u32;
+        let started = (self.hooks.now_ns)();
         loop {
             f.pos = start;
             let predicate = self.term_arg(f)?;
@@ -1587,7 +1589,11 @@ impl Aml {
                 Err(other) => return Err(other),
             }
             loops += 1;
-            if loops > MAX_LOOPS {
+            // Firmware polling hardware that never answers must not stall the caller.
+            if loops > MAX_LOOPS
+                || (loops.is_multiple_of(1024)
+                    && (self.hooks.now_ns)().wrapping_sub(started) > LOOP_TIMEOUT_NS)
+            {
                 return fail(Error::Timeout);
             }
         }

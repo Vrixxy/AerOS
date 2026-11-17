@@ -128,8 +128,33 @@ pub fn wait_for_interrupt() {
     crate::sysmon::add_idle(crate::time::monotonic_nanoseconds().saturating_sub(start));
 }
 
+/// Tries the FADT reset register, then the keyboard controller's reset line,
+/// then the chipset's reset port (0xcf9): many laptops ignore one of them.
 pub fn reboot() -> ! {
     disable_interrupts();
+    let settle = || {
+        for _ in 0..50_000_000 {
+            core::hint::spin_loop();
+        }
+    };
+    if let Some((space, address, value)) = crate::acpi::reset_register() {
+        match space {
+            0 if paging::kernel_range_mapped(address, 1) => unsafe {
+                core::ptr::write_volatile(address as usize as *mut u8, value);
+            },
+            1 => unsafe { outb(address as u16, value) },
+            2 => crate::pci::config_write(
+                0,
+                (address >> 32) as u8,
+                (address >> 16) as u8,
+                address as u16,
+                1,
+                u64::from(value),
+            ),
+            _ => {}
+        }
+        settle();
+    }
     for _ in 0..100_000 {
         if unsafe { inb(0x64) } & 2 == 0 {
             unsafe {
@@ -138,6 +163,14 @@ pub fn reboot() -> ! {
             break;
         }
         core::hint::spin_loop();
+    }
+    settle();
+    unsafe {
+        outb(0xcf9, 0x02);
+        for _ in 0..1000 {
+            core::hint::spin_loop();
+        }
+        outb(0xcf9, 0x06);
     }
     halt_forever()
 }

@@ -12,9 +12,9 @@ use crate::serial;
 
 static MODULE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/aeros-linux.elf"));
 
-const OPS_VERSION: usize = 6;
+const OPS_VERSION: usize = 8;
 const MAX_DMA_BUFFERS: usize = 256;
-const LOG_BYTES: usize = 16 * 1024;
+const LOG_BYTES: usize = 128 * 1024;
 const MAX_DEVICES: usize = 64;
 
 #[repr(C)]
@@ -39,6 +39,10 @@ struct LinuxOps {
     page_alloc: extern "sysv64" fn(u64) -> u64,
     page_free: extern "sysv64" fn(u64, u64),
     options: extern "sysv64" fn() -> u64,
+    map_pages: extern "sysv64" fn(*const u64, usize, i32) -> *mut u8,
+    unmap_pages: extern "sysv64" fn(*mut u8),
+    screen_size: extern "sysv64" fn(*mut u32, *mut u32),
+    display: extern "sysv64" fn(*mut u8, u32, u32, u32) -> i32,
 }
 
 #[repr(C)]
@@ -79,6 +83,33 @@ pub fn poll() {
         // SAFETY: the module's `aeros_linux_poll`, set by `initialize`.
         let poll: extern "sysv64" fn() = unsafe { core::mem::transmute(address) };
         poll();
+        let now = crate::time::monotonic_nanoseconds();
+        if now.saturating_sub(SAVED_AT.load(Relaxed)) >= 2_000_000_000 {
+            SAVED_AT.store(now, Relaxed);
+            save_log();
+        }
+    }
+}
+
+use core::sync::atomic::Ordering::Relaxed;
+
+/// While amdgpu is allowed to run, every line is written to LINUX.LOG at
+/// once, so a run on real hardware that hangs still leaves its last line.
+static SAVE_EACH_LINE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static SAVED_LENGTH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static SAVED_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SAVE_FAILED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn save_log() {
+    // SAFETY: see `Log`.
+    let (buffer, length) = unsafe { &*LOG.0.get() };
+    if *length != 0 && *length != SAVED_LENGTH.load(Relaxed) {
+        let saved = crate::fat::write_root_file(b"LINUX   LOG", &buffer[..*length]);
+        if saved {
+            SAVED_LENGTH.store(*length, Relaxed);
+        } else if !SAVE_FAILED.swap(true, Relaxed) {
+            serial::line("AEROS_LINUX_LOG saved=false");
+        }
     }
 }
 
@@ -141,6 +172,9 @@ extern "sysv64" fn log(text: *const u8, length: usize) {
     serial::text("\n");
     keep(line.as_bytes());
     keep(b"\r\n");
+    if SAVE_EACH_LINE.load(Relaxed) {
+        save_log();
+    }
 }
 
 extern "sysv64" fn alloc(size: usize, align: usize) -> *mut u8 {
@@ -409,15 +443,79 @@ extern "sysv64" fn firmware(name: *const u8, size: *mut usize) -> *const u8 {
     core::ptr::null()
 }
 
-/// Bit 0: amdgpu may drive the GPU (an `AMDGPU.ON` file on the boot partition).
+/// Bit 0: amdgpu may drive the GPU (an `AMDGPU.ON` file on the boot
+/// partition); bit 1: and its display core may take the screen over
+/// (`AMDGPU.DC` as well).
 extern "sysv64" fn options() -> u64 {
     let mut files = [crate::fat::FatFileEntry::EMPTY; 64];
     let count = crate::fat::list_root_files(&mut files);
-    u64::from(
-        files[..count]
-            .iter()
-            .any(|file| &file.name == b"AMDGPU  ON "),
-    )
+    let has = |name: &[u8; 11]| files[..count].iter().any(|file| &file.name == name);
+    let on = has(b"AMDGPU  ON ");
+    u64::from(on) | (u64::from(on && has(b"AMDGPU  DC ")) << 1)
+}
+
+/// Linux's `vmap`: scattered pages at one address in a kernel window.
+extern "sysv64" fn map_pages(frames: *const u64, count: usize, uncached: i32) -> *mut u8 {
+    if frames.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: the module passes an array of `count` physical addresses.
+    let frames = unsafe { core::slice::from_raw_parts(frames, count) };
+    crate::arch::paging::vmap(frames, uncached != 0)
+        .map_or(core::ptr::null_mut(), |address| address as usize as *mut u8)
+}
+
+extern "sysv64" fn unmap_pages(address: *mut u8) {
+    let _ = crate::arch::paging::vunmap(address as u64);
+}
+
+/// The firmware screen's size, which the desktop keeps drawing at.
+static SCREEN_SIZE: crate::sync::TicketLock<(u32, u32)> = crate::sync::TicketLock::new((0, 0));
+
+/// A framebuffer a Linux display driver set a mode on, waiting for the
+/// desktop to move to it: address, width, height, pitch in bytes.
+static DISPLAY: crate::sync::TicketLock<Option<(u64, u32, u32, u32)>> =
+    crate::sync::TicketLock::new(None);
+
+extern "sysv64" fn screen_size(width: *mut u32, height: *mut u32) {
+    let (w, h) = *SCREEN_SIZE.lock();
+    // SAFETY: the module passes two writable u32s.
+    unsafe {
+        *width = w;
+        *height = h;
+    }
+}
+
+extern "sysv64" fn display(pixels: *mut u8, width: u32, height: u32, pitch: u32) -> i32 {
+    let (w, h) = *SCREEN_SIZE.lock();
+    if pixels.is_null() || width < w || height < h || !pitch.is_multiple_of(4) || pitch < width * 4
+    {
+        serial::format(format_args!(
+            "AEROS_LINUX_DISPLAY taken=false {width}x{height} pitch={pitch} screen={w}x{h}\n"
+        ));
+        return -22;
+    }
+    *DISPLAY.lock() = Some((pixels as u64, width, height, pitch));
+    serial::format(format_args!(
+        "AEROS_LINUX_DISPLAY taken=true {width}x{height} pitch={pitch} screen={w}x{h}\n"
+    ));
+    0
+}
+
+/// The screen a Linux display driver took over, once: the desktop draws
+/// into it from then on (same size as before, XRGB8888).
+pub fn take_display(
+    current: crate::framebuffer::FrameBufferInfo,
+) -> Option<crate::framebuffer::FrameBufferInfo> {
+    let (address, _, height, pitch) = DISPLAY.lock().take()?;
+    Some(crate::framebuffer::FrameBufferInfo {
+        address: address as usize as *mut u32,
+        size: pitch as usize * height as usize,
+        width: current.width,
+        height: current.height,
+        stride: pitch as usize / 4,
+        format: crate::framebuffer::PixelFormat::Bgr,
+    })
 }
 
 static OPS: LinuxOps = LinuxOps {
@@ -441,6 +539,10 @@ static OPS: LinuxOps = LinuxOps {
     page_alloc,
     page_free,
     options,
+    map_pages,
+    unmap_pages,
+    screen_size,
+    display,
 };
 
 /// A BAR's size, found the way the PCI spec says (write all ones, read the
@@ -633,11 +735,17 @@ pub fn initialize(
     screen: crate::framebuffer::FrameBufferInfo,
 ) -> Option<Report> {
     *SCREEN.lock() = (screen.address as u64, screen.size as u64);
+    *SCREEN_SIZE.lock() = (screen.width as u32, screen.height as u32);
     ACPI.store(
         acpi as *const _ as *mut crate::acpi::AcpiInfo,
         core::sync::atomic::Ordering::Release,
     );
     *ECAM.lock() = find_ecam(acpi);
+    SAVE_EACH_LINE.store(options() & 1 != 0, Relaxed);
+    let vmap = crate::arch::paging::boot_state()
+        .is_some_and(|state| crate::arch::paging::vmap_init(&state, frames))
+        && crate::arch::paging::vmap_self_test();
+    serial::format(format_args!("AEROS_LINUX_VMAP verified={vmap}\n"));
     collect(pci);
     let Some((base, entry)) = place(frames) else {
         serial::line("AEROS_LINUX_DRIVERS loaded=false");
@@ -663,10 +771,7 @@ pub fn initialize(
     {
         POLL.store(poll as usize, core::sync::atomic::Ordering::Release);
     }
-    // SAFETY: see `Log`; the module has finished.
-    let (buffer, length) = unsafe { &*LOG.0.get() };
-    if *length != 0 {
-        let _ = crate::fat::write_root_file(b"LINUX   LOG", &buffer[..*length]);
-    }
+    SAVE_EACH_LINE.store(false, Relaxed);
+    save_log();
     (result == 0).then_some(report)
 }

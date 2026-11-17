@@ -2569,3 +2569,21 @@ fn guard_descriptor(descriptor: u32) -> Result<(), VfsError> {
 pub fn stats() -> VfsStats {
     FILESYSTEM.lock().stats(true)
 }
+
+/// Logs every file whose bytes live in the mutable pool (boot checks that
+/// count them say which ones they found).
+#[cfg(feature = "boot-test")]
+pub fn log_mutable_files() {
+    let filesystem = FILESYSTEM.lock();
+    for (index, node) in filesystem.nodes[..filesystem.node_count].iter().enumerate() {
+        if node.kind == NodeKind::File && node.storage != STATIC_STORAGE {
+            let mut path = [0u8; 128];
+            let length = filesystem.node_path(index as u16, &mut path);
+            crate::serial::format(format_args!(
+                "AEROS_TMPFS_FILE {} bytes={}\n",
+                core::str::from_utf8(&path[..length]).unwrap_or("?"),
+                MUTABLE_FILES.lock()[node.storage as usize].length
+            ));
+        }
+    }
+}

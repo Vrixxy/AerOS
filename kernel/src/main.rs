@@ -1240,6 +1240,10 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         && runtime_vfs.mutable_files == 1
         && runtime_vfs.mutable_bytes == 6
         && runtime_vfs.open_handles == 0;
+    #[cfg(feature = "boot-test")]
+    if !tmpfs_valid {
+        vfs::log_mutable_files();
+    }
     let process_table = process::stats();
     let process_generations = process::distinct_generation(&init_token, &compiled_token)
         && process::distinct_generation(&init_token, &std_token)

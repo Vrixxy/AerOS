@@ -7,11 +7,11 @@ struct kobject;
 struct device;
 struct file;
 struct vm_area_struct;
-struct bin_attribute;
 struct attribute {
 	const char *name;
 	umode_t mode;
 };
+struct bin_attribute;
 struct attribute_group {
 	const char *name;
 	umode_t (*is_visible)(struct kobject *, struct attribute *, int);

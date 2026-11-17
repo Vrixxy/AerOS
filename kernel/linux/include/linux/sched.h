@@ -28,6 +28,7 @@ struct task_struct {
 	struct task_struct *group_leader;
 	struct mm_struct *mm;
 	int tgid;
+	int fpu_ctx_level;
 };
 struct pid {
 	int nr;

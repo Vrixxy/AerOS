@@ -63,7 +63,10 @@ impl Bus for FakeEc {
     }
 
     fn write_command(&mut self, value: u8) {
-        assert_eq!(self.busy, 0, "command written while the input buffer was full");
+        assert_eq!(
+            self.busy, 0,
+            "command written while the input buffer was full"
+        );
         self.busy = 3;
         self.log.push(format!("cmd {value:#x}"));
         self.state = match value {
@@ -108,7 +111,10 @@ fn reads_and_writes_bytes() {
     assert!(ec::write(&mut ec, 0x20, 0xc3));
     assert_eq!(ec.space[0x20], 0xc3);
     assert_eq!(ec::read(&mut ec, 0x20), Some(0xc3));
-    assert_eq!(ec.log[..4], ["cmd 0x80", "data 0x10", "cmd 0x81", "data 0x20"]);
+    assert_eq!(
+        ec.log[..4],
+        ["cmd 0x80", "data 0x10", "cmd 0x81", "data 0x20"]
+    );
 }
 
 #[test]

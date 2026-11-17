@@ -1042,6 +1042,8 @@ const SOFT_PROTECTION: u64 = 0x7 << SOFT_SHIFT;
 /// A page of a `MAP_SHARED` or System V shared mapping: it stays writable
 /// and shared across `fork` instead of becoming copy-on-write.
 const SOFT_SHARED: u64 = 1 << 55;
+/// A shared page from a read-only source: `mprotect` may not make it writable.
+const SOFT_NO_WRITE: u64 = 1 << 56;
 const SOFT_BITS: u64 = SOFT_PROTECTION | SOFT_SHARED;
 
 /// What a page's entry says it holds: its frame, `SWAP_ENTRY | slot` for an
@@ -2484,6 +2486,7 @@ pub fn process_mmap_shared(
     pages: usize,
     protection: u8,
     frames: Option<&[u64]>,
+    may_write: bool,
 ) -> Option<u64> {
     if frames.is_some_and(|f| f.len() != pages) {
         return None;
@@ -2501,7 +2504,8 @@ pub fn process_mmap_shared(
         };
         space.set_mmap(
             start + offset,
-            mmap_entry(page, protection, true, space.nx_enabled),
+            mmap_entry(page, protection, true, space.nx_enabled)
+                | if may_write { 0 } else { SOFT_NO_WRITE },
         );
     }
     Some(mmap_address(space.user_slot, start))
@@ -2614,6 +2618,11 @@ pub fn process_mprotect(
     if !space.mmap_range_used(start, pages) {
         return false;
     }
+    if protection & 2 != 0
+        && (start..start + pages).any(|index| space.mmap_pte(index) & SOFT_NO_WRITE != 0)
+    {
+        return false;
+    }
     process_swap_in_all(space);
     let flags = translate_protection(protection, space.nx_enabled);
     for index in start..start + pages {
@@ -2637,7 +2646,10 @@ pub fn process_mprotect(
         };
         space.set_mmap(
             index,
-            physical | flags | with_protection(protection) | (entry & SOFT_SHARED),
+            physical
+                | flags
+                | with_protection(protection)
+                | (entry & (SOFT_SHARED | SOFT_NO_WRITE)),
         );
     }
     true
@@ -3654,4 +3666,169 @@ unsafe fn zero_page(address: u64) {
     unsafe {
         core::ptr::write_bytes(address as usize as *mut u8, 0, PAGE_SIZE as usize);
     }
+}
+
+#[cfg(feature = "linux-drivers")]
+/// Pages of the kernel window `vmap` maps scattered frames into (Linux's
+/// `vmap`, for the GPU driver): 128 MiB of addresses.
+const VMAP_TABLES: usize = 64;
+#[cfg(feature = "linux-drivers")]
+const VMAP_PAGES: usize = VMAP_TABLES * ENTRY_COUNT;
+#[cfg(feature = "linux-drivers")]
+const CACHE_DISABLE: u64 = (1 << 3) | (1 << 4);
+
+#[cfg(feature = "linux-drivers")]
+struct VmapRegion {
+    base: u64,
+    first_table: u64,
+    nx_enabled: bool,
+    /// Pages of the mapping that starts at each index (0 = free or inside one).
+    lengths: [u32; VMAP_PAGES],
+    used: [u64; VMAP_PAGES / 64],
+}
+
+#[cfg(feature = "linux-drivers")]
+static VMAP: TicketLock<VmapRegion> = TicketLock::new(VmapRegion {
+    base: 0,
+    first_table: 0,
+    nx_enabled: false,
+    lengths: [0; VMAP_PAGES],
+    used: [0; VMAP_PAGES / 64],
+});
+
+#[cfg(feature = "linux-drivers")]
+/// Reserves the `vmap` window under a free kernel root slot; done at boot,
+/// before any process copies the kernel's root table.
+pub fn vmap_init(state: &PagingState, frames: &mut FrameAllocator) -> bool {
+    let root = state.root_physical as usize as *mut u64;
+    let Some(slot) = (256..ENTRY_COUNT)
+        .find(|index| unsafe { core::ptr::read_volatile(root.add(*index)) } & PRESENT == 0)
+    else {
+        return false;
+    };
+    let Some(block) = frames.allocate_contiguous(2 + VMAP_TABLES as u64, 1) else {
+        return false;
+    };
+    let pdpt = block.address();
+    let directory = pdpt + PAGE_SIZE;
+    let first_table = directory + PAGE_SIZE;
+    let branch = PRESENT | WRITABLE;
+    unsafe {
+        for page in 0..2 + VMAP_TABLES as u64 {
+            zero_page(pdpt + page * PAGE_SIZE);
+        }
+        for table in 0..VMAP_TABLES {
+            core::ptr::write_volatile(
+                (directory as usize as *mut u64).add(table),
+                (first_table + table as u64 * PAGE_SIZE) | branch,
+            );
+        }
+        core::ptr::write_volatile(pdpt as usize as *mut u64, directory | branch);
+        core::ptr::write_volatile(root.add(slot), pdpt | branch);
+        write_cr3(read_cr3());
+    }
+    let mut region = VMAP.lock();
+    region.base = canonical_base(slot);
+    region.first_table = first_table;
+    region.nx_enabled = state.nx_enabled;
+    true
+}
+
+#[cfg(feature = "linux-drivers")]
+/// Maps `frames` (physical pages) one after another; `uncached` for memory a
+/// device reads without snooping the CPU's caches.
+pub fn vmap(frames: &[u64], uncached: bool) -> Option<u64> {
+    let mut region = VMAP.lock();
+    let count = frames.len();
+    if region.base == 0 || count == 0 || count > VMAP_PAGES {
+        return None;
+    }
+    let is_used =
+        |region: &VmapRegion, index: usize| region.used[index / 64] & (1 << (index % 64)) != 0;
+    let mut start = 0;
+    let mut run = 0;
+    let mut index = 0;
+    while index < VMAP_PAGES && run < count {
+        if is_used(&region, index) {
+            run = 0;
+            start = index + 1;
+        } else {
+            run += 1;
+        }
+        index += 1;
+    }
+    if run < count {
+        return None;
+    }
+    let flags = PRESENT
+        | WRITABLE
+        | if region.nx_enabled { NO_EXECUTE } else { 0 }
+        | if uncached { CACHE_DISABLE } else { 0 };
+    let table = region.first_table as usize as *mut u64;
+    for (offset, frame) in frames.iter().enumerate() {
+        let page = start + offset;
+        region.used[page / 64] |= 1 << (page % 64);
+        unsafe {
+            core::ptr::write_volatile(table.add(page), (frame & ADDRESS_MASK) | flags);
+            invalidate(region.base + page as u64 * PAGE_SIZE);
+        }
+    }
+    region.lengths[start] = count as u32;
+    Some(region.base + start as u64 * PAGE_SIZE)
+}
+
+#[cfg(feature = "linux-drivers")]
+/// Undoes a `vmap`; returns whether `address` was the start of one.
+pub fn vunmap(address: u64) -> bool {
+    let mut region = VMAP.lock();
+    if region.base == 0 || address < region.base || !address.is_multiple_of(PAGE_SIZE) {
+        return false;
+    }
+    let start = ((address - region.base) / PAGE_SIZE) as usize;
+    if start >= VMAP_PAGES || region.lengths[start] == 0 {
+        return false;
+    }
+    let count = region.lengths[start] as usize;
+    region.lengths[start] = 0;
+    let table = region.first_table as usize as *mut u64;
+    for page in start..start + count {
+        region.used[page / 64] &= !(1 << (page % 64));
+        unsafe {
+            core::ptr::write_volatile(table.add(page), 0);
+            invalidate(region.base + page as u64 * PAGE_SIZE);
+        }
+    }
+    true
+}
+
+#[cfg(feature = "linux-drivers")]
+/// Maps three scattered frames, checks they read back through the window in
+/// order, and unmaps them.
+pub fn vmap_self_test() -> bool {
+    let mut frames = [0u64; 3];
+    for (index, frame) in frames.iter_mut().enumerate() {
+        let Some(page) = crate::memory::allocate_global() else {
+            return false;
+        };
+        *frame = page.address();
+        unsafe {
+            zero_page(*frame);
+            core::ptr::write_volatile(*frame as usize as *mut u64, 0x564d_4150_0000 + index as u64);
+        }
+    }
+    frames.swap(0, 2);
+    let mapped = vmap(&frames, false);
+    let ordered = mapped.is_some_and(|base| {
+        (0..3).all(|page| unsafe {
+            core::ptr::read_volatile((base + page * PAGE_SIZE) as usize as *const u64)
+                == 0x564d_4150_0000 + [2, 1, 0][page as usize]
+        })
+    });
+    let unmapped = mapped.is_some_and(vunmap);
+    let again = vmap(&frames[..1], true);
+    let reused = again == mapped && again.is_some_and(vunmap);
+    for frame in frames {
+        let _ = crate::memory::release_global_address(frame);
+    }
+    ordered && unmapped && reused
 }

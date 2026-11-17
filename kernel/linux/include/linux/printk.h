@@ -23,6 +23,7 @@ int vprintk(const char *format, va_list args);
 int snprintf(char *buffer, size_t size, const char *format, ...)
 	__attribute__((format(printf, 3, 4)));
 int vsnprintf(char *buffer, size_t size, const char *format, va_list args);
+int vscnprintf(char *buffer, size_t size, const char *format, va_list args);
 int scnprintf(char *buffer, size_t size, const char *format, ...)
 	__attribute__((format(printf, 3, 4)));
 

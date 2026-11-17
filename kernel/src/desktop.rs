@@ -5392,7 +5392,16 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
         crate::audio::pump();
         crate::xhci::poll();
         #[cfg(feature = "linux-drivers")]
-        crate::linux::poll();
+        {
+            crate::linux::poll();
+            if let Some(info) = crate::linux::take_display(frame.info()) {
+                // SAFETY: the driver's framebuffer, mapped and at least this big.
+                unsafe { frame.retarget(info) };
+                let _ = present_desktop_mode(frame, fonts, &state, true);
+                cursor.erase(frame);
+                cursor.paint(frame, cursor_target(frame));
+            }
+        }
         crate::datafs::poll();
         crate::ntp::tick(crate::time::monotonic_nanoseconds());
         crate::keymap::sync_guest();

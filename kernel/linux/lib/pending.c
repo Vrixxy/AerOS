@@ -96,3 +96,20 @@ int drm_writeback_prepare_job(struct drm_writeback_job *job)
 {
 	return 0;
 }
+
+int drm_writeback_connector_init(struct drm_device *dev, struct drm_writeback_connector *wb_connector,
+				 const struct drm_connector_funcs *con_funcs,
+				 const struct drm_encoder_helper_funcs *enc_helper_funcs, const u32 *formats,
+				 int n_formats, u32 possible_crtcs)
+{
+	return -ENODEV;
+}
+
+void drm_writeback_queue_job(struct drm_writeback_connector *wb_connector,
+			     struct drm_connector_state *conn_state)
+{
+}
+
+void drm_writeback_signal_completion(struct drm_writeback_connector *wb_connector, int status)
+{
+}

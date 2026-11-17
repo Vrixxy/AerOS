@@ -1,5 +1,6 @@
 #ifndef _LINUX_PREEMPT_H
 #define _LINUX_PREEMPT_H
+#include <linux/percpu.h>
 #define preempt_disable() do { } while (0)
 #define preempt_enable() do { } while (0)
 #define preempt_enable_no_resched() do { } while (0)

@@ -11,4 +11,14 @@ void usleep_range(unsigned long minimum, unsigned long maximum);
 
 u64 ktime_get_ns(void);
 
+static inline void fsleep(unsigned long microseconds)
+{
+	if (microseconds <= 10)
+		udelay(microseconds);
+	else if (microseconds <= 20000)
+		usleep_range(microseconds, 2 * microseconds);
+	else
+		msleep((unsigned int)((microseconds + 999) / 1000));
+}
+
 #endif

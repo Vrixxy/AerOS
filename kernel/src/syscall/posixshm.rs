@@ -51,7 +51,7 @@ pub(super) fn is_shared_file(handle: u32) -> bool {
 
 /// Maps `pages` pages of the shared file `handle`, from page `first`, into
 /// the running process; returns the address or an error code.
-pub(super) fn map(handle: u32, first: usize, pages: usize, protection: u8) -> u64 {
+pub(super) fn map(handle: u32, first: usize, pages: usize, protection: u8, may_write: bool) -> u64 {
     let Ok(metadata) = vfs::descriptor_metadata(handle) else {
         return error(9);
     };
@@ -109,6 +109,7 @@ pub(super) fn map(handle: u32, first: usize, pages: usize, protection: u8) -> u6
         pages,
         protection,
         Some(&frames[..pages]),
+        may_write,
     ) {
         Some(Some(address)) => address,
         failed => {

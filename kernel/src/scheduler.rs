@@ -2184,6 +2184,7 @@ pub fn linux_mmap_shared_for_current_task(
     pages: usize,
     protection: u8,
     frames: Option<&[u64]>,
+    may_write: bool,
 ) -> Option<Option<u64>> {
     arch::disable_interrupts();
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
@@ -2191,7 +2192,7 @@ pub fn linux_mmap_shared_for_current_task(
     let owner = scheduler.leader_slot(current);
     let space = scheduler.tasks[owner].process_space.as_mut()?;
     Some(arch::paging::process_mmap_shared(
-        space, pages, protection, frames,
+        space, pages, protection, frames, may_write,
     ))
 }
 

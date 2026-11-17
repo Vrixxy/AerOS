@@ -403,7 +403,10 @@ fn gpe_handlers_are_found_and_notify_is_queued() {
         let mut found = [GpeHandler::default(); 8];
         let count = acpi_devices::scan_gpes(aml, &mut found);
         assert_eq!(count, 2);
-        let edge = found[..count].iter().find(|handler| !handler.level).unwrap();
+        let edge = found[..count]
+            .iter()
+            .find(|handler| !handler.level)
+            .unwrap();
         let level = found[..count].iter().find(|handler| handler.level).unwrap();
         assert_eq!(edge.number, 0x1c);
         assert_eq!(level.number, 0x05);
@@ -500,7 +503,14 @@ fn embedded_controller_region_is_read_and_written_through_the_hooks() {
 }
 
 fn pstate(mhz: u64, power: u64, latency: u64, control: u64) -> Vec<u8> {
-    package(&[int(mhz), int(power), int(latency), int(10), int(control), int(control)])
+    package(&[
+        int(mhz),
+        int(power),
+        int(latency),
+        int(10),
+        int(control),
+        int(control),
+    ])
 }
 
 #[test]
@@ -532,7 +542,10 @@ fn generic_register(space: u8, width: u8, address: u64) -> Vec<u8> {
 }
 
 fn processor_with_control(space: u8, width: u8, address: u64) -> Vec<u8> {
-    let states = package(&[pstate(2400, 35000, 10, 0x1d18), pstate(1200, 12000, 10, 0x0c04)]);
+    let states = package(&[
+        pstate(2400, 35000, 10, 0x1d18),
+        pstate(1200, 12000, 10, 0x0c04),
+    ]);
     let pair = package(&[
         buffer(&generic_register(space, width, address)),
         buffer(&generic_register(space, width, address + 2)),
@@ -547,8 +560,24 @@ fn processor_with_control(space: u8, width: u8, address: u64) -> Vec<u8> {
 fn the_control_register_and_the_write_for_a_state() {
     use aml_host::cpufreq::{Register, Switch};
     let cases = [
-        (1u8, 8u8, 0xb2u64, Register::Io { port: 0xb2, width: 8 }),
-        (0, 32, 0xfed4_0000, Register::Memory { address: 0xfed4_0000, width: 32 }),
+        (
+            1u8,
+            8u8,
+            0xb2u64,
+            Register::Io {
+                port: 0xb2,
+                width: 8,
+            },
+        ),
+        (
+            0,
+            32,
+            0xfed4_0000,
+            Register::Memory {
+                address: 0xfed4_0000,
+                width: 32,
+            },
+        ),
         (0x7f, 64, 0, Register::FixedHardware),
     ];
     for (space, width, address, expected) in cases {
@@ -561,15 +590,41 @@ fn the_control_register_and_the_write_for_a_state() {
             let switch = aml_host::cpufreq::plan(register, &state, true);
             match expected {
                 Register::Io { port, width } => {
-                    assert_eq!(switch, Switch::Io { port, width, value: 0x0c04 })
+                    assert_eq!(
+                        switch,
+                        Switch::Io {
+                            port,
+                            width,
+                            value: 0x0c04
+                        }
+                    )
                 }
                 Register::Memory { address, width } => {
-                    assert_eq!(switch, Switch::Memory { address, width, value: 0x0c04 })
+                    assert_eq!(
+                        switch,
+                        Switch::Memory {
+                            address,
+                            width,
+                            value: 0x0c04
+                        }
+                    )
                 }
                 Register::FixedHardware => {
-                    assert_eq!(switch, Switch::Msr { register: 0x199, value: 0x0c04 });
+                    assert_eq!(
+                        switch,
+                        Switch::Msr {
+                            register: 0x199,
+                            value: 0x0c04
+                        }
+                    );
                     let amd = aml_host::cpufreq::plan(register, &state, false);
-                    assert_eq!(amd, Switch::Msr { register: 0xc001_0062, value: 0x4 });
+                    assert_eq!(
+                        amd,
+                        Switch::Msr {
+                            register: 0xc001_0062,
+                            value: 0x4
+                        }
+                    );
                 }
             }
         });

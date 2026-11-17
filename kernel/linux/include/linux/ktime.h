@@ -26,6 +26,7 @@ static inline time64_t ktime_get_seconds(void) { return (time64_t)(ktime_get_ns(
 #define ktime_get_real_seconds ktime_get_seconds
 static inline ktime_t ktime_set(s64 seconds, unsigned long nanoseconds) { return seconds * NSEC_PER_SEC + (s64)nanoseconds; }
 static inline s64 ktime_to_ns(ktime_t time) { return time; }
+static inline s64 ktime_divns(ktime_t time, s64 divisor) { return time / divisor; }
 static inline ktime_t ns_to_ktime(u64 nanoseconds) { return (ktime_t)nanoseconds; }
 static inline s64 ktime_to_us(ktime_t time) { return time / NSEC_PER_USEC; }
 static inline s64 ktime_to_ms(ktime_t time) { return time / NSEC_PER_MSEC; }

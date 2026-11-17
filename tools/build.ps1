@@ -54,6 +54,17 @@ try {
     }
     New-Item -ItemType Directory -Force -Path $boot | Out-Null
     Copy-Item -Force -LiteralPath $binary -Destination (Join-Path $boot "BOOTX64.EFI")
+    # The Radeon in the user's laptop (1002:1638, Cezanne) loads these.
+    $firmware = Join-Path $root "build\gpu\firmware"
+    $pack = Join-Path $esp "FIRMWARE.PAK"
+    if (-not $LinuxDrivers -and (Test-Path -LiteralPath $pack)) {
+        # Only the Linux driver build reads it, and boot tests count the files here.
+        Remove-Item -Force -LiteralPath $pack
+    }
+    if ($LinuxDrivers -and (Test-Path -LiteralPath (Join-Path $firmware "amdgpu"))) {
+        python (Join-Path $PSScriptRoot "firmware-pak.py") $firmware (Join-Path $esp "FIRMWARE.PAK") "amdgpu/green_sardine_*.bin" | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "firmware-pak.py failed" }
+    }
 } finally {
     Pop-Location
 }

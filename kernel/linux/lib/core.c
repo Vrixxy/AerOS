@@ -114,6 +114,7 @@ void aeros_linux_poll(void);
 
 /* AerOS calls this once, right after loading the module. */
 extern bool aeros_amdgpu_enabled;
+extern int amdgpu_dc;
 
 int aeros_linux_entry(const struct aeros_ops *ops, struct aeros_linux_report *report)
 {
@@ -123,6 +124,8 @@ int aeros_linux_entry(const struct aeros_ops *ops, struct aeros_linux_report *re
 		return -EINVAL;
 	report->poll = aeros_linux_poll;
 	aeros_amdgpu_enabled = ops->options() & 1;
+	/* The display core (which takes the screen over) only with AMDGPU.DC. */
+	amdgpu_dc = ops->options() & 2 ? -1 : 0;
 	for (initcall_t *call = __start_aeros_initcalls; call < __stop_aeros_initcalls; call++) {
 		report->initcalls++;
 		if ((*call)() != 0)

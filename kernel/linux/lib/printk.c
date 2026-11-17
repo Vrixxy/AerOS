@@ -183,6 +183,15 @@ int snprintf(char *buffer, size_t size, const char *format, ...)
 	return length;
 }
 
+int vscnprintf(char *buffer, size_t size, const char *format, va_list args)
+{
+	int length = vsnprintf(buffer, size, format, args);
+
+	if (!size)
+		return 0;
+	return length < (int)size ? length : (int)size - 1;
+}
+
 int scnprintf(char *buffer, size_t size, const char *format, ...)
 {
 	va_list args;

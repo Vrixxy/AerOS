@@ -25,5 +25,11 @@
 #define __randomize_layout
 #define __rcu
 #define unreachable() __builtin_unreachable()
+#define noinline __attribute__((noinline))
+#define noinline_for_stack noinline
+#ifndef READ_ONCE
+#define READ_ONCE(x) (*(const volatile __typeof__(x) *)&(x))
+#define WRITE_ONCE(x, v) (*(volatile __typeof__(x) *)&(x) = (v))
+#endif
 
 #endif

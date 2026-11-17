@@ -53,4 +53,9 @@ void kmem_cache_destroy(struct kmem_cache *cache);
 #define kvfree_sensitive(pointer, size) kfree(pointer)
 #define kfree_sensitive(pointer) kfree(pointer)
 
+#ifndef ZERO_SIZE_PTR
+#define ZERO_SIZE_PTR ((void *)16)
+#endif
+#define ZERO_OR_NULL_PTR(x) ((unsigned long)(x) <= (unsigned long)ZERO_SIZE_PTR)
+
 #endif

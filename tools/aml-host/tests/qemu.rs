@@ -1,17 +1,41 @@
-use aml_host::aml::{Aml, Hooks, NodeKind, resources, Resource};
+use aml_host::aml::{Aml, Hooks, NodeKind, Resource, resources};
 
-fn io_read(_port: u16, _bytes: u8) -> u64 { 0 }
+fn io_read(_port: u16, _bytes: u8) -> u64 {
+    0
+}
 fn io_write(_port: u16, _bytes: u8, _value: u64) {}
-fn mem_read(_address: u64, _bytes: u8) -> Option<u64> { Some(0) }
-fn mem_write(_address: u64, _bytes: u8, _value: u64) -> bool { true }
-fn pci_read(_b: u8, _s: u8, _f: u8, _o: u16, _n: u8) -> u64 { 0 }
+fn mem_read(_address: u64, _bytes: u8) -> Option<u64> {
+    Some(0)
+}
+fn mem_write(_address: u64, _bytes: u8, _value: u64) -> bool {
+    true
+}
+fn pci_read(_b: u8, _s: u8, _f: u8, _o: u16, _n: u8) -> u64 {
+    0
+}
 fn pci_write(_b: u8, _s: u8, _f: u8, _o: u16, _n: u8, _v: u64) {}
-fn now() -> u64 { 0 }
-fn ec_read(_offset: u8) -> Option<u8> { None }
-fn ec_write(_offset: u8, _value: u8) -> bool { false }
+fn now() -> u64 {
+    0
+}
+fn ec_read(_offset: u8) -> Option<u8> {
+    None
+}
+fn ec_write(_offset: u8, _value: u8) -> bool {
+    false
+}
 
 fn hooks() -> Hooks {
-    Hooks { io_read, io_write, mem_read, mem_write, pci_read, pci_write, ec_read, ec_write, now_ns: now }
+    Hooks {
+        io_read,
+        io_write,
+        mem_read,
+        mem_write,
+        pci_read,
+        pci_write,
+        ec_read,
+        ec_write,
+        now_ns: now,
+    }
 }
 
 fn with_aml(body: impl FnOnce(&mut Aml) + Send + 'static) {
@@ -20,9 +44,17 @@ fn with_aml(body: impl FnOnce(&mut Aml) + Send + 'static) {
         .spawn(move || {
             let mut aml = Box::new(Aml::new(hooks()));
             aml.reset();
-            let table: &'static [u8] = Box::leak(std::fs::read("fixtures/qemu-q35-dsdt.bin").unwrap().into_boxed_slice());
+            let table: &'static [u8] = Box::leak(
+                std::fs::read("fixtures/qemu-q35-dsdt.bin")
+                    .unwrap()
+                    .into_boxed_slice(),
+            );
             let result = aml.load(table.as_ptr() as u64, table.len());
-            println!("load: {result:?} nodes={} errors={}", aml.node_count(), aml.load_errors);
+            println!(
+                "load: {result:?} nodes={} errors={}",
+                aml.node_count(),
+                aml.load_errors
+            );
             body(&mut aml);
         })
         .unwrap()
@@ -44,8 +76,14 @@ fn loads_and_lists() {
         let mut methods = 0;
         for index in 0..aml.node_count() {
             match aml.node_kind(index as u16) {
-                NodeKind::Device => { devices += 1; println!("device {}", path(aml, index as u16)); }
-                NodeKind::Method => { methods += 1; println!("method {}", path(aml, index as u16)); }
+                NodeKind::Device => {
+                    devices += 1;
+                    println!("device {}", path(aml, index as u16));
+                }
+                NodeKind::Method => {
+                    methods += 1;
+                    println!("method {}", path(aml, index as u16));
+                }
                 _ => {}
             }
         }
@@ -61,7 +99,11 @@ fn s5_package() {
         let len = aml.package_len(value).unwrap();
         let first = aml.package_element(value, 0).unwrap();
         let second = aml.package_element(value, 1).unwrap();
-        println!("S5 len={len} {:?} {:?}", aml.integer(first), aml.integer(second));
+        println!(
+            "S5 len={len} {:?} {:?}",
+            aml.integer(first),
+            aml.integer(second)
+        );
         assert!(len >= 2);
     });
 }
@@ -77,7 +119,12 @@ fn pci_root() {
         let crs = aml.evaluate(r"\_SB_.PCI0._CRS", &[]).unwrap();
         let bytes = aml.buffer(crs).unwrap().to_vec();
         let mut found_cf8 = false;
-        resources(&bytes, |r| { println!("{r:?}"); if let Resource::Io { minimum: 0xcf8, .. } = r { found_cf8 = true; } });
+        resources(&bytes, |r| {
+            println!("{r:?}");
+            if let Resource::Io { minimum: 0xcf8, .. } = r {
+                found_cf8 = true;
+            }
+        });
         assert!(found_cf8);
     });
 }
@@ -109,9 +156,16 @@ fn every_sta_and_crs() {
         for index in 0..aml.node_count() {
             let node = index as u16;
             let name = aml.node_name(node);
-            if aml.node_kind(node) == NodeKind::Method && (&name == b"_STA" || &name == b"_CRS" || &name == b"_HID" || &name == b"_ADR") {
+            if aml.node_kind(node) == NodeKind::Method
+                && (&name == b"_STA" || &name == b"_CRS" || &name == b"_HID" || &name == b"_ADR")
+            {
                 match aml.evaluate_node(node, &[]) {
-                    Ok(v) => { ok += 1; if &name == b"_STA" { println!("{} = {:?}", path(aml, node), v); } }
+                    Ok(v) => {
+                        ok += 1;
+                        if &name == b"_STA" {
+                            println!("{} = {:?}", path(aml, node), v);
+                        }
+                    }
                     Err(e) => bad.push((path(aml, node), e)),
                 }
             }
@@ -127,7 +181,9 @@ fn prt_follows_interrupt_mode() {
         let source_of = |aml: &mut Aml| -> String {
             let prt = aml.evaluate(r"\_SB_.PCI0._PRT", &[]).unwrap();
             let entry = aml.package_element(prt, 0).unwrap();
-            let node = aml.value_node(aml.package_element(entry, 2).unwrap()).unwrap();
+            let node = aml
+                .value_node(aml.package_element(entry, 2).unwrap())
+                .unwrap();
             path(aml, node)
         };
         let before = source_of(aml);

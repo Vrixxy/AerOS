@@ -74,22 +74,35 @@ struct page *pfn_to_page(unsigned long pfn)
  * out yet. */
 void *vmap(struct page **pages, unsigned int count, unsigned long flags, pgprot_t prot)
 {
+	bool uncached = pgprot_val(prot) & (_PAGE_CACHE_WC | _PAGE_CACHE_UC);
+	unsigned long long *frames;
 	unsigned int i;
+	void *address;
 
 	(void)flags;
-	(void)prot;
-	for (i = 1; i < count; i++) {
-		if (pages[i]->phys != pages[0]->phys + i * PAGE_SIZE) {
-			pr_warn("vmap: %u scattered pages can't be mapped yet\n", count);
-			return NULL;
-		}
-	}
-	return count ? page_address(pages[0]) : NULL;
+	if (!count)
+		return NULL;
+	for (i = 1; i < count && !uncached; i++)
+		if (pages[i]->phys != pages[0]->phys + i * PAGE_SIZE)
+			break;
+	if (!uncached && i == count)
+		return page_address(pages[0]);
+	frames = kmalloc_array(count, sizeof(*frames), GFP_KERNEL);
+	if (!frames)
+		return NULL;
+	for (i = 0; i < count; i++)
+		frames[i] = pages[i]->phys;
+	address = aeros->map_pages(frames, count, uncached);
+	kfree(frames);
+	if (!address)
+		pr_warn("vmap: no room for %u pages\n", count);
+	return address;
 }
 
 void vunmap(const void *address)
 {
-	(void)address;
+	if (address)
+		aeros->unmap_pages((void *)address);
 }
 
 /* TTM sizes its page pool from this; AerOS doesn't report RAM to the
@@ -228,3 +241,25 @@ dma_addr_t dma_map_page_attrs(struct device *dev, struct page *page, size_t offs
 
 struct cpuinfo_x86 boot_cpu_data = { .x86 = 0x17, .x86_vendor = X86_VENDOR_AMD, .x86_clflush_size = 64 };
 struct resource iomem_resource = { .name = "PCI mem", .end = ~0ull };
+
+void aeros_flush_address(unsigned long address, unsigned long bytes)
+{
+	unsigned long line;
+
+	for (line = address & ~63ul; line < address + bytes; line += 64)
+		__asm__ volatile("clflush (%0)" : : "r"(line) : "memory");
+	__asm__ volatile("mfence" : : : "memory");
+}
+
+/* A negative count is that many pages physically after pages[0]. */
+void aeros_flush_pages(struct page **pages, int count)
+{
+	int i;
+
+	if (count < 0) {
+		aeros_flush_address((unsigned long)page_address(pages[0]), (unsigned long)-count * PAGE_SIZE);
+		return;
+	}
+	for (i = 0; i < count; i++)
+		aeros_flush_address((unsigned long)page_address(pages[i]), PAGE_SIZE);
+}

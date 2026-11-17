@@ -82,8 +82,10 @@ static inline long atomic_long_cmpxchg(atomic_long_t *v, long old, long new_valu
 #define dma_rmb() barrier()
 #define cpu_relax() __asm__ volatile("pause" ::: "memory")
 
+#ifndef READ_ONCE
 #define READ_ONCE(x) (*(const volatile __typeof__(x) *)&(x))
 #define WRITE_ONCE(x, v) (*(volatile __typeof__(x) *)&(x) = (v))
+#endif
 #define smp_mb() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 #define smp_rmb() __atomic_thread_fence(__ATOMIC_ACQUIRE)
 #define smp_wmb() __atomic_thread_fence(__ATOMIC_RELEASE)

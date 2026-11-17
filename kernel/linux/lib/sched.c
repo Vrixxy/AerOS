@@ -255,6 +255,21 @@ void free_irq(unsigned int irq, void *data)
 			irqs[i].handler = 0;
 }
 
+/* No MSI or INTx delivery yet: every handler is called on each poll and
+ * wait step and checks its own device, as on a shared line. */
+static void run_irqs(void)
+{
+	static bool running;
+
+	if (running)
+		return;
+	running = true;
+	for (int i = 0; i < MAX_IRQS; i++)
+		if (irqs[i].handler)
+			irqs[i].handler((int)irqs[i].irq, irqs[i].data);
+	running = false;
+}
+
 void aeros_lock_twice(const void *lock)
 {
 	printk("lock %p taken twice (the Linux side is single-threaded)\n", lock);
@@ -329,9 +344,7 @@ void rcu_barrier(void)
  * underneath itself). */
 void aeros_wait_step(void)
 {
-	for (int i = 0; i < MAX_IRQS; i++)
-		if (irqs[i].handler)
-			irqs[i].handler((int)irqs[i].irq, irqs[i].data);
+	run_irqs();
 	run_irq_works();
 	run_timers();
 	if (!work_depth)
@@ -341,9 +354,7 @@ void aeros_wait_step(void)
 
 void aeros_linux_poll(void)
 {
-	for (int i = 0; i < MAX_IRQS; i++)
-		if (irqs[i].handler)
-			irqs[i].handler((int)irqs[i].irq, irqs[i].data);
+	run_irqs();
 	run_irq_works();
 	run_timers();
 	run_work();

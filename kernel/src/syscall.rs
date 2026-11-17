@@ -8449,11 +8449,15 @@ fn linux_mmap(arguments: [u64; 6]) -> u64 {
             if fixed {
                 return error(22);
             }
+            if protection & 2 != 0 && !process_fd.writable {
+                return error(13);
+            }
             return posixshm::map(
                 process_fd.handle,
                 (offset / 4096) as usize,
                 pages,
                 protection as u8,
+                process_fd.writable,
             );
         }
         if protection & 2 != 0 {
@@ -8473,7 +8477,7 @@ fn linux_mmap(arguments: [u64; 6]) -> u64 {
             flags & MAP_FIXED_NOREPLACE == 0,
         )
     } else if shared {
-        crate::scheduler::linux_mmap_shared_for_current_task(pages, protection as u8, None)
+        crate::scheduler::linux_mmap_shared_for_current_task(pages, protection as u8, None, true)
     } else {
         crate::scheduler::linux_mmap_for_current_task(pages, protection as u8)
     };

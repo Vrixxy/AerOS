@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+
 const SDT_HEADER_SIZE: usize = 36;
 const MAX_SDT_SIZE: usize = 1024 * 1024;
 const MAX_ROOT_ENTRIES: usize = 4096;
@@ -305,7 +307,28 @@ unsafe fn parse_fadt(info: &mut AcpiInfo) {
     if length >= 116 {
         info.fadt_flags = unsafe { read_u32(base.add(112)) };
     }
+    const RESET_REG_SUP: u32 = 1 << 10;
+    if length >= 129 && info.fadt_flags & RESET_REG_SUP != 0 {
+        let space = unsafe { core::ptr::read_volatile(base.add(116)) };
+        let address = unsafe { read_u64(base.add(120)) };
+        let value = unsafe { core::ptr::read_volatile(base.add(128)) };
+        if address != 0 && space <= 2 {
+            RESET_ADDRESS.store(address, Ordering::Relaxed);
+            RESET_SPACE_VALUE.store(u16::from(space) << 8 | u16::from(value), Ordering::Relaxed);
+        }
+    }
     info.fadt_valid = dsdt != 0 && pm1a_cnt != 0 && pm1_cnt_len != 0;
+}
+
+static RESET_ADDRESS: AtomicU64 = AtomicU64::new(0);
+static RESET_SPACE_VALUE: AtomicU16 = AtomicU16::new(0);
+
+/// The FADT's reset register: (address space, address, value). Space 0 is
+/// memory, 1 is I/O, 2 is PCI configuration space of bus 0.
+pub fn reset_register() -> Option<(u8, u64, u8)> {
+    let address = RESET_ADDRESS.load(Ordering::Relaxed);
+    let packed = RESET_SPACE_VALUE.load(Ordering::Relaxed);
+    (address != 0).then_some(((packed >> 8) as u8, address, packed as u8))
 }
 
 unsafe fn parse_hpet(info: &mut AcpiInfo, table_address: u64) {

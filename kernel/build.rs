@@ -84,6 +84,8 @@ const DRM_SOURCES: &[&str] = &[
     "drivers/gpu/drm/display/drm_display_helper_mod.c",
     "drivers/gpu/drm/display/drm_dp_helper.c",
     "drivers/gpu/drm/display/drm_dp_mst_topology.c",
+    "drivers/gpu/drm/display/drm_dsc_helper.c",
+    "drivers/gpu/drm/display/drm_hdmi_helper.c",
 ];
 
 const CFLAGS: &[&str] = &[
@@ -126,8 +128,8 @@ const UPSTREAM_CFLAGS: &[&str] = &[
     "-Wno-visibility",
 ];
 
-/// amdgpu (kernel/linux/amdgpu.list): built without its display core (DC),
-/// ACPI, and the pre-2014 SI/CIK families.
+/// amdgpu (kernel/linux/amdgpu.list) and its display core (amdgpu-dc.list):
+/// built without ACPI and the pre-2014 SI/CIK families.
 const AMD_CFLAGS: &[&str] = &[
     "-UKBUILD_MODNAME",
     "-DKBUILD_MODNAME=\"amdgpu\"",
@@ -138,15 +140,54 @@ const AMD_CFLAGS: &[&str] = &[
     "-Wno-format-security",
 ];
 
+const DC_CFLAGS: &[&str] = &[
+    "-DCONFIG_DRM_AMD_DC",
+    "-DCONFIG_DRM_AMD_DC_FP",
+    "-Wno-initializer-overrides",
+    // drm-kmod keeps the HDCP sysfs attribute behind this (misspelt) guard.
+    "-D_linux__",
+];
+
+/// For the display core's floating-point files (amdgpu-fp.list), which Linux
+/// brackets with kernel_fpu_begin/end; everything else stays integer-only.
+const FP_CFLAGS: &[&str] = &["-msse2", "-mstackrealign"];
+
 const AMD_INCLUDES: &[&str] = &[
+    "",
     "acp/include",
     "amdgpu",
     "amdkfd",
     "display",
     "display/amdgpu_dm",
     "display/dc",
+    "display/dc/clk_mgr",
+    "display/dc/dccg",
+    "display/dc/dml2",
+    "display/dc/dml2/dml21",
+    "display/dc/dml2/dml21/src/dml2_core",
+    "display/dc/dml2/dml21/src/dml2_mcg",
+    "display/dc/dml2/dml21/src/dml2_dpmm",
+    "display/dc/dml2/dml21/src/dml2_pmo",
+    "display/dc/dml2/dml21/src/dml2_standalone_libraries",
+    "display/dc/dml2/dml21/src/inc",
+    "display/dc/dml2/dml21/inc",
+    "display/dc/dio",
+    "display/dc/dpp",
+    "display/dc/dsc",
+    "display/dc/dwb",
+    "display/dc/hpo",
+    "display/dc/hubp",
+    "display/dc/hubbub",
+    "display/dc/hwss",
     "display/dc/inc",
     "display/dc/inc/hw",
+    "display/dc/mmhubbub",
+    "display/dc/mpc",
+    "display/dc/opp",
+    "display/dc/optc",
+    "display/dc/pg",
+    "display/dc/resource",
+    "display/dc/spl",
     "display/dmub/inc",
     "display/include",
     "display/modules/hdcp",
@@ -223,6 +264,26 @@ fn main() {
         .map(|line| drm.join(line.trim()))
         .collect();
     sources.extend(amd_sources.iter().cloned());
+    let dc_list = source.join("amdgpu-dc.list");
+    let fp_list = source.join("amdgpu-fp.list");
+    println!("cargo:rerun-if-changed={}", dc_list.display());
+    println!("cargo:rerun-if-changed={}", fp_list.display());
+    // AEROS_LINUX_DC=0 leaves the display core out (a much faster build).
+    println!("cargo:rerun-if-env-changed=AEROS_LINUX_DC");
+    let with_dc = env::var("AEROS_LINUX_DC").map_or(true, |value| value != "0");
+    sources.extend(
+        std::fs::read_to_string(&dc_list)
+            .unwrap()
+            .lines()
+            .filter(|line| with_dc && !line.trim().is_empty())
+            .map(|line| drm.join(line.trim())),
+    );
+    let fp_files: Vec<String> = std::fs::read_to_string(&fp_list)
+        .unwrap()
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
     // Initcalls run in link order: library code before the drivers using it.
     collect(&source.join("drivers"), &mut sources);
     let amd = drm.join("drivers/gpu/drm/amd");
@@ -249,6 +310,14 @@ fn main() {
         }
         if file.starts_with(&amd) {
             arguments.extend(AMD_CFLAGS.iter().map(Into::into));
+            if with_dc {
+                arguments.extend(DC_CFLAGS.iter().map(Into::into));
+            }
+            let name = file.file_name().unwrap().to_string_lossy();
+            if fp_files.iter().any(|fp| *fp == name) {
+                arguments.retain(|argument| argument != "-mgeneral-regs-only");
+                arguments.extend(FP_CFLAGS.iter().map(Into::into));
+            }
             for directory in ["include/drm", "drivers/gpu/drm/scheduler"] {
                 arguments.push("-I".into());
                 arguments.push(drm.join(directory).into());

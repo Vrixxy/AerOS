@@ -11,6 +11,7 @@ enum backlight_update_reason { BACKLIGHT_UPDATE_HOTKEY, BACKLIGHT_UPDATE_SYSFS }
 #define FB_BLANK_POWERDOWN 4
 #define BL_CORE_SUSPENDED (1 << 0)
 #define BL_CORE_FBBLANK (1 << 1)
+#define BL_CORE_SUSPENDRESUME (1 << 0)
 struct backlight_device;
 struct backlight_ops {
 	unsigned int options;

@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: MIT
 /* Boot self-test of the unmodified KMS core: a virtual display pipeline
  * (plane -> CRTC -> encoder -> HDMI connector) probes modes from a synthetic
- * 1080p EDID, then sets and clears a mode through the atomic helpers. */
+ * 1080p EDID, then sets and clears a mode through the atomic helpers.
+ * With AMDGPU.DC on a machine whose Radeon did not take the screen, a second
+ * such pipeline stays up and AerOS's display takeover runs on it, so the
+ * path from a DRM client modeset to the desktop drawing into the new
+ * framebuffer can be tried without the GPU. */
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <drm/drm_drv.h>
@@ -21,6 +25,11 @@
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_modeset_lock.h>
 #include <drm/drm_probe_helper.h>
+#include <linux/iosys-map.h>
+#include <aeros/ops.h>
+
+extern bool aeros_display_taken;
+int aeros_display_take_over(struct drm_device *dev);
 
 static const u8 edid[128] = {
 	0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
@@ -64,6 +73,58 @@ static void object_free(struct drm_gem_object *obj)
 static const struct drm_gem_object_funcs object_funcs = {
 	.free = object_free,
 };
+
+/* Dumb buffers in system memory, for the DRM client the takeover uses. */
+struct dumb_object {
+	struct drm_gem_object base;
+	void *pixels;
+};
+
+static void dumb_free(struct drm_gem_object *obj)
+{
+	struct dumb_object *dumb = container_of(obj, struct dumb_object, base);
+
+	drm_gem_object_release(obj);
+	kfree(dumb->pixels);
+	kfree(dumb);
+}
+
+static int dumb_vmap(struct drm_gem_object *obj, struct iosys_map *map)
+{
+	iosys_map_set_vaddr(map, container_of(obj, struct dumb_object, base)->pixels);
+	return 0;
+}
+
+static void dumb_vunmap(struct drm_gem_object *obj, struct iosys_map *map)
+{
+}
+
+static const struct drm_gem_object_funcs dumb_funcs = {
+	.free = dumb_free,
+	.vmap = dumb_vmap,
+	.vunmap = dumb_vunmap,
+};
+
+static int dumb_create(struct drm_file *file, struct drm_device *dev, struct drm_mode_create_dumb *args)
+{
+	struct dumb_object *dumb = kzalloc(sizeof(*dumb), GFP_KERNEL);
+	int error;
+
+	if (!dumb)
+		return -ENOMEM;
+	args->pitch = ALIGN(args->width * DIV_ROUND_UP(args->bpp, 8), 64);
+	args->size = PAGE_ALIGN((u64)args->pitch * args->height);
+	dumb->pixels = kzalloc(args->size, GFP_KERNEL);
+	if (!dumb->pixels) {
+		kfree(dumb);
+		return -ENOMEM;
+	}
+	dumb->base.funcs = &dumb_funcs;
+	drm_gem_private_object_init(dev, &dumb->base, args->size);
+	error = drm_gem_handle_create(file, &dumb->base, &args->handle);
+	drm_gem_object_put(&dumb->base);
+	return error;
+}
 
 static void plane_update(struct drm_plane *plane, struct drm_atomic_state *state)
 {
@@ -154,7 +215,35 @@ static const struct drm_connector_funcs connector_funcs = {
 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
 };
 
+static const struct drm_framebuffer_funcs fb_funcs;
+
+static struct drm_framebuffer *fb_create(struct drm_device *dev, struct drm_file *file,
+					 const struct drm_mode_fb_cmd2 *command)
+{
+	struct drm_gem_object *obj = drm_gem_object_lookup(file, command->handles[0]);
+	struct drm_framebuffer *fb;
+	int error;
+
+	if (!obj)
+		return ERR_PTR(-ENOENT);
+	fb = kzalloc(sizeof(*fb), GFP_KERNEL);
+	if (!fb) {
+		drm_gem_object_put(obj);
+		return ERR_PTR(-ENOMEM);
+	}
+	drm_helper_mode_fill_fb_struct(dev, fb, command);
+	fb->obj[0] = obj;
+	error = drm_framebuffer_init(dev, fb, &fb_funcs);
+	if (error) {
+		drm_gem_object_put(obj);
+		kfree(fb);
+		return ERR_PTR(error);
+	}
+	return fb;
+}
+
 static const struct drm_mode_config_funcs mode_config_funcs = {
+	.fb_create = fb_create,
 	.atomic_check = drm_atomic_helper_check,
 	.atomic_commit = drm_atomic_helper_commit,
 };
@@ -165,6 +254,7 @@ static const struct drm_framebuffer_funcs fb_funcs = {
 
 static const struct drm_driver driver = {
 	.driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
+	.dumb_create = dumb_create,
 	.name = "aeros-kms-test",
 	.desc = "AerOS KMS self-test",
 	.major = 1,
@@ -306,6 +396,28 @@ static int kms_check(struct pipe *p)
 	return 0;
 }
 
+static void take_over_test(void)
+{
+	static struct device parent;
+	struct drm_device *dev = drm_dev_alloc(&driver, &parent);
+	struct pipe *p;
+	int error;
+
+	if (IS_ERR(dev))
+		return;
+	p = kzalloc(sizeof(*p), GFP_KERNEL);
+	if (!p)
+		return;
+	p->dev = dev;
+	dev->dev_private = p;
+	error = build_pipe(p);
+	if (!error)
+		error = drm_dev_register(dev, 0);
+	if (!error)
+		error = aeros_display_take_over(dev);
+	pr_info("kms selftest: display takeover on the test pipeline: %d\n", error);
+}
+
 static int __init kms_selftest(void)
 {
 	static struct device parent;
@@ -338,6 +450,8 @@ static int __init kms_selftest(void)
 	}
 	if (!error)
 		pr_info("kms selftest: pipeline torn down, framebuffer released\n");
+	if (!error && (aeros->options() & 2) && !aeros_display_taken)
+		take_over_test();
 	return error;
 }
 

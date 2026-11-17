@@ -1,4 +1,4 @@
-param([string]$RootImage = "build\rootfs-disk-webkit.img", [int]$DataMiB = 2400, [switch]$SkipKernel)
+param([string]$RootImage = "build\rootfs-disk-webkit.img", [int]$DataMiB = 2400, [switch]$SkipKernel, [switch]$GpuTest)
 
 # Builds build\AerOS-Setup.exe: the Windows installer (installer\) with the
 # AerOS files appended as a zip archive and a 16-byte trailer ("AEROSPKG" +
@@ -6,6 +6,8 @@ param([string]$RootImage = "build\rootfs-disk-webkit.img", [int]$DataMiB = 2400,
 # read-only ext4 root at the start of $RootImage followed by a fresh, empty
 # ext4 data area of $DataMiB MiB (store installs live there and survive
 # reboots); the whole file stays under FAT32's 4 GiB limit.
+# -GpuTest adds the Linux driver adapter with amdgpu switched on (AMDGPU.ON)
+# and the Radeon's firmware (FIRMWARE.PAK); the driver writes LINUX.LOG.
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $targetDir = Join-Path $root "target\linux-guest"
@@ -18,7 +20,8 @@ try {
     if (-not $SkipKernel) {
         & (Join-Path $PSScriptRoot "build-fonts.ps1") | Out-Null
         & (Join-Path $PSScriptRoot "build-userspace.ps1") | Out-Null
-        & cargo build --release --target x86_64-unknown-uefi --target-dir $targetDir --features linux-guest,linux-smp
+        $features = if ($GpuTest) { "linux-guest,linux-smp,linux-drivers" } else { "linux-guest,linux-smp" }
+        & cargo build --release --target x86_64-unknown-uefi --target-dir $targetDir --features $features
         if ($LASTEXITCODE -ne 0) { throw "kernel build failed (exit $LASTEXITCODE)" }
     }
     & dotnet build installer\AerOSSetup.csproj -c Release -nologo -v q
@@ -86,6 +89,15 @@ try {
     Add-Entry "EFI/BOOT/BOOTX64.EFI" @(, @($kernel, -1))
     foreach ($name in $firmwareFiles.Keys) {
         Add-Entry $name @(, @((Join-Path $firmware $firmwareFiles[$name]), -1))
+    }
+    if ($GpuTest) {
+        $pack = Join-Path $root "build\installer\FIRMWARE.PAK"
+        python (Join-Path $PSScriptRoot "firmware-pak.py") (Join-Path $root "build\gpu\firmware") $pack "amdgpu/green_sardine_*.bin" | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "firmware-pak.py failed" }
+        Add-Entry "FIRMWARE.PAK" @(, @($pack, -1))
+        $switch = Join-Path $root "build\installer\AMDGPU.ON"
+        Set-Content -LiteralPath $switch -Value "amdgpu may drive the Radeon; delete this file to turn it off" -Encoding ascii
+        Add-Entry "AMDGPU.ON" @(, @($switch, -1))
     }
     Add-Entry "VMLINUZ" @(, @((Join-Path $esp "VMLINUZ"), -1))
     Add-Entry "INITRD" @(, @((Join-Path $esp "INITRD"), -1))
