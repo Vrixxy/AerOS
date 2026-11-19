@@ -290,8 +290,21 @@ extern "sysv64" fn pci_write(bdf: u32, offset: u32, bytes: u32, value: u32) {
     );
 }
 
-/// Device memory is identity-mapped, like the rest of the kernel's view.
-extern "sysv64" fn map_mmio(physical: u64, _length: u64) -> *mut u8 {
+/// `ioremap`: an uncached mapping in the `vmap` window. The kernel's
+/// identity map caches RAM, and an APU's "VRAM" is RAM set aside by the
+/// firmware, which the GPU and its security processor read and write
+/// without snooping the CPU's caches. Falls back to the identity map.
+extern "sysv64" fn map_mmio(physical: u64, length: u64) -> *mut u8 {
+    let offset = physical & 0xfff;
+    let pages = (offset + length).div_ceil(4096) as usize;
+    if length != 0 {
+        let first = physical - offset;
+        let frames: alloc::vec::Vec<u64> =
+            (0..pages as u64).map(|page| first + page * 4096).collect();
+        if let Some(address) = crate::arch::paging::vmap(&frames, true) {
+            return (address + offset) as usize as *mut u8;
+        }
+    }
     physical as usize as *mut u8
 }
 

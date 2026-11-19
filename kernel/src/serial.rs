@@ -5,7 +5,7 @@ use crate::arch;
 use crate::sync::TicketLock;
 
 const COM1: u16 = 0x3f8;
-const LOG_BYTES: usize = 16 * 1024;
+const LOG_BYTES: usize = 192 * 1024;
 static READY: AtomicBool = AtomicBool::new(false);
 static LOG: TicketLock<LogRing> = TicketLock::new(LogRing::new());
 
@@ -43,10 +43,19 @@ impl LogRing {
     }
 }
 
+/// Bytes logged since boot (a heartbeat for the boot watchdog).
+static TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "screen-log")]
+pub fn total_bytes() -> u64 {
+    TOTAL.load(Ordering::Relaxed)
+}
+
 fn record(value: u8) {
     if value == b'\r' {
         return;
     }
+    TOTAL.fetch_add(1, Ordering::Relaxed);
     if let Some(mut log) = LOG.try_lock() {
         log.push(value);
     }
@@ -58,7 +67,10 @@ pub fn log_tail(output: &mut [u8]) -> usize {
 }
 
 pub(crate) fn log_self_test() -> bool {
-    let mut ring = LogRing::new();
+    // A static: the ring is too large for the stack.
+    static TEST_RING: TicketLock<LogRing> = TicketLock::new(LogRing::new());
+    let mut ring = TEST_RING.lock();
+    *ring = LogRing::new();
     for index in 0..(LOG_BYTES + 100) {
         ring.push((index % 251) as u8);
     }
@@ -95,6 +107,8 @@ pub fn init() {
 
 pub fn byte(value: u8) {
     record(value);
+    #[cfg(feature = "screen-log")]
+    crate::bootscreen::byte(value);
     if !READY.load(Ordering::Acquire) {
         return;
     }

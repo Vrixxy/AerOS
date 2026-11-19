@@ -865,14 +865,23 @@ impl<'a> Painter<'a> {
         let plain_right = bounds.right() - radii.top_right.max(radii.bottom_right);
         for y in area.y..area.bottom() {
             if y >= band_top && y < band_bottom {
-                for x in area.x..area.right() {
-                    self.frame.blend(x, y, color.color(), color.alpha);
-                }
+                self.frame
+                    .blend_span(area.x, y, area.width, color.color(), color.alpha);
                 continue;
+            }
+            let span_left = plain_left.max(area.x);
+            let span_right = plain_right.min(area.right());
+            if span_left < span_right {
+                self.frame.blend_span(
+                    span_left,
+                    y,
+                    span_right - span_left,
+                    color.color(),
+                    color.alpha,
+                );
             }
             for x in area.x..area.right() {
                 if x >= plain_left && x < plain_right {
-                    self.frame.blend(x, y, color.color(), color.alpha);
                     continue;
                 }
                 let coverage = rounded_coverage(bounds, radii, Point::new(x, y));
@@ -1324,11 +1333,32 @@ impl<'a> Painter<'a> {
         let interior_x1 = bounds.right() - inset + style.inner_shadow_offset.x;
         let interior_y0 = bounds.y + inset + style.inner_shadow_offset.y;
         let interior_y1 = bounds.bottom() - inset + style.inner_shadow_offset.y;
+        // Along the straight middle of each side only the `softness` strip
+        // next to that side is shaded (a pill's ends are all corner, so the
+        // rectangle above covers nothing of it).
+        let reach = softness.max(corner);
+        let offset = style.inner_shadow_offset;
+        let band_x0 = bounds.x + reach + offset.x.max(0);
+        let band_x1 = bounds.right() - reach + offset.x.min(0);
+        let band_y0 = bounds.y + reach + offset.y.max(0);
+        let band_y1 = bounds.bottom() - reach + offset.y.min(0);
+        let quiet_y0 = bounds.y + softness + offset.y;
+        let quiet_y1 = bounds.bottom() - softness + offset.y;
+        let quiet_x0 = bounds.x + softness + offset.x;
+        let quiet_x1 = bounds.right() - softness + offset.x;
         for y in mask.y..mask.bottom() {
             let mut x = mask.x;
             while x < mask.right() {
                 if y >= interior_y0 && y < interior_y1 && x >= interior_x0 && x < interior_x1 {
                     x = interior_x1.min(mask.right());
+                    continue;
+                }
+                if y >= quiet_y0 && y < quiet_y1 && x >= band_x0 && x < band_x1 {
+                    x = band_x1.min(mask.right());
+                    continue;
+                }
+                if y >= band_y0 && y < band_y1 && x >= quiet_x0 && x < quiet_x1 {
+                    x = quiet_x1.min(mask.right());
                     continue;
                 }
                 let px = x;

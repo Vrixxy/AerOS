@@ -119,7 +119,8 @@ const MAX_NAME: usize = 20;
 const LOGIN_ERROR_NS: u64 = 1_500_000_000;
 /// Idle time on the desktop before the session locks itself.
 const AUTO_LOCK_NS: u64 = 300_000_000_000;
-const SHELL_LINE_MAX: usize = 56;
+/// Characters per Terminal line: the width of its window at the default size.
+const SHELL_LINE_MAX: usize = 84;
 /// What one command line typed into the Terminal can hold (it scrolls sideways
 /// past the window's width).
 const TERMINAL_INPUT_MAX: usize = shell::MAX_INPUT;
@@ -401,7 +402,7 @@ const DOCK_BUTTONS: [&str; 9] = ["", "", "", "", "", "", "", "", ""];
 const DOCK_NAMES: [&str; 9] = [
     "Apps",
     "Terminal",
-    "Quick settings",
+    "Settings",
     "Files",
     "Browser",
     "Notes",
@@ -4199,7 +4200,8 @@ impl Layout {
     fn new(frame: &FrameBuffer) -> Self {
         let width_scale = frame.width().saturating_mul(1_000) / DESIGN_WIDTH as usize;
         let height_scale = frame.height().saturating_mul(1_000) / DESIGN_HEIGHT as usize;
-        let milli = width_scale.min(height_scale).clamp(500, 2_000) as u16;
+        // Up to 4x: a 14-inch 2880x1800 panel needs about 3.8x to fill.
+        let milli = width_scale.min(height_scale).clamp(500, 4_000) as u16;
         let scale = Scale::from_milli(milli).unwrap_or(Scale::ONE);
         Self::with_scale(frame, scale)
     }
@@ -4520,9 +4522,26 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
     let mut touch_last_y = 0i32;
     let mut touch_moved = false;
     let mut last_input_ns = crate::time::monotonic_nanoseconds();
+    let mut splash_was_active = true;
     loop {
         let mut redraw = false;
         let splash_active = boot_splash(crate::time::monotonic_nanoseconds()).is_some();
+        // A splash held for Linux ends later than planned: the next screen's
+        // fade-in starts now.
+        if splash_was_active && !splash_active {
+            let now = crate::time::monotonic_nanoseconds();
+            state.screen_transition_at_ns = now;
+            state.motion_until_ns = state
+                .motion_until_ns
+                .max(now + SCREEN_TRANSITION_NS + 100_000_000);
+            redraw = true;
+        }
+        splash_was_active = splash_active;
+        // While the splash waits for Linux its animation keeps running.
+        if splash_active && linux_starting() {
+            let now = crate::time::monotonic_nanoseconds();
+            state.motion_until_ns = state.motion_until_ns.max(now + 200_000_000);
+        }
         crate::scheduler::relax_kernel();
         crate::acpi_events::poll();
         if crate::acpi_events::take_power_button()
@@ -4618,6 +4637,12 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
             if state.screen == Screen::Desktop && !released && scancode != 0xe0 {
                 if !was_extended && code == 0x0f && alt_down {
                     redraw |= state.switcher_step(shift_held);
+                    continue;
+                }
+                // Alt+F4 closes the window in front, as on other systems.
+                if !was_extended && code == 0x3e && alt_down && state.app != DesktopApp::None {
+                    state.app_close();
+                    redraw = true;
                     continue;
                 }
                 if state.switcher_open {
@@ -5308,6 +5333,9 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
         } else if wheel != 0 && state.app == DesktopApp::Browser && state.overlay == Overlay::None {
             crate::web::get().scroll_by(wheel * 3, BROWSER_VISIBLE_LINES);
             redraw = true;
+        } else if wheel != 0 && state.app == DesktopApp::Avatar && state.overlay == Overlay::None {
+            let logical = Layout::new(frame).to_logical(Point::new(pointer.x, pointer.y));
+            redraw |= state.avatar_wheel(logical, -wheel);
         }
         if over_linux != guest_ptr.over {
             cursor.erase(frame);
@@ -5404,6 +5432,10 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
         }
         crate::datafs::poll();
         crate::ntp::tick(crate::time::monotonic_nanoseconds());
+        #[cfg(not(feature = "boot-test"))]
+        crate::measure::finish_background();
+        #[cfg(feature = "screen-log")]
+        crate::DESKTOP_HEARTBEAT.fetch_add(1, core::sync::atomic::Ordering::Release);
         crate::keymap::sync_guest();
         let motion_animating_now = crate::time::monotonic_nanoseconds() < state.motion_until_ns;
         if motion_animating_now || motion_animating {
@@ -6213,28 +6245,55 @@ const BOOT_SPLASH_FADE_NS: u64 = 500_000_000;
 
 /// The boot splash for this frame, or `None` once it is over: the view
 /// (progress and timing) and how far it has faded to dark (0 = not at all).
+/// When the splash ends (0 until its fade has begun): later than the usual
+/// length while the Linux guest is still starting.
+static BOOT_SPLASH_END_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The longest the splash waits for Linux, so a guest that never comes up
+/// cannot keep anyone from their desktop.
+const BOOT_LINUX_WAIT_NS: u64 = 60_000_000_000;
+
+/// The Linux guest is booting and its agent is not up yet.
+fn linux_starting() -> bool {
+    crate::svm::linux_ready() && !crate::svm::linux_agent_ready()
+}
+
 fn boot_splash(now: u64) -> Option<(crate::loading::LoadingView, u8)> {
-    let start = BOOT_SPLASH_START_NS.load(core::sync::atomic::Ordering::Relaxed);
+    use core::sync::atomic::Ordering::Relaxed;
+    let start = BOOT_SPLASH_START_NS.load(Relaxed);
     if start == 0 {
         return None;
     }
     let elapsed = now.saturating_sub(start);
-    if elapsed >= BOOT_SPLASH_NS {
+    let fade_start = BOOT_SPLASH_NS - BOOT_SPLASH_FADE_NS;
+    let mut end = BOOT_SPLASH_END_NS.load(Relaxed);
+    let mut stage = "Starting AerOS";
+    if end == 0 && elapsed >= fade_start {
+        if linux_starting() && elapsed < BOOT_LINUX_WAIT_NS {
+            stage = "Starting Linux apps";
+        } else {
+            end = now.max(start + fade_start) + BOOT_SPLASH_FADE_NS;
+            BOOT_SPLASH_END_NS.store(end, Relaxed);
+        }
+    }
+    if end != 0 && now >= end {
         return None;
     }
-    let done = (elapsed * 1000 / BOOT_SPLASH_NS) as u32;
+    let done = (elapsed.min(fade_start) * 1000 / BOOT_SPLASH_NS) as u32;
     let inverse = 1000 - done;
-    let progress = (1000 - inverse * inverse / 1000) as u16;
+    let mut progress = (1000 - inverse * inverse / 1000) as u16;
+    if end != 0 {
+        progress = 1000;
+    }
     let view = crate::loading::LoadingView {
         kind: crate::loading::LoadingKind::System,
-        stage: "Starting AerOS",
+        stage,
         progress_permille: progress,
         elapsed_secs: (elapsed / 1_000_000_000) as u32,
         elapsed_ms: elapsed / 1_000_000,
     };
-    let fade_start = BOOT_SPLASH_NS - BOOT_SPLASH_FADE_NS;
-    let dark = if elapsed > fade_start {
-        ((elapsed - fade_start) * 255 / BOOT_SPLASH_FADE_NS) as u8
+    let dark = if end != 0 {
+        let fade_begin = end - BOOT_SPLASH_FADE_NS;
+        (now.saturating_sub(fade_begin).min(BOOT_SPLASH_FADE_NS) * 255 / BOOT_SPLASH_FADE_NS) as u8
     } else {
         0
     };
@@ -7445,7 +7504,8 @@ fn draw_dock(
         14,
         Color::rgb(255, 255, 255),
     );
-    if state.focus_visible && outer {
+    // An open window has the keyboard, and the window would half cover it.
+    if state.focus_visible && outer && state.app == DesktopApp::None {
         let center = dock_icon_rect(state.dock_focus).x + DOCK_ICON_SIZE / 2;
         draw_hint_pill(
             painter,
@@ -7512,7 +7572,7 @@ fn draw_app_switcher(
                 style
             },
             0xaea0_0001,
-            if cheap { 4 } else { 2 },
+            if cheap { 4 } else { 2 } * hidpi_step(layout),
         )
         .captured;
     let controls = true;
@@ -7534,6 +7594,10 @@ fn draw_app_switcher(
                 Rgba::new(255, 255, 255, 230),
             );
         }
+        let label = Rect::new(tile.x - 8, tile.bottom() + 2, tile.width + 16, 14);
+        let shadow = Rect::new(label.x + 1, label.y + 1, label.width, label.height);
+        centered_text(painter, icon_layout, font, shadow, launcher_name(index), 11, Color::rgb(0, 0, 0));
+        centered_text(painter, icon_layout, font, label, launcher_name(index), 11, Color::rgb(245, 248, 250));
         match LAUNCHER_BUILTINS.get(index) {
             Some(&(_, kind)) => draw_icon(painter, icon_layout, kind, tile),
             None => draw_store_icon(
@@ -7564,7 +7628,7 @@ fn draw_app_switcher(
         LAUNCHER_SEARCH,
         "Search",
         15,
-        Color::rgb(12, 20, 24),
+        Color::rgb(214, 228, 233),
     );
     for dot in 0..launcher_pages() {
         painter.fill_rounded_rect(
@@ -7575,16 +7639,6 @@ fn draw_app_switcher(
             } else {
                 Rgba::new(255, 255, 255, 110)
             },
-        );
-    }
-    if (state.focus_visible || state.launcher_hover) && state.app_focus < launcher_len() {
-        let tile = launcher_tile(state.app_focus);
-        draw_hint_pill(
-            painter,
-            layout,
-            font,
-            Point::new(tile.x + tile.width / 2, tile.y - 4),
-            launcher_name(state.app_focus),
         );
     }
     surface && controls
@@ -7969,8 +8023,12 @@ fn draw_window(
             blur_off,
         )
         .captured;
+        // A window too big to blur gets a plain tint, which is just as
+        // repeatable as a captured frost.
+        let plain = layout.rect(outer).width as usize * layout.rect(outer).height as usize
+            > crate::aerui::MAX_FROST_PIXELS;
         if cacheable
-            && captured
+            && (captured || plain)
             && cache_len <= cache.len()
             && painter.read_region(region, &mut cache[..cache_len])
         {
@@ -8168,7 +8226,7 @@ fn draw_linux(painter: &mut Painter<'_>, layout: Layout, ui_font: RasterFont, ou
                 layout,
                 ui_font,
                 Point::new(screen.x + 20, screen.y + 22),
-                "Linux is not running",
+                "Linux apps are not available",
                 15,
                 light,
             );
@@ -8177,7 +8235,7 @@ fn draw_linux(painter: &mut Painter<'_>, layout: Layout, ui_font: RasterFont, ou
                 layout,
                 ui_font,
                 Point::new(screen.x + 20, screen.y + 50),
-                "Build with --features linux-guest and put VMLINUZ,",
+                "The Linux part of AerOS did not start on this computer.",
                 11,
                 Color::rgb(150, 162, 174),
             );
@@ -8186,7 +8244,7 @@ fn draw_linux(painter: &mut Painter<'_>, layout: Layout, ui_font: RasterFont, ou
                 layout,
                 ui_font,
                 Point::new(screen.x + 20, screen.y + 68),
-                "INITRD and ROOTFS on the boot volume.",
+                "Everything else works as normal. A restart may help.",
                 11,
                 Color::rgb(150, 162, 174),
             );
@@ -9887,6 +9945,7 @@ fn draw_files(
     );
     let mut path_line: shell::Text<96> = shell::Text::new();
     let _ = path_line.push_str_checked(state.files_path.as_str());
+    glass_label_backing(painter, layout, Rect::new(main_x + 44, content_y, main_width - 44, 24));
     text(
         painter,
         layout,
@@ -9945,13 +10004,14 @@ fn draw_files(
             painter,
             layout,
             ui_font,
-            Rect::new(bounds.x, bounds.y + cell_height - 26, bounds.width, 16),
+            Rect::new(bounds.x, bounds.y + cell_height - 22, bounds.width, 16),
             label.as_str(),
             11,
             Color::rgb(20, 45, 55),
         );
     }
     painter.set_clip(previous_clip);
+    glass_label_backing(painter, layout, Rect::new(main_x, status_y - 3, main_width, 18));
     if state.files_entry_count == 0 {
         text(
             painter,
@@ -10020,6 +10080,16 @@ fn draw_files(
             Color::rgb(20, 48, 58),
         );
     }
+}
+
+/// A light rounded strip behind a line of dark text that sits directly on a
+/// window's glass, so it stays readable over dark wallpapers.
+fn glass_label_backing(painter: &mut Painter<'_>, layout: Layout, bounds: Rect) {
+    painter.fill_rounded_rect(
+        layout.rect(bounds),
+        layout.radii(CornerRadii::all(8)),
+        Rgba::new(246, 250, 252, 220),
+    );
 }
 
 fn draw_name_prompt(
@@ -10695,20 +10765,54 @@ const CURSOR_FILL: [[u8; CURSOR_SIZE]; CURSOR_SIZE] = [
 /// The pointer from the design: a rounded blob with a one pixel black outline
 /// over a light fill at 20 per cent, drawn from coverage tables.
 fn draw_cursor_at(frame: &mut FrameBuffer, x: i32, y: i32) {
+    let zoom = cursor_zoom(frame);
+    // A light halo outside the outline keeps the pointer visible on dark
+    // wallpapers.
     for row in 0..CURSOR_SIZE {
         for col in 0..CURSOR_SIZE {
-            let px = x - CURSOR_HOT.0 + col as i32;
-            let py = y - CURSOR_HOT.1 + row as i32;
-            let fill = CURSOR_FILL[row][col] as u32 * 20 / 100;
-            if fill > 0 {
-                frame.blend(px, py, Color::rgb(217, 217, 217), fill as u8);
-            }
             let stroke = CURSOR_STROKE[row][col];
-            if stroke > 0 {
-                frame.blend(px, py, Color::rgb(0, 0, 0), stroke);
+            if stroke == 0 {
+                continue;
+            }
+            let alpha = (stroke as u32 * 3 / 4) as u8;
+            for (ox, oy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                for dy in 0..zoom {
+                    for dx in 0..zoom {
+                        let px = x - CURSOR_HOT.0 * zoom + (col as i32 + ox) * zoom + dx;
+                        let py = y - CURSOR_HOT.1 * zoom + (row as i32 + oy) * zoom + dy;
+                        frame.blend(px, py, Color::rgb(255, 255, 255), alpha / 2);
+                    }
+                }
             }
         }
     }
+    for row in 0..CURSOR_SIZE {
+        for col in 0..CURSOR_SIZE {
+            let fill = CURSOR_FILL[row][col] as u32 * 20 / 100;
+            let stroke = CURSOR_STROKE[row][col];
+            if fill == 0 && stroke == 0 {
+                continue;
+            }
+            for dy in 0..zoom {
+                for dx in 0..zoom {
+                    let px = x - CURSOR_HOT.0 * zoom + col as i32 * zoom + dx;
+                    let py = y - CURSOR_HOT.1 * zoom + row as i32 * zoom + dy;
+                    if fill > 0 {
+                        frame.blend(px, py, Color::rgb(217, 217, 217), fill as u8);
+                    }
+                    if stroke > 0 {
+                        frame.blend(px, py, Color::rgb(0, 0, 0), stroke);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whole-number zoom for the pointer: 1 up to 1920 pixels wide, 2 on a
+/// 2880-wide laptop panel, so it keeps about the same size on screen.
+fn cursor_zoom(frame: &FrameBuffer) -> i32 {
+    ((frame.width() as i32 + 1000) / 1920).clamp(1, 4)
 }
 
 struct CursorSprite {
@@ -10765,12 +10869,16 @@ impl CursorSprite {
         if self.visible {
             let required = frame.info().stride.saturating_mul(frame.height());
             if required <= screen_capacity() {
+                let zoom = cursor_zoom(frame);
+                // The halo reaches one pointer pixel (`zoom` screen pixels)
+                // past the outline.
+                let margin = zoom + 1;
                 frame.restore_region(
                     &shadow_slice()[..required],
-                    self.x - CURSOR_HOT.0 - 1,
-                    self.y - CURSOR_HOT.1 - 1,
-                    CURSOR_SIZE + 2,
-                    CURSOR_SIZE + 2,
+                    self.x - CURSOR_HOT.0 * zoom - margin,
+                    self.y - CURSOR_HOT.1 * zoom - margin,
+                    CURSOR_SIZE * zoom as usize + 2 * margin as usize,
+                    CURSOR_SIZE * zoom as usize + 2 * margin as usize,
                 );
             }
             self.visible = false;
@@ -11170,7 +11278,7 @@ fn frost_mode(
         2
     } else {
         1
-    };
+    } * hidpi_step(layout);
     painter.frosted_rounded_rect_stepped(
         layout.rect(bounds),
         layout.radii(radii),
@@ -11178,6 +11286,12 @@ fn frost_mode(
         seed,
         step,
     )
+}
+
+/// Frost block size grows with the layout scale: a 2x2 block at 1x is the
+/// same size on screen as a 6x6 one at 3x, and the blur under it is smooth.
+fn hidpi_step(layout: Layout) -> usize {
+    (layout.scale.logical(1000) / 1000).clamp(1, 3) as usize
 }
 
 fn dock_style() -> FrostStyle {
@@ -11504,7 +11618,11 @@ fn live_wallpaper_tick(frame: &FrameBuffer, state: &mut DesktopState) -> bool {
         ((px << 17) / width) - 65_536,
         ((py << 17) / height) - 65_536,
     );
-    let active = state.screen == Screen::Desktop
+    // Above about 1920x1200 the CPU warp costs over 100 ms a frame and makes
+    // the pointer stutter, so big panels keep the still picture.
+    let affordable = info.width * info.height <= 2_400_000 || crate::virtio_gpu::cursor_active();
+    let active = affordable
+        && state.screen == Screen::Desktop
         && state.app == DesktopApp::None
         && state.overlay == Overlay::None
         && !state.bg_open
@@ -12170,12 +12288,15 @@ fn time_text() -> ClockBuffer {
 fn date_text() -> ClockBuffer {
     let current = crate::rtc::local_date_time();
     let mut result = ClockBuffer::new();
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     let _ = write!(
         result,
-        "{:02}:{:02}:{:02}",
+        "{} {} {}",
+        weekday_text(),
         current.day,
-        current.month,
-        current.year % 100
+        MONTHS[usize::from(current.month.clamp(1, 12)) - 1],
     );
     result
 }
@@ -13049,13 +13170,15 @@ fn draw_signin(
     }
     true
 }
-struct DockCache(UnsafeCell<[u32; 320_000]>);
+/// Sized for the dock at the largest layout scale (4x).
+struct DockCache(UnsafeCell<[u32; DOCK_CACHE_PIXELS]>);
+const DOCK_CACHE_PIXELS: usize = 1_300_000;
 
 unsafe impl Sync for DockCache {}
 
-static DOCK_CACHE: DockCache = DockCache(UnsafeCell::new([0; 320_000]));
+static DOCK_CACHE: DockCache = DockCache(UnsafeCell::new([0; DOCK_CACHE_PIXELS]));
 static DOCK_CACHE_KEY: AtomicU64 = AtomicU64::new(0);
-static DOCK_BASE_CACHE: DockCache = DockCache(UnsafeCell::new([0; 320_000]));
+static DOCK_BASE_CACHE: DockCache = DockCache(UnsafeCell::new([0; DOCK_CACHE_PIXELS]));
 static DOCK_BASE_KEY: AtomicU64 = AtomicU64::new(0);
 
 const PROF_WALLPAPER: usize = 0;
@@ -13117,11 +13240,12 @@ fn dock_cache_key(layout: Layout, region: Rect) -> u64 {
     key | 1
 }
 
-struct WindowCache(UnsafeCell<[u32; 1_800_000]>);
+/// Big enough for a maximized window on a 2880x1800 panel.
+struct WindowCache(UnsafeCell<[u32; 5_300_000]>);
 
 unsafe impl Sync for WindowCache {}
 
-static WINDOW_CACHE: WindowCache = WindowCache(UnsafeCell::new([0; 1_800_000]));
+static WINDOW_CACHE: WindowCache = WindowCache(UnsafeCell::new([0; 5_300_000]));
 static WINDOW_CACHE_KEY: AtomicU64 = AtomicU64::new(0);
 
 static PANEL_CACHE_KEY: AtomicU64 = AtomicU64::new(0);

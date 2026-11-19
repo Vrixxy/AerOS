@@ -3670,8 +3670,8 @@ unsafe fn zero_page(address: u64) {
 
 #[cfg(feature = "linux-drivers")]
 /// Pages of the kernel window `vmap` maps scattered frames into (Linux's
-/// `vmap`, for the GPU driver): 128 MiB of addresses.
-const VMAP_TABLES: usize = 64;
+/// `vmap`, for the GPU driver, and its `ioremap`s): 1 GiB of addresses.
+const VMAP_TABLES: usize = 512;
 #[cfg(feature = "linux-drivers")]
 const VMAP_PAGES: usize = VMAP_TABLES * ENTRY_COUNT;
 #[cfg(feature = "linux-drivers")]
@@ -3831,4 +3831,173 @@ pub fn vmap_self_test() -> bool {
         let _ = crate::memory::release_global_address(frame);
     }
     ordered && unmapped && reused
+}
+
+const MSR_PAT: u32 = 0x277;
+
+/// Makes PAT entry 1 (PWT set, PCD clear) write-combining, as Linux does.
+/// Every processor must agree, so each one calls this as it starts.
+pub fn enable_write_combining() {
+    let pat = read_msr(MSR_PAT);
+    // SAFETY: only entry 1 changes; no mapping in AerOS used PWT alone.
+    unsafe { write_msr(MSR_PAT, (pat & !0xff00) | (0x01 << 8)) };
+}
+
+/// Maps the framebuffer (rounded out to 2 MiB) write-combining. Firmware
+/// leaves it uncached, so every frame crawls onto the screen line by line.
+/// A 1 GiB page around it is split into 2 MiB pages first, so device
+/// registers elsewhere in that gigabyte stay uncached.
+/// Maps `length` bytes of device memory at `start` a second time, in an
+/// unused kernel slot, write-combining (PAT entry 1, see
+/// `enable_write_combining`), and returns where `start` lands. Every address
+/// space copies the kernel half of the root, so the mapping holds whichever
+/// one is loaded; the identity map may not (processes get their own copies).
+pub fn map_write_combining(
+    state: &PagingState,
+    start: u64,
+    length: u64,
+    frames: &mut FrameAllocator,
+) -> Option<u64> {
+    const HUGE: u64 = 1 << 7;
+    const PWT: u64 = 1 << 3;
+    const MIB2: u64 = 0x20_0000;
+    const GIB: u64 = 0x4000_0000;
+    if length == 0 {
+        return None;
+    }
+    let first = start & !(MIB2 - 1);
+    let end = start.checked_add(length)?.next_multiple_of(MIB2);
+    let directories = (end - first).div_ceil(GIB);
+    if directories > 4 {
+        return None;
+    }
+    let root = state.root_physical as usize as *mut u64;
+    let slot = (256..ENTRY_COUNT)
+        .find(|index| unsafe { core::ptr::read_volatile(root.add(*index)) } & PRESENT == 0)?;
+    let pdpt = frames.allocate_contiguous(1 + directories, 1)?.address();
+    // SAFETY: fresh, identity-mapped table pages; the slot was empty.
+    unsafe {
+        for page in 0..=directories {
+            zero_page(pdpt + page * PAGE_SIZE);
+        }
+        for directory in 0..directories {
+            core::ptr::write_volatile(
+                (pdpt as usize as *mut u64).add(directory as usize),
+                (pdpt + (1 + directory) * PAGE_SIZE) | PRESENT | WRITABLE,
+            );
+        }
+        // The directories are contiguous, so their entries run on.
+        let entries = (pdpt + PAGE_SIZE) as usize as *mut u64;
+        let mut offset = 0;
+        while first + offset < end {
+            core::ptr::write_volatile(
+                entries.add((offset / MIB2) as usize),
+                (first + offset) | PRESENT | WRITABLE | HUGE | PWT,
+            );
+            offset += MIB2;
+        }
+        core::ptr::write_volatile(root.add(slot), pdpt | PRESENT | WRITABLE);
+        write_cr3(read_cr3());
+    }
+    Some(canonical_base(slot) + (start - first))
+}
+
+pub fn write_combine_framebuffer(start: u64, length: u64, frames: &mut FrameAllocator) -> bool {
+    const MIB2: u64 = 0x20_0000;
+    let first = start & !(MIB2 - 1);
+    let end = (start + length).next_multiple_of(MIB2);
+    let root = read_cr3() & ADDRESS_MASK;
+    // The firmware's own page tables, which still map this range, are
+    // read-only: lift CR0.WP while the entries change.
+    let cr0: u64;
+    // SAFETY: reading CR0 has no side effects.
+    unsafe { asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: interrupts are off this early in boot; WP comes back below.
+    unsafe { asm!("mov cr0, {}", in(reg) cr0 & !(1 << 16), options(nostack, preserves_flags)) };
+    let changed = write_combine_entries(root, first, end, frames);
+    // SAFETY: restores the saved CR0.
+    unsafe { asm!("mov cr0, {}", in(reg) cr0, options(nostack, preserves_flags)) };
+    // SAFETY: reloading CR3 only flushes the TLB.
+    unsafe { write_cr3(read_cr3()) };
+    flush_caches();
+    changed
+}
+
+fn write_combine_entries(root: u64, first: u64, end: u64, frames: &mut FrameAllocator) -> bool {
+    const HUGE: u64 = 1 << 7;
+    const PWT: u64 = 1 << 3;
+    const PCD: u64 = 1 << 4;
+    const LARGE_PAT: u64 = 1 << 12;
+    const SMALL_PAT: u64 = 1 << 7;
+    const MIB2: u64 = 0x20_0000;
+    let mut changed = false;
+    let mut address = first;
+    while address < end {
+        let indices = [
+            (address >> 39) as usize & 511,
+            (address >> 30) as usize & 511,
+            (address >> 21) as usize & 511,
+        ];
+        // SAFETY: page tables are identity-mapped; entries are only made
+        // more restrictive about caching, never moved.
+        unsafe {
+            let pml4 = root as usize as *mut u64;
+            let top = core::ptr::read_volatile(pml4.add(indices[0]));
+            if top & PRESENT == 0 {
+                return changed;
+            }
+            let pdpt = (top & ADDRESS_MASK) as usize as *mut u64;
+            let mut middle = core::ptr::read_volatile(pdpt.add(indices[1]));
+            if middle & PRESENT == 0 {
+                return changed;
+            }
+            if middle & HUGE != 0 {
+                let Some(frame) = frames.allocate() else {
+                    return changed;
+                };
+                let directory = frame.address();
+                let gigabyte = middle & 0x000f_ffff_c000_0000;
+                let flags = middle & !0x000f_ffff_ffff_f000;
+                for index in 0..ENTRY_COUNT as u64 {
+                    core::ptr::write_volatile(
+                        (directory as usize as *mut u64).add(index as usize),
+                        (gigabyte + index * MIB2) | flags,
+                    );
+                }
+                middle = directory | (middle & (PRESENT | WRITABLE | (1 << 2)));
+                core::ptr::write_volatile(pdpt.add(indices[1]), middle);
+            }
+            let directory = (middle & ADDRESS_MASK) as usize as *mut u64;
+            let entry = core::ptr::read_volatile(directory.add(indices[2]));
+            if entry & PRESENT == 0 {
+                return changed;
+            }
+            if entry & HUGE != 0 {
+                core::ptr::write_volatile(
+                    directory.add(indices[2]),
+                    (entry & !(PCD | LARGE_PAT)) | PWT,
+                );
+            } else {
+                let table = (entry & ADDRESS_MASK) as usize as *mut u64;
+                for index in 0..ENTRY_COUNT {
+                    let page = core::ptr::read_volatile(table.add(index));
+                    if page & PRESENT != 0 {
+                        core::ptr::write_volatile(
+                            table.add(index),
+                            (page & !(PCD | SMALL_PAT)) | PWT,
+                        );
+                    }
+                }
+            }
+        }
+        changed = true;
+        address += MIB2;
+    }
+    changed
+}
+
+fn flush_caches() {
+    // SAFETY: writes back and invalidates the caches; changing a memory type
+    // requires no stale cached lines of it.
+    unsafe { core::arch::asm!("wbinvd", options(nostack, preserves_flags)) };
 }

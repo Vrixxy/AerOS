@@ -198,8 +198,23 @@ pub fn start_processor(destination: u32, trampoline: u64) -> bool {
     if !send_ipi(destination, startup) {
         return false;
     }
-    delay(200_000);
+    // The second start-up IPI only if the first went unanswered: the
+    // trampoline's first store marks offset 0x300. Some hypervisors keep an
+    // unneeded second one and replay it on the running processor later.
+    let stage = (trampoline + 0x300) as usize as *const u8;
+    // Up to 200 ms: a virtual processor can take that long to be scheduled.
+    for _ in 0..1000 {
+        delay(200_000);
+        if unsafe { core::ptr::read_volatile(stage) } != 0 {
+            return true;
+        }
+    }
     send_ipi(destination, startup)
+}
+
+#[cfg(feature = "screen-log")]
+pub fn send_nmi(destination: u32) -> bool {
+    send_ipi(destination, 0x400)
 }
 
 pub fn send_fixed(destination: u32, vector: u8) -> bool {

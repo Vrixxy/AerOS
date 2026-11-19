@@ -174,7 +174,40 @@ pub fn take_press() -> Option<(i32, i32)> {
 }
 
 pub fn ready() -> bool {
-    READY.load(Ordering::Acquire)
+    READY.load(Ordering::Acquire) || DEVICE_SEEN.load(Ordering::Acquire)
+}
+
+/// Set once a USB pointer has reported: laptops without a PS/2 mouse are
+/// otherwise never "ready" and the pointer would stay in the middle.
+static DEVICE_SEEN: AtomicBool = AtomicBool::new(false);
+static REMAINDER_X: AtomicI32 = AtomicI32::new(0);
+static REMAINDER_Y: AtomicI32 = AtomicI32::new(0);
+
+/// Pointer gain in 1/256 steps: wider screens move faster, and quick flicks
+/// cover more ground than slow, precise movement.
+fn gain(delta_x: i32, delta_y: i32) -> i32 {
+    let width = (BOUNDS.load(Ordering::Relaxed) >> 16) as i32;
+    let screen = (width * 256 / 1920).clamp(256, 640);
+    let speed = delta_x.abs().max(delta_y.abs()).min(24);
+    let acceleration = 256 + speed.saturating_sub(2) * 256 / 10;
+    screen * acceleration / 256
+}
+
+fn scaled(delta: i32, gain: i32, remainder: &AtomicI32) -> i32 {
+    let total = delta * gain + remainder.load(Ordering::Relaxed);
+    let whole = total / 256;
+    remainder.store(total - whole * 256, Ordering::Relaxed);
+    whole
+}
+
+/// A relative report from a USB mouse: like `inject_motion`, with pointer
+/// acceleration.
+pub fn inject_device_motion(buttons: u8, delta_x: i32, dy_down: i32, wheel: i32) {
+    DEVICE_SEEN.store(true, Ordering::Release);
+    let gain = gain(delta_x, dy_down);
+    let x = scaled(delta_x, gain, &REMAINDER_X);
+    let y = scaled(dy_down, gain, &REMAINDER_Y);
+    inject_motion(buttons, x, y, wheel);
 }
 
 pub fn handle_interrupt() {
@@ -259,6 +292,7 @@ pub fn inject_motion(buttons: u8, delta_x: i32, dy_down: i32, wheel: i32) {
 /// One absolute pointer report (USB tablet): `x`/`y` are 0..=0xffff across the
 /// screen; buttons and wheel as in `inject_motion`.
 pub fn inject_absolute(buttons: u8, x: u32, y: u32, wheel: i32) {
+    DEVICE_SEEN.store(true, Ordering::Release);
     let pressed = buttons & 0x01 != 0 && BUTTONS.load(Ordering::Relaxed) & 1 == 0;
     BUTTONS.store(buttons & 0x07, Ordering::Release);
     PACKETS.fetch_add(1, Ordering::Relaxed);

@@ -10,8 +10,52 @@ const IDT_ENTRIES: usize = 256;
 static BREAKPOINT_HIT: AtomicBool = AtomicBool::new(false);
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 static LOCAL_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
+/// A processor whose local timer only interrupts (the Linux guest's core).
+pub static TICK_ONLY_CPU: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
 static IPI_ACKS: AtomicU64 = AtomicU64::new(0);
 static IOAPIC_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
+/// Per-vector counts and where an NMI landed, for the boot watchdog
+/// (`--features screen-log`).
+#[cfg(feature = "screen-log")]
+static VECTOR_COUNTS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+#[cfg(feature = "screen-log")]
+static NMI_WANTED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "screen-log")]
+static NMI_RIP: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "screen-log")]
+static NMI_FLAGS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "screen-log")]
+static NMI_STACK: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
+
+/// The top of the stack the armed NMI interrupted (return addresses among it).
+#[cfg(feature = "screen-log")]
+pub fn nmi_stack(out: &mut [u64; 24]) {
+    for (slot, value) in out.iter_mut().zip(&NMI_STACK) {
+        *slot = value.load(Ordering::Acquire);
+    }
+}
+
+#[cfg(feature = "screen-log")]
+pub fn vector_counts(out: &mut [u64; 256]) {
+    for (slot, count) in out.iter_mut().zip(&VECTOR_COUNTS) {
+        *slot = count.load(Ordering::Relaxed);
+    }
+}
+
+/// Makes the next NMI record where it landed instead of being fatal.
+#[cfg(feature = "screen-log")]
+pub fn arm_nmi_probe() {
+    NMI_RIP.store(0, Ordering::Release);
+    NMI_WANTED.store(true, Ordering::Release);
+}
+
+/// (instruction pointer, flags) the armed NMI caught, if it arrived.
+#[cfg(feature = "screen-log")]
+pub fn nmi_probe() -> Option<(u64, u64)> {
+    let rip = NMI_RIP.load(Ordering::Acquire);
+    (rip != 0).then(|| (rip, NMI_FLAGS.load(Ordering::Acquire)))
+}
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -474,6 +518,28 @@ extern "C" fn aeros_interrupt_dispatch(frame: *mut InterruptFrame) -> u64 {
 
 fn interrupt_inner(frame: *mut InterruptFrame) -> u64 {
     let frame = unsafe { &mut *frame };
+    #[cfg(feature = "screen-log")]
+    {
+        if let Some(count) = VECTOR_COUNTS.get(frame.vector as usize) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        if frame.vector == 2 && NMI_WANTED.swap(false, Ordering::AcqRel) {
+            let rsp =
+                unsafe { core::ptr::read((frame as *const InterruptFrame as *const u64).add(20)) };
+            for (index, slot) in NMI_STACK.iter().enumerate() {
+                let address = rsp.wrapping_add(index as u64 * 8);
+                let value = if super::paging::kernel_range_mapped(address, 8) {
+                    unsafe { core::ptr::read_volatile(address as *const u64) }
+                } else {
+                    0
+                };
+                slot.store(value, Ordering::Release);
+            }
+            NMI_FLAGS.store(frame.rflags, Ordering::Release);
+            NMI_RIP.store(frame.rip, Ordering::Release);
+            return 0;
+        }
+    }
     match frame.vector {
         1 | 3 if frame.cs & 3 == 3 && crate::scheduler::is_traced() => {
             match frame.user_trap(5, false) {
@@ -505,6 +571,12 @@ fn interrupt_inner(frame: *mut InterruptFrame) -> u64 {
         48 => {
             LOCAL_TIMER_TICKS.fetch_add(1, Ordering::Release);
             crate::arch::apic::end_interrupt();
+            // The Linux guest's core: its tick only makes the guest exit so
+            // the hypervisor can deliver interrupts; it must not schedule.
+            // By APIC id: the guest rewrites TSC_AUX, which `this_cpu` reads.
+            if crate::smp::current_logical() == Some(TICK_ONLY_CPU.load(Ordering::Acquire)) {
+                return 0;
+            }
             // With user tasks on several processors only the tick that caught
             // a task in user mode preempts (that processor holds the kernel
             // lock then), and only the bootstrap processor keeps the clock.

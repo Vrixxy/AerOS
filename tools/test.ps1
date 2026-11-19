@@ -1,8 +1,11 @@
 param(
-    [ValidateRange(1, 8)]
+    [ValidateRange(1, 16)]
     [int]$CpuCount = 2,
-    [int]$MemoryMiB = 1024
+    [int]$MemoryMiB = 1024,
+    [string]$Accel = "whpx:tcg"
 )
+# Pure emulation (-Accel tcg) runs several times slower: stretch the waits.
+$slow = if ($Accel -like "*whpx*") { 1 } else { 8 }
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -141,7 +144,7 @@ foreach ($rootDisk in @(@{ File = "TLSRSA.DER"; Sector = 100 }, @{ File = "TLSEC
 $hdaCapture = Join-Path $root "build\hda-test.wav"
 Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $hdaCapture
 $arguments = @(
-    "-machine", "q35,accel=whpx:tcg",
+    "-machine", "q35,accel=$Accel",
     "-m", "${MemoryMiB}M",
     "-smp", "$CpuCount",
     "-cpu", "qemu64,+nx,+smep,+smap,+xsave,+xsaveopt,+rdrand,+rdtscp,+pdpe1gb",
@@ -277,11 +280,11 @@ function Test-AerosTcpBulk {
 # A one-shot HTTP server on the host's loopback for the guest's HTTP client to
 # download from through the card (the guest reaches the host as 10.0.2.2).
 $httpScript = {
-    param($address, $port)
+    param($address, $port, $slow)
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse($address), $port)
     $listener.Start()
     try {
-        $deadline = [DateTime]::UtcNow.AddSeconds(420)
+        $deadline = [DateTime]::UtcNow.AddSeconds(420 * $slow)
         while (-not $listener.Pending() -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 50 }
         if (-not $listener.Pending()) { return "no connection" }
         $client = $listener.AcceptTcpClient()
@@ -305,33 +308,33 @@ $httpScript = {
         $listener.Stop()
     }
 }
-$httpServer = Start-Job -ArgumentList "127.0.0.1", 18080 -ScriptBlock $httpScript
-$httpServer6 = Start-Job -ArgumentList "::1", 18081 -ScriptBlock $httpScript
+$httpServer = Start-Job -ArgumentList "127.0.0.1", 18080, $slow -ScriptBlock $httpScript
+$httpServer6 = Start-Job -ArgumentList "::1", 18081, $slow -ScriptBlock $httpScript
 $tcpServerEcho = $null
 # The guest's listener is single-shot and latches onto the first SYN it sees.
 # Connections opened while it was still booting leave slirp retrying a SYN for
 # a host socket that is already gone, so only start once the guest says it is
 # listening.
-$listenDeadline = [DateTime]::UtcNow.AddSeconds(180)
+$listenDeadline = [DateTime]::UtcNow.AddSeconds(180 * $slow)
 while ([DateTime]::UtcNow -lt $listenDeadline -and -not $process.HasExited) {
     if ((Test-Path -LiteralPath $serial) -and
         ([string](Get-Content -Raw -LiteralPath $serial)) -match "AEROS_TCP_LISTENING") { break }
     Start-Sleep -Milliseconds 100
 }
-$tcpServerDeadline = [DateTime]::UtcNow.AddSeconds(10)
+$tcpServerDeadline = [DateTime]::UtcNow.AddSeconds(10 * $slow)
 while ([DateTime]::UtcNow -lt $tcpServerDeadline -and $null -eq $tcpServerEcho) {
     $tcpServerEcho = Test-AerosTcpEcho -Port 17654 -TimeoutMs 1000
     if ($null -eq $tcpServerEcho) { Start-Sleep -Milliseconds 300 }
 }
 
-$netListenDeadline = [DateTime]::UtcNow.AddSeconds(60)
+$netListenDeadline = [DateTime]::UtcNow.AddSeconds(60 * $slow)
 while ([DateTime]::UtcNow -lt $netListenDeadline -and -not $process.HasExited) {
     if ((Test-Path -LiteralPath $serial) -and
         ([string](Get-Content -Raw -LiteralPath $serial)) -match "AEROS_TCP_NET_LISTENING") { break }
     Start-Sleep -Milliseconds 100
 }
 $tcpBulk = $null
-$bulkDeadline = [DateTime]::UtcNow.AddSeconds(20)
+$bulkDeadline = [DateTime]::UtcNow.AddSeconds(20 * $slow)
 while ([DateTime]::UtcNow -lt $bulkDeadline -and $null -eq $tcpBulk -and -not $process.HasExited) {
     $tcpBulk = Test-AerosTcpBulk -Port 17655 -Bytes 30000 -TimeoutMs 1000
     if ($null -eq $tcpBulk) { Start-Sleep -Milliseconds 300 }
@@ -357,7 +360,7 @@ function Send-AerosMonitor {
 
 function Send-AerosPowerButton { return (Send-AerosMonitor "system_powerdown") }
 
-$deadline = [DateTime]::UtcNow.AddSeconds(720)
+$deadline = [DateTime]::UtcNow.AddSeconds(720 * $slow)
 $output = ""
 $powerButtonSent = $false
 

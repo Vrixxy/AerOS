@@ -1,14 +1,13 @@
 //! The Avatar app: the `avatar-core` engine inside a desktop window.
 //! Layout, hit-testing and painting come from `avatar_core::ui`; this file
-//! only adapts them to `aerui`'s painter and the desktop's click path.
+//! only adapts them to `aerui`'s painter and the desktop's input path.
 
 use super::*;
 use crate::sync::TicketLock;
 use alloc::vec::Vec;
 use avatar_core::gfx::Surface;
-use avatar_core::model::{HairStyle, HeadShape, Outfit};
 use avatar_core::ui as avui;
-use avatar_core::{AppState, Command, Expression};
+use avatar_core::{AppState, Command};
 
 struct Frame {
     px: Vec<u8>,
@@ -19,27 +18,42 @@ struct Frame {
 struct AvatarApp {
     app: AppState,
     mood: usize,
-    selected: Option<avui::Category>,
+    category: avui::Category,
+    tab_scroll: i32,
+    grid_scroll: i32,
     version: u32,
     frame: Option<Frame>,
 }
 
 static AVATAR: TicketLock<Option<AvatarApp>> = TicketLock::new(None);
 
-fn next<T: Copy + PartialEq>(all: &[T], current: T) -> T {
-    let at = all.iter().position(|v| *v == current).unwrap_or(0);
-    all[(at + 1) % all.len()]
-}
-
 impl AvatarApp {
     fn new() -> Self {
         Self {
             app: AppState::new(),
             mood: 0,
-            selected: None,
+            category: avui::Category::Face,
+            tab_scroll: 0,
+            grid_scroll: 0,
             version: 1,
             frame: None,
         }
+    }
+
+    /// The UI with this app's category and scroll positions.
+    fn view(&self, bounds: avui::Rect) -> avui::Ui {
+        let mut view = avui::Ui::new(bounds);
+        view.category = self.category;
+        view.tab_scroll = self.tab_scroll;
+        view.grid_scroll = self.grid_scroll;
+        view.clamp_scroll();
+        view
+    }
+
+    fn keep(&mut self, view: &avui::Ui) {
+        self.category = view.category;
+        self.tab_scroll = view.tab_scroll;
+        self.grid_scroll = view.grid_scroll;
     }
 
     fn send(&mut self, command: Command) {
@@ -49,34 +63,19 @@ impl AvatarApp {
 
     fn act(&mut self, action: avui::Action) {
         match action {
-            avui::Action::OpenCategory(category) => {
-                self.selected = Some(category);
-                let avatar = &self.app.avatar;
-                match category {
-                    avui::Category::Face => {
-                        let head = next(HeadShape::ALL, avatar.head);
-                        self.send(Command::SetHead(head));
-                    }
-                    avui::Category::Hair => {
-                        let hair = next(HairStyle::ALL, avatar.hair);
-                        self.send(Command::SetHair(hair));
-                    }
-                    avui::Category::Style => {
-                        let outfit = next(Outfit::ALL, avatar.outfit);
-                        self.send(Command::SetOutfit(outfit));
-                    }
-                    avui::Category::Mood => {
-                        self.mood = (self.mood + 1) % Expression::PRESETS.len();
-                        let expression = Expression::PRESETS[self.mood].1;
-                        self.send(Command::SetExpression(expression));
-                    }
+            avui::Action::SelectCategory(_) => {}
+            avui::Action::Choose(category, index) => {
+                if category == avui::Category::Mood {
+                    self.mood = index;
+                }
+                if let Some(command) = category.command(index) {
+                    self.send(command);
                 }
             }
             avui::Action::Randomize => {
                 let seed = crate::time::monotonic_nanoseconds();
                 self.send(Command::Randomize(seed));
             }
-            avui::Action::EditName => {}
         }
     }
 
@@ -128,6 +127,9 @@ struct Adapter<'p, 'f> {
     layout: Layout,
     font: RasterFont,
     frame: &'p Frame,
+    /// The clip before `clip(Some(..))`, and whether that clip is empty.
+    saved_clip: Option<Rect>,
+    hidden: bool,
 }
 
 fn rect(r: avui::Rect) -> Rect {
@@ -138,8 +140,30 @@ fn rgba(c: avatar_core::model::Rgb) -> Rgba {
     Rgba::opaque(c.0, c.1, c.2)
 }
 
+fn isqrt(value: u64) -> u64 {
+    let mut result = 0u64;
+    let mut bit = 1u64 << 62;
+    let mut rest = value;
+    while bit > rest {
+        bit >>= 2;
+    }
+    while bit != 0 {
+        if rest >= result + bit {
+            rest -= result + bit;
+            result = (result >> 1) + bit;
+        } else {
+            result >>= 1;
+        }
+        bit >>= 2;
+    }
+    result
+}
+
 impl avui::Painter for Adapter<'_, '_> {
     fn round_rect(&mut self, r: avui::Rect, radius: i32, color: avatar_core::model::Rgb) {
+        if self.hidden {
+            return;
+        }
         self.painter.fill_rounded_rect(
             self.layout.rect(rect(r)),
             self.layout.radii(CornerRadii::all(radius)),
@@ -167,6 +191,9 @@ impl avui::Painter for Adapter<'_, '_> {
     }
 
     fn label(&mut self, r: avui::Rect, text: &str, color: avatar_core::model::Rgb) {
+        if self.hidden {
+            return;
+        }
         centered_text(
             self.painter,
             self.layout,
@@ -177,6 +204,63 @@ impl avui::Painter for Adapter<'_, '_> {
             Color::rgb(color.0, color.1, color.2),
         );
     }
+
+    /// Figma's white drop shadow (blur ~ two sigma), as a smooth falloff
+    /// around the circle moved down by `offset`; pixels the circle covers
+    /// are skipped.
+    fn glow(&mut self, c: avui::Circle, offset: i32, blur: i32) {
+        let disc = self
+            .layout
+            .rect(Rect::new(c.cx - c.r, c.cy - c.r, c.r * 2, c.r * 2));
+        let scaled = self
+            .layout
+            .rect(Rect::new(0, 0, offset.max(1), blur.max(2)));
+        let radius = disc.width as i64 / 2;
+        let (cx, cy) = (disc.x as i64 + radius, disc.y as i64 + radius);
+        let shifted = cy + scaled.width as i64;
+        let reach = (scaled.height as i64 * 3 / 4).max(2);
+        let outer = radius + reach;
+        let white = Color::rgb(255, 255, 255);
+        for y in shifted - outer..=shifted + outer {
+            for x in cx - outer..=cx + outer {
+                let (dx, dy0, dy) = (x - cx, y - cy, y - shifted);
+                if dx * dx + dy0 * dy0 < radius * radius {
+                    continue;
+                }
+                let distance = isqrt((dx * dx + dy * dy) as u64) as i64 - radius;
+                if distance >= reach {
+                    continue;
+                }
+                let u = ((distance + reach).max(0) * 1024 / (2 * reach)).min(1024);
+                let smooth = (3 * u * u * 1024 - 2 * u * u * u) / (1024 * 1024);
+                let alpha = 255 * (1024 - smooth) / 1024;
+                if alpha > 0 {
+                    self.painter
+                        .blend_pixel(x as i32, y as i32, white, alpha as u8);
+                }
+            }
+        }
+    }
+
+    fn clip(&mut self, r: Option<avui::Rect>) {
+        match r {
+            Some(r) => {
+                let base = *self.saved_clip.get_or_insert(self.painter.clip());
+                match base.intersect(self.layout.rect(rect(r))) {
+                    Some(area) => {
+                        self.hidden = !self.painter.set_clip(area);
+                    }
+                    None => self.hidden = true,
+                }
+            }
+            None => {
+                if let Some(base) = self.saved_clip.take() {
+                    self.painter.set_clip(base);
+                }
+                self.hidden = false;
+            }
+        }
+    }
 }
 
 pub(super) fn draw_avatar(
@@ -185,9 +269,8 @@ pub(super) fn draw_avatar(
     font: RasterFont,
     outer: Rect,
 ) {
-    let mut view = avui::Ui::new(content_bounds(outer));
     with_app(|app| {
-        view.selected = app.selected;
+        let view = app.view(content_bounds(outer));
         let preview = view.layout.preview;
         let physical = layout
             .rect(Rect::new(
@@ -197,7 +280,7 @@ pub(super) fn draw_avatar(
                 preview.r * 2,
             ))
             .width as usize;
-        let name = app.app.avatar.name.clone();
+        let current = view.category.current(&app.app.avatar, app.mood);
         let _ = app.frame(physical);
         let frame = app.frame.as_ref().unwrap();
         let mut adapter = Adapter {
@@ -205,8 +288,10 @@ pub(super) fn draw_avatar(
             layout,
             font,
             frame,
+            saved_clip: None,
+            hidden: false,
         };
-        avui::paint(&view, &name, &mut adapter);
+        avui::paint(&view, current, &mut adapter);
     });
 }
 
@@ -220,16 +305,43 @@ impl DesktopState {
         if self.app != DesktopApp::Avatar || self.overlay != Overlay::None {
             return None;
         }
-        let mut view = avui::Ui::new(content_bounds(window_base_rect(DesktopApp::Avatar)));
-        view.handle(avui::Event::Press {
-            x: point.x,
-            y: point.y,
-        });
-        let action = view.handle(avui::Event::Release {
-            x: point.x,
-            y: point.y,
-        })?;
-        with_app(|app| app.act(action));
-        Some(DesktopAction::Redraw)
+        let bounds = content_bounds(window_base_rect(DesktopApp::Avatar));
+        with_app(|app| {
+            let mut view = app.view(bounds);
+            view.handle(avui::Event::Press {
+                x: point.x,
+                y: point.y,
+            });
+            let action = view.handle(avui::Event::Release {
+                x: point.x,
+                y: point.y,
+            });
+            app.keep(&view);
+            if let Some(action) = action {
+                app.act(action);
+                Some(DesktopAction::Redraw)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Scrolls the category tabs or the option grid under the pointer.
+    pub(super) fn avatar_wheel(&mut self, point: Point, delta: i32) -> bool {
+        if self.app != DesktopApp::Avatar || self.overlay != Overlay::None {
+            return false;
+        }
+        let bounds = content_bounds(window_base_rect(DesktopApp::Avatar));
+        with_app(|app| {
+            let mut view = app.view(bounds);
+            let before = (view.tab_scroll, view.grid_scroll);
+            view.handle(avui::Event::Wheel {
+                x: point.x,
+                y: point.y,
+                delta,
+            });
+            app.keep(&view);
+            before != (view.tab_scroll, view.grid_scroll)
+        })
     }
 }

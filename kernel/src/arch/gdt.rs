@@ -12,7 +12,7 @@ const GDT_ENTRIES: usize = 7;
 const TSS_SIZE: usize = 104;
 const RING0_STACK_SIZE: usize = 32 * 1024;
 const DOUBLE_FAULT_STACK_SIZE: usize = 32 * 1024;
-const MAX_CPUS: usize = 8;
+const MAX_CPUS: usize = crate::acpi::MAX_PROCESSORS;
 
 #[repr(C, packed)]
 struct DescriptorTablePointer {

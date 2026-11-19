@@ -310,6 +310,11 @@ const MAP_POPULATE: u64 = 0x8000;
 const MAP_STACK: u64 = 0x20000;
 const MAP_FIXED_NOREPLACE: u64 = 0x100000;
 const MAX_PATH: usize = 256;
+mod aio;
+mod extra;
+mod keys;
+mod mq;
+mod perf;
 mod fdpass;
 mod fifo;
 mod flock;
@@ -587,6 +592,19 @@ struct Pipe {
     fifo: u64,
     /// A writer has opened the FIFO (so a reader stops waiting).
     fifo_writer: bool,
+    /// A POSIX message queue descriptor (`mq::QUEUES` index + 1, 0 for none)
+    /// and its `mq::READ`/`WRITE`/`NONBLOCK` bits.
+    mqueue: u16,
+    mq_flags: u8,
+    /// A `perf_event_open` counter (software event + 1, 0 for none): the
+    /// value banked in `counter`, the reading it started from, when it was
+    /// last enabled and the time it has run, and its `read_format`.
+    perf: u8,
+    perf_format: u8,
+    perf_on: bool,
+    perf_base: u64,
+    perf_since: u64,
+    perf_time: u64,
 }
 
 impl Pipe {
@@ -612,6 +630,14 @@ impl Pipe {
         onlcr: false,
         fifo: 0,
         fifo_writer: false,
+        mqueue: 0,
+        mq_flags: 0,
+        perf: 0,
+        perf_format: 0,
+        perf_on: false,
+        perf_base: 0,
+        perf_since: 0,
+        perf_time: 0,
     };
 }
 
@@ -1163,6 +1189,9 @@ fn linux_eventfd2(initial: u64, flags: u64) -> u64 {
 }
 
 fn pipe_read(slot: usize, destination: &mut [u8]) -> Result<usize, u64> {
+    if let Some(result) = perf::read(slot, destination) {
+        return result;
+    }
     if is_eventfd(slot) {
         return eventfd_read(slot, destination);
     }
@@ -3957,6 +3986,9 @@ fn dispatch_linux(number: u64, arguments: [u64; 6]) -> SyscallResult {
             arguments[3],
         )),
         _ => {
+            if let Some(result) = extra::dispatch(number, arguments) {
+                return SyscallResult::Return(result);
+            }
             let occurrence = UNKNOWN.fetch_add(1, Ordering::Relaxed);
             if occurrence < 8 {
                 crate::serial::format(format_args!(
@@ -4855,6 +4887,11 @@ fn udp_receive_with(
         .then_some((socket.remote, socket.remote_port));
     let timeout = socket.options.receive_timeout_ns;
     let started = crate::time::monotonic_nanoseconds();
+    // Nothing can ever answer a peer off this machine without a network:
+    // fail instead of waiting forever (a DNS query on a laptop with no
+    // connection hung the whole boot this way).
+    let unreachable =
+        socket.connected && !crate::net::is_ready() && !crate::tcpnet::is_local(socket.remote);
     loop {
         crate::tcpnet::poll();
         let received = if peek {
@@ -4874,6 +4911,9 @@ fn udp_receive_with(
         }
         if nonblocking {
             return Err(11);
+        }
+        if unreachable {
+            return Err(111);
         }
         if interrupted() {
             return Err(4);
@@ -8716,6 +8756,11 @@ fn linux_ioctl(descriptor: u64, request: u64, address: u64) -> u64 {
         }
         return 0;
     }
+    if process_fd.pipe
+        && let Some(result) = perf::ioctl(process_fd.handle as usize, request, address)
+    {
+        return result;
+    }
     if request == 0x541b && process_fd.pipe {
         let queued = PIPES
             .lock()
@@ -10554,12 +10599,15 @@ fn unblockable_signals() -> u64 {
 
 fn linux_uname(address: u64) -> u64 {
     let mut utsname = [0u8; 390];
+    let mut name = [0u8; 65];
     write_uts_field(&mut utsname, 0, b"Linux");
-    write_uts_field(&mut utsname, 1, b"aeros");
+    let length = extra::hostname(&mut name);
+    write_uts_field(&mut utsname, 1, &name[..length]);
     write_uts_field(&mut utsname, 2, b"6.8.0-aeros");
     write_uts_field(&mut utsname, 3, b"#1 AerOS SMP");
     write_uts_field(&mut utsname, 4, b"x86_64");
-    write_uts_field(&mut utsname, 5, b"(none)");
+    let length = extra::domainname(&mut name);
+    write_uts_field(&mut utsname, 5, &name[..length]);
     if !user::copy_to_user(address, &utsname) {
         return error(14);
     }

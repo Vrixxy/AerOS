@@ -71,7 +71,9 @@ pub fn initialize(acpi: &AcpiInfo, destination: u32) -> IoApicReport {
     write(address, register, low);
     let programmed_low = read(address, register);
     let programmed_high = read(address, register + 1);
-    let ticks = crate::arch::interrupts::ioapic_timer_self_test(100, 4).unwrap_or(0);
+    let ticks = crate::arch::interrupts::ioapic_timer_self_test(100, 4)
+        .or_else(|| crate::arch::interrupts::ioapic_timer_self_test(100, 4))
+        .unwrap_or(0);
     write(address, register, programmed_low | (1 << 16));
     let verified = programmed_low & 0xff == TIMER_VECTOR as u32
         && programmed_low & (1 << 16) == 0

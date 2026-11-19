@@ -21,6 +21,8 @@ linux-headless = ["linux-guest"]
 linux-smp = ["linux-guest"]
 # Linux drivers through the adapter in kernel/linux (needs Zig; see build.rs).
 linux-drivers = []
+# Shows the boot log on the screen until the desktop starts (no serial port).
+screen-log = []
 
 [dependencies]
 avatar-core = { path = "../avatar" }

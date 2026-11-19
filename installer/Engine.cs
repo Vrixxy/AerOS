@@ -30,14 +30,15 @@ namespace AerOSSetup
         public InstallRecord Installed;
         public string Problem;
 
-        /// Largest AerOS partition this PC can give, in bytes (Windows keeps
-        /// at least `Engine.WindowsReserve` free and FAT32 caps it at 32 GB).
+        /// Largest AerOS partition this PC can give, in bytes: Windows keeps
+        /// `Engine.WindowsReserve` free, the shrink can't pass Windows's
+        /// unmovable files, and FAT32 caps it at 32 GB.
         public long MaxAerOSBytes
         {
             get
             {
                 long byFree = FreeBytes - Engine.WindowsReserve;
-                long byShrink = ShrinkMinimum > 0 ? PartitionSize - ShrinkMinimum - Engine.WindowsReserve : byFree;
+                long byShrink = ShrinkMinimum > 0 ? PartitionSize - ShrinkMinimum - Engine.ShrinkMargin : byFree;
                 return Math.Max(0, Math.Min(Engine.MaxBytes, Math.Min(byFree, byShrink)));
             }
         }
@@ -58,6 +59,7 @@ namespace AerOSSetup
         public const long MiB = 1L << 20;
         public const long MaxBytes = 32 * GiB;
         public const long WindowsReserve = 10 * GiB;
+        public const long ShrinkMargin = GiB;
         const string BasicDataGuid = "{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}";
         const string RegistryKey = @"SOFTWARE\AerOS";
         const string UninstallKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AerOS";
@@ -232,7 +234,9 @@ namespace AerOSSetup
             if (info.Installed != null)
                 blockers.Add("AerOS is already installed. Uninstall it first.");
             if (info.Problem == null && wanted > info.MaxAerOSBytes)
-                blockers.Add("Not enough free space on C: (AerOS needs " + Gb(wanted) + ", and Windows keeps " + Gb(WindowsReserve) + ").");
+                blockers.Add(info.FreeBytes - WindowsReserve < wanted
+                    ? "Not enough free space on C: (AerOS needs " + Gb(wanted) + ", and Windows keeps " + Gb(WindowsReserve) + ")."
+                    : "Windows can only shrink C: by " + Gb(info.MaxAerOSBytes) + " right now (AerOS needs " + Gb(wanted) + "). Restart the PC and try again.");
             return blockers;
         }
 

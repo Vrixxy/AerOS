@@ -424,6 +424,48 @@ impl FrameBuffer {
         self.write(x, y, self.pack(result));
     }
 
+    /// `blend` over a horizontal run, with the same rounding, for big fills.
+    pub fn blend_span(&mut self, x: i32, y: i32, length: i32, color: Color, alpha: u8) {
+        if alpha == 0 || y < 0 || y as usize >= self.height {
+            return;
+        }
+        let start = x.max(0) as usize;
+        let end = (x.saturating_add(length).max(0) as usize).min(self.width);
+        let row_start = (y as usize).saturating_mul(self.stride).saturating_add(start);
+        if start >= end || row_start.saturating_add(end - start) > self.pixels {
+            return;
+        }
+        if matches!(self.format, PixelFormat::Bitmask { .. }) {
+            for px in start..end {
+                self.blend(px as i32, y, color, alpha);
+            }
+            return;
+        }
+        // RGB and BGR keep 8-bit channels in the low three bytes, so the
+        // blend can work on the packed value whatever the order.
+        let packed = self.pack(color);
+        // SAFETY: checked against `pixels` above.
+        let row = unsafe { core::slice::from_raw_parts_mut(self.address.add(row_start), end - start) };
+        if alpha == 255 {
+            row.fill(packed);
+            return;
+        }
+        let alpha = alpha as u32;
+        let inverse = 255 - alpha;
+        let source = [
+            (packed & 0xff) * alpha,
+            ((packed >> 8) & 0xff) * alpha,
+            ((packed >> 16) & 0xff) * alpha,
+        ];
+        for pixel in row.iter_mut() {
+            let value = *pixel;
+            let c0 = ((value & 0xff) * inverse + source[0]) / 255;
+            let c1 = (((value >> 8) & 0xff) * inverse + source[1]) / 255;
+            let c2 = (((value >> 16) & 0xff) * inverse + source[2]) / 255;
+            *pixel = c0 | (c1 << 8) | (c2 << 16);
+        }
+    }
+
     pub fn color_at(&self, x: i32, y: i32) -> Option<Color> {
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
             return None;

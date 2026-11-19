@@ -3,7 +3,7 @@ use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 const SDT_HEADER_SIZE: usize = 36;
 const MAX_SDT_SIZE: usize = 1024 * 1024;
 const MAX_ROOT_ENTRIES: usize = 4096;
-pub const MAX_PROCESSORS: usize = 8;
+pub const MAX_PROCESSORS: usize = 16;
 const MAX_OVERRIDES: usize = 16;
 
 #[derive(Clone, Copy)]

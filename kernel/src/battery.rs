@@ -77,6 +77,11 @@ pub fn level(now: u64) -> Option<Level> {
         }
         (nodes, count, level)
     });
+    if !scanned {
+        crate::serial::format(format_args!(
+            "AEROS_BATTERY batteries={count} level={level:?}\n"
+        ));
+    }
     let mut cache = CACHE.lock();
     cache.scanned = true;
     cache.nodes = nodes;

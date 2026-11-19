@@ -147,7 +147,9 @@ pub fn initialize(acpi: &AcpiInfo, paging: &PagingState, trampoline: u64) -> Smp
     let work_queue = work_queue_self_test(logical);
     let queue_dispatches = QUEUE_DISPATCHES.load(Ordering::Acquire);
     let queue_completions = QUEUE_COMPLETIONS.load(Ordering::Acquire);
-    let verified = acpi.enabled_processor_count == discovered as u16
+    // A PC with more processors than AerOS supports runs on the first
+    // `MAX_PROCESSORS` of them.
+    let verified = acpi.enabled_processor_count.min(MAX_PROCESSORS as u16) == discovered as u16
         && discovered as usize <= MAX_PROCESSORS
         && applications_started.saturating_add(1) == discovered
         && online == discovered
@@ -630,6 +632,7 @@ extern "sysv64" fn aeros_ap_entry(logical: u32, expected_apic_id: u32) -> ! {
         }
     }
     let descriptors = arch::gdt::init_for_cpu(logical);
+    arch::paging::enable_write_combining();
     arch::interrupts::load();
     let apic_id = arch::apic::initialize_secondary();
     let cpu = arch::CpuInfo::detect();

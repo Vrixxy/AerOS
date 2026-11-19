@@ -3411,6 +3411,13 @@ pub fn account_tick(user: bool) {
 }
 
 /// User and kernel CPU time of the running process, in nanoseconds.
+/// How many times the calling thread has been switched in.
+pub fn current_switches() -> u64 {
+    arch::disable_interrupts();
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    scheduler.tasks[scheduler.current].switches
+}
+
 pub fn current_cpu_time() -> (u64, u64) {
     arch::disable_interrupts();
     let scheduler = unsafe { &*SCHEDULER.0.get() };

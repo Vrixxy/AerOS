@@ -143,7 +143,7 @@ pub fn configure(mac: [u8; 6]) -> Configuration {
     let mut advert = [0u8; 512];
     let mut advert_length = 0;
     for _ in 0..3 {
-        result.solicited |= net::send_icmpv6(
+        let sent = net::send_icmpv6(
             mac,
             link_local,
             ALL_ROUTERS,
@@ -151,6 +151,11 @@ pub fn configure(mac: [u8; 6]) -> Configuration {
             255,
             &solicitation,
         );
+        result.solicited |= sent;
+        // Without a link nothing can answer: don't wait out the time-outs.
+        if !sent {
+            break;
+        }
         if let Some(message) =
             net::wait_icmpv6(mac, ICMP_ROUTER_ADVERTISEMENT, 1_000_000_000, &mut advert)
         {

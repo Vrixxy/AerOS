@@ -734,7 +734,26 @@ fn find_in_sectors(first_lba: u64, count: u64, name: &[u8; 11]) -> Option<Direct
 /// region, handled separately since it has no cluster chain of its own
 /// and can't grow). Never touches the EFI/BOOT tree — this only ever
 /// adds/replaces entries whose short name matches `name`.
+/// Serialises root-file writes, which update the FAT and the root
+/// directory in several steps.
+static ROOT_WRITE: TicketLock<()> = TicketLock::new(());
+
+/// `write_root_file` that gives up instead of waiting when another root
+/// write is in progress (the boot watchdog, on another processor).
+#[cfg(feature = "screen-log")]
+pub fn try_write_root_file(name: &[u8; 11], data: &[u8]) -> bool {
+    let Some(_writing) = ROOT_WRITE.try_lock() else {
+        return false;
+    };
+    write_root_file_locked(name, data)
+}
+
 pub fn write_root_file(name: &[u8; 11], data: &[u8]) -> bool {
+    let _writing = ROOT_WRITE.lock();
+    write_root_file_locked(name, data)
+}
+
+fn write_root_file_locked(name: &[u8; 11], data: &[u8]) -> bool {
     let Some(volume) = *MOUNTED.lock() else {
         return false;
     };
@@ -1572,4 +1591,60 @@ pub fn check_root_chains(fat: &Fat, name: &[u8; 11]) -> Option<ChainCheck> {
         }
     }
     Some(report)
+}
+
+/// Prints the root directory's first sector of each cluster as the driver
+/// reads it (8.3 names, attributes, first cluster, size), for a machine
+/// whose files are missing to the kernel but not to Windows.
+#[cfg(all(feature = "screen-log", feature = "linux-guest"))]
+pub fn log_root_listing() {
+    let Some(volume) = *MOUNTED.lock() else {
+        crate::serial::line("AEROS_FAT_ROOT mounted=false");
+        return;
+    };
+    crate::serial::format(format_args!(
+        "AEROS_FAT_ROOT bits={} root_cluster={} sectors_per_cluster={} clusters={}\n",
+        volume.fat_bits, volume.root_cluster, volume.sectors_per_cluster, volume.clusters
+    ));
+    if volume.fat_bits != 32 {
+        return;
+    }
+    let mut cluster = volume.root_cluster;
+    let mut sector = [0u8; 512];
+    for _ in 0..8 {
+        let lba = cluster_lba(&volume, cluster);
+        for offset in 0..volume.sectors_per_cluster as u64 {
+            if !crate::blockdev::read_sector(lba + offset, &mut sector) {
+                crate::serial::format(format_args!(
+                    "AEROS_FAT_ROOT read_failed lba={}\n",
+                    lba + offset
+                ));
+                return;
+            }
+            for entry in sector.chunks_exact(32) {
+                if entry[0] == 0 {
+                    crate::serial::line("AEROS_FAT_ROOT end");
+                    return;
+                }
+                if entry[11] == 0x0f {
+                    continue;
+                }
+                let name = core::str::from_utf8(&entry[..11]).unwrap_or("?");
+                crate::serial::format(format_args!(
+                    "AEROS_FAT_ROOT name={:?} attr={:#x} cluster={} bytes={}\n",
+                    name,
+                    entry[11],
+                    ((read_u16(entry, 20) as u32) << 16) | read_u16(entry, 26) as u32,
+                    read_u32(entry, 28)
+                ));
+            }
+        }
+        match next_cluster(&volume, cluster) {
+            Some(Some(next)) if next >= 2 => cluster = next,
+            other => {
+                crate::serial::format(format_args!("AEROS_FAT_ROOT chain_end={:?}\n", other));
+                return;
+            }
+        }
+    }
 }

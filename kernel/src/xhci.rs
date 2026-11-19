@@ -664,7 +664,7 @@ impl XhciState {
                     self.devices[device_index].funcs[func_index].previous = report;
                 }
                 Kind::Mouse => {
-                    crate::mouse::inject_motion(
+                    crate::mouse::inject_device_motion(
                         data[0] & 7,
                         data[1] as i8 as i32,
                         data[2] as i8 as i32,
@@ -773,10 +773,72 @@ impl Contexts {
     }
 }
 
+/// Brings up the USB controller that has a keyboard, mouse or tablet on it
+/// (laptops have several; the ports a USB receiver sits in may well be on
+/// the second), else the first one. Each is logged.
 pub fn initialize(pci: &PciInventory, frames: &mut FrameAllocator) -> XhciReport {
-    let Some(device) = pci.find_class(0x0c, 0x03, 0x30) else {
-        return XhciReport::EMPTY;
-    };
+    let mut controllers = [None; 8];
+    let mut count = 0;
+    for device in pci.devices() {
+        if device.class == 0x0c
+            && device.subclass == 0x03
+            && device.programming_interface == 0x30
+            && count < controllers.len()
+        {
+            controllers[count] = Some(*device);
+            count += 1;
+        }
+    }
+    let mut fallback = None;
+    for device in controllers[..count].iter().flatten() {
+        let report = initialize_controller(pci, *device, frames);
+        crate::serial::format(format_args!(
+            "AEROS_XHCI_CONTROLLER bdf={:02x}:{:02x}.{} id={:04x}:{:04x} present={} ports={} devices={} keyboards={} mice={} tablets={} hubs={} disks={}\n",
+            device.bus,
+            device.slot,
+            device.function,
+            device.vendor,
+            device.device,
+            report.present,
+            report.ports,
+            report.devices,
+            report.keyboards,
+            report.mice,
+            report.tablets,
+            report.hubs,
+            report.disks
+        ));
+        if report.keyboards + report.mice + report.tablets > 0 || count == 1 {
+            return report;
+        }
+        if fallback.is_none() {
+            fallback = Some(*device);
+        }
+        halt(report.base);
+    }
+    match fallback {
+        Some(device) => initialize_controller(pci, device, frames),
+        None => XhciReport::EMPTY,
+    }
+}
+
+/// Stops a controller this driver set up but will not use.
+fn halt(base: u64) {
+    if base == 0 {
+        return;
+    }
+    let cap_length = read_byte(base) as u64;
+    let operational = base + cap_length;
+    // SAFETY: the controller's registers, identity-mapped.
+    unsafe { write32(operational, 0, read32(operational, 0) & !1) };
+    let _ = wait_for(|| unsafe { read32(operational, 4) } & 1 != 0);
+}
+
+fn initialize_controller(
+    pci: &PciInventory,
+    device: crate::pci::PciDevice,
+    frames: &mut FrameAllocator,
+) -> XhciReport {
     if device.bars[0] & 1 != 0 || !pci.enable_memory_bus_master(device) {
         return XhciReport::EMPTY;
     }
@@ -1348,7 +1410,7 @@ fn handle_pointer(pointer: &Pointer, report: &[u8; 64]) {
     let x = pointer.x.read(data);
     let y = pointer.y.read(data);
     if pointer.x.relative {
-        crate::mouse::inject_motion(buttons, x, y, wheel);
+        crate::mouse::inject_device_motion(buttons, x, y, wheel);
     } else {
         let scale = |value: i32, field: &Field| -> u32 {
             let span = (field.max as i64 - field.min as i64).max(1);

@@ -912,6 +912,152 @@ fn main() {
     );
     let _ = std::fs::remove_file("/tmp/sx-ino");
 
+    // Linux AIO: a write then a read through io_submit, both reported by
+    // io_getevents with the caller's tag and byte count.
+    let aio_path = cstr("/tmp/sx-aio");
+    let aio_fd = sys(OPEN, [aio_path.as_ptr() as usize, 0o102, 0o644, 0, 0, 0]);
+    let mut context: u64 = 0;
+    let setup = sys(206, [8, &mut context as *mut u64 as usize, 0, 0, 0, 0]);
+    let block = |opcode: u16, tag: u64, buffer: usize, length: usize| {
+        let mut iocb = [0u8; 64];
+        iocb[..8].copy_from_slice(&tag.to_le_bytes());
+        iocb[16..18].copy_from_slice(&opcode.to_le_bytes());
+        iocb[20..24].copy_from_slice(&(aio_fd as u32).to_le_bytes());
+        iocb[24..32].copy_from_slice(&(buffer as u64).to_le_bytes());
+        iocb[32..40].copy_from_slice(&(length as u64).to_le_bytes());
+        iocb
+    };
+    let run = |iocb: &[u8; 64]| {
+        let list = [iocb.as_ptr() as u64];
+        let submitted = sys(209, [context as usize, 1, list.as_ptr() as usize, 0, 0, 0]);
+        let mut event = [0u8; 32];
+        let got = sys(208, [context as usize, 1, 1, event.as_mut_ptr() as usize, 0, 0]);
+        let tag = u64::from_le_bytes(event[..8].try_into().unwrap());
+        let result = i64::from_le_bytes(event[16..24].try_into().unwrap());
+        (submitted, got, tag, result)
+    };
+    let payload = *b"aio-data";
+    let written = run(&block(1, 0x1234, payload.as_ptr() as usize, 8));
+    let mut back = [0u8; 8];
+    let read_back = run(&block(0, 0x5678, back.as_mut_ptr() as usize, 8));
+    let destroyed = sys(207, [context as usize, 0, 0, 0, 0, 0]);
+    step(
+        "aio",
+        aio_fd >= 0
+            && setup == 0
+            && context != 0
+            && written == (1, 1, 0x1234, 8)
+            && read_back == (1, 1, 0x5678, 8)
+            && back == payload
+            && destroyed == 0,
+        57,
+    );
+    let _ = sys(CLOSE, [aio_fd as usize, 0, 0, 0, 0, 0]);
+    let _ = std::fs::remove_file("/tmp/sx-aio");
+
+    // Keyrings: store a "user" key, find it again, read it, revoke it.
+    let key_type = cstr("user");
+    let key_name = cstr("sx-key");
+    let secret = *b"hunter2";
+    let user_keyring = -4isize as usize;
+    let serial = sys(
+        248,
+        [key_type.as_ptr() as usize, key_name.as_ptr() as usize, secret.as_ptr() as usize, 7, user_keyring, 0],
+    );
+    let found = sys(249, [key_type.as_ptr() as usize, key_name.as_ptr() as usize, 0, 0, 0, 0]);
+    let mut key_out = [0u8; 16];
+    let key_len = sys(250, [11, serial as usize, key_out.as_mut_ptr() as usize, 16, 0, 0]);
+    let revoked = sys(250, [3, serial as usize, 0, 0, 0, 0]);
+    let after = sys(250, [11, serial as usize, key_out.as_mut_ptr() as usize, 16, 0, 0]);
+    step(
+        "keys",
+        serial > 0
+            && found == serial
+            && key_len == 7
+            && key_out[..7] == secret
+            && revoked == 0
+            && after == -128,
+        58,
+    );
+
+    // POSIX message queues: the higher priority comes out first, an empty
+    // non-blocking queue says EAGAIN, and the name goes with mq_unlink.
+    let queue_name = cstr("sx-mq");
+    let mut attr = [0u64; 4];
+    attr[1] = 4;
+    attr[2] = 64;
+    let mqd = sys(240, [queue_name.as_ptr() as usize, 0o2 | 0o100 | 0o4000, 0o600, attr.as_ptr() as usize, 0, 0]);
+    let low = sys(242, [mqd as usize, b"low".as_ptr() as usize, 3, 1, 0, 0]);
+    let high = sys(242, [mqd as usize, b"high!".as_ptr() as usize, 5, 9, 0, 0]);
+    let mut mq_buffer = [0u8; 64];
+    let mut mq_priority = 0u32;
+    let first = sys(243, [mqd as usize, mq_buffer.as_mut_ptr() as usize, 64, &mut mq_priority as *mut u32 as usize, 0, 0]);
+    let first_ok = first == 5 && &mq_buffer[..5] == b"high!" && mq_priority == 9;
+    let second = sys(243, [mqd as usize, mq_buffer.as_mut_ptr() as usize, 64, 0, 0, 0]);
+    let empty = sys(243, [mqd as usize, mq_buffer.as_mut_ptr() as usize, 64, 0, 0, 0]);
+    let mut current = [0u64; 4];
+    let attributes = sys(245, [mqd as usize, 0, current.as_mut_ptr() as usize, 0, 0, 0]);
+    let unlinked = sys(241, [queue_name.as_ptr() as usize, 0, 0, 0, 0, 0]);
+    let reopened = sys(240, [queue_name.as_ptr() as usize, 0o2, 0, 0, 0, 0]);
+    step(
+        "mqueue",
+        mqd >= 0
+            && low == 0
+            && high == 0
+            && first_ok
+            && second == 3
+            && empty == -11
+            && attributes == 0
+            && current[1] == 4
+            && current[2] == 64
+            && unlinked == 0
+            && reopened == -2,
+        49,
+    );
+    let _ = sys(CLOSE, [mqd as usize, 0, 0, 0, 0, 0]);
+
+    // perf_event_open: a task-clock counter grows while the process works,
+    // stands still while disabled and starts again from 0 after a reset;
+    // hardware cycles are "not supported" (ENOENT).
+    let mut perf_attr = [0u8; 128];
+    perf_attr[..4].copy_from_slice(&1u32.to_le_bytes());
+    perf_attr[4..8].copy_from_slice(&128u32.to_le_bytes());
+    perf_attr[8..16].copy_from_slice(&1u64.to_le_bytes());
+    perf_attr[32..40].copy_from_slice(&3u64.to_le_bytes());
+    let counter = sys(298, [perf_attr.as_ptr() as usize, 0, usize::MAX, usize::MAX, 0, 0]);
+    let mut spin = 0u64;
+    for index in 0..3_000_000u64 {
+        spin = spin.wrapping_mul(31).wrapping_add(index);
+    }
+    std::hint::black_box(spin);
+    let mut perf_values = [0u64; 3];
+    let first_read = sys(READ, [counter as usize, perf_values.as_mut_ptr() as usize, 24, 0, 0, 0]);
+    let busy = perf_values[0];
+    let disabled = sys(16, [counter as usize, 0x2401, 0, 0, 0, 0]);
+    let _ = sys(READ, [counter as usize, perf_values.as_mut_ptr() as usize, 24, 0, 0, 0]);
+    let held = perf_values[0];
+    let _ = sys(READ, [counter as usize, perf_values.as_mut_ptr() as usize, 24, 0, 0, 0]);
+    let still = perf_values[0];
+    let reset = sys(16, [counter as usize, 0x2403, 0, 0, 0, 0]);
+    let _ = sys(READ, [counter as usize, perf_values.as_mut_ptr() as usize, 24, 0, 0, 0]);
+    let after_reset = perf_values[0];
+    let mut cycles_attr = [0u8; 128];
+    cycles_attr[4..8].copy_from_slice(&128u32.to_le_bytes());
+    let cycles = sys(298, [cycles_attr.as_ptr() as usize, 0, usize::MAX, usize::MAX, 0, 0]);
+    step(
+        "perf",
+        counter >= 0
+            && first_read == 24
+            && disabled == 0
+            && held >= busy
+            && still == held
+            && reset == 0
+            && after_reset == 0
+            && cycles == -2,
+        48,
+    );
+    let _ = sys(CLOSE, [counter as usize, 0, 0, 0, 0, 0]);
+
     let _ = std::fs::remove_file("/tmp/sx-src");
     let _ = std::fs::remove_file("/tmp/sx-dst");
     let _ = std::fs::remove_file("/tmp/sx-node");

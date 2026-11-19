@@ -778,6 +778,7 @@ impl Wifi {
     fn dispatch(&mut self, data: &[u8], want: u8, out: &mut [u8]) -> Option<usize> {
         let rxd0 = le32(data, 0);
         let kind = rxd0 >> 27;
+        RX_KINDS[(kind & 7) as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let flag = (rxd0 >> 16) & 0xf;
         match kind {
             7 if flag != 1 => {
@@ -814,7 +815,15 @@ impl Wifi {
         match eid {
             0x0d if self.scanning => {
                 self.scanning = false;
-                note!("scan done: {} networks", self.network_count);
+                let kinds: [u32; 8] =
+                    core::array::from_fn(|index| RX_KINDS[index].load(core::sync::atomic::Ordering::Relaxed));
+                note!(
+                    "scan done: {} networks rx_kinds={:?} dropped={} beacons={}",
+                    self.network_count,
+                    kinds,
+                    SCAN_PROBE[0].load(core::sync::atomic::Ordering::Relaxed),
+                    SCAN_PROBE[1].load(core::sync::atomic::Ordering::Relaxed)
+                );
             }
             0x13 if self.link == Link::Connected => {
                 note!("beacon loss");
@@ -849,6 +858,7 @@ impl Wifi {
         let rxd2 = le32(data, 8);
         let rxd3 = le32(data, 12);
         if rxd1 & ((1 << 27) | (1 << 25)) != 0 {
+            SCAN_PROBE[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             return;
         }
         // Decrypted by the hardware with the installed key: a cipher was
@@ -903,7 +913,10 @@ impl Wifi {
         let from_bss = self.link != Link::Idle && body[10..16] == self.bss.bssid;
         match kind {
             0 => match subtype {
-                8 | 5 => self.scan_result(body, channel, rssi),
+                8 | 5 => {
+                    SCAN_PROBE[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    self.scan_result(body, channel, rssi)
+                }
                 13 if from_bss
                     && body[4..10] == self.mac
                     && body.len() >= 33
@@ -2274,6 +2287,14 @@ pub fn connected() -> bool {
 pub fn mac_address() -> Option<[u8; 6]> {
     present().then(|| WIFI.lock().mac)
 }
+
+/// Receive counters for diagnosing scans on real hardware: packets by RX
+/// descriptor kind, frames dropped for descriptor errors, beacons and probe
+/// responses seen.
+static RX_KINDS: [core::sync::atomic::AtomicU32; 8] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 8];
+static SCAN_PROBE: [core::sync::atomic::AtomicU32; 2] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 2];
 
 pub fn scan() -> bool {
     if !present() {

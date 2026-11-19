@@ -400,6 +400,12 @@ pub fn linux_ready() -> bool {
     linux::is_ready()
 }
 
+/// Runs the guest on the calling CPU (an SMP job) until it powers off.
+#[cfg(feature = "linux-guest")]
+pub fn linux_core(argument: u64) {
+    linux::run_dedicated(argument);
+}
+
 #[cfg(feature = "linux-guest")]
 pub fn linux_pump(budget_tsc: u64) -> bool {
     let start = crate::time::monotonic_nanoseconds();
@@ -957,7 +963,70 @@ mod linux {
 
     /// The one guest VM. It lives here between `pump()` slices so the
     /// desktop loop can run it a few milliseconds at a time.
+    /// What the run loop does after an exit has been handled.
+    enum Flow {
+        /// Enter the guest again.
+        Continue,
+        /// Hand the CPU back to the caller (the guest is idle or its slice
+        /// is over); it can run again.
+        Yield,
+        /// The guest has stopped for good.
+        Stop,
+    }
+
     static mut GUEST: Option<Machine> = None;
+    /// Held while anything runs or changes the guest: the dedicated core
+    /// between its slices, the desktop when it feeds input or commands.
+    static ENGINE: crate::sync::TicketLock<()> = crate::sync::TicketLock::new(());
+    /// Set while a core of its own runs the guest; the desktop then stops
+    /// pumping it.
+    static DEDICATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    static CORE_HSAVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    /// How long the dedicated core runs the guest before letting the desktop
+    /// at it (about a millisecond).
+    const CORE_SLICE_TSC: u64 = 3_000_000;
+
+    /// Runs the guest on the calling CPU until it powers off: started as an
+    /// SMP job, so Linux has a whole core instead of the gaps between
+    /// desktop frames.
+    pub fn run_dedicated(_argument: u64) {
+        let hsave = CORE_HSAVE.load(core::sync::atomic::Ordering::Acquire);
+        if hsave == 0 || guest().is_none() || !super::prepare_svm() {
+            crate::serial::line("AEROS_VM_CORE started=false");
+            return;
+        }
+        unsafe { write_msr(VM_HSAVE_PA_MSR, hsave) };
+        // A 1 kHz tick on this core makes the guest exit at least every
+        // millisecond: that is when its timers fire and pending interrupts
+        // (a finished disk read) are injected. Without one, a guest spinning
+        // without exits never got its completion.
+        let Some(cpu) = crate::smp::current_logical() else {
+            crate::serial::line("AEROS_VM_CORE started=false");
+            return;
+        };
+        crate::arch::interrupts::TICK_ONLY_CPU.store(cpu, core::sync::atomic::Ordering::Release);
+        let ticking = crate::arch::apic::start_timer(1000);
+        crate::serial::format(format_args!("AEROS_VM_CORE_TICK started={ticking}
+"));
+        DEDICATED.store(true, core::sync::atomic::Ordering::Release);
+        crate::serial::line("AEROS_VM_CORE started=true");
+        loop {
+            let alive = {
+                let _engine = ENGINE.lock();
+                flush_pending();
+                pump_raw(CORE_SLICE_TSC, false)
+            };
+            if !alive {
+                break;
+            }
+            // A moment with the lock free, so the desktop's input gets in.
+            for _ in 0..256 {
+                core::hint::spin_loop();
+            }
+        }
+        DEDICATED.store(false, core::sync::atomic::Ordering::Release);
+        crate::serial::line("AEROS_VM_CORE stopped=true");
+    }
 
     fn host_interrupts_enabled() -> bool {
         let flags: u64;
@@ -1014,6 +1083,10 @@ mod linux {
     /// Runs the guest for about `budget_tsc` cycles. Returns false once the
     /// guest has powered off, reset or hit an unhandled exit.
     pub fn pump(budget_tsc: u64) -> bool {
+        if DEDICATED.load(core::sync::atomic::Ordering::Acquire) {
+            return is_ready();
+        }
+        let _engine = ENGINE.lock();
         flush_pending();
         pump_raw(budget_tsc, false)
     }
@@ -1127,6 +1200,7 @@ mod linux {
         crate::sync::TicketLock::new(([None; PENDING_SLOTS], 0));
 
     pub fn command(op: u32, args: [u32; 4], text: &[u8]) {
+        let _engine = ENGINE.lock();
         flush_pending();
         let mut pending = PENDING.lock();
         if pending.1 == 0 && deliver(op, args, text) {
@@ -1210,6 +1284,7 @@ mod linux {
     }
 
     pub fn web_request(url: &[u8], cols: u32) -> bool {
+        let _engine = ENGINE.lock();
         let Some(machine) = guest() else {
             return false;
         };
@@ -1231,6 +1306,7 @@ mod linux {
     }
 
     pub fn web_take(seen: &mut u32, out: &mut [u8]) -> Option<(u32, usize)> {
+        let _engine = ENGINE.lock();
         let machine = guest()?;
         let base = machine.ram + FB_BASE + WEB_RES_OFFSET;
         let word = |offset: u64| unsafe { core::ptr::read_volatile((base + offset) as *const u32) };
@@ -1257,6 +1333,7 @@ mod linux {
         seen: &mut u32,
         out: &mut [super::LinuxApp; super::LINUX_MAX_APPS],
     ) -> Option<(usize, u32)> {
+        let _engine = ENGINE.lock();
         let machine = guest()?;
         let base = machine.ram + FB_BASE + APPS_OFFSET;
         let word = |offset: u64| unsafe { core::ptr::read_volatile((base + offset) as *const u32) };
@@ -1297,6 +1374,7 @@ mod linux {
     /// Host -> guest clipboard: text, then the sequence bump the agent
     /// notices.
     pub fn clipboard_set(text: &[u8]) {
+        let _engine = ENGINE.lock();
         let Some(machine) = guest() else {
             return;
         };
@@ -1316,6 +1394,7 @@ mod linux {
 
     /// Guest -> host clipboard (a seqlock: odd = being written).
     pub fn clipboard_take(seen: &mut u32, out: &mut [u8]) -> Option<usize> {
+        let _engine = ENGINE.lock();
         let machine = guest()?;
         let base = machine.ram + FB_BASE + CLIP_OUT_OFFSET;
         let word = |offset: u64| unsafe { core::ptr::read_volatile((base + offset) as *const u32) };
@@ -1341,6 +1420,7 @@ mod linux {
     }
 
     pub fn feed_scancode(code: u8) {
+        let _engine = ENGINE.lock();
         if let Some(machine) = guest() {
             machine.kbd_feed(code);
         }
@@ -1351,12 +1431,14 @@ mod linux {
     }
 
     pub fn mouse_feed(dx: i32, dy: i32, buttons: u8) {
+        let _engine = ENGINE.lock();
         if let Some(machine) = guest() {
             machine.mouse_feed(dx, dy, buttons, 0);
         }
     }
 
     pub fn mouse_wheel(buttons: u8, wheel: i32) {
+        let _engine = ENGINE.lock();
         if let Some(machine) = guest() {
             machine.mouse_feed(0, 0, buttons, wheel);
         }
@@ -1433,6 +1515,8 @@ mod linux {
         }
         let Some(vmlinuz_bytes) = fat::root_file_size(b"VMLINUZ    ") else {
             crate::serial::line("AEROS_VM_LINUX_KERNEL stage=image-absent file=VMLINUZ");
+            #[cfg(feature = "screen-log")]
+            fat::log_root_listing();
             return false;
         };
         let initrd_bytes = fat::root_file_size(b"INITRD     ").unwrap_or(0);
@@ -1509,6 +1593,11 @@ mod linux {
         let Some(hsave) = frames.allocate_contiguous(1, 1).map(|f| f.address()) else {
             return false;
         };
+        // The host save area is per CPU: the dedicated core gets its own.
+        if let Some(page) = frames.allocate_contiguous(1, 1).map(|f| f.address()) {
+            zero_region(page, PAGE_SIZE);
+            CORE_HSAVE.store(page, core::sync::atomic::Ordering::Release);
+        }
         let Some(host_vmcb) = frames.allocate_contiguous(1, 1).map(|f| f.address()) else {
             return false;
         };
@@ -2077,99 +2166,10 @@ mod linux {
                 if now.wrapping_sub(start) > budget_tsc {
                     return true;
                 }
-                let exit = unsafe { read_u64(self.vmcb, 0x070) };
-                self.last_exit = exit;
-                self.last_rip = unsafe { read_u64(self.vmcb, 0x578) };
-                match exit {
-                    EXIT_IOIO => self.handle_io(),
-                    EXIT_CPUID => self.handle_cpuid(),
-                    EXIT_MSR => self.handle_msr(),
-                    // The IRET that ends an injected NMI's handler (intercepted
-                    // only while an NMI is being serviced): NMIs are deliverable
-                    // again. It is a trap - the IRET has already completed.
-                    EXIT_IRET => self.nmi_done(),
-                    EXIT_PAUSE => {
-                        self.advance(2);
-                        // A spinning vCPU is waiting for the other one.
-                        if self.smp {
-                            self.slice_exits = SMP_SLICE_EXITS;
-                        }
-                    }
-                    // A host interrupt (APIC timer, keyboard...) forced this
-                    // exit; it is delivered to the HOST handler as soon as
-                    // host interrupts are enabled. In a headless run they
-                    // are off, so open a one-instruction window.
-                    EXIT_INTR => {
-                        if self.smp {
-                            self.slice_exits = SMP_SLICE_EXITS;
-                        }
-                        if !host_interrupts_enabled() {
-                            crate::arch::enable_interrupts();
-                            core::hint::spin_loop();
-                            crate::arch::disable_interrupts();
-                        }
-                    }
-                    EXIT_SHUTDOWN | 0x048 => {
-                        self.reset = true;
-                        return false;
-                    }
-                    EXIT_HLT => {
-                        let rflags = unsafe { read_u64(self.vmcb, 0x570) };
-                        if rflags & (1 << 9) == 0 {
-                            // HLT with interrupts off never wakes: an AP going
-                            // offline is fine, the BSP doing it is the end.
-                            if self.smp && self.cur != 0 {
-                                self.advance(1);
-                                self.vcpus[self.cur].halted = true;
-                                continue;
-                            }
-                            return false;
-                        }
-                        self.advance(1);
-                        if self.smp {
-                            // Clear the STI interrupt shadow (see below), park
-                            // this vCPU until something wakes it, and let the
-                            // scheduler pick who runs next.
-                            let int_state = unsafe { read_u64(self.vmcb, 0x068) };
-                            unsafe { write_u64(self.vmcb, 0x068, int_state & !1) };
-                            self.vcpus[self.cur].halted = true;
-                            continue;
-                        }
-                        // The STI that preceded this HLT left an interrupt shadow
-                        // in the VMCB; the HLT is done now, so drop it or a
-                        // pending device interrupt could never be injected.
-                        let int_state = unsafe { read_u64(self.vmcb, 0x068) };
-                        unsafe { write_u64(self.vmcb, 0x068, int_state & !1) };
-                        // A device interrupt is waiting to be delivered (e.g. the
-                        // next byte of a mouse packet): keep running so it goes
-                        // in right away - drivers drop packets whose bytes
-                        // straggle - and don't spend a timer tick on it.
-                        if self.has_pending_irq() {
-                            continue;
-                        }
-                        self.inject_timer();
-                        // Idle guest in desktop mode: hand the CPU back to
-                        // the desktop until its next tick instead of
-                        // spinning through back-to-back HLT exits.
-                        if !self.host_input {
-                            return true;
-                        }
-                    }
-                    EXIT_VMMCALL => {
-                        unsafe { write_u64(self.vmcb, 0x5f8, 2) };
-                        self.advance(3);
-                    }
-                    EXIT_NPF => {
-                        let gpa = unsafe { read_u64(self.vmcb, 0x080) };
-                        self.npf_gpa = gpa;
-                        if !self.map_fault(gpa) {
-                            return false;
-                        }
-                    }
-                    _ => return false,
-                }
-                if self.reset {
-                    return false;
+                match self.handle_exit() {
+                    Flow::Continue => {}
+                    Flow::Yield => return true,
+                    Flow::Stop => return false,
                 }
             }
             false
@@ -2179,6 +2179,106 @@ mod linux {
         /// (V_IRQ). Injecting another one now would overwrite it - and for an
         /// APIC vector that has already been marked in service the guest would
         /// then never run its handler or acknowledge it.
+        /// Handles the exit the current vCPU just took (its VMCB and
+        /// registers are the machine's current ones).
+        fn handle_exit(&mut self) -> Flow {
+            let exit = unsafe { read_u64(self.vmcb, 0x070) };
+            self.last_exit = exit;
+            self.last_rip = unsafe { read_u64(self.vmcb, 0x578) };
+            match exit {
+                EXIT_IOIO => self.handle_io(),
+                EXIT_CPUID => self.handle_cpuid(),
+                EXIT_MSR => self.handle_msr(),
+                // The IRET that ends an injected NMI's handler (intercepted
+                // only while an NMI is being serviced): NMIs are deliverable
+                // again. It is a trap - the IRET has already completed.
+                EXIT_IRET => self.nmi_done(),
+                EXIT_PAUSE => {
+                    self.advance(2);
+                    // A spinning vCPU is waiting for the other one.
+                    if self.smp {
+                        self.slice_exits = SMP_SLICE_EXITS;
+                    }
+                }
+                // A host interrupt (APIC timer, keyboard...) forced this
+                // exit; it is delivered to the HOST handler as soon as
+                // host interrupts are enabled. In a headless run they
+                // are off, so open a one-instruction window.
+                EXIT_INTR => {
+                    if self.smp {
+                        self.slice_exits = SMP_SLICE_EXITS;
+                    }
+                    if !host_interrupts_enabled() {
+                        crate::arch::enable_interrupts();
+                        core::hint::spin_loop();
+                        crate::arch::disable_interrupts();
+                    }
+                }
+                EXIT_SHUTDOWN | 0x048 => {
+                    self.reset = true;
+                    return Flow::Stop;
+                }
+                EXIT_HLT => {
+                    let rflags = unsafe { read_u64(self.vmcb, 0x570) };
+                    if rflags & (1 << 9) == 0 {
+                        // HLT with interrupts off never wakes: an AP going
+                        // offline is fine, the BSP doing it is the end.
+                        if self.smp && self.cur != 0 {
+                            self.advance(1);
+                            self.vcpus[self.cur].halted = true;
+                            return Flow::Continue;
+                        }
+                        return Flow::Stop;
+                    }
+                    self.advance(1);
+                    if self.smp {
+                        // Clear the STI interrupt shadow (see below), park
+                        // this vCPU until something wakes it, and let the
+                        // scheduler pick who runs next.
+                        let int_state = unsafe { read_u64(self.vmcb, 0x068) };
+                        unsafe { write_u64(self.vmcb, 0x068, int_state & !1) };
+                        self.vcpus[self.cur].halted = true;
+                        return Flow::Continue;
+                    }
+                    // The STI that preceded this HLT left an interrupt shadow
+                    // in the VMCB; the HLT is done now, so drop it or a
+                    // pending device interrupt could never be injected.
+                    let int_state = unsafe { read_u64(self.vmcb, 0x068) };
+                    unsafe { write_u64(self.vmcb, 0x068, int_state & !1) };
+                    // A device interrupt is waiting to be delivered (e.g. the
+                    // next byte of a mouse packet): keep running so it goes
+                    // in right away - drivers drop packets whose bytes
+                    // straggle - and don't spend a timer tick on it.
+                    if self.has_pending_irq() {
+                        return Flow::Continue;
+                    }
+                    self.inject_timer();
+                    // Idle guest in desktop mode: hand the CPU back to
+                    // the desktop until its next tick instead of
+                    // spinning through back-to-back HLT exits.
+                    if !self.host_input {
+                        return Flow::Yield;
+                    }
+                }
+                EXIT_VMMCALL => {
+                    unsafe { write_u64(self.vmcb, 0x5f8, 2) };
+                    self.advance(3);
+                }
+                EXIT_NPF => {
+                    let gpa = unsafe { read_u64(self.vmcb, 0x080) };
+                    self.npf_gpa = gpa;
+                    if !self.map_fault(gpa) {
+                        return Flow::Stop;
+                    }
+                }
+                _ => return Flow::Stop,
+            }
+            if self.reset {
+                return Flow::Stop;
+            }
+            Flow::Continue
+        }
+
         fn virq_pending(&self) -> bool {
             let int_ctl = unsafe { read_u64(self.vmcb, 0x060) };
             int_ctl & (1 << 8) != 0

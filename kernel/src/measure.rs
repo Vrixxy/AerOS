@@ -246,3 +246,57 @@ pub fn self_test(image_measured: bool) -> TestReport {
         no_reference,
     }
 }
+
+/// Normal boots hash the ~100 MB boot image on a spare processor instead of
+/// holding the boot for it (seconds on a laptop); `finish_background` on
+/// the boot processor logs and checks the result once it is ready.
+#[cfg(not(feature = "boot-test"))]
+static BACKGROUND: TicketLock<Option<Option<[u8; 32]>>> = TicketLock::new(None);
+#[cfg(not(feature = "boot-test"))]
+static BACKGROUND_STARTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(not(feature = "boot-test"))]
+fn background_job(_: u64) {
+    let digest = boot_image_digest();
+    *BACKGROUND.lock() = Some(digest);
+}
+
+/// Records the initramfs now and starts hashing the boot image on processor
+/// `cpu`; false (nothing started) when that processor is not free.
+#[cfg(not(feature = "boot-test"))]
+pub fn measure_boot_in_background(cpu: usize) -> bool {
+    record("initramfs", initramfs_digest());
+    let started = cpu != 0 && crate::smp::start_job(cpu, background_job, 0);
+    BACKGROUND_STARTED.store(started, core::sync::atomic::Ordering::Release);
+    started
+}
+
+/// Called from the desktop loop: once the background hash is in, records
+/// it, compares it with the sealed reference and reports a change.
+#[cfg(not(feature = "boot-test"))]
+pub fn finish_background() {
+    if !BACKGROUND_STARTED.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let Some(result) = BACKGROUND.try_lock().and_then(|mut slot| slot.take()) else {
+        return;
+    };
+    BACKGROUND_STARTED.store(false, core::sync::atomic::Ordering::Release);
+    if let Some(digest) = result {
+        record("boot-image", digest);
+    }
+    let status = compare(REFERENCE_PATH);
+    crate::serial::format(format_args!(
+        "AEROS_MEASURE entries=2 image_measured={} status={} register={}\n",
+        result.is_some(),
+        status.label(),
+        hex_text(&register()).as_str()
+    ));
+    if status == Status::Changed {
+        crate::audit::record(
+            "MEASURE",
+            format_args!("ALERT: the boot image differs from the sealed one"),
+        );
+    }
+}

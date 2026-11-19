@@ -484,3 +484,180 @@ pub(super) fn robust_cleanup(head: u64, tid: u32, group: u64) {
         abandon(pending);
     }
 }
+
+// The futex2 calls (Linux 5.16 / 6.7): 32-bit words only, as in Linux today.
+const FUTEX2_SIZE_MASK: u64 = 3;
+const FUTEX2_SIZE_U32: u64 = 2;
+const FUTEX2_PRIVATE: u64 = 0x80;
+const WAITV_LIMIT: usize = 128;
+
+fn futex2_operation(flags: u64, base: u64) -> Result<u64, u64> {
+    if flags & !(FUTEX2_SIZE_MASK | FUTEX2_PRIVATE) != 0
+        || flags & FUTEX2_SIZE_MASK != FUTEX2_SIZE_U32
+    {
+        return Err(error(22));
+    }
+    Ok(base | (flags & FUTEX2_PRIVATE))
+}
+
+fn clock_flag(clock: u64) -> Result<u64, u64> {
+    match clock {
+        0 => Ok(CLOCK_REALTIME_FLAG),
+        1 => Ok(0),
+        _ => Err(error(22)),
+    }
+}
+
+/// `futex_wake(uaddr, mask, nr, flags)`.
+pub(super) fn wake2(address: u64, mask: u64, count: u64, flags: u64) -> u64 {
+    match futex2_operation(flags, 10) {
+        Ok(operation) => operate([address, operation, count, 0, 0, mask]),
+        Err(failure) => failure,
+    }
+}
+
+/// `futex_wait(uaddr, val, mask, flags, timeout, clockid)`; the time-out is
+/// absolute on `clockid`.
+pub(super) fn wait2(
+    address: u64,
+    value: u64,
+    mask: u64,
+    flags: u64,
+    timeout: u64,
+    clock: u64,
+) -> u64 {
+    if value > u64::from(u32::MAX) {
+        return error(22);
+    }
+    let operation = match futex2_operation(flags, 9) {
+        Ok(operation) => operation,
+        Err(failure) => return failure,
+    };
+    let clock = match clock_flag(clock) {
+        Ok(flag) => flag,
+        Err(failure) if timeout != 0 => return failure,
+        Err(_) => 0,
+    };
+    operate([address, operation | clock, value, timeout, 0, mask])
+}
+
+struct WaitEntry {
+    value: u64,
+    address: u64,
+    flags: u64,
+}
+
+fn waitv_entry(array: u64, index: usize) -> Result<WaitEntry, u64> {
+    let mut raw = [0u8; 24];
+    if !user::copy_from_user(array.wrapping_add(index as u64 * 24), &mut raw) {
+        return Err(error(14));
+    }
+    let entry = WaitEntry {
+        value: u64::from_le_bytes(raw[..8].try_into().unwrap_or_default()),
+        address: u64::from_le_bytes(raw[8..16].try_into().unwrap_or_default()),
+        flags: u64::from(u32::from_le_bytes(
+            raw[16..20].try_into().unwrap_or_default(),
+        )),
+    };
+    if raw[20..24] != [0; 4] || entry.value > u64::from(u32::MAX) || entry.address & 3 != 0 {
+        return Err(error(22));
+    }
+    futex2_operation(entry.flags, 0)?;
+    Ok(entry)
+}
+
+/// `futex_requeue(waiters[2], flags, nr_wake, nr_requeue)`: wakes from the
+/// first word and moves the rest to the second, if the first still holds
+/// its expected value.
+pub(super) fn requeue2(waiters: u64, flags: u64, wake_count: u64, move_count: u64) -> u64 {
+    if flags != 0 {
+        return error(22);
+    }
+    let (from, to) = match (waitv_entry(waiters, 0), waitv_entry(waiters, 1)) {
+        (Ok(from), Ok(to)) => (from, to),
+        (Err(failure), _) | (_, Err(failure)) => return failure,
+    };
+    if !user::range_accessible(to.address, 4, true) {
+        return error(14);
+    }
+    let operation = 4 | (from.flags & FUTEX2_PRIVATE);
+    operate([
+        from.address,
+        operation,
+        wake_count,
+        move_count,
+        to.address,
+        from.value,
+    ])
+}
+
+/// `futex_waitv(waiters, nr, flags, timeout, clockid)`: sleeps until any of
+/// up to 128 words is woken and returns its index; EAGAIN when one already
+/// differs from its expected value.
+pub(super) fn waitv(waiters: u64, count: u64, flags: u64, timeout: u64, clock: u64) -> u64 {
+    FUTEX_CALLS.fetch_add(1, Ordering::Relaxed);
+    let count = count as usize;
+    if flags != 0 || count == 0 || count > WAITV_LIMIT {
+        return error(22);
+    }
+    let realtime = match clock_flag(clock) {
+        Ok(flag) => flag != 0,
+        Err(failure) => return failure,
+    };
+    let limit = match deadline(timeout, true, realtime) {
+        Ok(limit) => limit,
+        Err(failure) => return failure,
+    };
+    let group = crate::scheduler::current_group();
+    let mut slots = [usize::MAX; WAITV_LIMIT];
+    let release = |slots: &[usize]| {
+        for slot in slots.iter().copied().filter(|slot| *slot != usize::MAX) {
+            dequeue(slot);
+        }
+    };
+    for index in 0..count {
+        let entry = match waitv_entry(waiters, index) {
+            Ok(entry) => entry,
+            Err(failure) => {
+                release(&slots[..index]);
+                return failure;
+            }
+        };
+        if !user::range_accessible(entry.address, 4, true) {
+            release(&slots[..index]);
+            return error(14);
+        }
+        let (word_group, word) = key(entry.flags & FUTEX2_PRIVATE, group, entry.address);
+        let Some(slot) = enqueue(word_group, word, u32::MAX, 0, 0) else {
+            release(&slots[..index]);
+            return error(12);
+        };
+        slots[index] = slot;
+        match read_word(entry.address) {
+            Some(observed) if u64::from(observed) == entry.value => {}
+            Some(_) => {
+                release(&slots[..=index]);
+                return error(11);
+            }
+            None => {
+                release(&slots[..=index]);
+                return error(14);
+            }
+        }
+    }
+    loop {
+        yield_in_syscall();
+        if let Some(index) = slots[..count].iter().position(|slot| woken(*slot)) {
+            release(&slots[..count]);
+            return index as u64;
+        }
+        if interrupted() {
+            release(&slots[..count]);
+            return error(4);
+        }
+        if limit.is_some_and(|limit| crate::time::monotonic_nanoseconds() >= limit) {
+            release(&slots[..count]);
+            return error(110);
+        }
+    }
+}

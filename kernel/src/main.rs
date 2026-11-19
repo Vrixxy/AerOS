@@ -24,6 +24,8 @@ mod battery;
 mod bench;
 mod block;
 mod blockdev;
+#[cfg(feature = "screen-log")]
+mod bootscreen;
 mod bthci;
 pub mod button;
 mod capability;
@@ -198,6 +200,140 @@ fn stage(label: &str) {
         label,
         time::monotonic_nanoseconds() / 1_000_000
     ));
+    #[cfg(feature = "screen-log")]
+    save_boot_log();
+}
+
+/// The latest serial output as BOOT.LOG on the boot partition, so a machine
+/// that hangs without a serial port still shows how far it got.
+#[cfg(feature = "screen-log")]
+fn save_boot_log() {
+    save_log(b"BOOT    LOG");
+}
+
+/// The latest serial output (up to 192 KiB) as `name` on the boot partition.
+#[cfg(feature = "screen-log")]
+fn save_log(name: &[u8; 11]) {
+    static BUFFER: TicketLock<[u8; 192 * 1024]> = TicketLock::new([0; 192 * 1024]);
+    let Some(mut buffer) = BUFFER.try_lock() else {
+        return;
+    };
+    let length = serial::log_tail(&mut buffer[..]);
+    let _ = fat::try_write_root_file(name, &buffer[..length]);
+}
+
+#[cfg(feature = "screen-log")]
+static DESKTOP_STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Bumped by every pass of the desktop loop.
+#[cfg(feature = "screen-log")]
+pub static DESKTOP_HEARTBEAT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Runs on a spare processor for good. During boot, when the log stays
+/// quiet for 15 seconds, and once the desktop runs, when its loop stops for
+/// 15 seconds, it records which interrupts fired meanwhile and, through an
+/// NMI, where the boot processor is, then saves BOOT.LOG.
+#[cfg(feature = "screen-log")]
+fn boot_watchdog(bsp_apic_id: u64) {
+    use core::sync::atomic::Ordering;
+    let wait = |nanoseconds: u64| {
+        let start = time::monotonic_nanoseconds();
+        while time::monotonic_nanoseconds().wrapping_sub(start) < nanoseconds {
+            core::hint::spin_loop();
+        }
+    };
+    let base = uefi::image_base(efi_main as *const () as usize).unwrap_or(0);
+    let progress = || {
+        if DESKTOP_STARTED.load(Ordering::Acquire) {
+            DESKTOP_HEARTBEAT.load(Ordering::Acquire)
+        } else {
+            serial::total_bytes()
+        }
+    };
+    let mut last_bytes = progress();
+    let mut saved_bytes = last_bytes;
+    let mut quiet_since = time::monotonic_nanoseconds();
+    let mut before = [0u64; 256];
+    arch::interrupts::vector_counts(&mut before);
+    let mut desktop_seconds = 0u32;
+    loop {
+        wait(1_000_000_000);
+        let desktop = DESKTOP_STARTED.load(Ordering::Acquire);
+        // One snapshot a minute into the desktop: what the devices did after
+        // sign-in (pointer, battery, Wi-Fi) without waiting for a hang.
+        if desktop {
+            desktop_seconds += 1;
+            if desktop_seconds == 60 {
+                save_log(b"DESKTOP LOG");
+            }
+        }
+        let bytes = progress();
+        if bytes != last_bytes {
+            last_bytes = bytes;
+            quiet_since = time::monotonic_nanoseconds();
+            arch::interrupts::vector_counts(&mut before);
+            continue;
+        }
+        let quiet = time::monotonic_nanoseconds().wrapping_sub(quiet_since);
+        // Three quiet seconds of boot: keep the newest output on disk, in case
+        // this is a hang (stage saves alone miss whatever came after the
+        // last). Not on the desktop, which writes its own files.
+        if !desktop && quiet >= 3_000_000_000 && saved_bytes != bytes {
+            save_boot_log();
+            saved_bytes = bytes;
+        }
+        if quiet < 15_000_000_000 {
+            continue;
+        }
+        arch::interrupts::arm_nmi_probe();
+        let _ = arch::apic::send_nmi(bsp_apic_id as u32);
+        wait(200_000_000);
+        let (rip, flags) = arch::interrupts::nmi_probe().unwrap_or((0, 0));
+        let mut counts = [0u64; 256];
+        arch::interrupts::vector_counts(&mut counts);
+        let mut top = [(0usize, 0u64); 5];
+        for (vector, (now, then)) in counts.iter().zip(&before).enumerate() {
+            let delta = now.wrapping_sub(*then);
+            if let Some(slot) = top.iter().position(|(_, best)| delta > *best) {
+                top.copy_within(slot..4, slot + 1);
+                top[slot] = (vector, delta);
+            }
+        }
+        serial::format(format_args!(
+            "AEROS_WATCHDOG during={} quiet_s={} base={:#x} bsp_rip={:#x} bsp_if={} irqs={}:{} {}:{} {}:{} {}:{} {}:{}\n",
+            if desktop { "desktop" } else { "boot" },
+            quiet / 1_000_000_000,
+            base,
+            rip,
+            (flags >> 9) & 1,
+            top[0].0,
+            top[0].1,
+            top[1].0,
+            top[1].1,
+            top[2].0,
+            top[2].1,
+            top[3].0,
+            top[3].1,
+            top[4].0,
+            top[4].1
+        ));
+        let mut stack = [0u64; 24];
+        arch::interrupts::nmi_stack(&mut stack);
+        serial::text("AEROS_WATCHDOG_STACK");
+        for value in stack {
+            if value > base as u64 && value < base as u64 + 0x40_0000 {
+                serial::format(format_args!(" {value:#x}"));
+            }
+        }
+        serial::text("\n");
+        save_log(if desktop {
+            b"DESKTOP LOG"
+        } else {
+            b"BOOT    LOG"
+        });
+        last_bytes = progress();
+        quiet_since = time::monotonic_nanoseconds();
+        before = counts;
+    }
 }
 
 /// The framebuffer, recorded at boot so a panic can say what happened on
@@ -374,6 +510,13 @@ fn enable_iommu() -> bool {
     if !iommu::present() {
         return false;
     }
+    // Only proven under QEMU so far: on a real AMD laptop turning it on cut
+    // the NVMe disk off (reads and writes failed until the next boot).
+    let virtualized = core::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0;
+    if !virtualized {
+        serial::line("AEROS_IOMMU_SKIPPED reason=real-hardware");
+        return false;
+    }
     let mut before = [0u8; 512];
     let readable = blockdev::read_sector(0, &mut before);
     if !iommu::enable() {
@@ -430,6 +573,10 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     *BOOT_PHASE.lock() = 1;
     serial::init();
     serial::format(format_args!("AEROS_BOOT version={VERSION}\n"));
+    #[cfg(feature = "screen-log")]
+    unsafe {
+        uefi::console_print(table, "AerOS is starting...\r\n")
+    };
     let relocation = uefi::relocation_report();
     let base = uefi::image_base(efi_main as *const () as usize).unwrap_or(0);
     let pointers_fixed = core::ptr::eq(RELOCATION_SELF, &RELOCATION_MARKER);
@@ -470,6 +617,10 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         }
     };
     *BOOT_PHASE.lock() = 3;
+    // SAFETY: single-threaded boot; the panic handler only reads it.
+    unsafe { *PANIC_SCREEN.0.get() = Some(boot.framebuffer) };
+    #[cfg(feature = "screen-log")]
+    bootscreen::start(boot.framebuffer, fonts.mono().or(fonts.ui()));
 
     arch::disable_interrupts();
     let descriptors = arch::gdt::init();
@@ -564,7 +715,18 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     }
     let ioapic = ioapic::initialize(&acpi, apic.id);
     if !ioapic.verified {
+        serial::format(format_args!(
+            "AEROS_IOAPIC_DIAGNOSTIC present={} address={:#x} redirections={} gsi_base={} timer_gsi={} ticks={}\n",
+            ioapic.present,
+            ioapic.address,
+            ioapic.redirections,
+            ioapic.gsi_base,
+            ioapic.timer_gsi,
+            ioapic.ticks
+        ));
         serial::line("AEROS_IOAPIC_FAILURE");
+        // Only the legacy timer's route is in doubt; devices still get theirs.
+        #[cfg(feature = "boot-test")]
         arch::halt_forever();
     }
     let mut frames = FrameAllocator::from_map(&boot.memory);
@@ -580,6 +742,52 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     };
     scheduler::set_default_cr3(paging.root_physical);
     arch::paging::set_boot_state(&paging);
+    arch::paging::enable_write_combining();
+    let framebuffer_write_combined = arch::paging::write_combine_framebuffer(
+        boot.framebuffer.address as u64,
+        boot.framebuffer.size as u64,
+        &mut frames,
+    );
+    serial::format(format_args!(
+        "AEROS_FRAMEBUFFER base={:#x} bytes={} {}x{} write_combined={framebuffer_write_combined}\n",
+        boot.framebuffer.address as u64,
+        boot.framebuffer.size,
+        boot.framebuffer.width,
+        boot.framebuffer.height
+    ));
+    // The desktop draws through its own write-combining mapping of the
+    // screen; the cycle counts compare it with the identity map's speed.
+    let desktop_framebuffer = {
+        let mut info = boot.framebuffer;
+        let mapped = arch::paging::map_write_combining(
+            &paging,
+            boot.framebuffer.address as u64,
+            boot.framebuffer.size as u64,
+            &mut frames,
+        );
+        let rows = 32.min(info.height);
+        let first = (info.height - rows) * info.stride;
+        let pixels = rows * info.stride;
+        let time_writes = |base: *mut u32| {
+            let start = unsafe { core::arch::x86_64::_rdtsc() };
+            for index in first..first + pixels {
+                unsafe { core::ptr::write_volatile(base.add(index), 0) };
+            }
+            unsafe { core::arch::x86_64::_mm_sfence() };
+            unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start)
+        };
+        let identity_cycles = time_writes(boot.framebuffer.address);
+        let mapped_cycles = mapped.map_or(0, |address| time_writes(address as usize as *mut u32));
+        serial::format(format_args!(
+            "AEROS_FRAMEBUFFER_SPEED pixels={pixels} identity_cycles={identity_cycles} wc_cycles={mapped_cycles} mapped={}
+",
+            mapped.is_some()
+        ));
+        if let Some(address) = mapped {
+            info.address = address as usize as *mut u32;
+        }
+        info
+    };
     let demand_paging_ready = arch::paging::demand_init(&paging, &mut frames);
     // Every process's pages (and the shared libraries a dynamically linked
     // program maps) come from this pool: a quarter of the memory, leaving at
@@ -732,6 +940,13 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         }
     }
     let fat = fat::inspect(&partitions);
+    #[cfg(feature = "screen-log")]
+    {
+        let last = 63 - smp::online_mask().leading_zeros() as usize;
+        if last > 0 {
+            let _ = smp::start_job(last, boot_watchdog, u64::from(apic.id));
+        }
+    }
     let install = installer::install(installer::unattended_request(), &mut frames);
     let mut network = e1000::initialize(&pci, &mut frames);
     let rtl8139_nic = rtl8139::initialize(&pci, &mut frames);
@@ -739,8 +954,11 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     let _ = mt7921::initialize(&pci, &mut frames);
     #[cfg(feature = "linux-drivers")]
     let _ = linux::initialize(&acpi, &pci, &mut frames, boot.framebuffer);
+    stage("drivers");
     nic::select_primary(network.verified, &rtl8139_nic, &rtl8168_nic);
+    stage("iommu-start");
     let iommu_active = enable_iommu();
+    stage("iommu");
     #[cfg(feature = "boot-test")]
     {
         let test = iommu::self_test(&pci);
@@ -788,6 +1006,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         }
     }
     let internet = net::self_test(&network);
+    stage("network");
     #[cfg(feature = "boot-test")]
     {
         // The host side of this connects in over a QEMU hostfwd rule
@@ -929,7 +1148,9 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
             &initramfs_fonts::FONT_FILES,
         ],
     );
+    stage("vfs");
     let home = datafs::initialize();
+    stage("home");
     let assembled_volumes = raid::assemble();
     if assembled_volumes != 0 {
         serial::format(format_args!(
@@ -1075,8 +1296,26 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         }
     }
     #[cfg(feature = "linux-guest")]
-    svm::boot_linux(&mut frames);
+    {
+        svm::boot_linux(&mut frames);
+        // Linux gets a core of its own from the start: CPU 0 is the
+        // desktop's, CPU 1 the guest disk's worker and the last one the
+        // screen-log watchdog's.
+        let online = smp::online_mask();
+        let watchdog = if cfg!(feature = "screen-log") {
+            63 - online.leading_zeros() as usize
+        } else {
+            usize::MAX
+        };
+        if let Some(core) = (2..64).find(|cpu| online & (1 << cpu) != 0 && *cpu != watchdog) {
+            let submitted = smp::start_job(core, svm::linux_core, 0);
+            serial::format(format_args!("AEROS_VM_CORE cpu={core} submitted={submitted}
+"));
+        }
+    }
+    stage("linux-vm");
     process::initialize();
+    stage("process");
     let process_frames_before = frames.stats();
     let user_mapping = match arch::paging::map_user_probe(&paging, &mut frames) {
         Some(mapping) => mapping,
@@ -1085,7 +1324,9 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
             arch::halt_forever();
         }
     };
+    stage("user-probe-start");
     let user_probe = arch::user::run_probe(&user_mapping, &cpu);
+    stage("user-probe");
     let user_reap = arch::paging::destroy_user_probe(&paging, &mut frames, &user_mapping);
     let mut init_mapping = match arch::paging::map_user_image(&paging, &mut frames, &init_image) {
         Some(mapping) => mapping,
@@ -1893,9 +2134,12 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         || syscall_stats.truncate_calls != 1
         || syscall_stats.chmod_calls != 1
     {
-        serial::line("AEROS_USER_INVARIANT_FAILURE");
+        // Only a test boot sets up what these count; elsewhere the line above says it.
         #[cfg(feature = "boot-test")]
-        arch::halt_forever();
+        {
+            serial::line("AEROS_USER_INVARIANT_FAILURE");
+            arch::halt_forever();
+        }
     }
     serial::format(format_args!(
         "AEROS_PCI devices={} dropped={} storage={} network={} display={} usb={} bridges={} virtio={} capabilities={} verified={}\n",
@@ -2274,9 +2518,12 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
             fat_write_verified
         ));
         if !fat_write_verified {
-            serial::line("AEROS_FAT_WRITE_INVARIANT_FAILURE");
+            // Only a test boot sets up what these count; elsewhere the line above says it.
             #[cfg(feature = "boot-test")]
-            arch::halt_forever();
+            {
+                serial::line("AEROS_FAT_WRITE_INVARIANT_FAILURE");
+                arch::halt_forever();
+            }
         }
         let persist_payload = b"vfs persistence self-test\n";
         let persist_created =
@@ -2319,9 +2566,12 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
             persist_verified
         ));
         if !persist_verified {
-            serial::line("AEROS_VFS_PERSIST_INVARIANT_FAILURE");
+            // Only a test boot sets up what these count; elsewhere the line above says it.
             #[cfg(feature = "boot-test")]
-            arch::halt_forever();
+            {
+                serial::line("AEROS_VFS_PERSIST_INVARIANT_FAILURE");
+                arch::halt_forever();
+            }
         }
         // Proves cross-reboot rediscovery, not just same-boot create+read: if a
         // prior boot already created and left this directory, load_persisted_
@@ -3891,18 +4141,38 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         power_report.ready
     ));
     power::set(power_report);
-    let image_measured = measure::measure_boot();
-    let measured_status = measure::compare(measure::REFERENCE_PATH);
-    serial::format(format_args!(
-        "AEROS_MEASURE entries=2 image_measured={image_measured} status={} register={}\n",
-        measured_status.label(),
-        measure::hex_text(&measure::register()).as_str()
-    ));
-    if measured_status == measure::Status::Changed {
-        audit::record(
-            "MEASURE",
-            format_args!("ALERT: the boot image differs from the sealed one"),
-        );
+    // A normal boot hashes the boot image on a spare processor (the one below
+    // the boot watchdog's) and the desktop loop checks it when it is done.
+    #[cfg(not(feature = "boot-test"))]
+    let background_measure = {
+        let last = 63 - smp::online_mask().leading_zeros() as usize;
+        let spare = if cfg!(feature = "screen-log") {
+            last.saturating_sub(1)
+        } else {
+            last
+        };
+        measure::measure_boot_in_background(spare)
+    };
+    #[cfg(feature = "boot-test")]
+    let background_measure = false;
+    let image_measured = !background_measure && measure::measure_boot();
+    let measured_status = if background_measure {
+        measure::Status::NoReference
+    } else {
+        measure::compare(measure::REFERENCE_PATH)
+    };
+    if !background_measure {
+        serial::format(format_args!(
+            "AEROS_MEASURE entries=2 image_measured={image_measured} status={} register={}\n",
+            measured_status.label(),
+            measure::hex_text(&measure::register()).as_str()
+        ));
+        if measured_status == measure::Status::Changed {
+            audit::record(
+                "MEASURE",
+                format_args!("ALERT: the boot image differs from the sealed one"),
+            );
+        }
     }
     #[cfg(feature = "boot-test")]
     {
@@ -4133,7 +4403,7 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         }
     }
 
-    let mut framebuffer = unsafe { FrameBuffer::new(boot.framebuffer) };
+    let mut framebuffer = unsafe { FrameBuffer::new(desktop_framebuffer) };
     // SAFETY: single-threaded boot; the panic handler only reads it.
     unsafe { *PANIC_SCREEN.0.get() = Some(framebuffer.info()) };
     {
@@ -4397,6 +4667,11 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         serial::format(format_args!("AEROS_SMP_TASKS enabled={enabled}\n"));
     }
 
+    #[cfg(feature = "screen-log")]
+    {
+        bootscreen::stop();
+        DESKTOP_STARTED.store(true, core::sync::atomic::Ordering::Release);
+    }
     desktop::run(&mut framebuffer, &fonts, shell_info)
 }
 

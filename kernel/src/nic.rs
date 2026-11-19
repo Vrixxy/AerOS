@@ -125,7 +125,13 @@ pub fn present() -> bool {
     PRIMARY.load(Ordering::Acquire) != NONE
 }
 
+/// One CPU at a time in a card's descriptor rings: the drivers keep them in
+/// plain statics, and the Linux guest's core sends and receives through
+/// them while the desktop's network stack does too.
+static RINGS: crate::sync::TicketLock<()> = crate::sync::TicketLock::new(());
+
 pub fn transmit(packet: &[u8]) -> bool {
+    let _rings = RINGS.lock();
     let sent = match PRIMARY.load(Ordering::Acquire) {
         E1000 => e1000::transmit(packet),
         RTL8139 => rtl8139::transmit(packet),
@@ -146,6 +152,7 @@ pub fn transmit(packet: &[u8]) -> bool {
 /// arrived yet" (`None`), so none of their own bounded-retry loops need to
 /// know this filtering exists.
 pub fn try_receive(destination: &mut [u8]) -> Option<usize> {
+    let _rings = RINGS.lock();
     let length = match PRIMARY.load(Ordering::Acquire) {
         E1000 => e1000::try_receive(destination),
         RTL8139 => rtl8139::try_receive(destination),
@@ -165,7 +172,10 @@ pub fn try_receive(destination: &mut [u8]) -> Option<usize> {
 /// Receive that waits (bounded) for a frame.
 pub fn receive(destination: &mut [u8]) -> Option<usize> {
     if PRIMARY.load(Ordering::Acquire) == E1000 {
-        let length = e1000::receive(destination)?;
+        let length = {
+            let _rings = RINGS.lock();
+            e1000::receive(destination)?
+        };
         return if crate::firewall::blocks(&destination[..length]) {
             None
         } else {

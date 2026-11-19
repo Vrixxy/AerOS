@@ -372,6 +372,25 @@ unsafe fn record_boot_partition(services: *mut BootServices, image: Handle) {
     }
 }
 
+/// Prints on the firmware's text console (boot services must be running).
+#[cfg(feature = "screen-log")]
+pub unsafe fn console_print(system_table: *mut SystemTable, text: &str) {
+    type OutputString = unsafe extern "efiapi" fn(*mut c_void, *const u16) -> Status;
+    if system_table.is_null() {
+        return;
+    }
+    let output = unsafe { (*system_table).console_out };
+    if output.is_null() {
+        return;
+    }
+    let mut wide = [0u16; 128];
+    for (slot, unit) in wide[..127].iter_mut().zip(text.encode_utf16()) {
+        *slot = unit;
+    }
+    let print = unsafe { *output.cast::<u8>().add(8).cast::<OutputString>() };
+    unsafe { print(output, wide.as_ptr()) };
+}
+
 unsafe fn locate_framebuffer(services: *mut BootServices) -> Result<FrameBufferInfo, BootError> {
     let mut interface: *mut c_void = core::ptr::null_mut();
     let status = unsafe {
