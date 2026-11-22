@@ -81,6 +81,17 @@ pub fn push(app: u8, title: &str, body: &str) {
     store.generation = store.generation.wrapping_add(1);
 }
 
+/// Do not disturb: notifications are kept but do not pop up.
+static DO_NOT_DISTURB: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn do_not_disturb() -> bool {
+    DO_NOT_DISTURB.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_do_not_disturb(on: bool) {
+    DO_NOT_DISTURB.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Bumps every time something is posted (so the desktop can tell).
 pub fn generation() -> u32 {
     STORE.lock().generation

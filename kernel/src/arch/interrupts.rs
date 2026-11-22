@@ -10,9 +10,9 @@ const IDT_ENTRIES: usize = 256;
 static BREAKPOINT_HIT: AtomicBool = AtomicBool::new(false);
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 static LOCAL_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
-/// A processor whose local timer only interrupts (the Linux guest's core).
-pub static TICK_ONLY_CPU: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(usize::MAX);
+/// Processors whose local timer only interrupts (the Linux guest's cores),
+/// one bit per logical CPU.
+pub static TICK_ONLY_CPUS: AtomicU64 = AtomicU64::new(0);
 static IPI_ACKS: AtomicU64 = AtomicU64::new(0);
 static IOAPIC_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 /// Per-vector counts and where an NMI landed, for the boot watchdog
@@ -574,7 +574,9 @@ fn interrupt_inner(frame: *mut InterruptFrame) -> u64 {
             // The Linux guest's core: its tick only makes the guest exit so
             // the hypervisor can deliver interrupts; it must not schedule.
             // By APIC id: the guest rewrites TSC_AUX, which `this_cpu` reads.
-            if crate::smp::current_logical() == Some(TICK_ONLY_CPU.load(Ordering::Acquire)) {
+            if crate::smp::current_logical()
+                .is_some_and(|cpu| cpu < 64 && TICK_ONLY_CPUS.load(Ordering::Acquire) & (1 << cpu) != 0)
+            {
                 return 0;
             }
             // With user tasks on several processors only the tick that caught

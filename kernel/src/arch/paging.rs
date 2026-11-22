@@ -3802,6 +3802,35 @@ pub fn vunmap(address: u64) -> bool {
 }
 
 #[cfg(feature = "linux-drivers")]
+/// Switches the `vmap` window pages under `address..address + length` to
+/// write-combining (PAT entry 1), for a scanout buffer the CPU only writes.
+/// Returns how many pages changed.
+pub fn vmap_write_combine(address: u64, length: u64) -> usize {
+    const PWT: u64 = 1 << 3;
+    let region = VMAP.lock();
+    let window = VMAP_PAGES as u64 * PAGE_SIZE;
+    if region.base == 0 || address < region.base || address - region.base >= window {
+        return 0;
+    }
+    let first = ((address - region.base) / PAGE_SIZE) as usize;
+    let last = (((address - region.base).saturating_add(length).min(window)).div_ceil(PAGE_SIZE)) as usize;
+    let table = region.first_table as usize as *mut u64;
+    let mut changed = 0;
+    for page in first..last {
+        unsafe {
+            let entry = core::ptr::read_volatile(table.add(page));
+            if entry & PRESENT == 0 {
+                continue;
+            }
+            core::ptr::write_volatile(table.add(page), (entry & !CACHE_DISABLE) | PWT);
+            invalidate(region.base + page as u64 * PAGE_SIZE);
+        }
+        changed += 1;
+    }
+    changed
+}
+
+#[cfg(feature = "linux-drivers")]
 /// Maps three scattered frames, checks they read back through the window in
 /// order, and unmaps them.
 pub fn vmap_self_test() -> bool {

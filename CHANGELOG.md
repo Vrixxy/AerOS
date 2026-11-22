@@ -1,8 +1,146 @@
-# Changelog
+﻿# Changelog
 
 All notable changes to AerOS. Versions are not tagged yet; everything below is under Unreleased and grouped by area, newest first within each group.
 
 ## Unreleased
+
+### Smoother handover and full launcher glass (November 2026)
+
+- The Radeon's new screen gets a copy of the firmware screen before the
+  display driver switches to it, so the lock screen no longer redraws
+  top-to-bottom at takeover. LINUX.LOG notes it if vblank waits time out.
+- Quick settings clears its whole spring overshoot (1.2x) each frame, so no
+  leftover copies flash during the bounce.
+- The launcher glass covers the entire screen (it stopped at the design
+  frame), at 25% tint with strong frost; the glass blur cap is 64 px instead
+  of 32, so frost reads at full strength on the 2880x1800 panel.
+- Setup follows the new dark Figma screens: #111 card with a hairline, dark
+  Back/Next pills, the keyboard list in an inner panel, "Username" /
+  "Password" / "Verify password" labels over dark fields, a dark reset card.
+
+### Glass on the Radeon (November 2026)
+
+- AerOS runs its own compute programs on the laptop's Radeon: C code in
+  `kernel/linux/gpu` is compiled for GFX9 (gfx90c) by the clang inside Zig,
+  `tools/gpu-kernels.py` turns each kernel into machine code plus its
+  COMPUTE_PGM_RSRC1/RSRC2 values, and `kernel/linux/drivers/aeros_gpu.c`
+  dispatches them on a compute ring the way amdgpu runs its own GPR
+  workaround shaders. A self-test (256 threads, every value checked) passed
+  on the laptop.
+- The optical glass has a GPU path (`kernel/linux/gpu/glass.c`: the same
+  integer blur, bend, dispersion, grade, tint and light as aerui.rs), used
+  once the self-test passed, with the CPU path as the fallback. The first GPU
+  glass job is also drawn on the CPU and the two compared (LINUX.LOG:
+  "gpu glass check").
+- Settings > Display is a two-column glass panel like Figma's Glass popover:
+  brightness, glass colour (now with black) and opacity, light, angle,
+  refraction, depth, dispersion, splay, frost and Reset glass. The glass is
+  saved in SETTINGS.DAT (16 more bytes; older files still load), also from
+  the `glass` command.
+- Wi-Fi: the channel-domain command is sent without waiting for a reply,
+  as Linux does (the firmware never answers it), so the bogus "refused"
+  warning is gone and boot is about 3 seconds faster.
+- Dispersion for the Figma preset is 35% (60% left an orange fringe where
+  the dock meets a dark window).
+
+### Figma glass preset (November 2026)
+
+- The glass defaults are the Figma Glass preset used on the dock and the
+  launcher (light -45 degrees at 80%, refraction, depth, dispersion, frost
+  and splay at 100). The launcher sheet is 49% black with no stroke, as in
+  Figma; the dock's 1% black fill, strokes and inner shadow already matched.
+
+### Keyboard lights (November 2026)
+
+- The Wi-Fi password field takes every key: it counts as text input now, so
+  letters were no longer read as desktop shortcuts (only `d` used to get
+  through).
+
+- The Caps Lock light follows Caps Lock: `keyboard::set_leds` sends the PS/2
+  set-indicators command (0xED + mask) with interrupts held off, reading the
+  keyboard's ACKs itself and queueing any key or mouse byte that arrives
+  meanwhile.
+
+### Spring motion (November 2026)
+
+- New `desktop_motion.rs`: a mass on a spring (stiffness, damping)
+  integrated in 1 ms steps from the moment it was last aimed, so drawing
+  can read it at any instant and aiming it somewhere new mid-flight keeps
+  its position and speed.
+- Quick settings grows out of its gear on a spring with a little overshoot
+  (size, position and corner curvature together, via a layout scaled around
+  the gear) and can be reversed half-way.
+- Windows grow out of their dock icon on a spring (a little overshoot) and
+  settle back into it when closed; contents, corners and glass scale with
+  the frame. Apps without a dock icon grow from a smaller copy of themselves.
+- Every timed pop-in and slide (pop-ups, launcher icons, music island,
+  windows, login) now follows a spring curve instead of fixed easing.
+- Large glass is still drawn in strips, but each strip is held back until
+  the next one has read the untouched background, so full-screen glass has
+  no seams (the "blinds" lines on the 2880x1800 panel).
+
+### Optical glass (November 2026)
+
+- Every frosted surface now goes through one glass material: the background
+  is blurred with two box passes each way (close to a Gaussian), bent
+  outward near the rim by the glass depth and index of refraction over a
+  splay band (bilinear sampling, so the bend is smooth), with red and blue
+  bent by slightly different amounts (dispersion). A directional light gives
+  a specular rim on the lit side and shade on the far side, a glass colour is
+  laid over it like a Figma fill (25% opacity by default), and
+  adaptive contrast keeps dark glass dark enough for white text over any
+  wallpaper. Edges are anti-aliased from the shape signed distance.
+- Glass of any size is real glass: large surfaces are processed in strips, so
+  the full-screen launcher on a 2880x1800 panel no longer falls back to a flat
+  fill. Sides that meet the screen border get no rim.
+- Settings > Display has a glass colour picker and a Depth slider; `glass` in
+  the Terminal shows and sets every property (depth, refraction, splay,
+  dispersion, frost, light, angle, tint, adaptive, reset).
+
+### Figma pass 2 (November 2026)
+
+- Volume and brightness pop-ups only appear for the hardware keys, not when
+  a slider moves in quick settings or Settings, and use the Figma look: a
+  dark glass pill with a grey level pill and a light icon.
+- Quick settings drops down from the top, under its gear, instead of rising
+  from the dock.
+- The app launcher's glass covers the whole screen (no rounded card), is
+  lighter so the wallpaper shows through, and has a faint lit rim.
+- The feather and quick-settings gear stay on screen over the launcher too.
+
+### Radeon display takeover prep (November 2026)
+
+- amdgpu now starts fully on the laptop (security processor, power management
+  and every ring come up) since `ioremap` became uncached.
+- A registered backlight device now exists (no sysfs), so the display core
+  sets the panel's brightness itself when it takes the screen.
+- Panel Self Refresh, PSR-SU and Panel Replay are off: AerOS draws straight
+  into the scanout buffer without telling DC, so a self-refreshing panel
+  would freeze on an old frame.
+- The scanout buffer AerOS draws into is mapped write-combining instead of
+  uncached, so full-screen frames don't crawl.
+- Confirmed on the laptop: the display core drives the eDP panel at
+  2880x1800@90 and the desktop draws through it.
+- Brightness (slider, keys, saved setting) now sets the panel's real
+  backlight through the display driver when it has one, instead of dimming
+  pixels.
+- Frames are copied in right after the panel's vblank, top to bottom and
+  faster than the scanout, so the desktop no longer visibly wipes or tears.
+  The colour-bar check and its 1.5 s pause at takeover are gone.
+
+### Touchscreen (November 2026)
+
+- New driver for HID-over-I2C touchscreens (ACPI `PNP0C50`) on DesignWare I2C
+  controllers such as AMD's `AMDI0010`: tap to click, drag to drag. It starts a
+  few seconds after the desktop appears and leaves touchpads alone.
+- `touchscreen` in the Terminal shows what it found and why it isn't working.
+
+### Figma UI pass (November 2026)
+- Files follows the new design: a dark window with a back button, a path bar and a search pill on top, and a sidebar with Home, Recents, Desktop and Documents, the last four folders opened, This PC and External drive, each with its icon from the new icon pack. Typing in the search pill filters the folder. New folder, Rename and Delete sit on the bottom bar, and the grid shows five items per row.
+- The app launcher matches the design: a black search pill with a white outline on darker glass, and tiles placed as drawn. Its search pill now filters the launcher in place (Enter opens the first match) instead of opening the separate search.
+- The search panel opens with Super+Space only; the "/" shortcut is gone.
+- The feather and the quick-settings gear stay on screen over open windows and are hidden only by a full-screen app (the Browser or a maximized window).
+- Panels no longer stack on top of each other: opening the launcher, quick settings, clipboard, search, notifications, the feather menu or a right-click menu closes whichever of the others was open.
 
 ### First real laptop (ASUS Vivobook, 2880x1800, November 2026)
 - The pointer stayed in the middle of the screen on machines without a PS/2 mouse: it only followed the mouse when the PS/2 port reported one, while the dock already reacted to a USB mouse. A USB mouse or tablet now counts as a pointer as soon as it reports, and USB mice get pointer acceleration that also scales with screen width.
@@ -20,10 +158,26 @@ All notable changes to AerOS. Versions are not tagged yet; everything below is u
 - Frosted glass on high-resolution panels works in blocks that grow with the layout scale (the blur under it is smooth), and the inner shadow skips the middle of long straight edges, which a pill-shaped dock never did.
 - Wi-Fi scans log how many packets of each kind arrived, how many were dropped and how many beacons were seen, for the laptop's empty scan.
 
+### Everyday features (November 2026)
+- Battery health: Settings > Power shows how much of its first charge the battery still holds and its cycle count, and a notification says so once a session when that is under 50%. While charging, three readings in a row under 15 W (30 s apart, below 90%) bring a "Charging slowly" notification: the charger or cable may be weak.
+- Do not disturb: the open notification stack has a switch under it (click it or press D; D is now a key outside text fields too). While it is on, notifications are kept in the stack but do not pop up.
+- Hidden items in Files: Ctrl+H shows or hides dot-named items, Ctrl+Shift+H hides or unhides the selected one (a dot in front of its name).
+- Screen time: the time each app is in front while the user is active (input in the last five minutes) is counted; `screentime` in the Terminal shows today's totals, `screentime limit <minutes>` brings a notification once that much use has passed (`screentime limit off` removes it).
+- Terminal themes: `theme` lists them (classic, ocean, light, matrix, amber, purple) and `theme <name>` recolours the window, header, text, prompt and cursor.
+- Wi-Fi: the driver now gives the firmware its channel list (world domain, 2.4 GHz 1-13 and the 5 GHz channels) before scanning, as Linux's mt76 does; without it the laptop's scans ended at once with no networks.
+- The desktop's boot stack is 8 MiB (was 4).
+
+### Linux in the Terminal (November 2026)
+- `linux` in the AerOS Terminal switches it to a Debian shell (`root@debian:/root#`); `exit` comes back. `linux <command>` runs one command and stays in AerOS. Commands run in the guest through its agent and their output streams into the scrollback while they run, so `apt install` does not hold up the desktop; `cd` is remembered, `apt`/`apt-get` install, remove and upgrade answer yes non-interactively, a failing command shows `[exit N]`, and Ctrl+C interrupts the command's process group. A command line can be about 60 characters (the agent's mailbox holds 128 bytes with the wrapper); programs that need a real terminal (vim, htop) are not supported yet.
+- USB mice move without the jumps: pointer acceleration scaled reports by their size, and a report that piled up while a slow frame was drawn looked like a fast flick. The pointer now moves by the screen-width factor alone.
+
 ### Linux guest on its own core (November 2026)
 - The Debian guest ran only in the gaps between desktop frames, on the desktop's own CPU, and only once a Linux window, the browser or the store needed it. It now starts at boot on a CPU of its own (the first one after the guest disk's worker that the screen-log watchdog is not using; `AEROS_VM_CORE`), in slices of about a millisecond, so it is ready before it is opened and the desktop no longer slows it down. Input, commands and the clipboard reach it under a lock taken between slices; without a spare CPU the desktop runs it as before.
 - The network card drivers keep their rings in plain statics, and the guest's virtual network card now sends and receives from another CPU than the desktop's network stack: the card's transmit and receive paths take a lock (without it the guest's CPU locked up in its transmit path).
-- Still to do: the guest's virtual CPUs share that one core; spreading them over several cores is next.
+- The guest's core has a 1 kHz local timer whose interrupt only acknowledges: the guest exits at least every millisecond, which is when its timers fire and a finished disk read's interrupt is injected. Without it a guest spinning without exits waited forever for its first disk completion (a soft lockup, then a reboot). The timer handler recognises that core by APIC id, because the guest rewrites TSC_AUX, which `kernel_lock::this_cpu` reads (the hypervisor does not restore it yet).
+- The start-up splash waits for the Linux guest: when it would fade out while Linux is still starting it says "Starting Linux apps" and holds until the guest's agent is up, the guest has stopped or a minute has passed.
+- Each guest vCPU now runs on a core of its own, in parallel: the core takes the machine lock only to pick up its vCPU's interrupts before entering the guest and to handle the exit after it (`handle_exit`), and runs the guest itself with nothing held (`svm::linux_vcpu_core`, each core with its own host save area, host VMCB and 1 kHz tick). The guest gets as many vCPUs as there are free cores, up to 8, keeping one back for AerOS once there are more than four (8 on a 12-thread Ryzen 5 5600H); with too few free cores the whole guest runs on one core as before, its scheduler now round robin over any number of vCPUs. Under QEMU, Debian with 4 vCPUs reached its desktop in half the time it took with 2.
+- TSC_AUX is swapped on every guest entry and exit, so the host's `kernel_lock::this_cpu` is right on the guest's cores again.
 
 ### Linux system calls (November 2026)
 - Linux AIO (`io_setup`, `io_submit`, `io_getevents`, `io_pgetevents`, `io_cancel`, `io_destroy`): reads, writes, vectored reads and writes and syncs run inside `io_submit` and their completions wait for `io_getevents`, up to 8 contexts of 128 events.
@@ -190,7 +344,7 @@ All notable changes to AerOS. Versions are not tagged yet; everything below is u
 - A tmpfs file that cannot grow because the kernel heap is used up fails with `ENOSPC` (it said `EFBIG`, which means the file size limit), and when doubling the file's block does not fit, the exact size is tried.
 - POSIX shared memory: `/dev/shm` is a directory of memory files (it lives at `/tmp/.dev/shm`), and a file there mapped `MAP_SHARED` is the same frames in every process that maps it (`syscall/posixshm.rs`, found by inode; what a mapping writes is not written back to the file). `link` works inside `/dev/shm`, as much as `sem_open` needs (elsewhere it stays `EPERM`), and futexes that are not `FUTEX_PRIVATE` in a shared mapping are keyed by physical address, so a process-shared semaphore posted in one process wakes another. Python's `multiprocessing.Pool` and `asyncio` (client and server over loopback) are in the apps gate.
 - `recv` and `recvfrom` take a buffer bigger than one call fills (asyncio reads into 256 KiB; it was `EFAULT` past 64 KiB, and past 1472 bytes for UDP). `read`, `write`, `pread`, `pwrite`, `getrandom` and the device reads check the whole buffer against the process's address range, as Linux's `access_ok` does, and then only the part one call moves, instead of making every page of a large buffer present first.
-- The table that counts the owners of shared frames (copy-on-write after `fork`, program pages, shared mappings) never removed an entry, only marked it reusable, so once it had filled up over a boot every lookup of a frame not in it (every private page given back) walked all 8192 slots. Entries now go when their count does and the ones after them move up, and the table has 32768 slots. The benchmark that maps, touches and unmaps 8 pages went from about 200 µs to about 6 µs.
+- The table that counts the owners of shared frames (copy-on-write after `fork`, program pages, shared mappings) never removed an entry, only marked it reusable, so once it had filled up over a boot every lookup of a frame not in it (every private page given back) walked all 8192 slots. Entries now go when their count does and the ones after them move up, and the table has 32768 slots. The benchmark that maps, touches and unmaps 8 pages went from about 200 Âµs to about 6 Âµs.
 - The bigger process windows cost less: walks over the mapping area (`fork`, `exec`, exit, `/proc` maps, swap) stop at the highest page ever used, the search for free mapping space starts at a hint below which everything is used, small mappings (16 pages or fewer) get their frames at once, and a process's page tables are not wiped on release (only its stack is).
 - TCP `bind` to port 0 picks the ephemeral port right away, as Linux does (it was left to `listen`, so `getsockname` in between, which Python's `http.server` does, reported port 0), and a socket that is bound but not listening now holds its port against the next ephemeral pick. A Python probe runs `http.server` on a thread and fetches from it over loopback.
 - UDP: 16 sockets (was 8), 16 queued datagrams per socket (was 4) and 40 port bindings (was 24); bindings are reset in place too.
@@ -342,7 +496,7 @@ All notable changes to AerOS. Versions are not tagged yet; everything below is u
 - `userspace/ptrace` (`aeros-ptrace`) is the boot-test's tracer (`AEROS_PTRACE`, exit status 77): signal stop and suppression, entry/exit stops with a changed return value, skipped calls, `int3` stops, register and memory edits (data and code, with the parent proven untouched), single steps, FPU edits through `SETFPREGS`, the `execve` event, a traced null write, `PTRACE_KILL`, and `ATTACH`/`DETACH` on a running task. Each step prints `AEROS_PTRACE_STEP name ok`.
 
 ### Benchmarks
-- `userspace/bench` runs the same static micro-benchmarks on AerOS (boot-test gate `AEROS_BENCH`) and on Linux (`tools/bench-linux.ps1`, a Debian-kernel initramfs in the same QEMU configuration). `docs/BENCHMARKS.md` has the first comparison: CPU and memory work is within 2-3x of Linux, but every system call is about 250x slower (37 µs for `getpid`), which makes file and pipe operations the same factor slower. Unprofiled; that is the next performance task.
+- `userspace/bench` runs the same static micro-benchmarks on AerOS (boot-test gate `AEROS_BENCH`) and on Linux (`tools/bench-linux.ps1`, a Debian-kernel initramfs in the same QEMU configuration). `docs/BENCHMARKS.md` has the first comparison: CPU and memory work is within 2-3x of Linux, but every system call is about 250x slower (37 Âµs for `getpid`), which makes file and pipe operations the same factor slower. Unprofiled; that is the next performance task.
 
 ### AerFS
 - `aerfs.rs` is a copy-on-write filesystem: nothing is overwritten in place, every block pointer carries the CRC-32 of its target, and every change is one transaction committed by a single atomic superblock-sector write (two alternating slots), so a power cut leaves either the old tree or the new one and there is nothing to replay or repair. Files, directories and the inode table are 512-way radix trees; free space is rebuilt at mount from the metadata. `volume.rs` gives the VFS one interface over FAT and AerFS (an AerFS file is presented as a `fatfs::Node`), `datafs` mounts AerFS volumes under `/media` (USB sticks and SD cards that carry one mount by themselves), the shell gains `aerfs format|mount <disk>`, `fsck` works on them, and `/proc/mounts` shows the type. Limits: 256 MiB per volume, 58-byte names, no links, two volumes at once. `docs/AERFS.md` has the design and its limits.
@@ -350,7 +504,7 @@ All notable changes to AerOS. Versions are not tagged yet; everything below is u
 - Not done: AerFS as the home volume, an overlay that makes `/` itself writable, hard and symbolic links, encryption.
 
 ### Performance
-- Profiling the benchmark (`kernel/src/perf.rs`, `AEROS_PERF` lines) found the reason system calls were 250 times slower than Linux and fixed three unrelated causes: the monotonic clock read the HPET over memory-mapped I/O on every call (it is now the calibrated time stamp counter, checked against the HPET and refined every ten seconds; `time.rs`, gate `AEROS_CLOCK`); the antivirus scan on every file open and close compared every signature needle at every byte (needles are now indexed by first byte, 1.7 ms to 40 µs for 4 KiB; `antivirus.rs`); and the idle boot task was handed the CPU whenever a process blocked and slept a whole timer tick (a blocked read, wait or exit now yields work-first; `scheduler.rs`). `getpid` 37,066 ns to 344 ns, pipe round trip 1.43 ms to 6 us, `fork` plus `wait4` 1.44 ms to 32 us, tmpfs create-write-read-unlink 6.4 ms to 0.25 ms. `docs/BENCHMARKS.md` has the table and the reasoning.
+- Profiling the benchmark (`kernel/src/perf.rs`, `AEROS_PERF` lines) found the reason system calls were 250 times slower than Linux and fixed three unrelated causes: the monotonic clock read the HPET over memory-mapped I/O on every call (it is now the calibrated time stamp counter, checked against the HPET and refined every ten seconds; `time.rs`, gate `AEROS_CLOCK`); the antivirus scan on every file open and close compared every signature needle at every byte (needles are now indexed by first byte, 1.7 ms to 40 Âµs for 4 KiB; `antivirus.rs`); and the idle boot task was handed the CPU whenever a process blocked and slept a whole timer tick (a blocked read, wait or exit now yields work-first; `scheduler.rs`). `getpid` 37,066 ns to 344 ns, pipe round trip 1.43 ms to 6 us, `fork` plus `wait4` 1.44 ms to 32 us, tmpfs create-write-read-unlink 6.4 ms to 0.25 ms. `docs/BENCHMARKS.md` has the table and the reasoning.
 
 ### Kernel image randomisation
 - At the very start of boot (`uefi::relocate`, called first thing in `kernel_entry`, before the image data has been used) the kernel finds its own PE headers, picks a random 2 MiB-aligned free region from the firmware memory map with `aslr::pick_slot`, allocates it as loader code at that exact address, copies the headers and each section's data, applies its own base relocations for the new address (`aslr::apply_relocations`, 4,944 of them) and jumps to its entry point in the copy. The copy hands the original's pages back to the firmware. `AEROS_KASLR` reports where it moved from and to, how many slots there were, and checks that a pointer stored in the image points into the copy.

@@ -183,14 +183,12 @@ static DEVICE_SEEN: AtomicBool = AtomicBool::new(false);
 static REMAINDER_X: AtomicI32 = AtomicI32::new(0);
 static REMAINDER_Y: AtomicI32 = AtomicI32::new(0);
 
-/// Pointer gain in 1/256 steps: wider screens move faster, and quick flicks
-/// cover more ground than slow, precise movement.
-fn gain(delta_x: i32, delta_y: i32) -> i32 {
+/// Pointer gain in 1/256 steps: wider screens move proportionally faster.
+/// No acceleration by report size: a report that piled up while a frame was
+/// drawn is not a fast flick, and scaling it up made the pointer jump.
+fn gain(_delta_x: i32, _delta_y: i32) -> i32 {
     let width = (BOUNDS.load(Ordering::Relaxed) >> 16) as i32;
-    let screen = (width * 256 / 1920).clamp(256, 640);
-    let speed = delta_x.abs().max(delta_y.abs()).min(24);
-    let acceleration = 256 + speed.saturating_sub(2) * 256 / 10;
-    screen * acceleration / 256
+    (width * 256 / 1920).clamp(256, 640)
 }
 
 fn scaled(delta: i32, gain: i32, remainder: &AtomicI32) -> i32 {

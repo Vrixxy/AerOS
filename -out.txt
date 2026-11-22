@@ -1,0 +1,1 @@
+Bail out! ERROR:../../../block/vvfat.c:1901:get_cluster_count_for_direntry: assertion failed: (mapping->mode & MODE_DELETED)

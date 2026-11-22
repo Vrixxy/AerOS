@@ -115,6 +115,12 @@ void aeros_linux_poll(void);
 /* AerOS calls this once, right after loading the module. */
 extern bool aeros_amdgpu_enabled;
 extern int amdgpu_dc;
+extern uint amdgpu_dc_debug_mask;
+int aeros_set_backlight(unsigned int percent);
+int aeros_display_wait_vblank(void);
+unsigned int aeros_gpu_glass_buffers(unsigned int **source, unsigned int **result);
+struct aeros_glass_args;
+int aeros_gpu_glass(const struct aeros_glass_args *job);
 
 int aeros_linux_entry(const struct aeros_ops *ops, struct aeros_linux_report *report)
 {
@@ -123,9 +129,16 @@ int aeros_linux_entry(const struct aeros_ops *ops, struct aeros_linux_report *re
 	if (ops->version != AEROS_OPS_VERSION)
 		return -EINVAL;
 	report->poll = aeros_linux_poll;
+	report->backlight = aeros_set_backlight;
+	report->wait_vblank = aeros_display_wait_vblank;
+	report->gpu_glass_buffers = aeros_gpu_glass_buffers;
+	report->gpu_glass = (int (*)(const void *))aeros_gpu_glass;
 	aeros_amdgpu_enabled = ops->options() & 1;
 	/* The display core (which takes the screen over) only with AMDGPU.DC. */
 	amdgpu_dc = ops->options() & 2 ? -1 : 0;
+	/* AerOS draws straight into the scanout buffer without telling DC, so a
+	 * panel refreshing itself from its own copy would freeze: no PSR/Replay. */
+	amdgpu_dc_debug_mask |= 0x10 | 0x200 | 0x400;
 	for (initcall_t *call = __start_aeros_initcalls; call < __stop_aeros_initcalls; call++) {
 		report->initcalls++;
 		if ((*call)() != 0)

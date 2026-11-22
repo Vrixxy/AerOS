@@ -429,6 +429,10 @@ impl DesktopState {
     pub(super) fn brightness_step(&mut self, delta: i32) {
         let now = crate::time::monotonic_nanoseconds();
         self.set_brightness((self.brightness as i32 + delta).clamp(8, 100) as u8, now);
+        if self.overlay != Overlay::Quick {
+            self.brightness_hud_until_ns = now + VOLUME_HUD_NS;
+            self.motion_until_ns = self.motion_until_ns.max(self.brightness_hud_until_ns);
+        }
     }
 
     pub(super) fn set_brightness(&mut self, value: u8, now: u64) {
@@ -436,8 +440,7 @@ impl DesktopState {
         self.brightness = value.clamp(8, 100);
         crate::framebuffer::set_brightness(self.brightness);
         self.brightness_event_ns = now;
-        self.brightness_hud_until_ns = now + VOLUME_HUD_NS;
-        self.motion_until_ns = self.motion_until_ns.max(self.brightness_hud_until_ns);
+        self.motion_until_ns = self.motion_until_ns.max(now + 300_000_000);
     }
 
     pub(super) fn set_volume_to(&mut self, value: u8) {
@@ -447,8 +450,7 @@ impl DesktopState {
         self.volume = value.min(100);
         self.apply_volume();
         self.volume_event_ns = now;
-        self.volume_hud_until_ns = now + VOLUME_HUD_NS;
-        self.motion_until_ns = self.motion_until_ns.max(self.volume_hud_until_ns);
+        self.motion_until_ns = self.motion_until_ns.max(now + 300_000_000);
     }
 
     /// Battery saver: every processor at its slowest performance state (where
@@ -626,8 +628,8 @@ fn hud_bar(
         radii,
         Rgba::new(0, 0, 0, 44),
     );
-    painter.fill_rounded_rect(layout.rect(pill), radii, Rgba::new(94, 128, 146, 150));
-    painter.stroke_rounded_rect(layout.rect(pill), radii, 1, Rgba::new(255, 255, 255, 120));
+    painter.fill_rounded_rect(layout.rect(pill), radii, Rgba::new(10, 10, 12, 150));
+    painter.stroke_rounded_rect(layout.rect(pill), radii, 1, Rgba::new(255, 255, 255, 46));
     let fill_h = (pill.height * level.clamp(0, 100) / 100).max(0);
     if fill_h > 0 {
         let clip = layout.rect(Rect::new(
@@ -636,16 +638,16 @@ fn hud_bar(
             pill.width,
             fill_h,
         ));
-        if painter.set_clip(clip) {
-            painter.fill_rounded_rect(layout.rect(pill), radii, Rgba::new(238, 245, 248, 222));
+        if fill_h >= pill.width {
+            painter.fill_rounded_rect(clip, radii, Rgba::new(92, 92, 96, 240));
+        } else {
+            if painter.set_clip(clip) {
+                painter.fill_rounded_rect(layout.rect(pill), radii, Rgba::new(92, 92, 96, 240));
+            }
+            painter.reset_clip();
         }
-        painter.reset_clip();
     }
-    let ink = if fill_h > 36 {
-        Rgba::new(70, 92, 104, 255)
-    } else {
-        Rgba::new(244, 248, 250, 255)
-    };
+    let ink = Rgba::new(226, 226, 228, 255);
     let center = Point::new(pill.x + width / 2, pill.y + pill.height - 24);
     if left {
         icon_sun(painter, layout, center, 11, ink);
@@ -684,6 +686,8 @@ pub(super) const TOAST_SLIDE_NS: u64 = 520_000_000;
 pub(super) const TOAST_RECT: Rect = Rect::new(263, 16, 226, 64);
 pub(super) const STACK_FRONT_Y: i32 = 62;
 pub(super) const STACK_PEEK: i32 = 22;
+/// The Do not disturb switch under the open notification stack.
+pub(super) const DND_PILL: Rect = Rect::new(TOAST_RECT.x + 38, STACK_FRONT_Y + 72, 150, 24);
 const NOTIFY_STACK_NS: u64 = 520_000_000;
 
 /// How much of `text` fits in `width` physical pixels: (byte length, cut).
@@ -810,6 +814,10 @@ impl DesktopState {
     }
 
     pub(super) fn toggle_notify_center(&mut self) {
+        if !self.notif_open {
+            self.set_overlay(Overlay::None);
+            self.close_popups();
+        }
         let now = crate::time::monotonic_nanoseconds();
         self.notif_open = !self.notif_open;
         self.notif_at_ns = now;
@@ -824,6 +832,9 @@ impl DesktopState {
         }
         match key {
             DesktopKey::Escape | DesktopKey::Notifications => self.toggle_notify_center(),
+            DesktopKey::Character('d') | DesktopKey::Character('D') => {
+                crate::notify::set_do_not_disturb(!crate::notify::do_not_disturb());
+            }
             DesktopKey::Backspace => {
                 crate::notify::clear();
                 self.notif_seen = crate::notify::generation();
@@ -836,6 +847,10 @@ impl DesktopState {
 
     pub(super) fn notify_click(&mut self, point: Point) -> Option<DesktopAction> {
         let now = crate::time::monotonic_nanoseconds();
+        if self.notif_open && DND_PILL.contains(point) {
+            crate::notify::set_do_not_disturb(!crate::notify::do_not_disturb());
+            return Some(DesktopAction::Redraw);
+        }
         if self.notif_open {
             let mut items = [crate::notify::Notification::EMPTY; crate::notify::CAPACITY];
             let count = crate::notify::snapshot(&mut items).min(3);
@@ -944,6 +959,24 @@ pub(super) fn draw_notify_stack(
             Color::rgb(40, 44, 48),
         );
     }
+    if state.notif_open {
+        let on = crate::notify::do_not_disturb();
+        let radii = layout.radii(CornerRadii::all(DND_PILL.height / 2));
+        painter.fill_rounded_rect(
+            layout.rect(DND_PILL),
+            radii,
+            if on { Rgba::new(46, 120, 232, 240) } else { Rgba::new(219, 221, 223, 240) },
+        );
+        centered_text(
+            painter,
+            layout,
+            font,
+            DND_PILL,
+            if on { "Do not disturb: On" } else { "Do not disturb: Off" },
+            11,
+            if on { Color::rgb(255, 255, 255) } else { Color::rgb(40, 44, 48) },
+        );
+    }
 }
 
 // --------------------------------------------------------- context menu
@@ -970,6 +1003,7 @@ pub(super) fn context_row(panel: Rect, index: usize) -> Rect {
 
 impl DesktopState {
     pub(super) fn open_context_menu(&mut self, at: Point) {
+        self.close_popups();
         let now = crate::time::monotonic_nanoseconds();
         self.ctx_open = true;
         self.ctx_at_ns = now;

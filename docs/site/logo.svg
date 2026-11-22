@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="20 24 780 520" fill="none">
+  <defs>
+    <mask id="cut" maskUnits="userSpaceOnUse" x="0" y="0" width="820" height="560">
+      <rect x="0" y="0" width="820" height="560" fill="#fff"/>
+      <polyline points="58,303 120,318 200,335 280,345 350,348 410,340 470,322 540,296 610,262 628,250" stroke="#000" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
+      <line x1="335" y1="318" x2="362" y2="182" stroke="#000" stroke-width="40" stroke-linecap="round"/>
+      <line x1="452" y1="308" x2="484" y2="152" stroke="#000" stroke-width="40" stroke-linecap="round"/>
+      <line x1="392" y1="362" x2="438" y2="412" stroke="#000" stroke-width="38" stroke-linecap="round"/>
+      <line x1="512" y1="322" x2="574" y2="368" stroke="#000" stroke-width="38" stroke-linecap="round"/>
+    </mask>
+  </defs>
+  <g mask="url(#cut)" fill="#000">
+    <polygon points="462,32 490,40 520,58 550,85 580,108 610,125 650,131 700,130 745,133 775,148 788,170 788,200 778,235 762,270 740,305 712,340 680,375 645,410 610,443 575,468 545,485 520,496 503,505 487,461 479,493 450,510 410,522 375,526 352,525 321,462 310,497 285,495 255,478 225,450 198,418 178,385 165,350 160,320 158,280 165,240 185,195 210,150 245,108 285,72 330,50 370,40 403,35 411,115"/>
+    <polyline points="58,303 120,318 200,335 280,345" stroke="#000" stroke-width="56" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

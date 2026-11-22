@@ -205,7 +205,7 @@ impl Field {
 
 /// Where the interesting fields sit in a pointer's input report.
 #[derive(Clone, Copy)]
-struct Pointer {
+pub(crate) struct Pointer {
     report_id: u8,
     buttons_bit: u16,
     buttons: u8,
@@ -1252,6 +1252,14 @@ fn parse_configuration(buffer: u64, total: u16) -> ([Interface; MAX_INTERFACES],
 /// Reads a HID report descriptor for the first pointer-like input report
 /// (X/Y axes plus buttons and, when present, a wheel).
 fn parse_pointer(descriptor: u64, length: u16) -> Option<Pointer> {
+    parse_touch(descriptor, length, 0)
+}
+
+/// Like `parse_pointer`, but with `app` (usage page << 16 | usage) non-zero
+/// only fields of that application collection count, the first contact's
+/// X/Y win and the digitizer's tip switch is the button.
+pub(crate) fn parse_touch(descriptor: u64, length: u16, app: u32) -> Option<Pointer> {
+    let mut current_app = 0u32;
     let mut usage_page = 0u32;
     let mut logical_min = 0i32;
     let mut logical_max = 0i32;
@@ -1306,6 +1314,13 @@ fn parse_pointer(descriptor: u64, length: u16) -> Option<Pointer> {
             (2, 1) => usage_min = raw,
             (2, 2) => usage_max = raw,
             (0, 0xa) => {
+                if raw == 1 {
+                    current_app = match usages.first() {
+                        Some(&usage) if usage_count > 0 && usage > 0xffff => usage,
+                        Some(&usage) if usage_count > 0 => usage_page << 16 | usage,
+                        _ => 0,
+                    };
+                }
                 usage_count = 0;
                 usage_min = 0;
                 usage_max = 0;
@@ -1336,6 +1351,24 @@ fn parse_pointer(descriptor: u64, length: u16) -> Option<Pointer> {
                         min: logical_min,
                         max: logical_max,
                     };
+                    if app != 0 {
+                        if current_app != app {
+                            continue;
+                        }
+                        match (usage_page, usage) {
+                            (0x0d, 0x42) if pointer.buttons == 0 => {
+                                pointer.buttons_bit = field_bit as u16;
+                                pointer.buttons = 1;
+                            }
+                            (1, 0x30) if !pointer.x.present => {
+                                pointer.x = field;
+                                pointer.report_id = report_id;
+                            }
+                            (1, 0x31) if !pointer.y.present => pointer.y = field,
+                            _ => {}
+                        }
+                        continue;
+                    }
                     match (usage_page, usage) {
                         (9, _) => {
                             if pointer.buttons == 0 {
@@ -1385,6 +1418,25 @@ pub(crate) fn fuzz_descriptors(bytes: &[u8], report: &[u8; 64]) {
             pointer.wheel.read(report),
         );
     }
+}
+
+fn scale_field(value: i32, field: &Field) -> u32 {
+    let span = (field.max as i64 - field.min as i64).max(1);
+    ((value as i64 - field.min as i64).clamp(0, span) * 0xffff / span) as u32
+}
+
+/// A touch report's tip state and position (0..=0xffff on each axis).
+pub(crate) fn pointer_sample(pointer: &Pointer, report: &[u8; 64]) -> Option<(bool, u32, u32)> {
+    if pointer.report_id != 0 && report[0] != pointer.report_id {
+        return None;
+    }
+    let bit = pointer.buttons_bit as usize;
+    let down = pointer.buttons > 0 && report.get(bit / 8).is_some_and(|byte| byte >> (bit % 8) & 1 != 0);
+    Some((
+        down,
+        scale_field(pointer.x.read(report), &pointer.x),
+        scale_field(pointer.y.read(report), &pointer.y),
+    ))
 }
 
 fn handle_pointer(pointer: &Pointer, report: &[u8; 64]) {

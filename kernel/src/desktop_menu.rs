@@ -64,29 +64,25 @@ fn upload_tile() -> Rect {
     )
 }
 
-/// Whether the corner controls are on screen for this frame: only over the
-/// bare desktop, never under a window, a launcher panel or a full-screen mode.
-pub(super) fn corners_shown(
-    state: &DesktopState,
-    window_closing: bool,
-    window_opening: bool,
-    sliding: Option<Overlay>,
-) -> bool {
+/// The corners stay over windows, except a full-screen one (the Browser or a
+/// maximized window), which covers them.
+fn corners_fit(app: DesktopApp) -> bool {
+    app == DesktopApp::None || (app != DesktopApp::Browser && !is_maximized(app))
+}
+
+/// Whether the corner controls are on screen for this frame: over the
+/// desktop and windows, never under the launcher or a full-screen app.
+pub(super) fn corners_shown(state: &DesktopState, _sliding: Option<Overlay>) -> bool {
     state.screen == Screen::Desktop
-        && state.app == DesktopApp::None
-        && !window_closing
-        && !window_opening
+        && corners_fit(state.app)
         && !state.seamless.enabled
-        && state.overlay != Overlay::Apps
-        && sliding != Some(Overlay::Apps)
 }
 
 impl DesktopState {
     pub(super) fn corners_active(&self) -> bool {
         self.screen == Screen::Desktop
-            && self.app == DesktopApp::None
+            && corners_fit(self.app)
             && !self.seamless.enabled
-            && self.overlay != Overlay::Apps
             && !self.power_open
             && self.power_action == shellui::PowerAction::None
     }
@@ -102,8 +98,7 @@ impl DesktopState {
         }
         let now = crate::time::monotonic_nanoseconds();
         self.set_overlay(Overlay::None);
-        self.ctx_open = false;
-        self.clip_open = false;
+        self.close_popups();
         self.menu_open = true;
         self.menu_at_ns = now;
         self.menu_focus = 0;

@@ -20,8 +20,12 @@ mod avatarui;
 mod files_ui;
 #[path = "desktop_flow.rs"]
 mod flow;
+#[path = "desktop_linuxsh.rs"]
+mod linuxsh;
 #[path = "desktop_menu.rs"]
 mod menu;
+#[path = "desktop_motion.rs"]
+mod motion;
 #[path = "desktop_panels.rs"]
 mod panels;
 #[path = "desktop_search.rs"]
@@ -104,6 +108,8 @@ fn linux_pan() -> (i32, i32) {
     )
 }
 const OVERLAY_TRANSITION_NS: u64 = 450_000_000;
+/// Long enough for any spring motion to come to rest.
+const MOTION_SETTLE_NS: u64 = 1_200_000_000;
 const OVERLAY_SLIDE_PX: i32 = 350;
 const APP_ICON_FALL_NS: u64 = 140_000_000;
 const APP_ICON_FALL_STAGGER_NS: u64 = 8_000_000;
@@ -112,6 +118,8 @@ const DOCK_FALL_NS: u64 = 300_000_000;
 const DOCK_FALL_STAGGER_NS: u64 = 25_000_000;
 const DOCK_FALL_HEIGHT_PX: i32 = 60;
 const WINDOW_OPEN_NS: u64 = 150_000_000;
+/// How long a window takes to grow out of (or back into) its dock icon.
+const WINDOW_MORPH_NS: u64 = 420_000_000;
 const LOCK_LOGIN_SCROLL_NS: u64 = 320_000_000;
 const SCREEN_TRANSITION_NS: u64 = 220_000_000;
 const SCREEN_FADE_MAX_ALPHA: u32 = 130;
@@ -162,8 +170,9 @@ static TERMINAL_OLDER: crate::sync::TicketLock<TerminalHistory> =
         count: 0,
     });
 const FILES_MAX_ENTRIES: usize = 12;
-const FILES_GRID_COLUMNS: i32 = 3;
-const FILES_GRID_ROWS: i32 = 4;
+const FILES_GRID_COLUMNS: i32 = 5;
+const FILES_GRID_ROWS: i32 = 3;
+const FILES_RECENT: usize = 4;
 const NOTES_MAX_ENTRIES: usize = 7;
 const TRASH_MAX_ENTRIES: usize = 6;
 const NAME_INPUT_MAX: usize = 32;
@@ -334,8 +343,7 @@ fn utf8_backspace(bytes: &[u8]) -> usize {
 }
 
 fn ease_out_milli(progress_milli: u32) -> u32 {
-    let inverse = 1000 - progress_milli.min(1000);
-    1000 - (inverse * inverse) / 1000
+    motion::spring_curve(progress_milli, 1_000).clamp(0, 1_000) as u32
 }
 /// The dock as designed: a rounded bar with nine square slots and a capsule
 /// holding the time and the date (logical units).
@@ -352,16 +360,16 @@ const DOCK_CLOCK: Rect = Rect::new(503, 371, 212, 44);
 const LAUNCHER_PANEL: Rect = Rect::new(0, 0, DESIGN_WIDTH, DESIGN_HEIGHT);
 const LAUNCHER_COLUMNS: usize = 6;
 const LAUNCHER_PAGE: usize = LAUNCHER_COLUMNS * 3;
-const LAUNCHER_SEARCH: Rect = Rect::new(244, 33, 263, 43);
+const LAUNCHER_SEARCH: Rect = Rect::new(247, 31, 250, 40);
 
 /// Tile `index` (any page) on its own page.
 fn launcher_tile(index: usize) -> Rect {
     let slot = index % LAUNCHER_PAGE;
     Rect::new(
-        136 + (slot % LAUNCHER_COLUMNS) as i32 * 165 / 2,
-        101 + (slot / LAUNCHER_COLUMNS) as i32 * 86,
-        67,
-        67,
+        133 + (slot % LAUNCHER_COLUMNS) as i32 * 157 / 2,
+        97 + (slot / LAUNCHER_COLUMNS) as i32 * 84,
+        65,
+        65,
     )
 }
 
@@ -386,7 +394,41 @@ fn launcher_name(index: usize) -> &'static str {
 
 fn launcher_dot(page: usize) -> Rect {
     let first = 376 - (launcher_pages() as i32 * 12 - 4) / 2;
-    Rect::new(first + page as i32 * 12, 352, 8, 8)
+    Rect::new(first + page as i32 * 12, 350, 8, 8)
+}
+
+/// The launcher tiles on screen now: the current page, or the first page of
+/// apps whose name holds what was typed in the launcher's search pill.
+fn launcher_shown(state: &DesktopState, out: &mut [usize; LAUNCHER_PAGE]) -> usize {
+    let query = state.launcher_query.as_str();
+    let mut count = 0;
+    if query.is_empty() {
+        let page = state.app_focus / LAUNCHER_PAGE;
+        for index in page * LAUNCHER_PAGE..launcher_len().min((page + 1) * LAUNCHER_PAGE) {
+            out[count] = index;
+            count += 1;
+        }
+    } else {
+        for index in 0..launcher_len() {
+            if count < LAUNCHER_PAGE && ascii_contains(launcher_name(index), query) {
+                out[count] = index;
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn ascii_contains(haystack: &str, needle: &str) -> bool {
+    let (hay, needle) = (haystack.as_bytes(), needle.as_bytes());
+    needle.is_empty()
+        || (hay.len() >= needle.len()
+            && hay.windows(needle.len()).any(|window| window.eq_ignore_ascii_case(needle)))
+}
+
+fn text_hash(text: &str) -> u64 {
+    text.bytes()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3))
 }
 
 fn dock_icon_rect(index: usize) -> Rect {
@@ -648,6 +690,9 @@ impl DirEntryRow {
     }
 }
 
+/// Files shows dot-named (hidden) items too (Ctrl+H).
+static SHOW_HIDDEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 fn list_directory(path: &str, rows: &mut [DirEntryRow]) -> (usize, bool) {
     for row in rows.iter_mut() {
         *row = DirEntryRow::EMPTY;
@@ -661,8 +706,14 @@ fn list_directory(path: &str, rows: &mut [DirEntryRow]) -> (usize, bool) {
     loop {
         match vfs::next_directory_entry(descriptor) {
             Ok(Some(entry)) => {
-                // Dot names are system folders and files (.root, .trash).
-                if entry.name_len == 0 || entry.name[0] == b'.' {
+                // Dot names are hidden: system folders and files (.root,
+                // .trash) and what the user hid, unless Ctrl+H shows them.
+                let show_hidden = SHOW_HIDDEN.load(Ordering::Relaxed);
+                if entry.name_len == 0
+                    || (entry.name[0] == b'.' && !show_hidden)
+                    || entry.name[..entry.name_len as usize] == *b"."
+                    || entry.name[..entry.name_len as usize] == *b".."
+                {
                     continue;
                 }
                 if count == rows.len() {
@@ -1226,6 +1277,8 @@ struct DesktopState {
     /// How many lines the Terminal is scrolled back (0: at the bottom).
     terminal_scroll: usize,
     terminal_elevated: bool,
+    /// The Terminal's Linux mode and the command it has running in Debian.
+    linux_sh: linuxsh::LinuxShell,
     /// Set by `terminal_submit` when `ear <command>` comes back needing the
     /// account password (`shell::Control::NeedsPassword`): the terminal's
     /// next Enter completes that password instead of running a new command,
@@ -1248,6 +1301,11 @@ struct DesktopState {
     terminal_draft_len: usize,
     seamless: Seamless,
     clip_open: bool,
+    launcher_query: shell::Text<24>,
+    launcher_typing: bool,
+    files_query: shell::Text<32>,
+    files_searching: bool,
+    files_recent: [shell::Text<256>; FILES_RECENT],
     /// Bit per `DesktopApp`: opened and not closed (minimized ones count).
     open_apps: u16,
     settings_page: u8,
@@ -1287,6 +1345,9 @@ struct DesktopState {
     previous_screen: Screen,
     overlay_closing: Overlay,
     overlay_close_at_ns: u64,
+    /// How far the open panel (launcher, quick settings) has come out: a
+    /// spring, so opening and closing can reverse mid-way.
+    overlay_motion: motion::Motion,
     app_closing: DesktopApp,
     app_close_at_ns: u64,
     files_path: shell::Text<256>,
@@ -1473,6 +1534,7 @@ impl DesktopState {
             terminal_line_count: 0,
             terminal_scroll: 0,
             terminal_elevated: false,
+            linux_sh: linuxsh::LinuxShell::EMPTY,
             terminal_awaiting_password: false,
             terminal_pending_command: [0; TERMINAL_INPUT_MAX],
             terminal_pending_command_len: 0,
@@ -1484,6 +1546,11 @@ impl DesktopState {
             terminal_draft_len: 0,
             seamless: Seamless::new(),
             clip_open: false,
+            launcher_query: shell::Text::new(),
+            launcher_typing: false,
+            files_query: shell::Text::new(),
+            files_searching: false,
+            files_recent: [shell::Text::new(); FILES_RECENT],
             open_apps: 0,
             settings_page: 0,
             settings_cursor: 0,
@@ -1513,6 +1580,7 @@ impl DesktopState {
             previous_screen: Screen::Language,
             overlay_closing: Overlay::None,
             overlay_close_at_ns: 0,
+            overlay_motion: motion::Motion::at(0),
             app_closing: DesktopApp::None,
             app_close_at_ns: 0,
             files_path: shell::Text::new(),
@@ -1556,7 +1624,7 @@ impl DesktopState {
         MAXIMIZED_APP.store(next, Ordering::Relaxed);
         let now = crate::time::monotonic_nanoseconds();
         self.window_open_at_ns = now;
-        self.motion_until_ns = self.motion_until_ns.max(now.saturating_add(WINDOW_OPEN_NS));
+        self.motion_until_ns = self.motion_until_ns.max(now.saturating_add(WINDOW_MORPH_NS));
     }
 
     fn set_app(&mut self, target: DesktopApp) {
@@ -1572,13 +1640,13 @@ impl DesktopState {
         if target != DesktopApp::None && self.app != target {
             let now = crate::time::monotonic_nanoseconds();
             self.window_open_at_ns = now;
-            self.motion_until_ns = self.motion_until_ns.max(now.saturating_add(WINDOW_OPEN_NS));
+            self.motion_until_ns = self.motion_until_ns.max(now.saturating_add(WINDOW_MORPH_NS));
         }
         if target == DesktopApp::None && self.app != DesktopApp::None {
             let now = crate::time::monotonic_nanoseconds();
             self.app_closing = self.app;
             self.app_close_at_ns = now;
-            self.motion_until_ns = self.motion_until_ns.max(now.saturating_add(WINDOW_OPEN_NS));
+            self.motion_until_ns = self.motion_until_ns.max(now.saturating_add(WINDOW_MORPH_NS));
         }
         if target != DesktopApp::None {
             self.open_apps |= 1 << (target as u8);
@@ -1587,23 +1655,80 @@ impl DesktopState {
     }
 
     fn set_overlay(&mut self, target: Overlay) {
+        if target != Overlay::Apps {
+            self.launcher_typing = false;
+            self.launcher_query.clear();
+        }
+        if target != Overlay::None {
+            self.close_popups();
+        }
         let now = crate::time::monotonic_nanoseconds();
         if target != Overlay::None && self.overlay != target {
             self.hover_prev = usize::MAX;
             self.hover_index = usize::MAX;
             self.overlay_open_at_ns = now;
+            if self.overlay_closing != target || self.overlay_motion.settled(now) {
+                self.overlay_motion = motion::Motion::at(0);
+            }
+            self.overlay_motion.aim(1_000, motion::SNAPPY, now);
             self.motion_until_ns = self
                 .motion_until_ns
-                .max(now.saturating_add(OVERLAY_TRANSITION_NS));
+                .max(now.saturating_add(MOTION_SETTLE_NS));
         }
         if target == Overlay::None && self.overlay != Overlay::None {
             self.overlay_closing = self.overlay;
             self.overlay_close_at_ns = now;
+            self.overlay_motion.aim(0, motion::SETTLE, now);
             self.motion_until_ns = self
                 .motion_until_ns
-                .max(now.saturating_add(OVERLAY_TRANSITION_NS));
+                .max(now.saturating_add(MOTION_SETTLE_NS));
         }
         self.overlay = target;
+    }
+
+    /// Closes the small panels (search, notifications, clipboard, menus) so
+    /// only the one being opened is on screen.
+    fn close_popups(&mut self) {
+        self.close_search();
+        if self.notif_open {
+            self.toggle_notify_center();
+        }
+        if self.clip_open {
+            self.clip_open = false;
+            self.clip_at_ns = crate::time::monotonic_nanoseconds();
+        }
+        self.menu_open = false;
+        self.parcel_open = false;
+        self.ctx_open = false;
+    }
+
+    /// Typing into the launcher's search pill.
+    fn launcher_search_key(&mut self, key: DesktopKey) -> Option<DesktopAction> {
+        match key {
+            DesktopKey::Character(ch) => {
+                let mut bytes = [0u8; 4];
+                let _ = self.launcher_query.push_str_checked(ch.encode_utf8(&mut bytes));
+            }
+            DesktopKey::Backspace => {
+                let _ = self.launcher_query.backspace();
+            }
+            DesktopKey::Escape => {
+                if self.launcher_query.as_str().is_empty() {
+                    self.launcher_typing = false;
+                } else {
+                    self.launcher_query.clear();
+                }
+            }
+            DesktopKey::Activate => {
+                let mut shown = [0; LAUNCHER_PAGE];
+                if launcher_shown(self, &mut shown) > 0 {
+                    self.set_overlay(Overlay::None);
+                    self.launch_entry(shown[0]);
+                }
+            }
+            _ => return None,
+        }
+        Some(DesktopAction::Redraw)
     }
 
     /// Whether something on screen is waiting for typed text.
@@ -1614,7 +1739,12 @@ impl DesktopState {
                 && self.overlay == Overlay::None
                 && crate::store::get().detail.is_none())
             || self.app == DesktopApp::Terminal
-            || (self.app == DesktopApp::Files && self.files_mode != FilesMode::Browsing)
+            || (self.app == DesktopApp::Files
+                && (self.files_mode != FilesMode::Browsing || self.files_searching))
+            || (self.overlay == Overlay::Apps && self.launcher_typing)
+            || (self.app == DesktopApp::Settings
+                && self.settings_page == 0
+                && self.wifi_choice.is_some())
             || (self.app == DesktopApp::Notes && self.notes_mode != NotesMode::List)
             || matches!(
                 self.screen,
@@ -1718,6 +1848,12 @@ impl DesktopState {
     }
 
     fn handle(&mut self, key: DesktopKey) -> DesktopAction {
+        if self.overlay == Overlay::Apps
+            && self.launcher_typing
+            && let Some(action) = self.launcher_search_key(key)
+        {
+            return action;
+        }
         match key {
             DesktopKey::VolumeUp => {
                 self.volume_step(6);
@@ -2386,61 +2522,37 @@ impl DesktopState {
             && self.files_mode == FilesMode::Browsing
         {
             let base = window_base_rect(DesktopApp::Files);
-            let content_x = base.x + 10;
-            let content_y = base.y + 36;
-            let sidebar_width = 106;
-            for (index, (_, path)) in files_places().iter().enumerate() {
-                let bounds = Rect::new(
-                    content_x + 8,
-                    content_y + 28 + index as i32 * 30,
-                    sidebar_width - 16,
-                    26,
-                );
-                if bounds.contains(point) {
-                    let _ = crate::vfs::create_directory(path, 0o755);
-                    let mut name: shell::Text<256> = shell::Text::new();
-                    let _ = name.push_str_checked(path);
-                    self.files_path = name;
-                    self.files_selected = usize::MAX;
-                    self.files_status.clear();
-                    self.files_reload();
+            let parts = files_layout(base);
+            for (bounds, place) in files_sidebar_rows(base) {
+                if bounds.contains(point) && files_place_shown(self, place) {
+                    self.files_go(place);
                     return DesktopAction::Redraw;
                 }
             }
-            if Rect::new(content_x + 8, content_y + 148, sidebar_width - 16, 26).contains(point) {
+            if parts.search.contains(point) {
+                self.files_searching = true;
+                return DesktopAction::Redraw;
+            }
+            self.files_searching = false;
+            if parts.back.contains(point) {
+                self.files_up();
+                return DesktopAction::Redraw;
+            }
+            if parts.buttons[0].contains(point) {
                 self.files_mode = FilesMode::NamingFolder;
                 self.name_input.clear();
                 return DesktopAction::Redraw;
             }
-            if Rect::new(content_x + 8, content_y + 182, sidebar_width - 16, 26).contains(point) {
-                self.files_delete_selected();
-                return DesktopAction::Redraw;
-            }
-            if Rect::new(content_x + 8, content_y + 216, sidebar_width - 16, 26).contains(point) {
+            if parts.buttons[1].contains(point) {
                 self.files_begin_rename();
                 return DesktopAction::Redraw;
             }
-            let main_x = content_x + sidebar_width + 12;
-            let main_width = base.x + base.width - 10 - main_x;
-            if Rect::new(main_x, content_y, 44, 24).contains(point) {
-                self.files_up();
+            if parts.buttons[2].contains(point) {
+                self.files_delete_selected();
                 return DesktopAction::Redraw;
             }
-            let content_bottom = base.y + base.height - 10;
-            let status_y = content_bottom - 14;
-            let grid_top = content_y + 32;
-            let cell_width = main_width / FILES_GRID_COLUMNS;
-            let cell_height = ((status_y - 4) - grid_top) / FILES_GRID_ROWS;
             for index in 0..self.files_entry_count {
-                let column = index as i32 % FILES_GRID_COLUMNS;
-                let line = index as i32 / FILES_GRID_COLUMNS;
-                let bounds = Rect::new(
-                    main_x + column * cell_width,
-                    grid_top + line * cell_height,
-                    cell_width - 8,
-                    cell_height - 6,
-                );
-                if bounds.contains(point) {
+                if files_cell(parts.grid, index).contains(point) {
                     return self.files_click_item(index);
                 }
             }
@@ -2555,9 +2667,10 @@ impl DesktopState {
             }
         }
         if self.overlay == Overlay::Apps {
-            let page = self.app_focus / LAUNCHER_PAGE;
-            for index in page * LAUNCHER_PAGE..launcher_len().min((page + 1) * LAUNCHER_PAGE) {
-                let bounds = launcher_tile(index);
+            let mut shown = [0; LAUNCHER_PAGE];
+            let count = launcher_shown(self, &mut shown);
+            for (slot, &index) in shown[..count].iter().enumerate() {
+                let bounds = launcher_tile(slot);
                 if bounds.contains(point) {
                     self.app_focus = index;
                     self.focus_visible = true;
@@ -2571,8 +2684,7 @@ impl DesktopState {
                 }
             }
             if LAUNCHER_SEARCH.contains(point) {
-                self.set_overlay(Overlay::None);
-                self.open_search();
+                self.launcher_typing = true;
                 return DesktopAction::Redraw;
             }
             // Clicking anywhere else closes it.
@@ -2903,9 +3015,22 @@ impl DesktopState {
 
     fn files_reload(&mut self) {
         let path: shell::Text<256> = self.files_path;
-        let (count, overflow) = list_directory(path.as_str(), &mut self.files_entries);
+        let (mut count, overflow) = list_directory(path.as_str(), &mut self.files_entries);
+        let query = self.files_query;
+        if !query.as_str().is_empty() {
+            let mut kept = 0;
+            for index in 0..count {
+                let row = self.files_entries[index];
+                if ascii_contains(row.name_str(), query.as_str()) {
+                    self.files_entries[kept] = row;
+                    kept += 1;
+                }
+            }
+            count = kept;
+        }
         self.files_entry_count = count;
         self.files_overflow = overflow;
+        self.files_remember();
         if self.files_selected >= count {
             self.files_selected = usize::MAX;
         }
@@ -2922,8 +3047,64 @@ impl DesktopState {
         joined
     }
 
+    /// Puts the open folder first in the sidebar's recent folders.
+    fn files_remember(&mut self) {
+        let current = self.files_path;
+        if current.as_str().is_empty() {
+            return;
+        }
+        let mut next = [shell::Text::<256>::new(); FILES_RECENT];
+        next[0] = current;
+        let mut used = 1;
+        for item in self.files_recent {
+            if used < FILES_RECENT && !item.as_str().is_empty() && item.as_str() != current.as_str() {
+                next[used] = item;
+                used += 1;
+            }
+        }
+        self.files_recent = next;
+    }
+
+    /// Opens a sidebar place, making the folder if it is not there yet.
+    fn files_open_path(&mut self, path: &str) {
+        if path.is_empty() {
+            return;
+        }
+        let _ = crate::vfs::create_directory(path, 0o755);
+        let mut name: shell::Text<256> = shell::Text::new();
+        let _ = name.push_str_checked(path);
+        self.files_path = name;
+        self.files_selected = usize::MAX;
+        self.files_status.clear();
+        self.files_query.clear();
+        self.files_searching = false;
+        self.files_reload();
+    }
+
+    fn files_go(&mut self, place: FilesPlace) {
+        let target: shell::Text<256> = match place {
+            FilesPlace::Recents => {
+                let current = self.files_path;
+                self.files_recent
+                    .iter()
+                    .copied()
+                    .find(|item| !item.as_str().is_empty() && item.as_str() != current.as_str())
+                    .unwrap_or(current)
+            }
+            FilesPlace::Recent(slot) => self.files_recent[slot],
+            other => {
+                let mut path: shell::Text<256> = shell::Text::new();
+                let _ = path.push_str_checked(files_place_path(other));
+                path
+            }
+        };
+        self.files_open_path(target.as_str());
+    }
+
     fn files_navigate(&mut self, name: &str) {
         let joined = self.files_child_path(name);
+        self.files_query.clear();
+        self.files_searching = false;
         self.files_path = joined;
         self.files_selected = usize::MAX;
         self.files_status.clear();
@@ -3812,6 +3993,39 @@ fn terminal_submit(state: &mut DesktopState, shell: &mut shell::Shell<'_>) -> sh
     state.terminal_back = 0;
     state.terminal_history_index = 0;
 
+    if linuxsh::claims(state, command.as_str()) {
+        linuxsh::submit(state, command.as_str());
+        return shell::Control::None;
+    }
+    if command.as_str() == "glass" || command.as_str().starts_with("glass ") {
+        let mut echo: shell::Text<{ TERMINAL_INPUT_MAX + 64 }> = shell::Text::new();
+        let _ = write!(echo, "{}> {}", state.display_name(), command.as_str());
+        state.terminal_push_wrapped(echo.as_str());
+        glass_command(state, command.as_str());
+        return shell::Control::None;
+    }
+    if command.as_str() == "touchscreen" {
+        let mut echo: shell::Text<{ TERMINAL_INPUT_MAX + 64 }> = shell::Text::new();
+        let _ = write!(echo, "{}> {}", state.display_name(), command.as_str());
+        state.terminal_push_wrapped(echo.as_str());
+        crate::i2c_touch::describe(|line| state.terminal_push_wrapped(line));
+        return shell::Control::None;
+    }
+    if command.as_str() == "screentime" || command.as_str().starts_with("screentime ") {
+        let mut echo: shell::Text<{ TERMINAL_INPUT_MAX + 64 }> = shell::Text::new();
+        let _ = write!(echo, "{}> {}", state.display_name(), command.as_str());
+        state.terminal_push_wrapped(echo.as_str());
+        screen_time_command(state, command.as_str());
+        return shell::Control::None;
+    }
+    if command.as_str() == "theme" || command.as_str().starts_with("theme ") {
+        let mut echo: shell::Text<{ TERMINAL_INPUT_MAX + 64 }> = shell::Text::new();
+        let _ = write!(echo, "{}> {}", state.display_name(), command.as_str());
+        state.terminal_push_wrapped(echo.as_str());
+        terminal_theme_command(state, command.as_str());
+        return shell::Control::None;
+    }
+
     let prefix = if shell.is_elevated() {
         "root"
     } else {
@@ -4170,7 +4384,8 @@ impl KeyDecoder {
             0x10 => Some(DesktopKey::Quick),
             0x19 => Some(DesktopKey::Power),
             0x31 => Some(DesktopKey::Notifications),
-            0x35 => Some(DesktopKey::Search),
+            // D: Do not disturb, while the notification stack is open.
+            0x20 => Some(DesktopKey::Character('d')),
             0x21 => Some(DesktopKey::Menu),
             0x3f => Some(DesktopKey::BrightnessDown),
             0x40 => Some(DesktopKey::BrightnessUp),
@@ -4478,6 +4693,11 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
     let mut decoder = KeyDecoder::new();
     let mut cursor = CursorSprite::new();
     crate::mouse::set_bounds(frame.width(), frame.height());
+    serial::format(format_args!(
+        "AEROS_DESKTOP_STATE bytes={}
+",
+        core::mem::size_of::<DesktopState>()
+    ));
     let _ = present_desktop_mode(frame, fonts, &state, true);
     cursor.paint(frame, cursor_target(frame));
     crate::virtio_gpu::publish(frame);
@@ -4523,6 +4743,7 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
     let mut touch_moved = false;
     let mut last_input_ns = crate::time::monotonic_nanoseconds();
     let mut splash_was_active = true;
+    let mut screen_time_last_ns = crate::time::monotonic_nanoseconds();
     loop {
         let mut redraw = false;
         let splash_active = boot_splash(crate::time::monotonic_nanoseconds()).is_some();
@@ -4663,6 +4884,12 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 continue;
             }
             if state.screen == Screen::Desktop {
+                // Super+Space: search.
+                if scancode != 0xe0 && code == 0x39 && !was_extended && !released && meta_down {
+                    meta_used = true;
+                    redraw |= state.handle(DesktopKey::Search) == DesktopAction::Redraw;
+                    continue;
+                }
                 // Super+L: lock the session.
                 if scancode != 0xe0 && code == 0x26 && !was_extended {
                     if !released && meta_down {
@@ -4679,7 +4906,11 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 // Super+V: clipboard history.
                 if scancode != 0xe0 && code == 0x2f && !was_extended {
                     if !released && meta_down {
-                        state.clip_open = !state.clip_open;
+                        let opening = !state.clip_open;
+                        if opening {
+                            state.close_popups();
+                        }
+                        state.clip_open = opening;
                         state.clip_at_ns = crate::time::monotonic_nanoseconds();
                         state.motion_until_ns =
                             state.motion_until_ns.max(state.clip_at_ns + 700_000_000);
@@ -4778,6 +5009,33 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 redraw = true;
                 continue;
             }
+            // Files: Ctrl+H shows or hides hidden items; Ctrl+Shift+H hides
+            // or unhides the selected one.
+            if ctrl_down
+                && !was_extended
+                && !released
+                && code == 0x23
+                && state.screen == Screen::Desktop
+                && state.app == DesktopApp::Files
+                && state.overlay == Overlay::None
+                && state.files_mode == FilesMode::Browsing
+            {
+                if shift_held {
+                    state.files_toggle_hidden_selected();
+                } else {
+                    let shown = !SHOW_HIDDEN.load(Ordering::Relaxed);
+                    SHOW_HIDDEN.store(shown, Ordering::Relaxed);
+                    state.files_reload();
+                    state.files_status.clear();
+                    let _ = state.files_status.push_str_checked(if shown {
+                        "Showing hidden items (Ctrl+H hides them)"
+                    } else {
+                        "Hidden items are hidden (Ctrl+H shows them)"
+                    });
+                }
+                redraw = true;
+                continue;
+            }
             // Files: Ctrl+C / Ctrl+X / Ctrl+V set a file aside and place it.
             if ctrl_down
                 && !was_extended
@@ -4811,6 +5069,18 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                     let page = SHELL_HISTORY_LINES as i32 - 1;
                     state.terminal_scroll_by(if code == 0x49 { page } else { -page });
                 }
+                redraw = true;
+                continue;
+            }
+            // Ctrl+C for a command running in Debian (Linux mode).
+            if ctrl_down
+                && !was_extended
+                && !released
+                && code == 0x2e
+                && state.screen == Screen::Desktop
+                && state.app == DesktopApp::Terminal
+                && linuxsh::interrupt(&mut state)
+            {
                 redraw = true;
                 continue;
             }
@@ -4891,6 +5161,7 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
             let fed = decoder.feed(scancode);
             if state.caps_lock != decoder.caps {
                 state.caps_lock = decoder.caps;
+                let _ = keyboard::set_leds(decoder.caps, false, false);
                 redraw = true;
             }
             let Some(key) = fed else {
@@ -5351,7 +5622,10 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
             let generation = crate::notify::generation();
             if generation != state.notif_seen {
                 state.notif_seen = generation;
-                if state.screen == Screen::Desktop && !state.notif_open {
+                if state.screen == Screen::Desktop
+                    && !state.notif_open
+                    && !crate::notify::do_not_disturb()
+                {
                     state.notice_arrived(now);
                 }
                 redraw = true;
@@ -5419,12 +5693,14 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
         }
         crate::audio::pump();
         crate::xhci::poll();
+        crate::i2c_touch::poll();
         #[cfg(feature = "linux-drivers")]
         {
             crate::linux::poll();
             if let Some(info) = crate::linux::take_display(frame.info()) {
                 // SAFETY: the driver's framebuffer, mapped and at least this big.
                 unsafe { frame.retarget(info) };
+                crate::framebuffer::reapply_brightness();
                 let _ = present_desktop_mode(frame, fonts, &state, true);
                 cursor.erase(frame);
                 cursor.paint(frame, cursor_target(frame));
@@ -5455,6 +5731,14 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 setup_caret = caret_now;
                 redraw = true;
             }
+        }
+        {
+            let now = crate::time::monotonic_nanoseconds();
+            screen_time_tick(&state, now.saturating_sub(screen_time_last_ns), last_input_ns, now);
+            screen_time_last_ns = now;
+        }
+        if linuxsh::poll(&mut state, crate::time::monotonic_nanoseconds()) {
+            redraw |= state.app == DesktopApp::Terminal;
         }
         if state.app == DesktopApp::Terminal {
             let blink_phase_now =
@@ -6781,6 +7065,8 @@ fn present_desktop_mode(
         return false;
     }
     let shadow = &mut shadow_slice()[..required];
+    #[cfg(feature = "linux-drivers")]
+    crate::linux::wait_vblank();
     if full {
         frame.present_full(&staging, shadow)
     } else {
@@ -6847,20 +7133,20 @@ fn draw_desktop_base(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &Deskt
         && now.saturating_sub(state.screen_transition_at_ns) < LOCK_LOGIN_SCROLL_NS;
     let opening = state.screen == Screen::Desktop
         && state.app != DesktopApp::None
-        && now.saturating_sub(state.window_open_at_ns) < WINDOW_OPEN_NS;
+        && now.saturating_sub(state.window_open_at_ns) < WINDOW_MORPH_NS;
     let window_closing = state.screen == Screen::Desktop
         && state.app_closing != DesktopApp::None
         && state.app != state.app_closing
-        && now.saturating_sub(state.app_close_at_ns) < WINDOW_OPEN_NS;
+        && now.saturating_sub(state.app_close_at_ns) < WINDOW_MORPH_NS;
     let sliding_overlay = if state.screen != Screen::Desktop {
         None
     } else if matches!(state.overlay, Overlay::Apps | Overlay::Quick)
-        && now.saturating_sub(state.overlay_open_at_ns) < OVERLAY_TRANSITION_NS
+        && !state.overlay_motion.settled(now)
     {
         Some(state.overlay)
     } else if matches!(state.overlay_closing, Overlay::Apps | Overlay::Quick)
         && state.overlay != state.overlay_closing
-        && now.saturating_sub(state.overlay_close_at_ns) < OVERLAY_TRANSITION_NS
+        && !state.overlay_motion.settled(now)
     {
         Some(state.overlay_closing)
     } else {
@@ -6875,9 +7161,20 @@ fn draw_desktop_base(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &Deskt
         let card = layout.rect(LOGIN_CARD);
         Some(Rect::new(card.x, 0, card.width, frame.height() as i32))
     } else if opening {
-        Some(layout.rect(window_base_rect(state.app)))
+        Some(layout.rect(window_motion_bounds(state.app)))
     } else if window_closing {
-        Some(layout.rect(window_base_rect(state.app_closing)))
+        Some(layout.rect(window_motion_bounds(state.app_closing)))
+    } else if sliding_overlay == Some(Overlay::Quick) {
+        // The spring overshoots to 1.2x around the gear, so clear that much.
+        let p = panels::QUICK_PANEL;
+        let grow = |v: i32, anchor: i32| anchor + (v - anchor) * 6 / 5;
+        let left = grow(p.x, QUICK_ANCHOR.x);
+        let top = grow(p.y, QUICK_ANCHOR.y);
+        let right = grow(p.x + p.width, QUICK_ANCHOR.x);
+        let bottom = grow(p.y + p.height, QUICK_ANCHOR.y);
+        Some(layout.rect(Rect::new(left, top, right - left, bottom - top).expand(28)))
+    } else if sliding_overlay == Some(Overlay::Apps) {
+        None
     } else if let Some(overlay) = sliding_overlay {
         let physical = layout.rect(overlay_panel_rect(overlay));
         let extra = layout.scale.logical(OVERLAY_SLIDE_PX);
@@ -7033,13 +7330,14 @@ fn draw_desktop_base(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &Deskt
         && now >= state.shield_until_ns
         && fade_alpha == 0
         && loading_overlay(state, now).is_none()
-        && now.saturating_sub(state.overlay_open_at_ns) > OVERLAY_TRANSITION_NS + 100_000_000;
+        && state.overlay_motion.settled(now);
     let screen_len = (frame_pixels(screen_bounds)).min(screen_capacity());
     let panel_key = dock_cache_key(layout, screen_bounds)
         ^ ((state.app_focus as u64 + 1) << 8)
         ^ ((state.focus_visible as u64) << 20)
         ^ ((state.launcher_hover as u64) << 21)
         ^ ((crate::store::get().count as u64) << 24)
+        ^ (text_hash(state.launcher_query.as_str()) ^ state.launcher_typing as u64).rotate_left(40)
         ^ 0x9a7e_0000;
     let panel_cache = panel_buffer();
     if panel_static
@@ -7100,14 +7398,12 @@ fn draw_desktop_base(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &Deskt
         }
     }
     if state.overlay == Overlay::Quick || sliding_overlay == Some(Overlay::Quick) {
-        let opening = state.overlay == Overlay::Quick;
-        let at_ns = if opening {
-            state.overlay_open_at_ns
-        } else {
-            state.overlay_close_at_ns
-        };
-        let panel_layout = overlay_slide_layout(layout, opening, at_ns, now);
-        let _ = panels::draw_quick(&mut painter, panel_layout, ui_font, state, now);
+        // Grows out of the gear and springs into place, like Control Center.
+        let reveal = state.overlay_motion.value(now).clamp(0, 1_200);
+        if reveal > 30 {
+            let panel_layout = grow_from(layout, QUICK_ANCHOR, reveal);
+            let _ = panels::draw_quick(&mut painter, panel_layout, ui_font, state, now);
+        }
     }
     if state.clip_open {
         panels::draw_clipboard_panel(&mut painter, layout, ui_font, state, now);
@@ -7167,7 +7463,7 @@ fn draw_desktop_base(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &Deskt
         result
     };
     prof_add(PROF_DOCK, t_dock);
-    if menu::corners_shown(state, window_closing, opening, sliding_overlay) {
+    if menu::corners_shown(state, sliding_overlay) {
         menu::draw_corners(&mut painter, layout, state);
     }
     draw_music_hub(&mut painter, layout, ui_font, state, now);
@@ -7236,6 +7532,23 @@ fn overlay_panel_rect(overlay: Overlay) -> Rect {
 
 /// 0 = fully hidden (before opening / end of closing), 1000 = fully shown
 /// (settled open / start of closing), eased either direction.
+/// Where quick settings grows from: its gear in the top-right corner.
+const QUICK_ANCHOR: Point = Point::new(736, 22);
+
+/// `layout` scaled by `milli` / 1000 around `anchor` (logical), so whatever
+/// is drawn with it grows out of that point: size, position and corner
+/// curvature together.
+fn grow_from(layout: Layout, anchor: Point, milli: i32) -> Layout {
+    let scale = layout.scale.scaled_by(milli);
+    let x = layout.offset.x + layout.scale.logical(anchor.x);
+    let y = layout.offset.y + layout.scale.logical(anchor.y);
+    Layout {
+        scale,
+        offset: Point::new(x - scale.logical(anchor.x), y - scale.logical(anchor.y)),
+    }
+}
+
+#[allow(dead_code)]
 fn overlay_reveal_milli(opening: bool, at_ns: u64, now_ns: u64) -> i32 {
     let elapsed = now_ns.saturating_sub(at_ns);
     let progress_milli = if elapsed >= OVERLAY_TRANSITION_NS {
@@ -7252,17 +7565,6 @@ fn overlay_reveal_milli(opening: bool, at_ns: u64, now_ns: u64) -> i32 {
 /// position — the panel is tall enough that its starting position is
 /// mostly off-canvas, which is fine, it just means most of it is clipped
 /// away by the screen bounds until it slides into view.
-fn overlay_slide_layout(layout: Layout, opening: bool, at_ns: u64, now_ns: u64) -> Layout {
-    let reveal_milli = overlay_reveal_milli(opening, at_ns, now_ns);
-    let slide_logical = OVERLAY_SLIDE_PX * (1000 - reveal_milli) / 1000;
-    let mut shifted = layout;
-    shifted.offset.y = shifted
-        .offset
-        .y
-        .saturating_add(layout.scale.logical(slide_logical));
-    shifted
-}
-
 fn app_icon_fall_offset(panel_opened_at_ns: u64, index: usize, now_ns: u64) -> i32 {
     let start = panel_opened_at_ns.saturating_add(index as u64 * APP_ICON_FALL_STAGGER_NS);
     if now_ns < start {
@@ -7276,6 +7578,72 @@ fn app_icon_fall_offset(panel_opened_at_ns: u64, index: usize, now_ns: u64) -> i
     };
     let eased = ease_out_milli(progress_milli) as i32;
     APP_ICON_FALL_PX * (1000 - eased) / 1000
+}
+
+/// Where a window grows from: its dock icon, or a slightly smaller copy of
+/// itself for apps without one.
+fn window_origin(app: DesktopApp, base: Rect) -> Rect {
+    for index in 0..10 {
+        if search::dock_app(index) == app {
+            return dock_icon_rect(index);
+        }
+    }
+    let width = base.width * 85 / 100;
+    let height = base.height * 85 / 100;
+    Rect::new(
+        base.x + (base.width - width) / 2,
+        base.y + (base.height - height) / 2,
+        width,
+        height,
+    )
+}
+
+/// Everything a window covers while it morphs to or from its origin.
+fn window_motion_bounds(app: DesktopApp) -> Rect {
+    let base = window_base_rect(app);
+    let from = window_origin(app, base);
+    let x = base.x.min(from.x) - 12;
+    let y = base.y.min(from.y) - 12;
+    Rect::new(
+        x,
+        y,
+        base.right().max(from.right()) + 12 - x,
+        base.bottom().max(from.bottom()) + 12 - y,
+    )
+}
+
+/// `layout` mapped so a window drawn at its full size lands on a rectangle
+/// travelling between its origin and its place: opening springs out with a
+/// little overshoot, closing settles back in. Contents, corners and glass
+/// scale with it.
+fn window_morph_layout(layout: Layout, state: &DesktopState, now_ns: u64, closing: bool) -> Layout {
+    let (app, at) = if closing {
+        (state.app_closing, state.app_close_at_ns)
+    } else {
+        (state.app, state.window_open_at_ns)
+    };
+    if at == 0 || now_ns.saturating_sub(at) >= WINDOW_MORPH_NS {
+        return layout;
+    }
+    let progress = progress_of(now_ns, at, WINDOW_MORPH_NS);
+    let t = if closing {
+        1000 - motion::spring_curve(progress, 1_000)
+    } else {
+        motion::spring_curve(progress, 720)
+    };
+    let base = window_base_rect(state.app);
+    let from = window_origin(app, base);
+    let x = lerp_i32(from.x, base.x, t);
+    let y = lerp_i32(from.y, base.y, t);
+    let width = lerp_i32(from.width, base.width, t).max(4);
+    let scale = layout.scale.scaled_by(width * 1000 / base.width.max(1));
+    Layout {
+        scale,
+        offset: Point::new(
+            layout.offset.x + layout.scale.logical(x) - scale.logical(base.x),
+            layout.offset.y + layout.scale.logical(y) - scale.logical(base.y),
+        ),
+    }
 }
 
 fn window_open_scale(base: Rect, opened_at_ns: u64, now_ns: u64) -> Rect {
@@ -7558,12 +7926,18 @@ fn draw_app_switcher(
     // While the panel moves it is still real glass, but the colour work is
     // done per 3x3 block (about 9x cheaper): the full-quality blur of a
     // panel this size made the slide choppy.
+    let screen = painter.screen();
     let surface = painter
         .frosted_rounded_rect_stepped(
-            layout.rect(LAUNCHER_PANEL),
-            layout.radii(CornerRadii::all(30)),
+            screen,
+            CornerRadii::all(0),
             {
-                let mut style = layout.frost(dock_style());
+                let mut style = layout.frost(FrostStyle {
+                    blur_radius: 36,
+                    ..dock_style()
+                });
+                style.tint = Rgba::new(0, 0, 0, 64);
+                style.border = Rgba::transparent();
                 if cheap {
                     style.shadow = Rgba::transparent();
                     style.shadow_spread = 0;
@@ -7577,14 +7951,16 @@ fn draw_app_switcher(
         .captured;
     let controls = true;
     let page = state.app_focus / LAUNCHER_PAGE;
-    for index in page * LAUNCHER_PAGE..launcher_len().min((page + 1) * LAUNCHER_PAGE) {
+    let mut shown = [0; LAUNCHER_PAGE];
+    let count = launcher_shown(state, &mut shown);
+    for (slot, &index) in shown[..count].iter().enumerate() {
         let fall = if opening {
             app_icon_fall_offset(panel_opened_at_ns, index, now_ns)
         } else {
             0
         };
         let icon_layout = shift_layout_y(layout, fall);
-        let tile = launcher_tile(index);
+        let tile = launcher_tile(slot);
         draw_app_tile(painter, icon_layout, tile);
         if state.focus_visible && state.app_focus == index {
             painter.stroke_rounded_rect(
@@ -7613,24 +7989,38 @@ fn draw_app_switcher(
     painter.fill_rounded_rect(
         layout.rect(LAUNCHER_SEARCH),
         layout.radii(CornerRadii::all(LAUNCHER_SEARCH.height / 2)),
-        Rgba::new(40, 82, 92, 150),
+        Rgba::new(0, 0, 0, 235),
     );
     painter.stroke_rounded_rect(
         layout.rect(LAUNCHER_SEARCH),
         layout.radii(CornerRadii::all(LAUNCHER_SEARCH.height / 2)),
         1,
-        Rgba::new(10, 22, 28, 200),
+        Rgba::new(255, 255, 255, 230),
     );
-    centered_text(
-        painter,
-        layout,
-        font,
-        LAUNCHER_SEARCH,
-        "Search",
-        15,
-        Color::rgb(214, 228, 233),
-    );
-    for dot in 0..launcher_pages() {
+    let query = state.launcher_query.as_str();
+    let mut pill: shell::Text<32> = shell::Text::new();
+    if state.launcher_typing || !query.is_empty() {
+        let _ = pill.push_str_checked(query);
+        if state.launcher_typing {
+            let _ = pill.push_str_checked("|");
+        }
+    } else {
+        let _ = pill.push_str_checked("Search");
+    }
+    centered_text(painter, layout, font, LAUNCHER_SEARCH, pill.as_str(), 15, Color::rgb(255, 255, 255));
+    if count == 0 {
+        centered_text(
+            painter,
+            layout,
+            font,
+            Rect::new(0, 190, DESIGN_WIDTH, 20),
+            "No apps match",
+            13,
+            Color::rgb(200, 200, 200),
+        );
+    }
+    let dots = if query.is_empty() { launcher_pages() } else { 0 };
+    for dot in 0..dots {
         painter.fill_rounded_rect(
             layout.rect(launcher_dot(dot)),
             layout.radii(CornerRadii::all(4)),
@@ -7772,23 +8162,276 @@ fn terminal_tab(window: Rect) -> Rect {
 
 /// The Terminal as designed: black, with a dark grey title bar holding a
 /// black tab pill and a "+".
+/// Screen time this session: milliseconds each app was in front while the
+/// user was active (input in the last five minutes), by `DesktopApp`.
+static SCREEN_TIME_MS: [core::sync::atomic::AtomicU64; 10] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 10];
+/// The daily limit in minutes (0 = none) and whether its reminder was shown.
+static SCREEN_LIMIT_MINUTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SCREEN_LIMIT_WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+const SCREEN_ACTIVE_NS: u64 = 300_000_000_000;
+
+const SCREEN_TIME_APPS: [(DesktopApp, &str); 9] = [
+    (DesktopApp::Browser, "Browser"),
+    (DesktopApp::Settings, "Settings"),
+    (DesktopApp::Files, "Files"),
+    (DesktopApp::Notes, "Notes"),
+    (DesktopApp::Trash, "Trash"),
+    (DesktopApp::Terminal, "Terminal"),
+    (DesktopApp::Linux, "Linux"),
+    (DesktopApp::Store, "Store"),
+    (DesktopApp::Avatar, "Avatar"),
+];
+
+/// Counts `elapsed` towards the app in front, and reminds once when the
+/// day's limit is passed.
+fn screen_time_tick(state: &DesktopState, elapsed_ns: u64, last_input_ns: u64, now: u64) {
+    if state.screen != Screen::Desktop
+        || state.app == DesktopApp::None
+        || now.saturating_sub(last_input_ns) > SCREEN_ACTIVE_NS
+    {
+        return;
+    }
+    let slot = state.app as usize % SCREEN_TIME_MS.len();
+    SCREEN_TIME_MS[slot].fetch_add(elapsed_ns.min(1_000_000_000) / 1_000_000, Ordering::Relaxed);
+    let limit = SCREEN_LIMIT_MINUTES.load(Ordering::Relaxed);
+    if limit != 0
+        && screen_time_total_ms() >= limit * 60_000
+        && !SCREEN_LIMIT_WARNED.swap(true, Ordering::Relaxed)
+    {
+        let mut body = ClockBuffer56::new();
+        let _ = write!(body, "You've used apps for {limit} minutes today.");
+        crate::notify::push(1, "Screen time limit reached", body.as_str());
+    }
+}
+
+fn screen_time_total_ms() -> u64 {
+    SCREEN_TIME_MS.iter().map(|value| value.load(Ordering::Relaxed)).sum()
+}
+
+fn push_duration(out: &mut impl Write, milliseconds: u64) {
+    let minutes = milliseconds / 60_000;
+    let _ = if minutes >= 60 {
+        write!(out, "{}h {}m", minutes / 60, minutes % 60)
+    } else if minutes > 0 {
+        write!(out, "{minutes}m")
+    } else {
+        write!(out, "{}s", milliseconds / 1000)
+    };
+}
+
+/// `screentime`, `screentime limit <minutes>` and `screentime limit off`.
+fn screen_time_command(state: &mut DesktopState, line: &str) {
+    let rest = line["screentime".len()..].trim();
+    if let Some(value) = rest.strip_prefix("limit") {
+        let value = value.trim();
+        if value == "off" || value == "0" {
+            SCREEN_LIMIT_MINUTES.store(0, Ordering::Relaxed);
+            state.terminal_push_line("Screen time limit is off.");
+        } else if let Ok(minutes) = value.parse::<u64>() {
+            SCREEN_LIMIT_MINUTES.store(minutes.min(24 * 60), Ordering::Relaxed);
+            SCREEN_LIMIT_WARNED.store(false, Ordering::Relaxed);
+            let mut text: shell::Text<64> = shell::Text::new();
+            let _ = write!(text, "You'll get a reminder after {} minutes of use.", minutes.min(24 * 60));
+            state.terminal_push_line(text.as_str());
+        } else {
+            state.terminal_push_line("Use: screentime limit <minutes>  or  screentime limit off");
+        }
+        return;
+    }
+    let mut total: shell::Text<64> = shell::Text::new();
+    let _ = total.push_str_checked("Screen time today: ");
+    push_duration(&mut total, screen_time_total_ms());
+    state.terminal_push_line(total.as_str());
+    for (app, name) in SCREEN_TIME_APPS {
+        let used = SCREEN_TIME_MS[app as usize % SCREEN_TIME_MS.len()].load(Ordering::Relaxed);
+        if used >= 1000 {
+            let mut row: shell::Text<64> = shell::Text::new();
+            let _ = write!(row, "  {name:<10} ");
+            push_duration(&mut row, used);
+            state.terminal_push_line(row.as_str());
+        }
+    }
+    let limit = SCREEN_LIMIT_MINUTES.load(Ordering::Relaxed);
+    if limit != 0 {
+        let mut row: shell::Text<64> = shell::Text::new();
+        let _ = write!(row, "Daily limit: {limit} minutes");
+        state.terminal_push_line(row.as_str());
+    }
+}
+
+/// `glass`: shows the glass material; `glass <property> <value>` changes
+/// it (depth, refraction, splay, dispersion, frost, light, angle, tint,
+/// adaptive), `glass reset` restores the defaults.
+fn glass_command(state: &mut DesktopState, line: &str) {
+    let mut optics = crate::aerui::glass_optics();
+    let mut words = line["glass".len()..].split_whitespace();
+    let property = words.next();
+    let value = words.next();
+    let number = value.and_then(|text| text.parse::<u32>().ok());
+    let valid = match (property, value, number) {
+        (None, _, _) => true,
+        (Some("reset"), _, _) => {
+            optics = crate::aerui::GlassOptics::DEFAULT;
+            true
+        }
+        (Some("depth"), _, Some(n)) => {
+            optics.depth = n.min(40) as u8;
+            true
+        }
+        (Some("refraction"), _, Some(n)) => {
+            optics.refraction = n.clamp(100, 300) as u16;
+            true
+        }
+        (Some("splay"), _, Some(n)) => {
+            optics.splay = n.clamp(1, 60) as u8;
+            true
+        }
+        (Some("dispersion"), _, Some(n)) => {
+            optics.dispersion = n.min(80) as u8;
+            true
+        }
+        (Some("frost"), _, Some(n)) => {
+            optics.frost = n.min(200) as u8;
+            true
+        }
+        (Some("light"), _, Some(n)) => {
+            optics.light = n.min(100) as u8;
+            true
+        }
+        (Some("angle"), _, Some(n)) => {
+            optics.light_angle = (n % 360) as u16;
+            true
+        }
+        (Some("adaptive"), Some(word), _) => {
+            optics.adaptive = word == "on";
+            true
+        }
+        (Some("tint"), Some(hex), _) => {
+            let digits = hex.trim_start_matches('#');
+            match u32::from_str_radix(digits, 16) {
+                Ok(rgb) if digits.len() == 6 => {
+                    let opacity = words
+                        .next()
+                        .and_then(|text| text.trim_end_matches('%').parse::<u32>().ok())
+                        .unwrap_or(25)
+                        .min(100);
+                    optics.tint = Rgba::new(
+                        (rgb >> 16) as u8,
+                        (rgb >> 8) as u8,
+                        rgb as u8,
+                        (opacity * 255 / 100) as u8,
+                    );
+                    true
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    if !valid {
+        state.terminal_push_wrapped(
+            "Use: glass [reset | depth | refraction | splay | dispersion | frost | light | angle <n> | tint #rrggbb [opacity%] | adaptive on|off]",
+        );
+        return;
+    }
+    crate::aerui::set_glass_optics(optics);
+    let _ = crate::settings::save();
+    let mut row: shell::Text<160> = shell::Text::new();
+    let _ = write!(
+        row,
+        "depth {} refraction {}.{:02} splay {} dispersion {}% frost {}% light {}% at {} deg",
+        optics.depth,
+        optics.refraction / 100,
+        optics.refraction % 100,
+        optics.splay,
+        optics.dispersion,
+        optics.frost,
+        optics.light,
+        optics.light_angle
+    );
+    state.terminal_push_wrapped(row.as_str());
+    let mut tint: shell::Text<96> = shell::Text::new();
+    let _ = write!(
+        tint,
+        "tint #{:02x}{:02x}{:02x} at {}% adaptive contrast {}",
+        optics.tint.red,
+        optics.tint.green,
+        optics.tint.blue,
+        (optics.tint.alpha as u32 * 100 + 127) / 255,
+        if optics.adaptive { "on" } else { "off" }
+    );
+    state.terminal_push_wrapped(tint.as_str());
+}
+
+/// A Terminal colour scheme (`theme <name>` in the Terminal).
+#[derive(Clone, Copy)]
+struct TerminalTheme {
+    name: &'static str,
+    background: (u8, u8, u8),
+    header: (u8, u8, u8),
+    text: (u8, u8, u8),
+    prompt: (u8, u8, u8),
+    /// The tab label and close cross on the header.
+    label: (u8, u8, u8),
+}
+
+const TERMINAL_THEMES: [TerminalTheme; 6] = [
+    TerminalTheme { name: "classic", background: (0, 0, 0), header: (58, 58, 58), text: (206, 212, 218), prompt: (40, 240, 40), label: (255, 255, 255) },
+    TerminalTheme { name: "ocean", background: (10, 22, 38), header: (28, 50, 78), text: (200, 226, 245), prompt: (90, 200, 255), label: (230, 242, 255) },
+    TerminalTheme { name: "light", background: (246, 246, 242), header: (214, 214, 208), text: (34, 36, 40), prompt: (0, 120, 70), label: (30, 30, 30) },
+    TerminalTheme { name: "matrix", background: (0, 10, 2), header: (8, 38, 12), text: (90, 255, 130), prompt: (190, 255, 190), label: (190, 255, 190) },
+    TerminalTheme { name: "amber", background: (22, 13, 0), header: (54, 34, 6), text: (255, 192, 90), prompt: (255, 224, 150), label: (255, 224, 150) },
+    TerminalTheme { name: "purple", background: (24, 12, 38), header: (50, 28, 74), text: (226, 212, 246), prompt: (205, 145, 255), label: (240, 230, 255) },
+];
+
+static TERMINAL_THEME: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn terminal_theme() -> TerminalTheme {
+    TERMINAL_THEMES[TERMINAL_THEME.load(Ordering::Relaxed) % TERMINAL_THEMES.len()]
+}
+
+/// `theme` lists the Terminal colour schemes, `theme <name>` picks one.
+fn terminal_theme_command(state: &mut DesktopState, line: &str) {
+    let wanted = line["theme".len()..].trim();
+    if wanted.is_empty() {
+        let mut list: shell::Text<120> = shell::Text::new();
+        let _ = list.push_str_checked("Themes:");
+        for (index, theme) in TERMINAL_THEMES.iter().enumerate() {
+            let _ = list.push_str_checked(" ");
+            let _ = list.push_str_checked(theme.name);
+            if index == TERMINAL_THEME.load(Ordering::Relaxed) {
+                let _ = list.push_str_checked("*");
+            }
+        }
+        state.terminal_push_line(list.as_str());
+        state.terminal_push_line("Pick one with: theme <name>");
+        return;
+    }
+    match TERMINAL_THEMES.iter().position(|theme| theme.name.eq_ignore_ascii_case(wanted)) {
+        Some(index) => TERMINAL_THEME.store(index, Ordering::Relaxed),
+        None => state.terminal_push_line("No such theme. Type theme to see them."),
+    }
+}
+
 fn draw_terminal_chrome(painter: &mut Painter<'_>, layout: Layout, font: RasterFont, outer: Rect) {
-    let white = Rgba::opaque(255, 255, 255);
+    let theme = terminal_theme();
+    let white = Rgba::opaque(theme.label.0, theme.label.1, theme.label.2);
     painter.fill_rounded_rect(
         layout.rect(outer),
         layout.radii(CornerRadii::all(30)),
-        Rgba::opaque(0, 0, 0),
+        Rgba::opaque(theme.background.0, theme.background.1, theme.background.2),
     );
     painter.fill_rounded_rect(
         layout.rect(Rect::new(outer.x, outer.y, outer.width, 53)),
         layout.radii(CornerRadii::new(30, 30, 0, 0)),
-        Rgba::opaque(58, 58, 58),
+        Rgba::opaque(theme.header.0, theme.header.1, theme.header.2),
     );
     let tab = terminal_tab(outer);
     painter.fill_rounded_rect(
         layout.rect(tab),
         layout.radii(CornerRadii::all(tab.height / 2)),
-        Rgba::opaque(0, 0, 0),
+        Rgba::opaque(theme.background.0, theme.background.1, theme.background.2),
     );
     text(
         painter,
@@ -7797,7 +8440,7 @@ fn draw_terminal_chrome(painter: &mut Painter<'_>, layout: Layout, font: RasterF
         Point::new(tab.x + 24, tab.y + 11),
         "Terminal",
         14,
-        Color::rgb(255, 255, 255),
+        Color::rgb(theme.label.0, theme.label.1, theme.label.2),
     );
     let cross = Point::new(tab.right() - 19, tab.y + tab.height / 2);
     for step in -3..=3 {
@@ -7843,6 +8486,7 @@ fn window_controls_anchor(app: DesktopApp, window: Rect) -> (i32, i32, i32) {
         DesktopApp::Terminal => (window.right() - 21, window.y + 27, 24),
         DesktopApp::Notes => (window.right() - 36, window.y + 40, 24),
         DesktopApp::Browser => (window.right() - 22, window.y + 31, 24),
+        DesktopApp::Files => (window.right() - 22, window.y + 22, 24),
         _ => (window.right() - 20, window.y + 14, 26),
     }
 }
@@ -7974,12 +8618,9 @@ fn draw_window(
     closing: bool,
 ) -> bool {
     let base = window_base_rect(state.app);
-    let outer = if closing {
-        window_close_scale(base, state.app_close_at_ns, now_ns)
-    } else {
-        window_open_scale(base, state.window_open_at_ns, now_ns)
-    };
-    let opening = !closing && now_ns.saturating_sub(state.window_open_at_ns) < WINDOW_OPEN_NS;
+    let layout = window_morph_layout(layout, state, now_ns, closing);
+    let outer = base;
+    let opening = !closing && now_ns.saturating_sub(state.window_open_at_ns) < WINDOW_MORPH_NS;
     let blur_off = opening || closing || state.app == DesktopApp::Browser;
     // A settled window's frosted body only depends on the wallpaper, so it is
     // rendered once and replayed (every keystroke used to re-blur it).
@@ -8050,6 +8691,14 @@ fn draw_window(
             layout.radii(CornerRadii::all(46)),
             Rgba::new(255, 251, 0, 130),
         );
+    } else if state.app == DesktopApp::Files {
+        painter.fill_rounded_rect(layout.rect(outer), layout.radii(CornerRadii::all(22)), Rgba::opaque(22, 22, 23));
+        painter.stroke_rounded_rect(
+            layout.rect(outer),
+            layout.radii(CornerRadii::all(22)),
+            1,
+            Rgba::new(255, 255, 255, 70),
+        );
     } else if state.app == DesktopApp::Browser {
         draw_browser(painter, layout, ui_font, mono_font, state);
         draw_window_controls(painter, layout, state.app, outer);
@@ -8069,7 +8718,7 @@ fn draw_window(
         match state.app {
             DesktopApp::Browser => "Browser",
             DesktopApp::Settings => "",
-            DesktopApp::Files => "Files",
+            DesktopApp::Files => "",
             DesktopApp::Notes => "",
             DesktopApp::Trash => "Trash",
             DesktopApp::Terminal => "",
@@ -8321,7 +8970,10 @@ fn draw_shell_window(
             at,
             line,
             11,
-            Color::rgb(206, 212, 218),
+            {
+                let ink = terminal_theme().text;
+                Color::rgb(ink.0, ink.1, ink.2)
+            },
         );
     }
     drop(older);
@@ -8336,7 +8988,7 @@ fn draw_shell_window(
         visible
     };
     let prompt_y = scrollback_top + prompt_row as i32 * SHELL_ROW;
-    let mut prompt: shell::Text<48> = shell::Text::new();
+    let mut prompt: shell::Text<160> = shell::Text::new();
     if job {
     } else if scroll > 0 {
         let _ = write!(prompt, "-- {scroll} lines back, PgDn returns --");
@@ -8352,6 +9004,8 @@ fn draw_shell_window(
                 PasswdStage::Confirm => "Confirm new password:",
             }
         );
+    } else if state.linux_sh.active || state.linux_sh.running() {
+        state.linux_sh.prompt(&mut prompt);
     } else {
         let prefix = if state.terminal_elevated {
             "root"
@@ -8367,7 +9021,10 @@ fn draw_shell_window(
         Point::new(card.x + 12, prompt_y),
         prompt.as_str(),
         11,
-        Color::rgb(40, 240, 40),
+        {
+            let prompt = terminal_theme().prompt;
+            Color::rgb(prompt.0, prompt.1, prompt.2)
+        },
     );
     // Text width measurement only works in physical pixels, so everything
     // from here on works in the same physical space `layout.point` maps
@@ -8424,7 +9081,10 @@ fn draw_shell_window(
         Point::new(typed_x, prompt_origin.y),
         shown,
         physical_size,
-        Color::rgb(230, 233, 236),
+        {
+            let ink = terminal_theme().text;
+            Color::rgb(ink.0, ink.1, ink.2)
+        },
     );
     if (now_ns / 530_000_000).is_multiple_of(2)
         && scroll == 0
@@ -8443,7 +9103,10 @@ fn draw_shell_window(
                 layout.scale.logical(14),
             ),
             CornerRadii::all(1),
-            Rgba::new(230, 233, 236, 220),
+            {
+                let ink = terminal_theme().text;
+                Rgba::new(ink.0, ink.1, ink.2, 220)
+            },
         );
     }
 }
@@ -9832,6 +10495,141 @@ fn draw_entry_icon_large(painter: &mut Painter<'_>, layout: Layout, origin: Poin
     }
 }
 
+/// The Files window as designed: a header with back, path and search, a
+/// sidebar of places, the item grid and a bottom bar (logical units).
+struct FilesLayout {
+    back: Rect,
+    path: Rect,
+    search: Rect,
+    grid: Rect,
+    status: Rect,
+    buttons: [Rect; 3],
+}
+
+const FILES_HEADER: i32 = 44;
+const FILES_SIDEBAR: i32 = 112;
+const FILES_BUTTONS: [&str; 3] = ["New folder", "Rename", "Delete"];
+
+fn files_layout(outer: Rect) -> FilesLayout {
+    let top = outer.y + 11;
+    let search = Rect::new(outer.right() - 96 - 136, top, 136, 22);
+    let back = Rect::new(outer.x + 14, top, 28, 22);
+    let path = Rect::new(back.right() + 8, top, search.x - 10 - (back.right() + 8), 22);
+    let main_x = outer.x + FILES_SIDEBAR + 10;
+    let main_right = outer.right() - 12;
+    let bar_y = outer.bottom() - 30;
+    let grid_top = outer.y + FILES_HEADER + 8;
+    let grid = Rect::new(main_x, grid_top, main_right - main_x, bar_y - 6 - grid_top);
+    let widths = [70, 56, 52];
+    let mut buttons = [Rect::new(0, 0, 0, 0); 3];
+    let mut x = main_right;
+    for index in (0..3).rev() {
+        x -= widths[index];
+        buttons[index] = Rect::new(x, bar_y, widths[index], 20);
+        x -= 6;
+    }
+    let status = Rect::new(main_x, bar_y, x - main_x, 20);
+    FilesLayout {
+        back,
+        path,
+        search,
+        grid,
+        status,
+        buttons,
+    }
+}
+
+fn files_cell(grid: Rect, index: usize) -> Rect {
+    let width = grid.width / FILES_GRID_COLUMNS;
+    let height = grid.height / FILES_GRID_ROWS;
+    Rect::new(
+        grid.x + (index as i32 % FILES_GRID_COLUMNS) * width,
+        grid.y + (index as i32 / FILES_GRID_COLUMNS) * height,
+        width - 6,
+        height - 6,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FilesPlace {
+    Home,
+    Recents,
+    Desktop,
+    Documents,
+    Recent(usize),
+    Computer,
+    Drive,
+}
+
+fn files_place_path(place: FilesPlace) -> &'static str {
+    let home = crate::datafs::route("/home").is_some();
+    match place {
+        FilesPlace::Home => files_places()[0].1,
+        FilesPlace::Documents => files_places()[1].1,
+        FilesPlace::Desktop if home => "/home/Desktop",
+        FilesPlace::Desktop => "/data/Desktop",
+        FilesPlace::Computer => "/",
+        FilesPlace::Drive => "/media",
+        FilesPlace::Recents | FilesPlace::Recent(_) => "",
+    }
+}
+
+/// Each sidebar row and the place it opens: four places, the recent
+/// folders, then This PC and the external drives.
+fn files_sidebar_rows(outer: Rect) -> [(Rect, FilesPlace); 10] {
+    let top = outer.y + FILES_HEADER;
+    let row = |offset: i32, height: i32| Rect::new(outer.x + 6, top + offset, FILES_SIDEBAR - 12, height);
+    [
+        (row(8, 22), FilesPlace::Home),
+        (row(30, 22), FilesPlace::Recents),
+        (row(52, 22), FilesPlace::Desktop),
+        (row(74, 22), FilesPlace::Documents),
+        (row(107, 20), FilesPlace::Recent(0)),
+        (row(127, 20), FilesPlace::Recent(1)),
+        (row(147, 20), FilesPlace::Recent(2)),
+        (row(167, 20), FilesPlace::Recent(3)),
+        (row(199, 22), FilesPlace::Computer),
+        (row(221, 22), FilesPlace::Drive),
+    ]
+}
+
+fn files_place_shown(state: &DesktopState, place: FilesPlace) -> bool {
+    match place {
+        FilesPlace::Recent(slot) => !state.files_recent[slot].as_str().is_empty(),
+        _ => true,
+    }
+}
+
+fn files_place_label(state: &DesktopState, place: FilesPlace) -> &str {
+    match place {
+        FilesPlace::Home => "Home",
+        FilesPlace::Recents => "Recents",
+        FilesPlace::Desktop => "Desktop",
+        FilesPlace::Documents => "Documents",
+        FilesPlace::Computer => "This PC",
+        FilesPlace::Drive => "External drive",
+        FilesPlace::Recent(slot) => {
+            let path = state.files_recent[slot].as_str();
+            match path.trim_end_matches('/').rsplit('/').next() {
+                Some(name) if !name.is_empty() => name,
+                _ => "/",
+            }
+        }
+    }
+}
+
+fn files_place_icon(place: FilesPlace) -> usize {
+    match place {
+        FilesPlace::Home => 21,
+        FilesPlace::Recents => 22,
+        FilesPlace::Desktop => 23,
+        FilesPlace::Documents => 24,
+        FilesPlace::Recent(_) => 25,
+        FilesPlace::Computer => 26,
+        FilesPlace::Drive => 27,
+    }
+}
+
 fn draw_files(
     painter: &mut Painter<'_>,
     layout: Layout,
@@ -9855,147 +10653,179 @@ fn draw_files(
         );
         return;
     }
-    let content_x = outer.x + 10;
-    let content_y = outer.y + 36;
-    let content_right = outer.x + outer.width - 10;
-    let content_bottom = outer.y + outer.height - 10;
-
-    let sidebar_width = 106;
-    let sidebar = Rect::new(
-        content_x,
-        content_y,
-        sidebar_width,
-        content_bottom - content_y,
+    let parts = files_layout(outer);
+    let square = layout.radii(CornerRadii::all(0));
+    let line = Rgba::new(255, 255, 255, 40);
+    let white = Color::rgb(236, 236, 236);
+    painter.fill_rounded_rect(
+        layout.rect(Rect::new(outer.x, outer.y + FILES_HEADER, outer.width, 1)),
+        square,
+        line,
     );
     painter.fill_rounded_rect(
-        layout.rect(sidebar),
-        layout.radii(CornerRadii::all(14)),
-        Rgba::opaque(228, 241, 250),
-    );
-    text(
-        painter,
-        layout,
-        ui_font,
-        Point::new(sidebar.x + 12, sidebar.y + 8),
-        "Places",
-        11,
-        Color::rgb(60, 95, 110),
-    );
-    for (index, (label, path)) in files_places().iter().enumerate() {
-        let bounds = Rect::new(
-            sidebar.x + 8,
-            sidebar.y + 28 + index as i32 * 30,
-            sidebar_width - 16,
-            26,
-        );
-        let active = state.files_path.as_str() == *path;
-        painter.fill_rounded_rect(
-            layout.rect(bounds),
-            layout.radii(CornerRadii::all(8)),
-            if active {
-                Rgba::new(110, 180, 228, 220)
-            } else {
-                Rgba::new(255, 255, 255, 95)
-            },
-        );
-        text(
-            painter,
-            layout,
-            ui_font,
-            Point::new(bounds.x + 10, bounds.y + 5),
-            label,
-            12,
-            if active {
-                Color::rgb(8, 28, 42)
-            } else {
-                Color::rgb(35, 70, 85)
-            },
-        );
-    }
-    small_button(
-        painter,
-        layout,
-        ui_font,
-        Rect::new(sidebar.x + 8, sidebar.y + 148, sidebar_width - 16, 26),
-        "New folder",
-    );
-    small_button(
-        painter,
-        layout,
-        ui_font,
-        Rect::new(sidebar.x + 8, sidebar.y + 182, sidebar_width - 16, 26),
-        "Delete",
-    );
-    small_button(
-        painter,
-        layout,
-        ui_font,
-        Rect::new(sidebar.x + 8, sidebar.y + 216, sidebar_width - 16, 26),
-        "Rename",
+        layout.rect(Rect::new(
+            outer.x + FILES_SIDEBAR,
+            outer.y + FILES_HEADER + 1,
+            1,
+            outer.height - FILES_HEADER - 16,
+        )),
+        square,
+        line,
     );
 
-    let main_x = sidebar.x + sidebar_width + 12;
-    let main_width = content_right - main_x;
-    small_button(
-        painter,
-        layout,
-        ui_font,
-        Rect::new(main_x, content_y, 44, 24),
-        "Up",
+    painter.fill_rounded_rect(
+        layout.rect(parts.back),
+        layout.radii(CornerRadii::all(11)),
+        Rgba::opaque(58, 58, 60),
     );
-    let mut path_line: shell::Text<96> = shell::Text::new();
-    let _ = path_line.push_str_checked(state.files_path.as_str());
-    glass_label_backing(painter, layout, Rect::new(main_x + 44, content_y, main_width - 44, 24));
+    centered_text(painter, layout, ui_font, parts.back, "<", 13, white);
+    painter.fill_rounded_rect(
+        layout.rect(parts.path),
+        layout.radii(CornerRadii::all(8)),
+        Rgba::opaque(80, 80, 82),
+    );
+    let path = state.files_path.as_str();
+    let room = ((parts.path.width - 20) / 7).max(4) as usize;
+    let mut shown: shell::Text<256> = shell::Text::new();
+    if path.len() > room {
+        let mut start = path.len() - (room - 2);
+        while !path.is_char_boundary(start) {
+            start += 1;
+        }
+        let _ = shown.push_str_checked("..");
+        let _ = shown.push_str_checked(&path[start..]);
+    } else {
+        let _ = shown.push_str_checked(path);
+    }
     text(
         painter,
         layout,
         mono_font,
-        Point::new(main_x + 52, content_y + 5),
-        path_line.as_str(),
+        Point::new(parts.path.x + 10, parts.path.y + 5),
+        shown.as_str(),
+        11,
+        white,
+    );
+    painter.fill_rounded_rect(
+        layout.rect(parts.search),
+        layout.radii(CornerRadii::all(11)),
+        Rgba::opaque(255, 255, 255),
+    );
+    let query = state.files_query.as_str();
+    let mut search: shell::Text<40> = shell::Text::new();
+    if query.is_empty() && !state.files_searching {
+        let _ = search.push_str_checked("Search");
+    } else {
+        let _ = search.push_str_checked(query);
+        if state.files_searching {
+            let _ = search.push_str_checked("|");
+        }
+    }
+    text(
+        painter,
+        layout,
+        ui_font,
+        Point::new(parts.search.x + 12, parts.search.y + 4),
+        search.as_str(),
         12,
-        Color::rgb(25, 65, 76),
+        if query.is_empty() && !state.files_searching {
+            Color::rgb(140, 140, 140)
+        } else {
+            Color::rgb(20, 20, 20)
+        },
     );
 
-    let grid_top = content_y + 32;
-    let status_y = content_bottom - 14;
-    let grid_bounds = Rect::new(main_x, grid_top, main_width, (status_y - 4) - grid_top);
-    painter.fill_rounded_rect(
-        layout.rect(grid_bounds),
-        layout.radii(CornerRadii::all(14)),
-        Rgba::opaque(250, 252, 253),
-    );
-    let clip = layout.rect(grid_bounds);
+    let rows = files_sidebar_rows(outer);
+    for (bounds, place) in rows {
+        if !files_place_shown(state, place) {
+            continue;
+        }
+        let target = match place {
+            FilesPlace::Recent(slot) => state.files_recent[slot].as_str(),
+            other => files_place_path(other),
+        };
+        let active = !target.is_empty() && target == path && !matches!(place, FilesPlace::Recent(_));
+        if active {
+            painter.fill_rounded_rect(
+                layout.rect(bounds),
+                layout.radii(CornerRadii::all(7)),
+                Rgba::new(255, 255, 255, 30),
+            );
+        }
+        let small = matches!(place, FilesPlace::Recent(_));
+        let icon = if small { 13 } else { 15 };
+        painter.draw_rgba_scaled(
+            layout.rect(Rect::new(bounds.x + 6, bounds.y + (bounds.height - icon) / 2, icon, icon)),
+            desktop_icon(files_place_icon(place)),
+            DESKTOP_ICON_SIZE,
+            DESKTOP_ICON_SIZE,
+        );
+        let mut label: shell::Text<20> = shell::Text::new();
+        let name = files_place_label(state, place);
+        if name.len() > 15 {
+            let mut end = 13;
+            while !name.is_char_boundary(end) {
+                end -= 1;
+            }
+            let _ = label.push_str_checked(&name[..end]);
+            let _ = label.push_str_checked("..");
+        } else {
+            let _ = label.push_str_checked(name);
+        }
+        text(
+            painter,
+            layout,
+            ui_font,
+            Point::new(bounds.x + 26, bounds.y + if small { 4 } else { 4 }),
+            label.as_str(),
+            if small { 10 } else { 12 },
+            if small { Color::rgb(205, 205, 205) } else { white },
+        );
+    }
+    for divider in [outer.y + FILES_HEADER + 100, outer.y + FILES_HEADER + 192] {
+        painter.fill_rounded_rect(
+            layout.rect(Rect::new(outer.x, divider, FILES_SIDEBAR, 1)),
+            square,
+            line,
+        );
+    }
+
+    let clip = layout.rect(parts.grid);
     let previous_clip = painter.clip();
     painter.set_clip(clip);
-    let cell_width = main_width / FILES_GRID_COLUMNS;
-    let cell_height = grid_bounds.height / FILES_GRID_ROWS;
     for index in 0..state.files_entry_count {
         let row = state.files_entries[index];
-        let column = index as i32 % FILES_GRID_COLUMNS;
-        let line = index as i32 / FILES_GRID_COLUMNS;
-        let bounds = Rect::new(
-            main_x + column * cell_width,
-            grid_top + line * cell_height,
-            cell_width - 8,
-            cell_height - 6,
-        );
+        let bounds = files_cell(parts.grid, index);
         if index == state.files_selected {
             painter.fill_rounded_rect(
                 layout.rect(bounds),
                 layout.radii(CornerRadii::all(10)),
-                Rgba::new(150, 205, 240, 150),
+                Rgba::new(255, 255, 255, 34),
             );
         }
-        draw_entry_icon_large(
-            painter,
-            layout,
-            Point::new(bounds.x + bounds.width / 2 - 12, bounds.y + 8),
-            row.is_dir,
-        );
+        if row.is_dir {
+            painter.draw_rgba_scaled(
+                layout.rect(Rect::new(bounds.x + bounds.width / 2 - 16, bounds.y + 4, 32, 32)),
+                desktop_icon(25),
+                DESKTOP_ICON_SIZE,
+                DESKTOP_ICON_SIZE,
+            );
+        } else {
+            draw_entry_icon_large(
+                painter,
+                layout,
+                Point::new(bounds.x + bounds.width / 2 - 13, bounds.y + 10),
+                false,
+            );
+        }
         let mut label: shell::Text<20> = shell::Text::new();
         let full = row.name_str();
         if full.len() > 13 {
-            let _ = label.push_str_checked(&full[..12]);
+            let mut end = 12;
+            while !full.is_char_boundary(end) {
+                end -= 1;
+            }
+            let _ = label.push_str_checked(&full[..end]);
             let _ = label.push_str_checked(".");
         } else {
             let _ = label.push_str_checked(full);
@@ -10004,92 +10834,58 @@ fn draw_files(
             painter,
             layout,
             ui_font,
-            Rect::new(bounds.x, bounds.y + cell_height - 22, bounds.width, 16),
+            Rect::new(bounds.x, bounds.y + 40, bounds.width, 16),
             label.as_str(),
             11,
-            Color::rgb(20, 45, 55),
+            white,
         );
     }
     painter.set_clip(previous_clip);
-    glass_label_backing(painter, layout, Rect::new(main_x, status_y - 3, main_width, 18));
     if state.files_entry_count == 0 {
         text(
             painter,
             layout,
-            mono_font,
-            Point::new(main_x + 4, grid_top + 8),
-            "(empty)",
+            ui_font,
+            Point::new(parts.grid.x + 4, parts.grid.y + 8),
+            if query.is_empty() { "This folder is empty" } else { "Nothing matches" },
             12,
-            Color::rgb(90, 106, 112),
+            Color::rgb(150, 150, 150),
         );
     }
-    if let Some(row) = state.files_entries.get(state.files_selected).copied()
-        && state.files_status.as_str().is_empty()
-    {
-        let mut line: shell::Text<96> = shell::Text::new();
+
+    let mut status: shell::Text<96> = shell::Text::new();
+    if !state.files_status.as_str().is_empty() {
+        let _ = status.push_str_checked(state.files_status.as_str());
+    } else if let Some(row) = state.files_entries.get(state.files_selected).copied() {
         if row.is_dir {
-            let _ = write!(line, "{}  -  folder", row.name_str());
+            let _ = write!(status, "{}  -  folder", row.name_str());
         } else {
             let mut size: shell::Text<24> = shell::Text::new();
             format_bytes(row.size, &mut size);
-            let _ = write!(line, "{}  -  {}", row.name_str(), size.as_str());
+            let _ = write!(status, "{}  -  {}", row.name_str(), size.as_str());
         }
-        text(
-            painter,
-            layout,
-            mono_font,
-            Point::new(main_x, status_y),
-            line.as_str(),
-            11,
-            Color::rgb(38, 71, 80),
-        );
     } else if state.files_overflow {
-        let mut line: shell::Text<96> = shell::Text::new();
-        let _ = write!(
-            line,
-            "showing first {} items - more exist on disk",
-            state.files_entry_count
-        );
-        text(
-            painter,
-            layout,
-            mono_font,
-            Point::new(main_x, status_y),
-            line.as_str(),
-            11,
-            Color::rgb(160, 110, 40),
-        );
-    } else if !state.files_status.as_str().is_empty() {
-        text(
-            painter,
-            layout,
-            mono_font,
-            Point::new(main_x, status_y),
-            state.files_status.as_str(),
-            11,
-            Color::rgb(15, 49, 61),
-        );
+        let _ = write!(status, "first {} items shown", state.files_entry_count);
     } else {
-        text(
-            painter,
-            layout,
-            mono_font,
-            Point::new(main_x, status_y),
-            "Arrows select - Enter opens - F2 renames",
-            11,
-            Color::rgb(20, 48, 58),
-        );
+        let _ = write!(status, "{} items", state.files_entry_count);
     }
-}
-
-/// A light rounded strip behind a line of dark text that sits directly on a
-/// window's glass, so it stays readable over dark wallpapers.
-fn glass_label_backing(painter: &mut Painter<'_>, layout: Layout, bounds: Rect) {
-    painter.fill_rounded_rect(
-        layout.rect(bounds),
-        layout.radii(CornerRadii::all(8)),
-        Rgba::new(246, 250, 252, 220),
+    text(
+        painter,
+        layout,
+        mono_font,
+        Point::new(parts.status.x, parts.status.y + 4),
+        status.as_str(),
+        11,
+        Color::rgb(170, 170, 170),
     );
+    for (bounds, label) in parts.buttons.iter().zip(FILES_BUTTONS) {
+        painter.fill_rounded_rect(
+            layout.rect(*bounds),
+            layout.radii(CornerRadii::all(10)),
+            Rgba::opaque(58, 58, 60),
+        );
+        centered_text(painter, layout, ui_font, *bounds, label, 11, white);
+    }
 }
 
 fn draw_name_prompt(
@@ -10617,11 +11413,9 @@ fn draw_setup(
         layout.radii(CornerRadii::all(46)),
         Rgba::new(0, 0, 0, 46),
     );
-    painter.fill_rounded_rect(
-        layout.rect(card),
-        layout.radii(CornerRadii::all(42)),
-        Rgba::new(250, 251, 252, 255),
-    );
+    let card_radii = layout.radii(CornerRadii::all(56));
+    painter.fill_rounded_rect(layout.rect(card), card_radii, Rgba::new(17, 17, 17, 255));
+    painter.stroke_rounded_rect(layout.rect(card), card_radii, 1, Rgba::new(255, 255, 255, 70));
     match state.screen {
         Screen::Language => flow::draw_language(painter, layout, font, state, now),
         Screen::Keyboard => flow::draw_keyboard(painter, layout, font, state, now),
@@ -11913,7 +12707,8 @@ fn corner_self_test() -> bool {
     state.click(Point::new(DESIGN_WIDTH - 20, 20));
     let gear_toggles = state.overlay == Overlay::None;
     state.set_app(DesktopApp::Notes);
-    let hidden_under_window = state.click(feather) != DesktopAction::Redraw || !state.menu_open;
+    let over_window = state.click(feather) == DesktopAction::Redraw && state.menu_open;
+    state.click(feather);
     state.set_app(DesktopApp::None);
     // "Quit all apps" is the sixth row; Notes is still open behind the desktop.
     let still_open = state.open_apps != 0;
@@ -11931,7 +12726,7 @@ fn corner_self_test() -> bool {
         parcel_closes,
         gear,
         gear_toggles,
-        hidden_under_window,
+        over_window,
         quits,
     ];
     if flags.contains(&false) {
@@ -12413,8 +13208,7 @@ const VOLUME_SLIDE_NS: u64 = 380_000_000;
 const AMBIENT_FRAME_NS: u64 = 45_000_000;
 
 fn ease_out_back_milli(progress_milli: u32) -> i32 {
-    let u = progress_milli.min(1000) as i64 - 1000;
-    (1000 + 2702 * u * u * u / 1_000_000_000 + 1702 * u * u / 1_000_000) as i32
+    motion::spring_curve(progress_milli, 550)
 }
 
 fn ease_in_out_milli(progress_milli: u32) -> i32 {
@@ -13231,6 +14025,7 @@ fn dock_cache_key(layout: Layout, region: Rect) -> u64 {
     }
     mix(region.x as u64);
     mix(region.y as u64);
+    mix(crate::aerui::glass_generation());
     mix(region.width as u64);
     mix(region.height as u64);
     mix(layout.offset.x as u64);

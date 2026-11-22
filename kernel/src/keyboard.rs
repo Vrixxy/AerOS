@@ -94,6 +94,48 @@ pub fn pop_scancode() -> Option<u8> {
     Some(byte)
 }
 
+/// Lights the keyboard's Caps Lock, Num Lock and Scroll Lock LEDs (PS/2
+/// "set indicators"). Interrupts are held off so the keyboard's ACKs are read
+/// here; a key that arrives meanwhile still goes into the queue.
+pub fn set_leds(caps: bool, num: bool, scroll: bool) -> bool {
+    if !READY.load(Ordering::Acquire) {
+        return false;
+    }
+    let mask = (scroll as u8) | (num as u8) << 1 | (caps as u8) << 2;
+    let flags: u64;
+    unsafe { core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags)) };
+    arch::disable_interrupts();
+    let ok = send_keyboard(0xed) && send_keyboard(mask);
+    if flags & (1 << 9) != 0 {
+        arch::enable_interrupts();
+    }
+    ok
+}
+
+/// Sends one byte to the keyboard and waits for its ACK (resending once).
+fn send_keyboard(byte: u8) -> bool {
+    for _ in 0..2 {
+        if !wait_write() {
+            return false;
+        }
+        unsafe { arch::outb(DATA, byte) };
+        for _ in 0..8 {
+            if !wait_read() {
+                return false;
+            }
+            let status = unsafe { arch::inb(STATUS) };
+            let reply = unsafe { arch::inb(DATA) };
+            match reply {
+                0xfa if status & 0x20 == 0 => return true,
+                0xfe if status & 0x20 == 0 => break,
+                _ if status & 0x20 != 0 => crate::mouse::feed_byte(reply),
+                _ => push_scancode(reply),
+            }
+        }
+    }
+    false
+}
+
 fn report(controller: bool, routed: bool) -> KeyboardReport {
     let read = READ.load(Ordering::Acquire);
     let write = WRITE.load(Ordering::Acquire);

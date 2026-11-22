@@ -14,8 +14,11 @@ pub(super) const RESET_LINK: Rect = Rect::new(276, 399, 200, 19);
 const RESET_CARD: Rect = Rect::new(206, 112, 340, 230);
 pub(super) const RESET_CANCEL: Rect = Rect::new(226, 276, 140, 44);
 pub(super) const RESET_OK: Rect = Rect::new(386, 276, 140, 44);
-const INK: Color = Color::rgb(22, 26, 32);
-const INK_SOFT: Color = Color::rgb(86, 96, 108);
+const INK: Color = Color::rgb(245, 245, 247);
+const INK_SOFT: Color = Color::rgb(150, 152, 158);
+/// Figma setup: #111 card and panels with a faint white hairline.
+const PANEL: Rgba = Rgba::new(21, 21, 21, 255);
+const HAIRLINE: Rgba = Rgba::new(255, 255, 255, 46);
 pub(super) const WELCOME_NS: u64 = 3_600_000_000;
 const SLIDE_NS: u64 = 620_000_000;
 const KB_SCROLL_NS: u64 = 280_000_000;
@@ -39,11 +42,11 @@ pub(super) fn shift_layout_x(layout: Layout, logical_dx: i32) -> Layout {
 fn light_pill(painter: &mut Painter<'_>, layout: Layout, bounds: Rect, tint: Rgba) {
     let radii = layout.radii(CornerRadii::all(bounds.height / 2));
     painter.fill_rounded_rect(layout.rect(bounds), radii, tint);
-    painter.stroke_rounded_rect(layout.rect(bounds), radii, 1, Rgba::new(26, 30, 36, 210));
+    painter.stroke_rounded_rect(layout.rect(bounds), radii, 1, Rgba::new(255, 255, 255, 120));
 }
 
 fn field_pill(painter: &mut Painter<'_>, layout: Layout, bounds: Rect) {
-    light_pill(painter, layout, bounds, Rgba::new(241, 243, 246, 255));
+    light_pill(painter, layout, bounds, Rgba::new(14, 14, 14, 255));
 }
 
 fn caret_on(now: u64) -> bool {
@@ -193,6 +196,10 @@ pub(super) fn draw_keyboard(
         true,
         "Next",
     );
+    let panel = Rect::new(198, 100, 356, 294);
+    let panel_radii = layout.radii(CornerRadii::all(23));
+    painter.fill_rounded_rect(layout.rect(panel), panel_radii, PANEL);
+    painter.stroke_rounded_rect(layout.rect(panel), panel_radii, 1, HAIRLINE);
     let search = Rect::new(216, 112, 320, 46);
     field_pill(painter, layout, search);
     let query = field_text(&state.kb_search[..state.kb_search_len], false, now);
@@ -218,17 +225,12 @@ pub(super) fn draw_keyboard(
             }
             let row = Rect::new(KB_LIST.x, y, KB_LIST.width, KB_ROW_HEIGHT);
             let selected = position == state.kb_cursor;
-            light_pill(
-                painter,
-                layout,
-                row,
-                if selected {
-                    Rgba::new(208, 228, 252, 255)
-                } else {
-                    Rgba::new(241, 243, 246, 255)
-                },
-            );
             if selected {
+                painter.fill_rounded_rect(
+                    layout.rect(row),
+                    layout.radii(CornerRadii::all(KB_ROW_HEIGHT / 2)),
+                    Rgba::new(255, 255, 255, 26),
+                );
                 painter.stroke_rounded_rect(
                     layout.rect(row.expand(2)),
                     layout.radii(CornerRadii::all(KB_ROW_HEIGHT / 2 + 2)),
@@ -274,7 +276,7 @@ pub(super) fn draw_keyboard(
         painter.fill_rounded_rect(
             layout.rect(track),
             layout.radii(CornerRadii::all(4)),
-            Rgba::new(26, 30, 36, 28),
+            Rgba::new(255, 255, 255, 24),
         );
         let total = count as i32 * KB_ROW_PITCH;
         let thumb_h = (track.height * KB_VISIBLE * KB_ROW_PITCH / total).max(24);
@@ -284,7 +286,7 @@ pub(super) fn draw_keyboard(
         painter.fill_rounded_rect(
             layout.rect(Rect::new(track.x, thumb_y, 8, thumb_h)),
             layout.radii(CornerRadii::all(4)),
-            Rgba::new(70, 78, 90, 230),
+            Rgba::new(235, 235, 238, 235),
         );
     }
     hint(
@@ -310,22 +312,19 @@ pub(super) fn draw_credentials(
         Screen::Password => ("Set a password", "Next"),
         _ => ("Confirm your password", "Finish"),
     };
-    chrome(painter, layout, font, "", true, next);
+    chrome(painter, layout, font, heading, true, next);
     let card = CREDENTIALS_CARD;
     let card_radii = layout.radii(CornerRadii::all(23));
-    painter.fill_rounded_rect(layout.rect(card), card_radii, Rgba::opaque(255, 255, 255));
-    painter.stroke_rounded_rect(layout.rect(card), card_radii, 1, Rgba::opaque(0, 0, 0));
-    centered_text(
-        painter,
-        layout,
-        font,
-        Rect::new(card.x, 136, card.width, 30),
-        heading,
-        19,
-        INK,
-    );
+    painter.fill_rounded_rect(layout.rect(card), card_radii, PANEL);
+    painter.stroke_rounded_rect(layout.rect(card), card_radii, 1, HAIRLINE);
+    let label = match state.screen {
+        Screen::Username => "Username",
+        Screen::Password => "Password",
+        _ => "Verify password",
+    };
+    painter.text(font, layout.point(Point::new(CREDENTIALS_FIELD.x + 14, 160)), label, layout.scale.logical(15), INK);
     let field = CREDENTIALS_FIELD;
-    light_pill(painter, layout, field, Rgba::opaque(255, 255, 255));
+    field_pill(painter, layout, field);
     let (bytes, masked) = match state.screen {
         Screen::Password => (
             &state.setup_password_input[..state.setup_password_len],
@@ -367,7 +366,7 @@ pub(super) fn draw_credentials(
         painter.fill_rounded_rect(
             Rect::new(bar.x + width + gap, bar.y, bar.width, bar.height),
             layout.radii(CornerRadii::all(4)),
-            Rgba::opaque(0, 0, 0),
+            Rgba::opaque(245, 245, 247),
         );
     }
     if matches!(state.screen, Screen::Password | Screen::Confirm) {
@@ -384,7 +383,7 @@ pub(super) fn draw_credentials(
         );
     }
     let (message, tone) = if !state.setup_error.is_empty() {
-        (state.setup_error, Color::rgb(206, 52, 40))
+        (state.setup_error, Color::rgb(255, 105, 97))
     } else {
         (
             match state.screen {
@@ -441,7 +440,13 @@ pub(super) fn draw_reset(
     painter.fill_rounded_rect(
         layout.rect(RESET_CARD),
         layout.radii(CornerRadii::all(34)),
-        Rgba::new(250, 251, 252, 255),
+        Rgba::new(17, 17, 17, 255),
+    );
+    painter.stroke_rounded_rect(
+        layout.rect(RESET_CARD),
+        layout.radii(CornerRadii::all(34)),
+        1,
+        HAIRLINE,
     );
     centered_text(
         painter,
@@ -479,9 +484,9 @@ pub(super) fn draw_reset(
         .enumerate()
     {
         let tint = if index == 1 {
-            Rgba::new(250, 222, 218, 255)
+            Rgba::new(92, 24, 20, 255)
         } else {
-            Rgba::new(241, 243, 246, 255)
+            Rgba::new(14, 14, 14, 255)
         };
         light_pill(painter, layout, *bounds, tint);
         if state.reset_focus as usize == index {

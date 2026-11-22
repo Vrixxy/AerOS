@@ -91,25 +91,69 @@ pub fn set_prefs(prefs: Prefs) -> bool {
 /// byte, then (since the desktop preferences were added) those, packed.
 const BASE_BYTES: usize = 8;
 const FULL_BYTES: usize = 16;
+/// Then the glass material (Settings > Display), 16 bytes.
+const GLASS_BYTES: usize = 32;
+
+fn pack_glass(glass: crate::aerui::GlassOptics) -> [u8; 16] {
+    let [angle_low, angle_high] = glass.light_angle.to_le_bytes();
+    let [ior_low, ior_high] = glass.refraction.to_le_bytes();
+    [
+        b'G',
+        glass.depth,
+        ior_low,
+        ior_high,
+        glass.splay,
+        glass.dispersion,
+        glass.frost,
+        angle_low,
+        angle_high,
+        glass.light,
+        glass.tint.red,
+        glass.tint.green,
+        glass.tint.blue,
+        glass.tint.alpha,
+        glass.adaptive as u8,
+        0,
+    ]
+}
+
+fn unpack_glass(bytes: &[u8]) -> Option<crate::aerui::GlassOptics> {
+    (bytes.len() >= 16 && bytes[0] == b'G').then(|| crate::aerui::GlassOptics {
+        depth: bytes[1].min(40),
+        refraction: u16::from_le_bytes([bytes[2], bytes[3]]).clamp(100, 300),
+        splay: bytes[4].clamp(1, 60),
+        dispersion: bytes[5].min(80),
+        frost: bytes[6].min(200),
+        light_angle: u16::from_le_bytes([bytes[7], bytes[8]]) % 360,
+        light: bytes[9].min(100),
+        tint: crate::aerui::Rgba::new(bytes[10], bytes[11], bytes[12], bytes[13]),
+        adaptive: bytes[14] != 0,
+    })
+}
 
 /// Reads the saved settings (if any) and applies them.
 pub fn load() -> bool {
     let Ok(descriptor) = vfs::open_file(PATH, false, false, false, 0, false) else {
         return false;
     };
-    let mut bytes = [0u8; FULL_BYTES + 1];
+    let mut bytes = [0u8; GLASS_BYTES + 1];
     let read = vfs::read(descriptor, &mut bytes);
     let _ = vfs::close(descriptor);
     let Ok(length) = read else {
         return false;
     };
-    if (length != BASE_BYTES && length != FULL_BYTES) || &bytes[..4] != MAGIC {
+    if (length != BASE_BYTES && length != FULL_BYTES && length != GLASS_BYTES) || &bytes[..4] != MAGIC {
         return false;
     }
     crate::rtc::set_timezone_index(bytes[4] as usize);
     NTP_ENABLED.store(bytes[5] != 0, Ordering::Release);
     crate::keymap::set_layout(bytes[6] as usize);
-    if length == FULL_BYTES {
+    if length == GLASS_BYTES
+        && let Some(glass) = unpack_glass(&bytes[FULL_BYTES..GLASS_BYTES])
+    {
+        crate::aerui::set_glass_optics(glass);
+    }
+    if length >= FULL_BYTES {
         let mut packed = [0u8; 8];
         packed.copy_from_slice(&bytes[BASE_BYTES..FULL_BYTES]);
         PREFS.store(u64::from_le_bytes(packed), Ordering::Release);
@@ -118,15 +162,23 @@ pub fn load() -> bool {
 }
 
 pub fn save() -> bool {
-    let mut bytes = [0u8; FULL_BYTES];
+    let mut bytes = [0u8; GLASS_BYTES];
     bytes[..4].copy_from_slice(MAGIC);
     bytes[4] = crate::rtc::timezone_index() as u8;
     bytes[5] = ntp_enabled() as u8;
     bytes[6] = crate::keymap::layout_index() as u8;
     let packed = PREFS.load(Ordering::Acquire);
-    bytes[BASE_BYTES..].copy_from_slice(&packed.to_le_bytes());
-    // Without desktop preferences the file stays in its first, short form.
-    let length = if packed == 0 { BASE_BYTES } else { FULL_BYTES };
+    bytes[BASE_BYTES..FULL_BYTES].copy_from_slice(&packed.to_le_bytes());
+    let glass = crate::aerui::glass_optics();
+    bytes[FULL_BYTES..].copy_from_slice(&pack_glass(glass));
+    // Without desktop preferences or a changed glass the file stays short.
+    let length = if glass != crate::aerui::GlassOptics::DEFAULT {
+        GLASS_BYTES
+    } else if packed == 0 {
+        BASE_BYTES
+    } else {
+        FULL_BYTES
+    };
     let Ok(descriptor) = vfs::open_file(PATH, true, false, true, 0o644, true) else {
         return false;
     };
@@ -153,5 +205,17 @@ pub fn self_test() -> bool {
     let clamped = Prefs::unpack(Prefs::PRESENT | 0xffff)
         .is_some_and(|prefs| prefs.volume == 100 && prefs.brightness == 100)
         && Prefs::unpack(Prefs::PRESENT).is_some_and(|prefs| prefs.brightness == 8);
-    round_trip && absent && clamped
+    let glass = crate::aerui::GlassOptics {
+        depth: 12,
+        refraction: 175,
+        splay: 20,
+        dispersion: 40,
+        frost: 120,
+        light_angle: 300,
+        light: 55,
+        tint: crate::aerui::Rgba::new(1, 2, 3, 64),
+        adaptive: false,
+    };
+    let glass_round_trip = unpack_glass(&pack_glass(glass)) == Some(glass);
+    round_trip && absent && clamped && glass_round_trip
 }

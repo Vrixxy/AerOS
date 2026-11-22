@@ -14,6 +14,11 @@ pub struct Level {
     pub charging: bool,
     /// Until empty (or full while charging), when the firmware says.
     pub minutes: Option<u32>,
+    /// What a full charge holds now, as a share of what it held new.
+    pub health: Option<u8>,
+    pub cycles: Option<u32>,
+    /// Power going in while charging, in milliwatts, when the firmware says.
+    pub charge_mw: Option<u32>,
 }
 
 struct Cache {
@@ -67,10 +72,23 @@ pub fn level(now: u64) -> Option<Level> {
         for node in &nodes[..count] {
             let battery = acpi_devices::read_battery(aml, *node);
             if let Some(percent) = battery.percent() {
+                let health = (battery.design_capacity != 0 && battery.full_capacity != 0).then(|| {
+                    (battery.full_capacity as u64 * 100 / battery.design_capacity as u64).min(100) as u8
+                });
+                let charge_mw = (battery.charging && battery.rate != 0).then(|| {
+                    if battery.current_units {
+                        (battery.rate as u64 * battery.voltage_mv as u64 / 1000) as u32
+                    } else {
+                        battery.rate
+                    }
+                });
                 level = Some(Level {
                     percent,
                     charging: battery.charging,
                     minutes: battery.minutes(),
+                    health,
+                    cycles: battery.cycles,
+                    charge_mw,
                 });
                 break;
             }
@@ -90,6 +108,18 @@ pub fn level(now: u64) -> Option<Level> {
     cache.changes = changes;
     cache.level = level;
     level
+}
+
+/// "Health 87%, 312 cycles" (or nothing known).
+pub fn describe_health(level: Option<Level>, out: &mut impl Write) {
+    let Some(level) = level else {
+        return;
+    };
+    let _ = match (level.health, level.cycles) {
+        (Some(health), Some(cycles)) if cycles > 0 => write!(out, "{health}%, {cycles} cycles"),
+        (Some(health), _) => write!(out, "{health}%"),
+        (None, _) => write!(out, "Unknown"),
+    };
 }
 
 /// "76%, charging", "76%, 2h 10m left" or "No battery".

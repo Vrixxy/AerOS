@@ -105,6 +105,7 @@ bool aeros_amdgpu_enabled;
 extern int amdgpu_dc;
 struct drm_device;
 int aeros_display_take_over(struct drm_device *dev);
+void aeros_gpu_selftest(struct drm_device *dev);
 
 int pci_register_driver(struct pci_driver *driver)
 {
@@ -138,6 +139,8 @@ int pci_register_driver(struct pci_driver *driver)
 			continue;
 		}
 		bound_count++;
+		if (!strcmp(driver->name, "amdgpu"))
+			aeros_gpu_selftest(pci_get_drvdata(dev));
 		if (!strcmp(driver->name, "amdgpu") && amdgpu_dc)
 			aeros_display_take_over(pci_get_drvdata(dev));
 	}

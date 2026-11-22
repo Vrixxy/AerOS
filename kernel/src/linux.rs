@@ -71,9 +71,134 @@ pub struct Report {
     pub drivers: u32,
     pub bound: u32,
     poll: Option<extern "sysv64" fn()>,
+    backlight: Option<extern "sysv64" fn(u32) -> i32>,
+    wait_vblank: Option<extern "sysv64" fn() -> i32>,
+    gpu_glass_buffers: Option<extern "sysv64" fn(*mut *mut u32, *mut *mut u32) -> u32>,
+    gpu_glass: Option<extern "sysv64" fn(*const GlassArgs) -> i32>,
+}
+
+/// One glass job for the GPU (kernel/linux/gpu/glass.c's `glass_args`):
+/// the capture is `width` x `height` pixels from (`left`, `top`), the result
+/// covers the area (`ax`, `ay`, `aw`, `ah`) in frame coordinates.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct GlassArgs {
+    pub input: u64,
+    pub output: u64,
+    pub width: i32,
+    pub height: i32,
+    pub radius: i32,
+    pub left: i32,
+    pub top: i32,
+    pub ax: i32,
+    pub ay: i32,
+    pub aw: i32,
+    pub ah: i32,
+    pub sx: i32,
+    pub sy: i32,
+    pub sw: i32,
+    pub sh: i32,
+    pub radii: [i32; 4],
+    pub splay: i32,
+    pub bend: i32,
+    pub spread: i32,
+    pub gain: i32,
+    pub lift: i32,
+    pub rim: i32,
+    pub shade: i32,
+    pub light_x: i32,
+    pub light_y: i32,
+    pub intensity: i32,
+    pub tint: [i32; 4],
+    pub saturation: i32,
+    pub brightness: i32,
+    pub noise_alpha: i32,
+    pub seed: u32,
+    pub crystal: [i32; 4],
+}
+
+static GPU_GLASS_BUFFERS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static GPU_GLASS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The GPU's glass source and result buffers, when the Radeon draws glass.
+pub fn gpu_glass_buffers() -> Option<(&'static mut [u32], &'static mut [u32])> {
+    let address = GPU_GLASS_BUFFERS.load(core::sync::atomic::Ordering::Acquire);
+    if address == 0 {
+        return None;
+    }
+    // SAFETY: the module's `aeros_gpu_glass_buffers`, set by `initialize`.
+    let buffers: extern "sysv64" fn(*mut *mut u32, *mut *mut u32) -> u32 =
+        unsafe { core::mem::transmute(address) };
+    let (mut source, mut result) = (core::ptr::null_mut(), core::ptr::null_mut());
+    let pixels = buffers(&mut source, &mut result) as usize;
+    if pixels == 0 || source.is_null() || result.is_null() {
+        GPU_GLASS_BUFFERS.store(0, core::sync::atomic::Ordering::Release);
+        return None;
+    }
+    // SAFETY: two separate GPU buffers of `pixels` words each, mapped for the
+    // CPU, used only on the desktop thread between glass jobs.
+    Some(unsafe {
+        (
+            core::slice::from_raw_parts_mut(source, pixels),
+            core::slice::from_raw_parts_mut(result, pixels),
+        )
+    })
+}
+
+/// Runs a glass job on the GPU; false (and the GPU path off) on failure.
+pub fn gpu_glass(args: &GlassArgs) -> bool {
+    let address = GPU_GLASS.load(core::sync::atomic::Ordering::Acquire);
+    if address == 0 {
+        return false;
+    }
+    // SAFETY: the module's `aeros_gpu_glass`, set by `initialize`.
+    let run: extern "sysv64" fn(*const GlassArgs) -> i32 = unsafe { core::mem::transmute(address) };
+    if run(args) == 0 {
+        return true;
+    }
+    GPU_GLASS_BUFFERS.store(0, core::sync::atomic::Ordering::Release);
+    false
 }
 
 static POLL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static BACKLIGHT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static WAIT_VBLANK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static VBLANK_MISSES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Waits for the taken-over screen's next vblank, so a frame copied in from
+/// the top stays ahead of the scanout. Gives up after repeated timeouts.
+pub fn wait_vblank() -> bool {
+    let address = WAIT_VBLANK.load(core::sync::atomic::Ordering::Acquire);
+    if address == 0 || VBLANK_MISSES.load(Relaxed) >= 5 {
+        return false;
+    }
+    // SAFETY: the module's `aeros_display_wait_vblank`, set by `initialize`.
+    let wait: extern "sysv64" fn() -> i32 = unsafe { core::mem::transmute(address) };
+    match wait() {
+        0 => {
+            VBLANK_MISSES.store(0, Relaxed);
+            true
+        }
+        -19 => false,
+        _ => {
+            if VBLANK_MISSES.fetch_add(1, Relaxed) == 4 {
+                log_line(format_args!("display: vblank waits time out, presenting unsynced"));
+            }
+            false
+        }
+    }
+}
+
+/// Sets a Linux display driver's panel backlight; false when none has one.
+pub fn set_backlight(percent: u32) -> bool {
+    let address = BACKLIGHT.load(core::sync::atomic::Ordering::Acquire);
+    if address == 0 {
+        return false;
+    }
+    // SAFETY: the module's `aeros_set_backlight`, set by `initialize`.
+    let set: extern "sysv64" fn(u32) -> i32 = unsafe { core::mem::transmute(address) };
+    set(percent) == 0
+}
 
 /// Runs the Linux side's due timers, queued work and interrupt handlers;
 /// the desktop loop calls this every pass.
@@ -159,6 +284,14 @@ impl PciInfo {
         bar_sizes: [0; 6],
         bar_flags: [0; 6],
     };
+}
+
+/// Adds one of AerOS's own lines to LINUX.LOG (saved with the next save).
+pub fn log_line(arguments: core::fmt::Arguments<'_>) {
+    let mut text: crate::shell::Text<160> = crate::shell::Text::new();
+    let _ = core::fmt::Write::write_fmt(&mut text, arguments);
+    keep(text.as_str().as_bytes());
+    keep(b"\r\n");
 }
 
 extern "sysv64" fn log(text: *const u8, length: usize) {
@@ -499,7 +632,14 @@ extern "sysv64" fn screen_size(width: *mut u32, height: *mut u32) {
     }
 }
 
+/// The firmware screen's row length in pixels, when it is XRGB8888.
+static SCREEN_STRIDE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 extern "sysv64" fn display(pixels: *mut u8, width: u32, height: u32, pitch: u32) -> i32 {
+    if pixels.is_null() {
+        *DISPLAY.lock() = None;
+        return 0;
+    }
     let (w, h) = *SCREEN_SIZE.lock();
     if pixels.is_null() || width < w || height < h || !pitch.is_multiple_of(4) || pitch < width * 4
     {
@@ -509,8 +649,24 @@ extern "sysv64" fn display(pixels: *mut u8, width: u32, height: u32, pitch: u32)
         return -22;
     }
     *DISPLAY.lock() = Some((pixels as u64, width, height, pitch));
+    let combined =
+        crate::arch::paging::vmap_write_combine(pixels as u64, pitch as u64 * height as u64);
+    let (firmware, _) = *SCREEN.lock();
+    let stride = SCREEN_STRIDE.load(Relaxed);
+    if firmware != 0 && stride >= w as usize {
+        for row in 0..h as usize {
+            // SAFETY: both screens hold at least `h` rows of `w` pixels.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (firmware as *const u32).add(row * stride),
+                    pixels.add(row * pitch as usize) as *mut u32,
+                    w as usize,
+                );
+            }
+        }
+    }
     serial::format(format_args!(
-        "AEROS_LINUX_DISPLAY taken=true {width}x{height} pitch={pitch} screen={w}x{h}\n"
+        "AEROS_LINUX_DISPLAY taken=true {width}x{height} pitch={pitch} screen={w}x{h} wc_pages={combined}\n"
     ));
     0
 }
@@ -749,6 +905,9 @@ pub fn initialize(
 ) -> Option<Report> {
     *SCREEN.lock() = (screen.address as u64, screen.size as u64);
     *SCREEN_SIZE.lock() = (screen.width as u32, screen.height as u32);
+    if matches!(screen.format, crate::framebuffer::PixelFormat::Bgr) {
+        SCREEN_STRIDE.store(screen.stride, Relaxed);
+    }
     ACPI.store(
         acpi as *const _ as *mut crate::acpi::AcpiInfo,
         core::sync::atomic::Ordering::Release,
@@ -783,6 +942,22 @@ pub fn initialize(
         && let Some(poll) = report.poll
     {
         POLL.store(poll as usize, core::sync::atomic::Ordering::Release);
+    }
+    if result == 0
+        && let Some(backlight) = report.backlight
+    {
+        BACKLIGHT.store(backlight as usize, core::sync::atomic::Ordering::Release);
+    }
+    if result == 0
+        && let Some(wait) = report.wait_vblank
+    {
+        WAIT_VBLANK.store(wait as usize, core::sync::atomic::Ordering::Release);
+    }
+    if result == 0
+        && let (Some(buffers), Some(run)) = (report.gpu_glass_buffers, report.gpu_glass)
+    {
+        GPU_GLASS_BUFFERS.store(buffers as usize, core::sync::atomic::Ordering::Release);
+        GPU_GLASS.store(run as usize, core::sync::atomic::Ordering::Release);
     }
     SAVE_EACH_LINE.store(false, Relaxed);
     save_log();

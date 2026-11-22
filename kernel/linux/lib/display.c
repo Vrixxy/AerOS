@@ -13,28 +13,47 @@
 #include <drm/drm_fourcc.h>
 #include <drm/drm_modes.h>
 #include <aeros/ops.h>
+#include <drm/drm_vblank.h>
+#include <drm/drm_crtc.h>
+#include <linux/backlight.h>
 
 bool aeros_display_taken;
+struct backlight_device *aeros_backlight;
+
+/* AerOS's brightness setting, on the first registered panel backlight. */
+int aeros_set_backlight(unsigned int percent)
+{
+	struct backlight_device *bd = aeros_backlight;
+
+	if (!bd || bd->props.max_brightness <= 0)
+		return -ENODEV;
+	percent = min(percent, 100u);
+	bd->props.brightness = DIV_ROUND_UP(bd->props.max_brightness * percent * percent, 10000);
+	return backlight_update_status(bd);
+}
 static struct drm_client_dev client;
 static struct drm_client_buffer *buffer;
+static struct drm_crtc *scanout_crtc;
 
 static const struct drm_client_funcs client_funcs = {
 	.owner = NULL,
 };
 
-static void draw_pattern(u8 *pixels, u32 width, u32 height, u32 pitch)
+/* Waits for the scanned-out CRTC's next vblank (at most 20 ms), so AerOS can
+ * copy a frame in from the top while the panel is between refreshes. */
+int aeros_display_wait_vblank(void)
 {
-	static const u32 bars[] = { 0xffffff, 0xffff00, 0x00ffff, 0x00ff00, 0xff00ff, 0xff0000, 0x0000ff, 0x202020 };
+	struct drm_crtc *crtc = scanout_crtc;
+	u64 last;
+	long left;
 
-	for (u32 y = 0; y < height; y++) {
-		u32 *row = (u32 *)(pixels + (size_t)y * pitch);
-
-		for (u32 x = 0; x < width; x++) {
-			bool border = x < 8 || y < 8 || x >= width - 8 || y >= height - 8;
-
-			row[x] = border ? 0xffffff : bars[x * 8 / width];
-		}
-	}
+	if (!crtc || drm_crtc_vblank_get(crtc))
+		return -ENODEV;
+	last = drm_crtc_vblank_count(crtc);
+	left = wait_event_timeout(crtc->dev->vblank[drm_crtc_index(crtc)].queue,
+				  drm_crtc_vblank_count(crtc) != last, msecs_to_jiffies(20));
+	drm_crtc_vblank_put(crtc);
+	return left ? 0 : -ETIMEDOUT;
 }
 
 int aeros_display_take_over(struct drm_device *dev)
@@ -66,6 +85,8 @@ int aeros_display_take_over(struct drm_device *dev)
 			modeset->crtc->name);
 		width = max_t(u32, width, modeset->mode->hdisplay);
 		height = max_t(u32, height, modeset->mode->vdisplay);
+		if (!lit)
+			scanout_crtc = modeset->crtc;
 		lit++;
 	}
 	mutex_unlock(&client.modeset_mutex);
@@ -89,22 +110,26 @@ int aeros_display_take_over(struct drm_device *dev)
 		pr_err("display: framebuffer can't be mapped (%d)\n", ret);
 		goto free_buffer;
 	}
-	draw_pattern(map.is_iomem ? (u8 *)map.vaddr_iomem : map.vaddr, width, height, buffer->pitch);
 	mutex_lock(&client.modeset_mutex);
 	drm_client_for_each_modeset(modeset, &client) {
 		if (modeset->mode)
 			modeset->fb = buffer->fb;
 	}
 	mutex_unlock(&client.modeset_mutex);
+	/* AerOS copies the firmware screen in first, so the switch is invisible. */
+	ret = aeros->display(map.is_iomem ? (void *)map.vaddr_iomem : map.vaddr, width, height, buffer->pitch);
+	if (ret) {
+		pr_err("display: AerOS refused the framebuffer (%d)\n", ret);
+		goto unmap;
+	}
 	ret = drm_client_modeset_commit(&client);
 	if (ret) {
 		pr_err("display: modeset failed (%d)\n", ret);
+		aeros->display(NULL, 0, 0, 0);
 		goto unmap;
 	}
-	pr_info("display: test pattern on %d screen(s), %ux%u, pitch %u\n", lit, width, height, buffer->pitch);
-	msleep(1500);
-	ret = aeros->display(map.is_iomem ? (void *)map.vaddr_iomem : map.vaddr, width, height, buffer->pitch);
-	aeros_display_taken = !ret;
+	pr_info("display: %d screen(s), %ux%u, pitch %u\n", lit, width, height, buffer->pitch);
+	aeros_display_taken = 1;
 	pr_info("display: handed to AerOS (%d)\n", ret);
 	drm_client_register(&client);
 	return 0;

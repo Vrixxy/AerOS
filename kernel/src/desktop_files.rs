@@ -6,6 +6,31 @@ impl DesktopState {
     /// Keyboard control of the Files grid; `None` leaves the key to the
     /// generic desktop handling.
     pub(super) fn files_key(&mut self, key: DesktopKey) -> Option<DesktopAction> {
+        if self.files_searching {
+            match key {
+                DesktopKey::Character(ch) => {
+                    let mut bytes = [0u8; 4];
+                    let _ = self.files_query.push_str_checked(ch.encode_utf8(&mut bytes));
+                }
+                DesktopKey::Backspace => {
+                    let _ = self.files_query.backspace();
+                }
+                DesktopKey::Escape => {
+                    self.files_searching = false;
+                    self.files_query.clear();
+                }
+                DesktopKey::Activate => {
+                    self.files_searching = false;
+                    if self.files_entry_count > 0 {
+                        self.files_selected = 0;
+                    }
+                    return Some(DesktopAction::Redraw);
+                }
+                _ => return None,
+            }
+            self.files_reload();
+            return Some(DesktopAction::Redraw);
+        }
         let count = self.files_entry_count;
         match key {
             DesktopKey::Left | DesktopKey::Right | DesktopKey::Up | DesktopKey::Down => {
@@ -45,6 +70,41 @@ impl DesktopState {
                 Some(DesktopAction::Redraw)
             }
             _ => None,
+        }
+    }
+
+    /// Hides the selected item (a dot in front of its name) or unhides it.
+    pub(super) fn files_toggle_hidden_selected(&mut self) {
+        let Some(row) = self.files_entries.get(self.files_selected).copied() else {
+            return;
+        };
+        let name = row.name_str();
+        let mut renamed: shell::Text<64> = shell::Text::new();
+        let hiding = !name.starts_with('.');
+        if hiding {
+            let _ = renamed.push_str_checked(".");
+            let _ = renamed.push_str_checked(name);
+        } else {
+            let _ = renamed.push_str_checked(&name[1..]);
+        }
+        if renamed.as_str().is_empty() {
+            return;
+        }
+        let from = self.files_child_path(name);
+        let to = self.files_child_path(renamed.as_str());
+        self.files_status.clear();
+        match vfs::rename(from.as_str(), to.as_str()) {
+            Ok(()) => {
+                let _ = self.files_status.push_str_checked(if hiding {
+                    "Hidden. Ctrl+H shows hidden items."
+                } else {
+                    "No longer hidden."
+                });
+                self.files_reload();
+            }
+            Err(_) => {
+                let _ = self.files_status.push_str_checked("Could not change that item.");
+            }
         }
     }
 

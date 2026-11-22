@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AerOS — The desktop, rebuilt from scratch</title>
+  <meta name="description" content="AerOS is an experimental desktop operating system written from scratch in Rust for 64-bit UEFI PCs. Dual-boot it next to Windows with one installer.">
+  <meta name="theme-color" content="#ffffff">
+  <script>
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem("aeros-theme"); } catch (e) {}
+      if (t !== "light" && t !== "dark") t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+      document.documentElement.setAttribute("data-theme", t);
+      document.documentElement.classList.add("js");
+      try { if (sessionStorage.getItem("aeros-boot")) document.documentElement.classList.add("no-boot"); } catch (e) {}
+    })();
+  </script>
+  <meta property="og:title" content="AerOS">
+  <meta property="og:description" content="An experimental desktop operating system, written from scratch in Rust.">
+  <meta property="og:image" content="site/desktop.png">
+  <link rel="icon" href="site/logo.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Inter+Tight:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="site/styles.css">
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <mask id="leaf-cut" maskUnits="userSpaceOnUse" x="0" y="0" width="820" height="560">
+        <rect x="0" y="0" width="820" height="560" fill="#fff"/>
+        <polyline points="58,303 120,318 200,335 280,345 350,348 410,340 470,322 540,296 610,262 628,250" fill="none" stroke="#000" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
+        <line x1="335" y1="318" x2="362" y2="182" stroke="#000" stroke-width="40" stroke-linecap="round"/>
+        <line x1="452" y1="308" x2="484" y2="152" stroke="#000" stroke-width="40" stroke-linecap="round"/>
+        <line x1="392" y1="362" x2="438" y2="412" stroke="#000" stroke-width="38" stroke-linecap="round"/>
+        <line x1="512" y1="322" x2="574" y2="368" stroke="#000" stroke-width="38" stroke-linecap="round"/>
+      </mask>
+      <symbol id="leaf" viewBox="20 24 780 520">
+        <g mask="url(#leaf-cut)">
+          <polygon fill="currentColor" points="462,32 490,40 520,58 550,85 580,108 610,125 650,131 700,130 745,133 775,148 788,170 788,200 778,235 762,270 740,305 712,340 680,375 645,410 610,443 575,468 545,485 520,496 503,505 487,461 479,493 450,510 410,522 375,526 352,525 321,462 310,497 285,495 255,478 225,450 198,418 178,385 165,350 160,320 158,280 165,240 185,195 210,150 245,108 285,72 330,50 370,40 403,35 411,115"/>
+          <polyline points="58,303 120,318 200,335 280,345" fill="none" stroke="currentColor" stroke-width="56" stroke-linecap="round" stroke-linejoin="round"/>
+        </g>
+      </symbol>
+    </defs>
+  </svg>
+
+  <div class="boot" aria-hidden="true">
+    <div class="boot-mark"><svg><use href="#leaf"/></svg></div>
+    <div class="boot-bar"><span></span></div>
+  </div>
+  <div class="cursor" aria-hidden="true">
+    <svg viewBox="-1 -1 22 23" width="22" height="23">
+      <defs>
+        <path id="cursor-shape" d="M0.175192 6.29946C-0.821003 2.58161 2.58107 -0.820466 6.29892 0.175729L16.3237 2.86186C21.3477 4.20804 21.172 11.3906 16.1072 12.5744C14.2787 13.0018 12.8446 14.4364 12.4271 16.2672C11.2878 21.2625 4.2201 21.3953 2.89402 16.4463L0.175192 6.29946Z"/>
+        <clipPath id="cursor-inside"><use href="#cursor-shape"/></clipPath>
+        <filter id="cursor-inner" x="0" y="0" width="24" height="24.0868" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+          <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+          <feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
+          <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+          <feOffset dx="9.06" dy="9.06"/>
+          <feGaussianBlur stdDeviation="2"/>
+          <feComposite in2="hardAlpha" operator="arithmetic" k2="-1" k3="1"/>
+          <feColorMatrix type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.25 0"/>
+          <feBlend mode="normal" in2="shape"/>
+        </filter>
+      </defs>
+      <use class="cursor-fill" href="#cursor-shape" fill="#D9D9D9" fill-opacity="0.2" filter="url(#cursor-inner)"/>
+      <use class="cursor-edge-out" href="#cursor-shape" fill="none" stroke="#000" stroke-width="2"/>
+      <use class="cursor-edge-in" href="#cursor-shape" fill="none" stroke="#fff" stroke-width="2" clip-path="url(#cursor-inside)"/>
+    </svg>
+  </div>
+  <div class="progress" aria-hidden="true"></div>
+  <header class="nav" id="top">
+    <div class="wrap nav-inner">
+      <a class="brand" href="#top" aria-label="AerOS home">
+        <span class="brand-mark"><svg><use href="#leaf"/></svg></span>
+        <span class="brand-name">AerOS</span>
+        <span class="tag">Experimental</span>
+      </a>
+      <nav class="nav-links" aria-label="Sections">
+        <a href="#features">Features</a>
+        <a href="#install">Install</a>
+        <a href="#specs">Specs</a>
+        <a href="#devices">Devices</a>
+        <a href="#faq">FAQ</a>
+        <button class="plain plain-mobile" type="button" aria-pressed="false"><span class="plain-switch"></span>Plain English</button>
+      </nav>
+      <div class="nav-actions">
+        <a class="link-quiet" href="https://github.com/Vrixxy/AerOS">GitHub</a>
+        <button class="plain" type="button" aria-pressed="false" title="Swap technical terms for everyday language"><span class="plain-switch"></span>Plain English</button>
+        <button class="theme" type="button" aria-label="Switch to dark mode">
+          <svg class="sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+          <svg class="moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>
+        </button>
+        <a class="btn btn-dark btn-sm" href="#download">Download</a>
+      </div>
+      <button class="plain plain-bar" type="button" aria-pressed="false"><span class="plain-switch"></span>Plain English</button>
+      <button class="theme theme-mobile" type="button" aria-label="Switch to dark mode">
+        <svg class="sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        <svg class="moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>
+      </button>
+      <button class="menu" aria-label="Open menu" aria-expanded="false"><span></span><span></span></button>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="wrap">
+        <p class="eyebrow reveal"><span class="dot"></span>Experimental OS project<span class="hide-sm"> · Developer Preview</span></p>
+        <h1 class="display reveal">The desktop,<br>rebuilt from scratch.<span class="type-caret" aria-hidden="true"></span></h1>
+        <p class="lede reveal" data-plain="AerOS is a brand-new operating system for PCs, like Windows or macOS, but made completely from scratch. Install it next to Windows in a few clicks, then pick which one to use whenever you turn your PC on.">AerOS is an independent operating system for 64-bit PCs. Its own kernel, its own desktop, its own drivers, written in Rust from the first line. Install it next to Windows in a few clicks.</p>
+        <div class="cta reveal">
+          <a class="btn btn-dark" href="#download">
+            <svg class="ico" viewBox="0 0 24 24"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19h14"/></svg>
+            Download for Windows
+          </a>
+          <a class="btn btn-light" href="https://github.com/Vrixxy/AerOS">View source</a>
+        </div>
+        <p class="fineprint reveal">AerOS-Setup.exe · Dual-boot installer · Windows 10 and 11</p>
+      </div>
+      <div class="wrap hero-shot reveal">
+        <div class="tilt-stage">
+          <figure class="device" data-tilt>
+            <div class="screen">
+              <div class="shots">
+                <img class="shot is-active" src="site/desktop.png" width="1280" height="800" alt="The AerOS desktop: a dock with app icons and a clock over a dark wave wallpaper">
+                <img class="shot" src="site/launcher.png" width="1280" height="800" alt="The AerOS app launcher">
+                <img class="shot" src="site/setup.png" width="1280" height="800" alt="AerOS setup choosing a keyboard layout">
+              </div>
+            </div>
+            <div class="base"></div>
+          </figure>
+        </div>
+        <div class="tabs" role="tablist" aria-label="Screens">
+          <button class="tab is-active" role="tab" aria-selected="true" data-shot="0"><span>Desktop</span><i></i></button>
+          <button class="tab" role="tab" aria-selected="false" data-shot="1"><span>Launcher</span><i></i></button>
+          <button class="tab" role="tab" aria-selected="false" data-shot="2"><span>Setup</span><i></i></button>
+        </div>
+      </div>
+    </section>
+
+    <section class="strip">
+      <div class="wrap strip-grid">
+        <div class="stat reveal"><strong data-plain="Safe">Rust</strong><span data-plain="Built in a language that prevents whole kinds of crashes">Kernel and desktop, no_std</span></div>
+        <div class="stat reveal"><strong data-plain="Modern">UEFI</strong><span data-plain="Starts up like any modern PC">Boots straight from firmware</span></div>
+        <div class="stat reveal"><strong><span data-count="90">90</span> Hz</strong><span data-plain="Silky smooth screen on AMD laptops">Native Radeon display driver</span></div>
+        <div class="stat reveal"><strong>Debian <span data-count="13">13</span></strong><span data-plain="Runs apps made for Linux too">Linux apps in its own hypervisor</span></div>
+      </div>
+    </section>
+
+    <div class="marquee" aria-hidden="true">
+      <div class="marquee-track">
+        <span>Rust kernel</span><span>UEFI boot</span><span>AMD-V hypervisor</span><span>Native Radeon driver</span><span>TCP/IP and TLS</span><span>Wi-Fi</span><span>App Store</span><span>Debian apps</span><span>Malware scanner</span><span>Dual-boot installer</span>
+        <span>Rust kernel</span><span>UEFI boot</span><span>AMD-V hypervisor</span><span>Native Radeon driver</span><span>TCP/IP and TLS</span><span>Wi-Fi</span><span>App Store</span><span>Debian apps</span><span>Malware scanner</span><span>Dual-boot installer</span>
+      </div>
+      <div class="marquee-track marquee-reverse">
+        <span>Spring animations</span><span>Optical glass</span><span>Touch support</span><span>Keyboard layouts</span><span>Caps Lock light</span><span>Backlight control</span><span>Saved settings</span><span>Files</span><span>Notes</span><span>Browser</span>
+        <span>Spring animations</span><span>Optical glass</span><span>Touch support</span><span>Keyboard layouts</span><span>Caps Lock light</span><span>Backlight control</span><span>Saved settings</span><span>Files</span><span>Notes</span><span>Browser</span>
+      </div>
+    </div>
+
+    <section class="section" id="features">
+      <div class="wrap">
+        <div class="head reveal">
+          <p class="kicker">Features</p>
+          <h2>Everything a desktop needs.<br><span class="muted">Nothing it doesn't.</span></h2>
+        </div>
+
+        <div class="bento">
+          <article class="card card-wide reveal">
+            <div class="card-copy">
+              <h3>A launcher that gets out of the way</h3>
+              <p>Every app one keypress away. Press the Windows key, type, and go. Pages of apps, search that filters as you type, and a dock that keeps what you use close.</p>
+            </div>
+            <div class="card-media"><img src="site/launcher.png" width="1280" height="800" loading="lazy" alt="The AerOS app launcher with Terminal, Files, Browser, Notes, Settings and Store"></div>
+          </article>
+
+          <article class="card reveal">
+            <div class="glyph"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M7 9l3 2.5L7 14M12 14h5"/></svg></div>
+            <h3>Runs Linux apps</h3>
+            <p data-plain="Thousands of great free apps are made for Linux. AerOS can run them in a window on your desktop, with no extra setup.">AerOS ships its own AMD-V hypervisor. It boots a real Debian 13 kernel, so Linux software runs right in a window on your desktop.</p>
+            <pre class="term" aria-label="Example terminal session"><code data-type="$ uname -sr|Linux 6.12 (Debian 13, in AerOS)|$ python3 --version|Python 3.13"></code></pre>
+          </article>
+
+          <article class="card reveal">
+            <div class="glyph"><svg viewBox="0 0 24 24"><path d="M6 8h12l-1 12H7L6 8z"/><path d="M9 8V6a3 3 0 0 1 6 0v2"/></svg></div>
+            <h3>App Store</h3>
+            <p>Browse and install apps with one click. The Store pulls Debian-powered apps and sets them up for you. No terminal required.</p>
+          </article>
+
+          <article class="card reveal">
+            <div class="glyph"><svg viewBox="0 0 24 24"><path d="M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6l7-3z"/><path d="M9 12l2 2 4-4"/></svg></div>
+            <h3>Secure by design</h3>
+            <p data-plain="Your password is stored safely, anyone guessing it gets locked out, apps can&#x27;t mess with important files, and a built-in virus scanner catches bad files.">Salted password hashing, lockout after repeated attempts, protected system files, and AerOS Shield, a built-in malware scanner with quarantine.</p>
+          </article>
+
+          <article class="card reveal">
+            <div class="glyph"><svg viewBox="0 0 24 24"><path d="M2 9a15 15 0 0 1 20 0M5 12.5a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0"/><circle cx="12" cy="19" r="1"/></svg></div>
+            <h3 data-plain="Internet that just works">Its own network stack</h3>
+            <p data-plain="AerOS connects to the internet and to secure websites by itself. Works with cable internet, and with Wi-Fi on some laptops.">TCP/IP, DNS and TLS written for AerOS. Wired Ethernet, plus Wi-Fi on MediaTek cards.</p>
+          </article>
+
+          <article class="card reveal">
+            <div class="glyph"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg></div>
+            <h3 data-plain="Smooth, fast graphics">Real GPU acceleration</h3>
+            <p data-plain="On laptops with AMD graphics, AerOS uses the graphics chip directly, so everything moves smoothly at the screen&#x27;s full speed.">On AMD Radeon graphics AerOS drives the panel itself at full refresh rate and renders its effects on the GPU.</p>
+          </article>
+
+          <article class="card card-dark card-wide reveal">
+            <div class="card-copy">
+              <h3>The essentials, built in</h3>
+              <p>Ready the moment you sign in.</p>
+            </div>
+            <ul class="apps">
+              <li><span class="app-ico"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 10l2.5 2L7 14"/></svg></span>Terminal</li>
+              <li><span class="app-ico"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg></span>Files</li>
+              <li><span class="app-ico"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></svg></span>Browser</li>
+              <li><span class="app-ico"><svg viewBox="0 0 24 24"><path d="M6 3h9l3 3v15H6V3z"/><path d="M9 10h6M9 14h6M9 18h3"/></svg></span>Notes</li>
+              <li><span class="app-ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg></span>Settings</li>
+              <li><span class="app-ico"><svg viewBox="0 0 24 24"><path d="M6 8h12l-1 12H7L6 8z"/><path d="M9 8V6a3 3 0 0 1 6 0v2"/></svg></span>Store</li>
+            </ul>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="statement" aria-label="About AerOS">
+      <div class="wrap">
+        <p class="statement-text">Every pixel, every packet, every driver. Written for AerOS, by hand, in Rust. No borrowed desktop, no skin on someone else's system. Just a new operating system, built to feel fast.</p>
+      </div>
+    </section>
+
+    <section class="section section-split" id="setup">
+      <div class="wrap split">
+        <div class="split-copy reveal">
+          <p class="kicker">First boot</p>
+          <h2>Set up in under a minute.</h2>
+          <p class="body">Pick your keyboard layout, choose a name and a password, and you're on your desktop. Everything you set is saved and survives a restart.</p>
+          <ul class="ticks">
+            <li>Keyboard layouts with live search</li>
+            <li>Show or hide your password as you type</li>
+            <li>Caps Lock warning and light</li>
+          </ul>
+        </div>
+        <figure class="split-media reveal">
+          <img src="site/setup.png" width="1280" height="800" loading="lazy" alt="AerOS setup: choosing a keyboard layout from a list">
+        </figure>
+      </div>
+    </section>
+
+    <section class="section section-ink" id="install">
+      <div class="wrap">
+        <div class="head reveal">
+          <p class="kicker">Installer</p>
+          <h2>One installer. Windows stays.</h2>
+          <p class="body" data-plain="The installer borrows some free space from your Windows drive, puts AerOS there, and lets you choose AerOS or Windows when your PC starts. Windows stays the main one, and you can remove AerOS any time, just like any other app.">AerOS-Setup.exe makes room next to Windows, copies AerOS onto its own partition and adds it to your boot menu. Windows remains your default, and you can remove AerOS from Apps &amp; features at any time.</p>
+        </div>
+        <div class="steps-rail" aria-hidden="true"><span></span></div>
+        <ol class="steps">
+          <li class="step reveal">
+            <span class="num">01</span>
+            <h3>Download</h3>
+            <p data-plain="Download the installer and open it. Click Yes when Windows asks for permission.">Get AerOS-Setup.exe and run it. It asks for administrator rights.</p>
+          </li>
+          <li class="step reveal">
+            <span class="num">02</span>
+            <h3>Choose Dualboot</h3>
+            <p data-plain="The installer checks that your PC can run AerOS and has enough free space.">The installer checks your PC: UEFI, your disk, and free space on C:.</p>
+          </li>
+          <li class="step reveal">
+            <span class="num">03</span>
+            <h3>Pick a size</h3>
+            <p data-plain="Choose how much room AerOS gets. Your Windows files stay exactly as they are.">Choose how much space AerOS gets. Your Windows files are left untouched.</p>
+          </li>
+          <li class="step reveal">
+            <span class="num">04</span>
+            <h3>Restart into AerOS</h3>
+            <p data-plain="One click starts AerOS. Next time you turn on your PC, Windows starts as usual.">One click boots AerOS once. Windows still starts by default next time.</p>
+          </li>
+        </ol>
+        <div class="notice reveal">
+          <svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16.5v.5"/></svg>
+          <p data-plain="&lt;strong&gt;Heads up:&lt;/strong&gt; a security setting called Secure Boot only lets Microsoft-approved systems start. You&#x27;ll switch it off once, and the installer shows you exactly how. If your drive is locked with BitLocker, keep your recovery key handy."><strong>Secure Boot:</strong> AerOS is not signed by Microsoft. If Secure Boot is on, the installer shows you how to turn it off once. If BitLocker is on, keep your recovery key ready before you start.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-soft" id="check">
+      <div class="wrap">
+        <div class="head reveal">
+          <p class="kicker">Compatibility check</p>
+          <h2>Will my PC run AerOS?</h2>
+          <p class="body">Tell us about your PC. The answer updates as you go.</p>
+        </div>
+        <div class="checker reveal">
+          <form class="check-form" onsubmit="return false">
+            <fieldset>
+              <legend>Processor</legend>
+              <div class="seg" data-key="cpu">
+                <button type="button" data-v="amd" class="on">AMD</button>
+                <button type="button" data-v="intel">Intel</button>
+                <button type="button" data-v="arm">ARM / Snapdragon</button>
+                <button type="button" data-v="mac">Mac</button>
+              </div>
+            </fieldset>
+            <fieldset>
+              <legend data-plain="Startup type">Firmware</legend>
+              <div class="seg" data-key="fw">
+                <button type="button" data-v="uefi" class="on">UEFI</button>
+                <button type="button" data-v="bios">Legacy BIOS</button>
+                <button type="button" data-v="unsure">Not sure</button>
+              </div>
+            </fieldset>
+            <fieldset>
+              <legend>Windows</legend>
+              <div class="seg" data-key="win">
+                <button type="button" data-v="11" class="on">Windows 11</button>
+                <button type="button" data-v="10">Windows 10</button>
+                <button type="button" data-v="none">None</button>
+              </div>
+            </fieldset>
+            <fieldset>
+              <legend>Memory <output data-out="ram">8 GB</output></legend>
+              <input type="range" min="2" max="32" step="2" value="8" data-key="ram" aria-label="Memory in GB">
+            </fieldset>
+            <fieldset>
+              <legend>Free space on C: <output data-out="disk">64 GB</output></legend>
+              <input type="range" min="4" max="256" step="4" value="64" data-key="disk" aria-label="Free space in GB">
+            </fieldset>
+          </form>
+          <div class="verdict" aria-live="polite">
+            <div class="verdict-mark"><svg viewBox="0 0 24 24" class="ico"><path d="M6 12.5l4 4 8-9"/></svg></div>
+            <p class="verdict-kicker">Result</p>
+            <h3 class="verdict-title">Ready to install</h3>
+            <ul class="verdict-list"></ul>
+            <a class="btn btn-dark verdict-cta" href="#download">Get the installer</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="specs">
+      <div class="wrap">
+        <div class="head reveal">
+          <p class="kicker">System requirements</p>
+          <h2>Minimum specs.</h2>
+        </div>
+        <div class="spec-table reveal" role="table" aria-label="System requirements">
+          <div class="spec-row spec-headrow" role="row">
+            <span role="columnheader"></span><span role="columnheader">Minimum</span><span role="columnheader">Recommended</span>
+          </div>
+          <div class="spec-row" role="row"><span role="rowheader">Processor</span><span role="cell" data-plain="An AMD or Intel processor (not Mac, not ARM)">64-bit x86 (AMD or Intel), 2 cores</span><span role="cell" data-plain="A recent AMD Ryzen laptop">AMD Ryzen with AMD-V, 4+ cores</span></div>
+          <div class="spec-row" role="row"><span role="rowheader">Memory</span><span role="cell" data-plain="4 GB of memory">4 GB RAM</span><span role="cell" data-plain="8 GB of memory or more">8 GB RAM or more</span></div>
+          <div class="spec-row" role="row"><span role="rowheader">Storage</span><span role="cell">16 GB free on drive C:</span><span role="cell" data-plain="32 GB free on a fast SSD">32 GB free on an NVMe SSD</span></div>
+          <div class="spec-row" role="row"><span role="rowheader">Firmware</span><span role="cell" data-plain="Most PCs sold since about 2012">UEFI with a GPT disk</span><span role="cell" data-plain="A PC where you can change startup settings">UEFI, Secure Boot switchable</span></div>
+          <div class="spec-row" role="row"><span role="rowheader">Graphics</span><span role="cell" data-plain="Any screen">Any display the UEFI firmware drives</span><span role="cell" data-plain="A laptop with built-in AMD graphics">AMD Radeon Vega integrated graphics</span></div>
+          <div class="spec-row" role="row"><span role="rowheader">Installer</span><span role="cell">Windows 10 or 11, 64-bit</span><span role="cell">Windows 11</span></div>
+          <div class="spec-row" role="row"><span role="rowheader">Linux apps</span><span role="cell" data-plain="An AMD processor">AMD-V virtualisation enabled</span><span role="cell" data-plain="8 GB of memory and an AMD processor">8 GB RAM, AMD-V enabled</span></div>
+          <div class="spec-row" role="row"><span role="rowheader">Internet</span><span role="cell">Optional</span><span role="cell" data-plain="Cable internet or supported Wi-Fi, to download apps">Ethernet or MediaTek Wi-Fi for the Store</span></div>
+        </div>
+        <p class="note reveal" data-plain="Very old PCs, Macs and ARM laptops (like Snapdragon ones) won&#x27;t work. Running Linux apps currently needs an AMD processor.">Legacy BIOS PCs, Macs and ARM devices are not supported. Linux apps need AMD-V; Intel VT-x support is written but has not been tested on Intel hardware yet.</p>
+      </div>
+    </section>
+
+    <section class="section section-soft" id="devices">
+      <div class="wrap">
+        <div class="head reveal">
+          <p class="kicker">Supported devices</p>
+          <h2>Tested on real hardware.</h2>
+          <p class="body">AerOS is developed and tested daily on the laptop below. Other PCs with similar parts are likely to work, but haven't been tested.</p>
+        </div>
+
+        <div class="devices">
+          <article class="device-card reveal">
+            <span class="badge badge-solid">Primary test device</span>
+            <h3>ASUS Vivobook 14</h3>
+            <p class="model" data-plain="The laptop AerOS is built and tested on every day">TN3402QA · AMD Ryzen 5 5600H · Radeon Vega 7</p>
+            <ul class="dl">
+              <li><span>Display</span><span data-plain="Sharp, smooth screen at full speed">2880 × 1800 at 90 Hz, native driver</span></li>
+              <li><span>Storage</span><span data-plain="Fast built-in SSD">NVMe SSD</span></li>
+              <li><span>Wi-Fi</span><span data-plain="Works, still being improved">MediaTek MT7921 (experimental)</span></li>
+              <li><span>Input</span><span>Keyboard, touchpad, touchscreen (experimental)</span></li>
+            </ul>
+          </article>
+          <article class="device-card reveal">
+            <span class="badge">Virtual machines</span>
+            <h3 data-plain="Virtual machines">QEMU with UEFI</h3>
+            <p class="model" data-plain="Try AerOS in a window on the computer you already have">OVMF firmware · KVM, WHPX or TCG</p>
+            <ul class="dl">
+              <li><span>Display</span><span data-plain="Any window size">virtio-gpu, any resolution</span></li>
+              <li><span>Storage</span><span data-plain="Virtual drives and USB">virtio-blk, NVMe, AHCI, USB</span></li>
+              <li><span>Network</span><span data-plain="Virtual network">e1000, virtio-net</span></li>
+              <li><span>Input</span><span data-plain="Mouse and keyboard">USB tablet, PS/2, virtio-input</span></li>
+            </ul>
+          </article>
+          <article class="device-card reveal">
+            <span class="badge">Likely to work</span>
+            <h3>AMD Ryzen laptops</h3>
+            <p class="model" data-plain="Laptops from 2020 to 2022 with AMD Ryzen chips">Ryzen 4000 / 5000 mobile with Radeon graphics</p>
+            <ul class="dl">
+              <li><span>Why</span><span>Same graphics, chipset and firmware as the test device</span></li>
+              <li><span>Status</span><span>Untested. Reports are welcome on GitHub</span></li>
+            </ul>
+          </article>
+        </div>
+
+        <div class="compat reveal">
+          <div class="compat-head">
+            <h3>Hardware compatibility</h3>
+            <div class="filters">
+              <div class="chips" role="group" aria-label="Filter by status">
+                <button type="button" class="chip on" data-f="all">All</button>
+                <button type="button" class="chip" data-f="yes">Supported</button>
+                <button type="button" class="chip" data-f="exp">Experimental</button>
+                <button type="button" class="chip" data-f="no">Not yet</button>
+              </div>
+              <input class="search" type="search" placeholder="Search hardware" aria-label="Search hardware">
+            </div>
+          </div>
+          <div class="compat-grid">
+            <div class="compat-item"><span data-plain="Fast SSDs">NVMe SSDs</span><span class="pill pill-yes">Supported</span></div>
+            <div class="compat-item"><span data-plain="Regular hard drives and SSDs">SATA (AHCI) drives</span><span class="pill pill-yes">Supported</span></div>
+            <div class="compat-item"><span>USB storage</span><span class="pill pill-yes">Supported</span></div>
+            <div class="compat-item"><span>SD card readers</span><span class="pill pill-yes">Supported</span></div>
+            <div class="compat-item"><span>USB keyboards and mice</span><span class="pill pill-yes">Supported</span></div>
+            <div class="compat-item"><span data-plain="Built-in laptop keyboards">PS/2 laptop keyboards</span><span class="pill pill-yes">Supported</span></div>
+            <div class="compat-item"><span data-plain="Cable internet">Intel and Realtek Ethernet</span><span class="pill pill-yes">Supported</span></div>
+            <div class="compat-item"><span data-plain="Basic screen on any PC">UEFI firmware display</span><span class="pill pill-yes">Supported</span></div>
+            <div class="compat-item"><span data-plain="AMD laptop graphics at full speed">AMD Radeon Vega graphics</span><span class="pill pill-exp">Experimental</span></div>
+            <div class="compat-item"><span data-plain="Wi-Fi on MediaTek cards">MediaTek MT7921 Wi-Fi</span><span class="pill pill-exp">Experimental</span></div>
+            <div class="compat-item"><span data-plain="Touchscreens">I2C touchscreens</span><span class="pill pill-exp">Experimental</span></div>
+            <div class="compat-item"><span data-plain="Sound">Intel HD Audio</span><span class="pill pill-exp">Experimental</span></div>
+            <div class="compat-item"><span data-plain="Full speed on NVIDIA and Intel graphics">NVIDIA and Intel graphics drivers</span><span class="pill pill-no">Not yet</span></div>
+            <div class="compat-item"><span>Intel Wi-Fi</span><span class="pill pill-no">Not yet</span></div>
+            <div class="compat-item"><span>Bluetooth</span><span class="pill pill-no">Not yet</span></div>
+            <div class="compat-item"><span>Fingerprint readers</span><span class="pill pill-no">Not yet</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="download">
+      <div class="wrap">
+        <div class="download reveal">
+          <div class="download-mark"><svg><use href="#leaf"/></svg></div>
+          <h2>Try AerOS.</h2>
+          <p class="body">Developer Preview · November 2026</p>
+          <div class="cta cta-center">
+            <a class="btn btn-dark btn-lg" href="https://github.com/Vrixxy/AerOS/releases/latest/download/AerOS-Setup.exe">
+              <svg class="ico" viewBox="0 0 24 24"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19h14"/></svg>
+              Download AerOS-Setup.exe
+            </a>
+            <a class="btn btn-light btn-lg" href="https://github.com/Vrixxy/AerOS/releases">All releases</a>
+          </div>
+          <p class="fineprint">About 480 MB · Windows 10 and 11 (64-bit) · Requires administrator rights</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-ink" id="experimental">
+      <div class="wrap exp">
+        <div class="reveal">
+          <p class="kicker">Read before installing</p>
+          <h2>An experimental OS project.</h2>
+        </div>
+        <div class="exp-copy reveal">
+          <p>AerOS is an independent project, built from scratch. It is not finished, it is not a replacement for Windows or Linux, and it will have bugs.</p>
+          <ul class="ticks ticks-light">
+            <li>Back up anything important before you install.</li>
+            <li>Install changes your disk partitions. Use a PC you can afford to experiment on.</li>
+            <li>Hardware support is limited and mostly tested on one laptop.</li>
+            <li>AerOS is free for personal, non-commercial use under the AerOS Non-Commercial License.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="faq">
+      <div class="wrap faq-wrap">
+        <div class="head reveal">
+          <p class="kicker">FAQ</p>
+          <h2>Questions.</h2>
+        </div>
+        <div class="faq reveal">
+          <details>
+            <summary>Is AerOS based on Linux?</summary>
+            <p data-plain="No. AerOS is its own system, built from scratch. It can still run Linux apps by quietly running a small Linux inside itself, and it borrows a few graphics and Wi-Fi parts from Linux so more laptops work.">No. The kernel, desktop, file system, network stack and apps are AerOS's own, written in Rust. AerOS can run a Debian Linux kernel inside its own hypervisor so Linux apps work, and it reuses parts of Linux's AMD graphics and MediaTek Wi-Fi drivers through a compatibility layer.</p>
+          </details>
+          <details>
+            <summary>Will installing AerOS delete Windows?</summary>
+            <p data-plain="No. The installer borrows some space from your Windows drive for AerOS and leaves your files alone. Windows still starts by default. Changing how a drive is split up always carries a small risk, so back up first.">No. The installer shrinks drive C: to make a separate partition for AerOS and leaves your Windows files alone. Windows stays the default in your boot menu. Still, any change to partitions carries risk, so back up first.</p>
+          </details>
+          <details>
+            <summary>How do I remove AerOS?</summary>
+            <p>Open Settings › Apps › Installed apps in Windows, find AerOS and choose Uninstall. It removes the boot entry and the AerOS partition, and gives the space back to drive C:.</p>
+          </details>
+          <details>
+            <summary>Why do I need to turn off Secure Boot?</summary>
+            <p data-plain="Secure Boot is a safety setting that only lets Microsoft-approved systems start. AerOS isn&#x27;t on Microsoft&#x27;s list, so you switch the setting off once. The installer shows you how, step by step.">Secure Boot only starts systems signed by Microsoft. AerOS is signed with its own key, so the firmware won't start it until Secure Boot is turned off. The installer shows you how, step by step.</p>
+          </details>
+          <details>
+            <summary>Can I try it without installing?</summary>
+            <p data-plain="Yes. You can run AerOS in a window on your current computer using a free program called QEMU. Instructions are on GitHub.">Yes. AerOS runs in QEMU with UEFI firmware. The repository's tools folder has scripts that build and start it in a virtual machine.</p>
+          </details>
+          <details>
+            <summary>Where do I report a bug?</summary>
+            <p>Open an issue on GitHub with your PC model and what happened. AerOS writes logs to its own partition, which helps a lot.</p>
+          </details>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="wrap footer-inner">
+      <div class="footer-brand">
+        <span class="brand-mark"><svg><use href="#leaf"/></svg></span>
+        <div>
+          <strong>AerOS</strong>
+          <p>An experimental OS project.</p>
+        </div>
+      </div>
+      <nav class="footer-links" aria-label="Footer">
+        <div>
+          <h4>Product</h4>
+          <a href="#features">Features</a>
+          <a href="#specs">Specs</a>
+          <a href="#devices">Devices</a>
+          <a href="#download">Download</a>
+        </div>
+        <div>
+          <h4>Project</h4>
+          <a href="https://github.com/Vrixxy/AerOS">Source code</a>
+          <a href="https://github.com/Vrixxy/AerOS/blob/main/CHANGELOG.md">Changelog</a>
+          <a href="https://github.com/Vrixxy/AerOS/tree/main/docs">Documentation</a>
+          <a href="https://github.com/Vrixxy/AerOS/issues">Report a bug</a>
+        </div>
+      </nav>
+    </div>
+    <div class="wrap wordmark" aria-hidden="true"><span>A</span><span>e</span><span>r</span><span>O</span><span>S</span></div>
+    <div class="wrap footer-base">
+      <span>© 2026 AerOS. Free for non-commercial use. <span class="egg-hint">Psst, type “aeros”.</span></span>
+      <a href="#top">Back to top ↑</a>
+    </div>
+  </footer>
+
+  <div class="toast" role="status" aria-live="polite"></div>
+  <a class="to-top" href="#top" aria-label="Back to top"><svg viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></svg></a>
+  <script src="site/script.js"></script>
+</body>
+</html>

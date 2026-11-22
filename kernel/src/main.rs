@@ -159,6 +159,7 @@ mod web;
 mod wifi_known;
 mod wpa;
 mod xhci;
+mod i2c_touch;
 
 use core::panic::PanicInfo;
 
@@ -494,7 +495,7 @@ fn panic(info: &PanicInfo<'_>) -> ! {
 /// sequence in one very large function, and the firmware's own stack (sized
 /// for firmware, and mapped read-only just below it on some machines)
 /// overflowed on it depending on the CPU count.
-const BOOT_STACK_SIZE: usize = 4 * 1024 * 1024;
+const BOOT_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 #[repr(align(4096))]
 #[allow(dead_code)]
@@ -1297,7 +1298,6 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
     }
     #[cfg(feature = "linux-guest")]
     {
-        svm::boot_linux(&mut frames);
         // Linux gets a core of its own from the start: CPU 0 is the
         // desktop's, CPU 1 the guest disk's worker and the last one the
         // screen-log watchdog's.
@@ -1307,10 +1307,34 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
         } else {
             usize::MAX
         };
-        if let Some(core) = (2..64).find(|cpu| online & (1 << cpu) != 0 && *cpu != watchdog) {
+        // One core per guest vCPU when there are enough; otherwise the whole
+        // guest on one core.
+        let mut free = [0usize; 16];
+        let mut count = 0;
+        for cpu in 2..64 {
+            if online & (1 << cpu) != 0 && cpu != watchdog && count < free.len() {
+                free[count] = cpu;
+                count += 1;
+            }
+        }
+        // As many vCPUs as there are free cores (one kept back for AerOS's
+        // own programs once there are plenty), at least the two the guest
+        // has always had.
+        let wanted = if count > 4 { count - 1 } else { count };
+        svm::linux_set_vcpu_count(wanted.max(2));
+        svm::boot_linux(&mut frames);
+        let vcpus = svm::linux_vcpu_count();
+        if count >= vcpus {
+            for (vcpu, cpu) in free[..vcpus].iter().enumerate() {
+                let submitted = smp::start_job(*cpu, svm::linux_vcpu_core, vcpu as u64);
+                serial::format(format_args!(
+                    "AEROS_VM_CORE vcpu={vcpu} cpu={cpu} submitted={submitted}\n"
+                ));
+            }
+        } else if count > 0 {
+            let core = free[0];
             let submitted = smp::start_job(core, svm::linux_core, 0);
-            serial::format(format_args!("AEROS_VM_CORE cpu={core} submitted={submitted}
-"));
+            serial::format(format_args!("AEROS_VM_CORE cpu={core} submitted={submitted}\n"));
         }
     }
     stage("linux-vm");

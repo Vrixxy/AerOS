@@ -9,7 +9,13 @@
 // x2APIC mode is switched on before the guest starts (IA32_APIC_BASE.EXTD),
 // which is why no APIC MMIO page has to be decoded.
 
-const NUM_VCPUS: usize = 2;
+/// The most vCPUs a guest can have; `active_vcpus` of them are offered to it.
+const NUM_VCPUS: usize = 8;
+static ACTIVE_VCPUS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(2);
+
+fn active_vcpus() -> usize {
+    ACTIVE_VCPUS.load(core::sync::atomic::Ordering::Acquire).clamp(1, NUM_VCPUS)
+}
 const MP_TABLE_GPA: u64 = 0xf_0000;
 /// TSC cycles per APIC timer count at divide-by-1 (the guest calibrates the
 /// timer against the TSC anyway, so any consistent value works).
@@ -127,6 +133,9 @@ struct Vcpu {
     nmi_pending: bool,
     /// An injected NMI's handler hasn't executed IRET yet: further NMIs wait.
     nmi_blocked: bool,
+    /// The guest's TSC_AUX (its CPU number for RDTSCP); the host's own value
+    /// goes back after every exit.
+    tsc_aux: u64,
     apic: Apic,
 }
 
@@ -141,6 +150,7 @@ impl Vcpu {
             sipi_wait: false,
             nmi_pending: false,
             nmi_blocked: false,
+            tsc_aux: 0,
             apic: Apic::new(id),
         }
     }
@@ -171,17 +181,19 @@ fn intercept_apic_msrs(msrpm: u64) {
 fn build_mp_table(ram: u64) {
     let signature = __cpuid_count(1, 0);
     let table = MP_TABLE_GPA + 0x10;
-    let mut bytes = [0u8; 44 + 20 * NUM_VCPUS + 8];
+    let active = active_vcpus();
+    let mut storage = [0u8; 44 + 20 * NUM_VCPUS + 8];
+    let bytes = &mut storage[..44 + 20 * active + 8];
     bytes[0..4].copy_from_slice(b"PCMP");
     let length = bytes.len() as u16;
     bytes[4..6].copy_from_slice(&length.to_le_bytes());
     bytes[6] = 4; // spec revision 1.4
     bytes[8..16].copy_from_slice(b"AEROS   ");
     bytes[16..28].copy_from_slice(b"AerOS-VM    ");
-    let entries = (NUM_VCPUS + 1) as u16;
+    let entries = (active + 1) as u16;
     bytes[34..36].copy_from_slice(&entries.to_le_bytes());
     bytes[36..40].copy_from_slice(&(APIC_BASE_ADDRESS as u32).to_le_bytes());
-    for id in 0..NUM_VCPUS {
+    for id in 0..active {
         let at = 44 + 20 * id;
         bytes[at] = 0; // processor entry
         bytes[at + 1] = id as u8; // local APIC id
@@ -190,7 +202,7 @@ fn build_mp_table(ram: u64) {
         bytes[at + 4..at + 8].copy_from_slice(&signature.eax.to_le_bytes());
         bytes[at + 8..at + 12].copy_from_slice(&signature.edx.to_le_bytes());
     }
-    let bus = 44 + 20 * NUM_VCPUS;
+    let bus = 44 + 20 * active;
     bytes[bus] = 1; // bus entry
     bytes[bus + 1] = 0;
     bytes[bus + 2..bus + 8].copy_from_slice(b"ISA   ");
@@ -480,13 +492,16 @@ impl Machine {
         self.blk_poll();
         self.wake_vcpus(now);
         let current = self.cur;
-        let other = 1 - current;
+        let count = active_vcpus();
+        // The next runnable vCPU after this one, round robin.
+        let other = (1..count)
+            .map(|step| (current + step) % count)
+            .find(|index| self.vcpu_runnable(*index));
         let current_ok = self.vcpu_runnable(current);
-        let other_ok = self.vcpu_runnable(other);
-        if current_ok && (self.slice_exits < SMP_SLICE_EXITS || !other_ok) {
+        if current_ok && (self.slice_exits < SMP_SLICE_EXITS || other.is_none()) {
             return true;
         }
-        if other_ok {
+        if let Some(other) = other {
             self.switch_vcpu(other);
             return true;
         }

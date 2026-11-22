@@ -308,7 +308,7 @@ fn main() {
             arguments.push("-I".into());
             arguments.push(directory.into());
         }
-        if file.starts_with(&amd) {
+        if file.starts_with(&amd) || file.ends_with("drivers/aeros_gpu.c") {
             arguments.extend(AMD_CFLAGS.iter().map(Into::into));
             if with_dc {
                 arguments.extend(DC_CFLAGS.iter().map(Into::into));

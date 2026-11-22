@@ -49,6 +49,7 @@ impl DesktopState {
         }
         let now = crate::time::monotonic_nanoseconds();
         self.set_overlay(Overlay::None);
+        self.close_popups();
         self.search_open = true;
         self.search_at_ns = now;
         self.search_len = 0;
@@ -56,7 +57,7 @@ impl DesktopState {
         self.motion_until_ns = self.motion_until_ns.max(now + OPEN_NS + 80_000_000);
     }
 
-    fn close_search(&mut self) {
+    pub(super) fn close_search(&mut self) {
         if !self.search_open {
             return;
         }
@@ -282,9 +283,11 @@ impl DesktopState {
     /// Called with the pointer position (design coordinates) when it moves.
     pub(super) fn hover_dock(&mut self, point: Point, now: u64) -> bool {
         if self.screen == Screen::Desktop && self.overlay == Overlay::Apps {
-            let page = self.app_focus / LAUNCHER_PAGE;
-            let tile = (page * LAUNCHER_PAGE..launcher_len().min((page + 1) * LAUNCHER_PAGE))
-                .find(|&index| launcher_tile(index).contains(point));
+            let mut shown = [0; LAUNCHER_PAGE];
+            let count = launcher_shown(self, &mut shown);
+            let tile = (0..count)
+                .find(|&slot| launcher_tile(slot).contains(point))
+                .map(|slot| shown[slot]);
             let changed = match tile {
                 Some(index) => !self.launcher_hover || self.app_focus != index,
                 None => self.launcher_hover,

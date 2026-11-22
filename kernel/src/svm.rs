@@ -12,6 +12,8 @@ const VM_CR_LOCK: u64 = 1 << 3;
 const FS_BASE_MSR: u32 = 0xc000_0100;
 const GS_BASE_MSR: u32 = 0xc000_0101;
 const KERNEL_GS_BASE_MSR: u32 = 0xc000_0102;
+#[cfg_attr(not(feature = "linux-guest"), allow(dead_code))]
+const TSC_AUX_MSR: u32 = 0xc000_0103;
 
 pub(crate) const PAGE_SIZE: u64 = 4096;
 const PAGE_2M: u64 = 0x20_0000;
@@ -404,6 +406,23 @@ pub fn linux_ready() -> bool {
 #[cfg(feature = "linux-guest")]
 pub fn linux_core(argument: u64) {
     linux::run_dedicated(argument);
+}
+
+/// Runs one guest vCPU (the argument) on the calling CPU, an SMP job.
+#[cfg(feature = "linux-guest")]
+pub fn linux_vcpu_core(argument: u64) {
+    linux::run_vcpu_core(argument);
+}
+
+#[cfg(feature = "linux-guest")]
+pub fn linux_vcpu_count() -> usize {
+    linux::vcpu_count()
+}
+
+/// How many vCPUs to build the guest with (before `boot_linux`).
+#[cfg(feature = "linux-guest")]
+pub fn linux_set_vcpu_count(count: usize) {
+    linux::set_vcpu_count(count);
 }
 
 #[cfg(feature = "linux-guest")]
@@ -982,6 +1001,136 @@ mod linux {
     /// pumping it.
     static DEDICATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     static CORE_HSAVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    /// Per vCPU core: a host save area page and a host VMCB page after it.
+    static VCPU_CORE_PAGES: [core::sync::atomic::AtomicU64; NUM_VCPUS] =
+        [const { core::sync::atomic::AtomicU64::new(0) }; NUM_VCPUS];
+
+    pub fn vcpu_count() -> usize {
+        active_vcpus()
+    }
+
+    /// How many vCPUs the guest is given (2 up to `NUM_VCPUS`); set before
+    /// the guest is built, from the cores free to run them.
+    pub fn set_vcpu_count(count: usize) {
+        ACTIVE_VCPUS.store(count.clamp(2, NUM_VCPUS), core::sync::atomic::Ordering::Release);
+    }
+
+    /// Runs vCPU `index` on the calling CPU until the guest stops: one core
+    /// per vCPU, so the guest's CPUs run at the same time. The machine is
+    /// shared, so everything but the guest's own execution happens under
+    /// `ENGINE`: picking up interrupts before entry, handling the exit
+    /// after it.
+    pub fn run_vcpu_core(index: u64) {
+        use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+        let index = index as usize;
+        let pages = VCPU_CORE_PAGES.get(index).map_or(0, |page| page.load(Acquire));
+        let cpu = crate::smp::current_logical();
+        if pages == 0 || cpu.is_none() || guest().is_none() || !super::prepare_svm() {
+            crate::serial::format(format_args!("AEROS_VM_VCPU_CORE vcpu={index} started=false\n"));
+            return;
+        }
+        let cpu = cpu.unwrap_or(0);
+        let (hsave, host_vmcb) = (pages, pages + PAGE_SIZE);
+        unsafe { write_msr(VM_HSAVE_PA_MSR, hsave) };
+        crate::arch::interrupts::TICK_ONLY_CPUS.fetch_or(1 << cpu, AcqRel);
+        let ticking = crate::arch::apic::start_timer(1000);
+        let swap_aux = __cpuid_count(0x8000_0001, 0).edx & (1 << 27) != 0;
+        let host_aux = if swap_aux { read_msr(TSC_AUX_MSR) } else { 0 };
+        {
+            let _engine = ENGINE.lock();
+            let Some(machine) = guest() else {
+                return;
+            };
+            unsafe { crate::arch::fpu::restore_context(machine.vcpus[index].fpu as *const u8) };
+            if index == 0 && machine.last_tick_tsc == 0 {
+                machine.last_tick_tsc = rdtsc();
+            }
+        }
+        DEDICATED.store(true, Release);
+        crate::serial::format(format_args!(
+            "AEROS_VM_VCPU_CORE vcpu={index} cpu={cpu} tick={ticking} started=true\n"
+        ));
+        loop {
+            // 1. Under the lock: this vCPU's turn and its pending interrupts.
+            let entry = {
+                let _engine = ENGINE.lock();
+                let Some(machine) = guest() else {
+                    break;
+                };
+                if machine.dead {
+                    break;
+                }
+                if index == 0 {
+                    flush_pending();
+                }
+                machine.cur = index;
+                machine.vmcb = machine.vcpus[index].vmcb;
+                machine.gpr = machine.vcpus[index].gpr;
+                let now = rdtsc();
+                machine.blk_poll();
+                machine.wake_vcpus(now);
+                if index == 0
+                    && !machine.vcpu_runnable(0)
+                    && machine.pit_ticking()
+                    && !machine.tick_pending
+                    && !machine.virq_pending()
+                    && now.wrapping_sub(machine.last_tick_tsc) >= machine.tick_period()
+                {
+                    machine.vcpus[0].halted = false;
+                    machine.inject_timer();
+                    machine.tick_pending = true;
+                }
+                if machine.vcpu_runnable(index) {
+                    if machine.mouse_event_len > 0 {
+                        machine.mouse_flush();
+                    }
+                    machine.maybe_tick();
+                    Some((machine.vmcb, machine.gpr, machine.vcpus[index].tsc_aux))
+                } else {
+                    None
+                }
+            };
+            let Some((vmcb, mut gpr, guest_aux)) = entry else {
+                for _ in 0..2_000 {
+                    core::hint::spin_loop();
+                }
+                continue;
+            };
+            // 2. The guest runs with nothing held.
+            if swap_aux {
+                unsafe { write_msr(TSC_AUX_MSR, guest_aux) };
+            }
+            unsafe { vmentry(vmcb, host_vmcb, gpr.as_mut_ptr()) };
+            let aux = if swap_aux { read_msr(TSC_AUX_MSR) } else { 0 };
+            if swap_aux {
+                unsafe { write_msr(TSC_AUX_MSR, host_aux) };
+            }
+            // 3. Under the lock again: why it stopped.
+            let _engine = ENGINE.lock();
+            let Some(machine) = guest() else {
+                break;
+            };
+            machine.cur = index;
+            machine.vmcb = vmcb;
+            machine.gpr = gpr;
+            machine.vcpus[index].tsc_aux = aux;
+            machine.exits += 1;
+            let now = rdtsc();
+            if machine.tick_pending
+                && now.wrapping_sub(machine.last_tick_tsc) > 20 * machine.tick_period()
+            {
+                machine.tick_pending = false;
+                machine.last_tick_tsc = now;
+            }
+            let flow = machine.handle_exit();
+            machine.vcpus[index].gpr = machine.gpr;
+            if let Flow::Stop = flow {
+                machine.dead = true;
+                break;
+            }
+        }
+        crate::serial::format(format_args!("AEROS_VM_VCPU_CORE vcpu={index} stopped=true\n"));
+    }
     /// How long the dedicated core runs the guest before letting the desktop
     /// at it (about a millisecond).
     const CORE_SLICE_TSC: u64 = 3_000_000;
@@ -1004,7 +1153,8 @@ mod linux {
             crate::serial::line("AEROS_VM_CORE started=false");
             return;
         };
-        crate::arch::interrupts::TICK_ONLY_CPU.store(cpu, core::sync::atomic::Ordering::Release);
+        crate::arch::interrupts::TICK_ONLY_CPUS
+            .fetch_or(1 << cpu, core::sync::atomic::Ordering::AcqRel);
         let ticking = crate::arch::apic::start_timer(1000);
         crate::serial::format(format_args!("AEROS_VM_CORE_TICK started={ticking}
 "));
@@ -1593,10 +1743,18 @@ mod linux {
         let Some(hsave) = frames.allocate_contiguous(1, 1).map(|f| f.address()) else {
             return false;
         };
-        // The host save area is per CPU: the dedicated core gets its own.
+        // The host save area is per CPU: the dedicated core gets its own,
+        // and with a core per vCPU each of those a save area and a host
+        // VMCB.
         if let Some(page) = frames.allocate_contiguous(1, 1).map(|f| f.address()) {
             zero_region(page, PAGE_SIZE);
             CORE_HSAVE.store(page, core::sync::atomic::Ordering::Release);
+        }
+        for index in 0..NUM_VCPUS {
+            if let Some(block) = frames.allocate_contiguous(2, 1).map(|f| f.address()) {
+                zero_region(block, 2 * PAGE_SIZE);
+                VCPU_CORE_PAGES[index].store(block, core::sync::atomic::Ordering::Release);
+            }
         }
         let Some(host_vmcb) = frames.allocate_contiguous(1, 1).map(|f| f.address()) else {
             return false;
@@ -1610,20 +1768,25 @@ mod linux {
         let Some(msrpm) = frames.allocate_contiguous(2, 1).map(|f| f.address()) else {
             return false;
         };
-        // The second vCPU's VMCB and both vCPUs' FPU save areas (an XSAVE
+        // The other vCPUs' VMCBs and every vCPU's FPU save area (an XSAVE
         // area needs 64-byte alignment; a page has it).
-        let Some(vmcb1) = frames.allocate_contiguous(1, 1).map(|f| f.address()) else {
-            return false;
-        };
-        let Some(fpu0) = frames.allocate_contiguous(1, 1).map(|f| f.address()) else {
-            return false;
-        };
-        let Some(fpu1) = frames.allocate_contiguous(1, 1).map(|f| f.address()) else {
-            return false;
-        };
-        zero_region(vmcb1, PAGE_SIZE);
-        zero_region(fpu0, PAGE_SIZE);
-        zero_region(fpu1, PAGE_SIZE);
+        let mut vmcbs = [0u64; NUM_VCPUS];
+        let mut fpus = [0u64; NUM_VCPUS];
+        vmcbs[0] = vmcb;
+        for index in 0..NUM_VCPUS {
+            let Some(fpu) = frames.allocate_contiguous(1, 1).map(|f| f.address()) else {
+                return false;
+            };
+            zero_region(fpu, PAGE_SIZE);
+            fpus[index] = fpu;
+            if index > 0 {
+                let Some(page) = frames.allocate_contiguous(1, 1).map(|f| f.address()) else {
+                    return false;
+                };
+                zero_region(page, PAGE_SIZE);
+                vmcbs[index] = page;
+            }
+        }
 
         zero_region(npt, 6 * PAGE_SIZE);
         zero_region(hsave, PAGE_SIZE);
@@ -1677,17 +1840,18 @@ mod linux {
         }
         let npt_pd = build_linux_npt(npt, ram, chosen, scratch);
         build_vmcb(vmcb, npt, iopm, msrpm);
-        // vCPU 1 shares the BSP's control area (intercepts, nested page table,
-        // permission maps) but needs its own ASID: with one shared ASID the
-        // TLB could hand one vCPU the other's translations.
-        for offset in (0..0x400u64).step_by(8) {
-            unsafe { write_u64(vmcb1, offset, read_u64(vmcb, offset)) };
+        // The other vCPUs share the BSP's control area (intercepts, nested
+        // page table, permission maps) but each needs its own ASID: with one
+        // shared ASID the TLB could hand one vCPU another's translations.
+        for (index, other) in vmcbs.iter().enumerate().skip(1) {
+            for offset in (0..0x400u64).step_by(8) {
+                unsafe { write_u64(*other, offset, read_u64(vmcb, offset)) };
+            }
+            unsafe { write_u32(*other, 0x058, index as u32 + 1) };
         }
-        unsafe { write_u32(vmcb1, 0x058, 2) };
-        // Both vCPUs start from the host's current FPU state.
-        unsafe {
-            crate::arch::fpu::save_context(fpu0 as *mut u8);
-            crate::arch::fpu::save_context(fpu1 as *mut u8);
+        // Every vCPU starts from the host's current FPU state.
+        for fpu in fpus {
+            unsafe { crate::arch::fpu::save_context(fpu as *mut u8) };
         }
         if SMP {
             intercept_apic_msrs(msrpm);
@@ -1758,7 +1922,7 @@ mod linux {
             smp: SMP,
             cur: 0,
             slice_exits: 0,
-            vcpus: [Vcpu::new(0, vmcb, fpu0), Vcpu::new(1, vmcb1, fpu1)],
+            vcpus: core::array::from_fn(|index| Vcpu::new(index as u32, vmcbs[index], fpus[index])),
             i8042_cfg: 0x47,
             i8042_cmd: 0,
             kbd_out: [0; KBD_QUEUE_SIZE],
@@ -1805,6 +1969,8 @@ mod linux {
             last_net_poll_tsc: 0,
         };
         machine.gpr[3] = ZERO_PAGE;
+        // vCPU 0's own copy too: a core per vCPU starts from that copy.
+        machine.vcpus[0].gpr = machine.gpr;
 
         unsafe { write_msr(VM_HSAVE_PA_MSR, hsave) };
         crate::serial::format(format_args!(
@@ -2050,6 +2216,8 @@ mod linux {
         /// exit this monitor doesn't handle).
         fn run_for(&mut self, budget_tsc: u64) -> bool {
             let start = rdtsc();
+            let swap_aux = __cpuid_count(0x8000_0001, 0).edx & (1 << 27) != 0;
+            let host_aux = if swap_aux { read_msr(TSC_AUX_MSR) } else { 0 };
             // The single-CPU guest restarts its (fast, fixed) tick clock on
             // every slice. In SMP mode the tick follows the guest's PIT
             // programming (4 ms at HZ=250), which is longer than a desktop
@@ -2106,7 +2274,16 @@ mod linux {
                 }
                 self.maybe_tick();
                 let ctx = self.gpr.as_mut_ptr();
+                // The guest writes TSC_AUX (its CPU number), which the host
+                // reads through RDTSCP to know which processor it is on.
+                if swap_aux {
+                    unsafe { write_msr(TSC_AUX_MSR, self.vcpus[self.cur].tsc_aux) };
+                }
                 unsafe { vmentry(self.vmcb, self.host_vmcb, ctx) };
+                if swap_aux {
+                    self.vcpus[self.cur].tsc_aux = read_msr(TSC_AUX_MSR);
+                    unsafe { write_msr(TSC_AUX_MSR, host_aux) };
+                }
                 self.exits += 1;
                 self.slice_exits = self.slice_exits.saturating_add(1);
                 let now = rdtsc();

@@ -157,6 +157,7 @@ const EXT_PROTECT_CTRL: Cmd = Cmd::Ext(0x3e);
 const EXT_MAC_INIT_CTRL: Cmd = Cmd::Ext(0x46);
 const EXT_SET_RX_PATH: Cmd = Cmd::Ext(0x4e);
 const CE_START_HW_SCAN: Cmd = Cmd::Ce(0x03);
+const CE_SET_CHAN_DOMAIN: Cmd = Cmd::Ce(0x0f);
 const CE_GET_NIC_CAPAB: Cmd = Cmd::Ce(0x8a);
 const UNI_DEV_INFO: Cmd = Cmd::Uni(0x01);
 const UNI_BSS_INFO: Cmd = Cmd::Uni(0x02);
@@ -1448,6 +1449,11 @@ impl Wifi {
         {
             return false;
         }
+        // Without a channel list the firmware has nothing to scan: a scan
+        // "finishes" at once with no networks (seen on the laptop).
+        if !self.channel_domain() {
+            note!("channel domain could not be sent; scans may find nothing");
+        }
         let mut device = [0u8; 16];
         put16(&mut device, 4, 0);
         put16(&mut device, 6, 12);
@@ -1457,6 +1463,31 @@ impl Wifi {
         self.bss_basic(&mut basic, true, false);
         self.mcu_ok("device info", UNI_DEV_INFO, &device)
             && self.mcu_ok("bss info", UNI_BSS_INFO, &basic)
+    }
+
+    /// The channels the firmware may use (as mt76_connac's
+    /// set_channel_domain): world regulatory domain "00", 2.4 GHz 1-13 and
+    /// the usual 5 GHz channels, 20/40 MHz at 2.4 GHz and up to 160 MHz at
+    /// 5 GHz.
+    fn channel_domain(&mut self) -> bool {
+        const LOW: [u16; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+        const HIGH: [u16; 25] = [
+            36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140,
+            144, 149, 153, 157, 161, 165,
+        ];
+        let mut request = [0u8; 12 + 8 * (LOW.len() + HIGH.len())];
+        request[..2].copy_from_slice(b"00");
+        request[4] = 0; // 2.4 GHz: 20/40 MHz
+        request[5] = 3; // 5 GHz: 20/40/80/160 MHz
+        request[6] = 3;
+        request[8] = LOW.len() as u8;
+        request[9] = HIGH.len() as u8;
+        for (index, channel) in LOW.iter().chain(HIGH.iter()).enumerate() {
+            put16(&mut request, 12 + index * 8, *channel);
+        }
+        // The firmware takes this one without answering (Linux sends it with
+        // wait_resp = false); waiting for a reply cost 3 s every boot.
+        self.mcu_send(CE_SET_CHAN_DOMAIN, &request).is_some()
     }
 
     fn set_channel(&mut self, cmd: Cmd, channel: u8) -> bool {

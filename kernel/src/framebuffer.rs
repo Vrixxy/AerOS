@@ -54,11 +54,21 @@ pub struct FrameBuffer {
 static BRIGHTNESS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(100);
 static BRIGHTNESS_SHOWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(100);
 
+static BRIGHTNESS_WANTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(100);
+
+/// Uses the panel's real backlight when a display driver offers one, and
+/// dims pixels as they are copied otherwise.
 pub fn set_brightness(percent: u8) {
-    BRIGHTNESS.store(
-        percent.clamp(5, 100) as u32,
-        core::sync::atomic::Ordering::Relaxed,
-    );
+    let percent = percent.clamp(5, 100) as u32;
+    BRIGHTNESS_WANTED.store(percent, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "linux-drivers")]
+    let percent = if crate::linux::set_backlight(percent) { 100 } else { percent };
+    BRIGHTNESS.store(percent, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Applies the brightness again, after a display driver took the screen.
+pub fn reapply_brightness() {
+    set_brightness(BRIGHTNESS_WANTED.load(core::sync::atomic::Ordering::Relaxed) as u8);
 }
 
 fn dim_pixel(value: u32, percent: u32) -> u32 {

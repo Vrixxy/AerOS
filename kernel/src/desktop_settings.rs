@@ -64,6 +64,82 @@ fn slider_track(pane: Rect, y: i32) -> Rect {
     Rect::new(row.x + 76, row.y + 19, 146, 4)
 }
 
+/// The glass colours the Display page offers, each at 25% opacity.
+const GLASS_SWATCHES: [Rgba; 6] = [
+    Rgba::new(255, 255, 255, 0),
+    Rgba::new(0, 0, 0, 64),
+    Rgba::new(120, 170, 255, 64),
+    Rgba::new(185, 140, 255, 64),
+    Rgba::new(255, 150, 200, 64),
+    Rgba::new(140, 230, 180, 64),
+];
+
+/// The Display page: two columns of compact rows, laid out like Figma's
+/// Glass panel (brightness first, then the glass's colour and optics).
+const CELL_WIDTH: i32 = 188;
+const CELL_HEIGHT: i32 = 34;
+const CELL_PITCH: i32 = 41;
+
+fn display_cell(pane: Rect, column: i32, row: i32) -> Rect {
+    Rect::new(
+        pane.x + column * (CELL_WIDTH + 12),
+        pane.y + row * CELL_PITCH,
+        CELL_WIDTH,
+        CELL_HEIGHT,
+    )
+}
+
+fn display_track(cell: Rect) -> Rect {
+    Rect::new(cell.x + 82, cell.y + 15, cell.width - 98, 4)
+}
+
+fn glass_swatch(pane: Rect, index: usize) -> Rect {
+    let row = Rect::new(pane.x, pane.y + CELL_PITCH, CELL_WIDTH * 2 + 12, CELL_HEIGHT);
+    Rect::new(row.x + 82 + index as i32 * 28, row.y + 7, 20, 20)
+}
+
+/// The glass sliders: label, (column, row), and how a 0..=100 position maps
+/// to the material and back.
+const GLASS_SLIDERS: [(&str, i32, i32); 9] = [
+    ("Opacity", 1, 0),
+    ("Light", 0, 2),
+    ("Angle", 1, 2),
+    ("Refraction", 0, 3),
+    ("Depth", 1, 3),
+    ("Dispersion", 0, 4),
+    ("Splay", 1, 4),
+    ("Frost", 0, 5),
+    ("", 1, 5),
+];
+
+fn glass_slider_get(optics: crate::aerui::GlassOptics, index: usize) -> u8 {
+    let value = match index {
+        0 => optics.tint.alpha as u32 * 100 / 255,
+        1 => optics.light as u32,
+        2 => optics.light_angle as u32 * 100 / 359,
+        3 => (optics.refraction as u32).saturating_sub(100) / 2,
+        4 => optics.depth as u32 * 100 / 40,
+        5 => optics.dispersion as u32 * 100 / 80,
+        6 => optics.splay as u32 * 100 / 60,
+        _ => optics.frost as u32 / 2,
+    };
+    value.min(100) as u8
+}
+
+fn glass_slider_set(optics: &mut crate::aerui::GlassOptics, index: usize, percent: u32) {
+    let percent = percent.min(100);
+    match index {
+        0 => optics.tint.alpha = (percent * 255 / 100) as u8,
+        1 => optics.light = percent as u8,
+        2 => optics.light_angle = (percent * 359 / 100) as u16,
+        3 => optics.refraction = (100 + percent * 2) as u16,
+        4 => optics.depth = (percent * 40 / 100) as u8,
+        5 => optics.dispersion = (percent * 80 / 100) as u8,
+        6 => optics.splay = (percent * 60 / 100).max(1) as u8,
+        _ => optics.frost = (percent * 2) as u8,
+    }
+}
+
 fn slider_percent(track: Rect, x: i32) -> i32 {
     (x - track.x) * 100 / track.width.max(1)
 }
@@ -181,9 +257,37 @@ impl DesktopState {
                 return Some(DesktopAction::Redraw);
             }
             PAGE_DISPLAY => {
-                if slider_row(pane, 0).contains(point) {
-                    let raw = slider_percent(slider_track(pane, 0), point.x);
+                let brightness = display_cell(pane, 0, 0);
+                if brightness.contains(point) {
+                    let raw = slider_percent(display_track(brightness), point.x);
                     self.set_brightness(raw.clamp(8, 100) as u8, now);
+                    return Some(DesktopAction::Redraw);
+                }
+                let mut optics = crate::aerui::glass_optics();
+                let mut changed = false;
+                for (index, swatch) in GLASS_SWATCHES.iter().enumerate() {
+                    if glass_swatch(pane, index).expand(3).contains(point) {
+                        let alpha = if optics.tint.alpha == 0 { swatch.alpha } else { optics.tint.alpha };
+                        optics.tint = Rgba::new(swatch.red, swatch.green, swatch.blue, if index == 0 { 0 } else { alpha });
+                        changed = true;
+                    }
+                }
+                for (index, (label, column, row)) in GLASS_SLIDERS.iter().enumerate() {
+                    let cell = display_cell(pane, *column, *row);
+                    if !cell.contains(point) {
+                        continue;
+                    }
+                    if label.is_empty() {
+                        optics = crate::aerui::GlassOptics::DEFAULT;
+                    } else {
+                        let raw = slider_percent(display_track(cell), point.x).clamp(0, 100);
+                        glass_slider_set(&mut optics, index, raw as u32);
+                    }
+                    changed = true;
+                }
+                if changed {
+                    crate::aerui::set_glass_optics(optics);
+                    let _ = crate::settings::save();
                     return Some(DesktopAction::Redraw);
                 }
             }
@@ -588,39 +692,69 @@ pub(super) fn draw_settings(
             );
         }
         PAGE_DISPLAY => {
+            let brightness = display_cell(pane, 0, 0);
             draw_slider_row(
                 painter,
                 layout,
                 font,
-                slider_row(pane, 0),
-                slider_track(pane, 0),
+                brightness,
+                display_track(brightness),
                 "Brightness",
                 state.brightness,
             );
-            draw_info_box(
-                painter,
-                layout,
-                font,
-                info_rect(pane, below(SLIDER_ROW.height)),
-                &[
-                    (
-                        "Cursor",
-                        if crate::virtio_gpu::cursor_active() {
-                            "Hardware (GPU)"
-                        } else {
-                            "Software"
-                        },
-                    ),
-                    (
-                        "Glass",
-                        if crate::virtio_gpu::frost_available() {
-                            "Blurred on the GPU"
-                        } else {
-                            "Blurred on the CPU"
-                        },
-                    ),
-                ],
+            let optics = crate::aerui::glass_optics();
+            let row = Rect::new(pane.x, pane.y + CELL_PITCH, CELL_WIDTH * 2 + 12, CELL_HEIGHT);
+            painter.stroke_rounded_rect(
+                layout.rect(row),
+                layout.radii(CornerRadii::all(row.height / 2)),
+                1,
+                OUTLINE,
             );
+            text(painter, layout, font, Point::new(row.x + 12, row.y + 13), "Glass", 10, INK);
+            for (index, swatch) in GLASS_SWATCHES.iter().enumerate() {
+                let dot = glass_swatch(pane, index);
+                let chosen = if index == 0 {
+                    optics.tint.alpha == 0
+                } else {
+                    optics.tint.alpha != 0
+                        && (optics.tint.red, optics.tint.green, optics.tint.blue)
+                            == (swatch.red, swatch.green, swatch.blue)
+                };
+                let shown = if index == 0 {
+                    Rgba::new(236, 238, 242, 255)
+                } else {
+                    Rgba::new(swatch.red, swatch.green, swatch.blue, 255)
+                };
+                painter.fill_rounded_rect(layout.rect(dot), layout.radii(CornerRadii::all(10)), shown);
+                painter.stroke_rounded_rect(
+                    layout.rect(dot.expand(if chosen { 2 } else { 0 })),
+                    layout.radii(CornerRadii::all(12)),
+                    if chosen { 2 } else { 1 },
+                    if chosen { Rgba::new(255, 255, 255, 255) } else { Rgba::new(255, 255, 255, 70) },
+                );
+            }
+            for (index, (label, column, row)) in GLASS_SLIDERS.iter().enumerate() {
+                let cell = display_cell(pane, *column, *row);
+                if label.is_empty() {
+                    painter.stroke_rounded_rect(
+                        layout.rect(cell),
+                        layout.radii(CornerRadii::all(cell.height / 2)),
+                        1,
+                        OUTLINE,
+                    );
+                    text(painter, layout, font, Point::new(cell.x + 48, cell.y + 13), "Reset glass", 10, INK);
+                    continue;
+                }
+                draw_slider_row(
+                    painter,
+                    layout,
+                    font,
+                    cell,
+                    display_track(cell),
+                    label,
+                    glass_slider_get(optics, index),
+                );
+            }
         }
         PAGE_SOUND => {
             draw_slider_row(
@@ -697,10 +831,10 @@ pub(super) fn draw_settings(
         }
         PAGE_POWER => {
             let mut charge = ClockBuffer::new();
-            crate::battery::describe(
-                crate::battery::level(crate::time::monotonic_nanoseconds()),
-                &mut charge,
-            );
+            let battery = crate::battery::level(crate::time::monotonic_nanoseconds());
+            crate::battery::describe(battery, &mut charge);
+            let mut health = ClockBuffer::new();
+            crate::battery::describe_health(battery, &mut health);
             draw_info_box(
                 painter,
                 layout,
@@ -709,10 +843,11 @@ pub(super) fn draw_settings(
                     pane.x + SETTING_ROW.width + 24,
                     pane.y,
                     INFO_BOX.width,
-                    INFO_BOX.height / 2,
+                    INFO_BOX.height * 2 / 3,
                 ),
                 &[
                     ("Battery", charge.as_str()),
+                    ("Health", health.as_str()),
                     ("Saver", if state.battery_saver { "On" } else { "Off" }),
                 ],
             );
@@ -953,9 +1088,39 @@ impl DesktopState {
     /// Warns once at 10% and once at 5% while the battery runs down; at 5%
     /// it also turns on battery saver and saves open work.
     pub(super) fn battery_tick(&mut self, now: u64) {
+        use core::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
+        static HEALTH_WARNED: AtomicBool = AtomicBool::new(false);
+        static SLOW_READINGS: AtomicU8 = AtomicU8::new(0);
         let Some(level) = crate::battery::level(now) else {
             return;
         };
+        // Once a session: a battery that holds under half its first charge.
+        if let Some(health) = level.health
+            && health < 50
+            && !HEALTH_WARNED.swap(true, Relaxed)
+        {
+            let mut body = ClockBuffer56::new();
+            let _ = write!(body, "It holds {health}% of its first charge.");
+            crate::notify::push(1, "Battery health is low", body.as_str());
+        }
+        // Charging under 15 W on three readings in a row (they are 30 s
+        // apart) while not nearly full: the charger or cable is probably
+        // weak. Said once per plug-in.
+        match level.charge_mw {
+            Some(power) if level.charging && level.percent < 90 && power < 15_000 => {
+                let readings = SLOW_READINGS.load(Relaxed);
+                if readings < 3 {
+                    SLOW_READINGS.store(readings + 1, Relaxed);
+                    if readings + 1 == 3 {
+                        let mut body = ClockBuffer56::new();
+                        let _ = write!(body, "Only {} W. The charger or cable may be weak.", power / 1000);
+                        crate::notify::push(1, "Charging slowly", body.as_str());
+                    }
+                }
+            }
+            _ if !level.charging => SLOW_READINGS.store(0, Relaxed),
+            _ => {}
+        }
         if level.charging || level.percent > 15 {
             self.battery_warned = 100;
             return;

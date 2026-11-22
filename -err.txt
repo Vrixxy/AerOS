@@ -1,0 +1,3 @@
+C:\Program Files\qemu\qemu-system-x86_64.exe: warning: Ignoring request for interrupt vector 0
+**
+ERROR:../../../block/vvfat.c:1901:get_cluster_count_for_direntry: assertion failed: (mapping->mode & MODE_DELETED)

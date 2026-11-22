@@ -3,7 +3,7 @@ use crate::framebuffer::{Color, FrameBuffer};
 use crate::sync::TicketLock;
 
 pub const MAX_FROST_PIXELS: usize = 1_048_576;
-const MAX_BLUR_RADIUS: u8 = 32;
+const MAX_BLUR_RADIUS: u8 = 64;
 /// Below this many pixels the CPU blur is cheaper than a GPU round trip.
 const GPU_FROST_MIN_PIXELS: usize = 3_000;
 
@@ -246,6 +246,11 @@ impl Scale {
             .then_some(Self(((value as u32 * 1_024 + 500) / 1_000) as u16))
     }
 
+    /// This scale times `milli` / 1000, for things growing in or out.
+    pub fn scaled_by(self, milli: i32) -> Self {
+        Self((self.0 as i64 * milli.max(1) as i64 / 1_000).clamp(1, u16::MAX as i64) as u16)
+    }
+
     pub fn logical(self, value: i32) -> i32 {
         let scaled = value as i64 * self.0 as i64;
         if scaled >= 0 {
@@ -337,6 +342,7 @@ impl FrostStyle {
     }
 
     pub fn scaled(mut self, scale: Scale) -> Self {
+        GLASS_SCALE.store(scale.0 as u32, core::sync::atomic::Ordering::Relaxed);
         self.blur_radius = scale
             .logical(self.blur_radius as i32)
             .clamp(0, MAX_BLUR_RADIUS as i32) as u8;
@@ -651,6 +657,10 @@ impl<'a> Painter<'a> {
         };
         self.clip = clipped;
         true
+    }
+
+    pub fn screen(&self) -> Rect {
+        Rect::new(0, 0, self.frame.width() as i32, self.frame.height() as i32)
     }
 
     pub fn reset_clip(&mut self) {
@@ -1005,6 +1015,21 @@ impl<'a> Painter<'a> {
             };
         }
         let pixels = area.width as usize * area.height as usize;
+        if glass_optics().optical() {
+            let fitted = radii.fit(bounds);
+            if step == 1 {
+                self.paint_shadow(bounds, fitted, style);
+            }
+            if self.optical_glass(area, bounds, fitted, style, noise_seed) {
+                self.stroke_rounded_rect(bounds, fitted, style.border_width, style.border);
+                return FrostReport {
+                    pixels,
+                    blur_radius: style.blur_radius,
+                    captured: true,
+                    clipped: area != bounds,
+                };
+            }
+        }
         if pixels > MAX_FROST_PIXELS {
             self.fill_rounded_rect(bounds, radii, style.tint);
             self.stroke_rounded_rect(bounds, radii, style.border_width, style.border);
@@ -1821,5 +1846,563 @@ pub fn self_test() -> UiCoreReport {
         interaction,
         frost,
         verified: geometry && scaling && interaction && frost,
+    }
+}
+
+// ------------------------------------------------------------ optical glass
+
+/// The glass material every frosted surface is made of: a lens with
+/// thickness and an index of refraction, frost, dispersion, a light, and a
+/// colour laid over it like a fill layer (alpha = its opacity, 25% for the
+/// picker's colours). Logical pixels; `refraction` is the index x 100.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GlassOptics {
+    pub depth: u8,
+    pub refraction: u16,
+    pub splay: u8,
+    pub dispersion: u8,
+    pub frost: u8,
+    pub light_angle: u16,
+    pub light: u8,
+    pub tint: Rgba,
+    pub adaptive: bool,
+}
+
+impl GlassOptics {
+    /// The Figma Glass preset every AerOS surface uses: light -45 degrees
+    /// (from the top left) at 80%, refraction, depth, dispersion, frost and
+    /// splay all at 100.
+    pub const DEFAULT: Self = Self {
+        depth: 16,
+        refraction: 200,
+        splay: 28,
+        dispersion: 35,
+        frost: 100,
+        light_angle: 135,
+        light: 80,
+        tint: Rgba::new(255, 255, 255, 0),
+        adaptive: true,
+    };
+
+    fn optical(self) -> bool {
+        self.depth != 0 || self.light != 0 || self.tint.alpha != 0 || self.adaptive
+    }
+}
+
+static GLASS: TicketLock<GlassOptics> = TicketLock::new(GlassOptics::DEFAULT);
+/// One strip of finished glass (colour, coverage in the top byte), held back
+/// until the next strip has captured the untouched background above it.
+static GLASS_HELD: TicketLock<[u32; MAX_FROST_PIXELS]> = TicketLock::new([0; MAX_FROST_PIXELS]);
+static GLASS_SCALE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1024);
+
+pub fn glass_optics() -> GlassOptics {
+    *GLASS.lock()
+}
+
+/// Set once the first GPU glass job has been compared with the CPU's.
+#[cfg(feature = "linux-drivers")]
+static GPU_GLASS_CHECKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static GLASS_GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn set_glass_optics(optics: GlassOptics) {
+    *GLASS.lock() = optics;
+    GLASS_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Bumps whenever the material changes, for caches of drawn glass.
+pub fn glass_generation() -> u64 {
+    GLASS_GENERATION.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// sin of `degrees` x 256 (Bhaskara I approximation, within 0.2%).
+fn sin256(degrees: i32) -> i32 {
+    let d = degrees.rem_euclid(360);
+    let (x, sign) = if d > 180 { (d - 180, -1) } else { (d, 1) };
+    let p = x * (180 - x);
+    sign * 256 * 4 * p / (40_500 - p)
+}
+
+/// Signed distance into a rounded rectangle at pixel (x, y) centre in
+/// 1/16 px (positive inside) and the outward normal x 256.
+fn rounded_sdf(bounds: Rect, radii: CornerRadii, x: i32, y: i32) -> (i32, i32, i32) {
+    let px = x * 16 + 8 - (bounds.x * 16 + bounds.width * 8);
+    let py = y * 16 + 8 - (bounds.y * 16 + bounds.height * 8);
+    let radius = match (px < 0, py < 0) {
+        (true, true) => radii.top_left,
+        (false, true) => radii.top_right,
+        (false, false) => radii.bottom_right,
+        (true, false) => radii.bottom_left,
+    } * 16;
+    let qx = px.abs() - (bounds.width * 8 - radius);
+    let qy = py.abs() - (bounds.height * 8 - radius);
+    let (ox, oy) = (qx.max(0) as i64, qy.max(0) as i64);
+    let outside = (ox * ox + oy * oy).isqrt() as i32;
+    let distance = -(outside + qx.max(qy).min(0) - radius);
+    let (nx, ny) = if qx > 0 && qy > 0 && outside > 0 {
+        (qx * 256 / outside, qy * 256 / outside)
+    } else if qx > qy {
+        (256, 0)
+    } else {
+        (0, 256)
+    };
+    (
+        distance,
+        if px < 0 { -nx } else { nx },
+        if py < 0 { -ny } else { ny },
+    )
+}
+
+fn channel(pixel: FrostPixel, index: usize) -> i32 {
+    match index {
+        0 => pixel.red as i32,
+        1 => pixel.green as i32,
+        _ => pixel.blue as i32,
+    }
+}
+
+/// Bilinear sample of one channel at (x, y) in 1/16 px of the buffer.
+fn bilinear(buffer: &[FrostPixel], width: usize, height: usize, x: i32, y: i32, index: usize) -> i32 {
+    let x = x.clamp(0, (width as i32 - 1) * 16);
+    let y = y.clamp(0, (height as i32 - 1) * 16);
+    let (x0, y0) = ((x >> 4) as usize, (y >> 4) as usize);
+    let (fx, fy) = (x & 15, y & 15);
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
+    let at = |sx: usize, sy: usize| channel(buffer[sy * width + sx], index);
+    let top = at(x0, y0) * (16 - fx) + at(x1, y0) * fx;
+    let bottom = at(x0, y1) * (16 - fx) + at(x1, y1) * fx;
+    (top * (16 - fy) + bottom * fy + 128) / 256
+}
+
+fn vertical_blur(
+    source: &[FrostPixel],
+    destination: &mut [FrostPixel],
+    width: usize,
+    height: usize,
+    radius: usize,
+) {
+    for x in 0..width {
+        let (mut start, mut end) = (0usize, radius.min(height - 1));
+        let mut sum = [0u32; 3];
+        for y in start..=end {
+            let p = source[y * width + x];
+            sum[0] += p.red as u32;
+            sum[1] += p.green as u32;
+            sum[2] += p.blue as u32;
+        }
+        for y in 0..height {
+            let samples = (end - start + 1) as u32;
+            destination[y * width + x] = FrostPixel {
+                red: (sum[0] / samples) as u8,
+                green: (sum[1] / samples) as u8,
+                blue: (sum[2] / samples) as u8,
+            };
+            if y + 1 == height {
+                break;
+            }
+            let next_start = (y + 1).saturating_sub(radius);
+            let next_end = (y + 1 + radius).min(height - 1);
+            if next_start > start {
+                let p = source[start * width + x];
+                sum[0] -= p.red as u32;
+                sum[1] -= p.green as u32;
+                sum[2] -= p.blue as u32;
+            }
+            if next_end > end {
+                let p = source[next_end * width + x];
+                sum[0] += p.red as u32;
+                sum[1] += p.green as u32;
+                sum[2] += p.blue as u32;
+            }
+            start = next_start;
+            end = next_end;
+        }
+    }
+}
+
+impl Painter<'_> {
+    /// Frosted glass as a lens: the background is blurred (two box passes
+    /// each way, close to a Gaussian), bent outward near the rim by the
+    /// depth and refraction over the splay band, each colour by a slightly
+    /// different amount (dispersion), graded, held to a legible brightness,
+    /// filtered through the tinted crystal and lit from one direction: a
+    /// specular rim facing the light, shade on the far side. Works in strips,
+    /// so a full-screen sheet needs no more memory than a small panel.
+    /// False when the material is switched off.
+    fn optical_glass(
+        &mut self,
+        area: Rect,
+        bounds: Rect,
+        radii: CornerRadii,
+        style: FrostStyle,
+        seed: u32,
+    ) -> bool {
+        let optics = glass_optics();
+        if !optics.optical() {
+            return false;
+        }
+        let scale = GLASS_SCALE.load(core::sync::atomic::Ordering::Relaxed) as i32;
+        let physical = |logical: i32| (logical * scale + 512) / 1024;
+        let splay = (physical(optics.splay as i32) * 16).max(16);
+        let bend =
+            physical(optics.depth as i32) * 16 * (optics.refraction.max(100) as i32 - 100) / 50;
+        let spread = optics.dispersion as i32;
+        let blur = (style.blur_radius as usize * optics.frost as usize / 100)
+            .min(MAX_BLUR_RADIUS as usize);
+        let pass = if blur == 0 { 0 } else { (blur * 3 / 5).max(1) };
+        let margin = (blur + 2) as i32 + bend * (100 + spread) / 1600;
+        let (frame_w, frame_h) = (self.frame.width() as i32, self.frame.height() as i32);
+        let left = (area.x - margin).max(0);
+        let right = (area.right() + margin).min(frame_w);
+        let width = (right - left).max(0) as usize;
+        if width == 0 {
+            return true;
+        }
+        let rows = (MAX_FROST_PIXELS / width) as i32 - 2 * margin;
+        if rows < 4 {
+            return false;
+        }
+        let light_x = sin256(optics.light_angle as i32 + 90);
+        let light_y = -sin256(optics.light_angle as i32);
+        let intensity = optics.light as i32;
+        let rim = (physical(3) * 8).max(16);
+        let shade = physical(14) * 16;
+        let crystal = optics.tint;
+        let filter = [crystal.red as i32, crystal.green as i32, crystal.blue as i32];
+        let tint_luma = (style.tint.red as i32 * 54
+            + style.tint.green as i32 * 183
+            + style.tint.blue as i32 * 19)
+            / 256;
+        let dark_glass = style.tint.alpha < 40 || tint_luma < 128;
+        let reach = (splay.max(shade) / 16 + 8) as i32;
+        let mut shape = bounds;
+        if bounds.x <= 0 {
+            shape.x -= reach;
+            shape.width += reach;
+        }
+        if bounds.y <= 0 {
+            shape.y -= reach;
+            shape.height += reach;
+        }
+        if bounds.right() >= frame_w {
+            shape.width += reach;
+        }
+        if bounds.bottom() >= frame_h {
+            shape.height += reach;
+        }
+        #[cfg(feature = "linux-drivers")]
+        let checking = !GPU_GLASS_CHECKED.load(core::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "linux-drivers")]
+        let gpu_ran = self.gpu_glass(
+            area,
+            shape,
+            radii,
+            style,
+            seed,
+            [left, right, margin],
+            [splay, bend, spread, rim, shade, light_x, light_y, intensity],
+            pass,
+            optics,
+            dark_glass,
+            checking,
+        );
+        #[cfg(feature = "linux-drivers")]
+        if gpu_ran && !checking {
+            return true;
+        }
+        let mut contrast: Option<(i32, i32)> = None;
+        let mut scratch = FROST_SCRATCH.lock();
+        let mut held = GLASS_HELD.lock();
+        let mut held_rows: Option<(i32, i32)> = None;
+        let mut strip = area.y;
+        while strip < area.bottom() {
+            let strip_end = (strip + rows).min(area.bottom());
+            let top = (strip - margin).max(0);
+            let bottom = (strip_end + margin).min(frame_h);
+            let height = (bottom - top) as usize;
+            let count = width * height;
+            capture(
+                self.frame,
+                Rect::new(left, top, width as i32, height as i32),
+                &mut scratch.source[..count],
+            );
+            if let Some((from, to)) = held_rows.take() {
+                self.flush_held(&held[..], area, from, to);
+            }
+            let FrostScratch { source, horizontal } = &mut *scratch;
+            if pass > 0 {
+                horizontal_blur(&source[..count], &mut horizontal[..count], width, height, pass);
+                horizontal_blur(&horizontal[..count], &mut source[..count], width, height, pass);
+                vertical_blur(&source[..count], &mut horizontal[..count], width, height, pass);
+                vertical_blur(&horizontal[..count], &mut source[..count], width, height, pass);
+            }
+            let blurred = &source[..count];
+            let (gain, lift) = *contrast.get_or_insert_with(|| {
+                if !optics.adaptive {
+                    return (256, 0);
+                }
+                let (mut total, mut samples) = (0i64, 0i64);
+                for y in ((strip - top) as usize..(strip_end - top) as usize).step_by(9) {
+                    for x in ((area.x - left) as usize..(area.right() - left) as usize).step_by(9) {
+                        let p = blurred[y * width + x];
+                        total +=
+                            (p.red as i64 * 54 + p.green as i64 * 183 + p.blue as i64 * 19) / 256;
+                        samples += 1;
+                    }
+                }
+                let mean = (total / samples.max(1)) as i32;
+                if dark_glass {
+                    (if mean > 118 { 118 * 256 / mean } else { 256 }, 0)
+                } else {
+                    (256, (150 - mean).max(0))
+                }
+            });
+            for y in strip..strip_end {
+                let local_y = y - top;
+                for x in area.x..area.right() {
+                    let slot = (y - strip) as usize * area.width as usize + (x - area.x) as usize;
+                    let (distance, nx, ny) = rounded_sdf(shape, radii, x, y);
+                    if distance <= -8 {
+                        held[slot] = 0;
+                        continue;
+                    }
+                    let coverage = ((distance + 8) * 255 / 16).clamp(0, 255) as u8;
+                    let local_x = x - left;
+                    let mut rgb = if distance >= splay || bend == 0 {
+                        let p = blurred[local_y as usize * width + local_x as usize];
+                        [p.red as i32, p.green as i32, p.blue as i32]
+                    } else {
+                        let t = (splay - distance) * 256 / splay;
+                        let shift = bend * t / 256 * t / 256;
+                        let sample = |percent: i32, index: usize| {
+                            let s = shift * percent / 100;
+                            bilinear(
+                                blurred,
+                                width,
+                                height,
+                                local_x * 16 + nx * s / 256,
+                                local_y * 16 + ny * s / 256,
+                                index,
+                            )
+                        };
+                        [sample(100 + spread, 0), sample(100, 1), sample(100 - spread, 2)]
+                    };
+                    for value in rgb.iter_mut() {
+                        *value = *value * gain / 256;
+                        *value += (255 - *value) * lift / 255;
+                    }
+                    let graded = transform_frost(
+                        FrostPixel {
+                            red: rgb[0].clamp(0, 255) as u8,
+                            green: rgb[1].clamp(0, 255) as u8,
+                            blue: rgb[2].clamp(0, 255) as u8,
+                        },
+                        style,
+                        x,
+                        y,
+                        seed,
+                    );
+                    let mut out = [graded.red as i32, graded.green as i32, graded.blue as i32];
+                    let facing = (nx * light_x + ny * light_y) / 256;
+                    let highlight = if facing > 0 && distance < rim {
+                        intensity * facing / 256 * facing / 256 * (rim - distance) / rim * 255 / 100
+                    } else {
+                        0
+                    };
+                    let shadow = if facing < 0 && distance < shade {
+                        intensity * -facing / 256 * (shade - distance) / shade * 90 / 100
+                    } else {
+                        0
+                    };
+                    for (index, value) in out.iter_mut().enumerate() {
+                        *value = (*value * (255 - crystal.alpha as i32)
+                            + filter[index] * crystal.alpha as i32)
+                            / 255;
+                        *value -= *value * shadow / 256;
+                        *value += (255 - *value) * highlight / 256;
+                    }
+                    held[slot] = (coverage as u32) << 24
+                        | (out[0].clamp(0, 255) as u32) << 16
+                        | (out[1].clamp(0, 255) as u32) << 8
+                        | out[2].clamp(0, 255) as u32;
+                }
+            }
+            held_rows = Some((strip, strip_end));
+            strip = strip_end;
+        }
+        if let Some((from, to)) = held_rows {
+            self.flush_held(&held[..], area, from, to);
+        }
+        #[cfg(feature = "linux-drivers")]
+        if checking
+            && gpu_ran
+            && !GPU_GLASS_CHECKED.swap(true, core::sync::atomic::Ordering::Relaxed)
+            && let Some((_, result)) = crate::linux::gpu_glass_buffers()
+        {
+            self.compare_gpu_glass(&result[..], area);
+        }
+        true
+    }
+
+    /// The first GPU glass job is also drawn on the CPU: logs how many fully
+    /// covered pixels differ and by how much at most.
+    #[cfg(feature = "linux-drivers")]
+    fn compare_gpu_glass(&self, result: &[u32], area: Rect) {
+        let (mut differ, mut worst, mut covered) = (0usize, 0i32, 0usize);
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                let value = result[(y - area.y) as usize * area.width as usize + (x - area.x) as usize];
+                if value >> 24 != 255 {
+                    continue;
+                }
+                covered += 1;
+                let Some(cpu) = self.frame.color_at(x, y) else {
+                    continue;
+                };
+                let gap = (cpu.red as i32 - (value >> 16 & 255) as i32)
+                    .abs()
+                    .max((cpu.green as i32 - (value >> 8 & 255) as i32).abs())
+                    .max((cpu.blue as i32 - (value & 255) as i32).abs());
+                if gap > 0 {
+                    differ += 1;
+                    worst = worst.max(gap);
+                }
+            }
+        }
+        crate::serial::format(format_args!(
+            "AEROS_GPU_GLASS_CHECK area={}x{} covered={covered} differ={differ} worst={worst}\n",
+            area.width, area.height
+        ));
+        crate::linux::log_line(format_args!(
+            "gpu glass check: {}x{}, {covered} pixels, {differ} differ (worst by {worst})",
+            area.width, area.height
+        ));
+    }
+
+    /// The same glass on the Radeon (kernel/linux/gpu/glass.c): the whole
+    /// capture in one go, blurred and shaded there, written back here (not
+    /// when `checking`: the CPU then draws it too, to compare).
+    #[cfg(feature = "linux-drivers")]
+    #[allow(clippy::too_many_arguments)]
+    fn gpu_glass(
+        &mut self,
+        area: Rect,
+        shape: Rect,
+        radii: CornerRadii,
+        style: FrostStyle,
+        seed: u32,
+        [left, right, margin]: [i32; 3],
+        [splay, bend, spread, rim, shade, light_x, light_y, intensity]: [i32; 8],
+        pass: usize,
+        optics: GlassOptics,
+        dark_glass: bool,
+        checking: bool,
+    ) -> bool {
+        let Some((source, result)) = crate::linux::gpu_glass_buffers() else {
+            return false;
+        };
+        let top = (area.y - margin).max(0);
+        let bottom = (area.bottom() + margin).min(self.frame.height() as i32);
+        let (width, height) = ((right - left) as usize, (bottom - top) as usize);
+        if width * height > source.len() || (area.width * area.height) as usize > result.len() {
+            return false;
+        }
+        let (mut total, mut samples) = (0i64, 0i64);
+        for y in 0..height {
+            for x in 0..width {
+                let color = self
+                    .frame
+                    .color_at(left + x as i32, top + y as i32)
+                    .unwrap_or(Color::rgb(0, 0, 0));
+                source[y * width + x] =
+                    (color.red as u32) << 16 | (color.green as u32) << 8 | color.blue as u32;
+            }
+        }
+        if optics.adaptive {
+            for y in ((area.y - top) as usize..(area.bottom() - top) as usize).step_by(9) {
+                for x in ((area.x - left) as usize..(area.right() - left) as usize).step_by(9) {
+                    let p = source[y * width + x];
+                    total += ((p >> 16 & 255) as i64 * 54 + (p >> 8 & 255) as i64 * 183 + (p & 255) as i64 * 19) / 256;
+                    samples += 1;
+                }
+            }
+        }
+        let mean = (total / samples.max(1)) as i32;
+        let (gain, lift) = if !optics.adaptive {
+            (256, 0)
+        } else if dark_glass {
+            (if mean > 118 { 118 * 256 / mean } else { 256 }, 0)
+        } else {
+            (256, (150 - mean).max(0))
+        };
+        let args = crate::linux::GlassArgs {
+            width: width as i32,
+            height: height as i32,
+            radius: pass as i32,
+            left,
+            top,
+            ax: area.x,
+            ay: area.y,
+            aw: area.width,
+            ah: area.height,
+            sx: shape.x,
+            sy: shape.y,
+            sw: shape.width,
+            sh: shape.height,
+            radii: [radii.top_left, radii.top_right, radii.bottom_right, radii.bottom_left],
+            splay,
+            bend,
+            spread,
+            gain,
+            lift,
+            rim,
+            shade,
+            light_x,
+            light_y,
+            intensity,
+            tint: [
+                style.tint.red as i32,
+                style.tint.green as i32,
+                style.tint.blue as i32,
+                style.tint.alpha as i32,
+            ],
+            saturation: style.saturation_percent as i32,
+            brightness: style.brightness_percent as i32,
+            noise_alpha: style.noise_alpha as i32,
+            seed,
+            crystal: [
+                optics.tint.red as i32,
+                optics.tint.green as i32,
+                optics.tint.blue as i32,
+                optics.tint.alpha as i32,
+            ],
+            ..Default::default()
+        };
+        if !crate::linux::gpu_glass(&args) {
+            return false;
+        }
+        if !checking {
+            self.flush_held(&result[..], area, area.y, area.bottom());
+        }
+        true
+    }
+
+    /// Writes a held strip of glass (rows `from..to` of `area`) to the frame.
+    fn flush_held(&mut self, held: &[u32], area: Rect, from: i32, to: i32) {
+        for y in from..to {
+            for x in area.x..area.right() {
+                let value = held[(y - from) as usize * area.width as usize + (x - area.x) as usize];
+                let coverage = (value >> 24) as u8;
+                if coverage == 0 {
+                    continue;
+                }
+                let color = Color::rgb((value >> 16) as u8, (value >> 8) as u8, value as u8);
+                if coverage == 255 {
+                    self.frame.pixel(x, y, color);
+                } else {
+                    self.frame.blend(x, y, color, coverage);
+                }
+            }
+        }
     }
 }

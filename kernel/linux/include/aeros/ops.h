@@ -55,6 +55,10 @@ struct aeros_linux_report {
 	unsigned int drivers;
 	unsigned int bound;
 	void (*poll)(void);
+	int (*backlight)(unsigned int percent);
+	int (*wait_vblank)(void);
+	unsigned int (*gpu_glass_buffers)(unsigned int **source, unsigned int **result);
+	int (*gpu_glass)(const void *job);
 };
 
 extern const struct aeros_ops *aeros;
