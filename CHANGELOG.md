@@ -4,6 +4,133 @@ All notable changes to AerOS. Versions are not tagged yet; everything below is u
 
 ## Unreleased
 
+### Goals list: game mode, picture-in-picture, diagnostics, screen time (November 2026)
+
+- `docs/GOALS.md`: the wishlist as a checklist, ticked off as items land.
+- Game mode (Super+G or Spotlight "game mode"): a crosshair in the middle
+  of the screen over everything (also on the fast window path), Do Not
+  Disturb while it is on (the old setting comes back after), and Shift+<
+  latches Shift for the focused Linux game (the real Shift's release is
+  held back until it is unlatched).
+- Picture-in-picture (Super+P on a focused Linux window): the window shrinks
+  to a live thumbnail above the dock, over everything; clicking it brings
+  the window back.
+- Settings > About has a Hardware box: graphics driver and resolution,
+  internal and USB storage, Wi-Fi card, battery charge/health/cycles,
+  touchscreen and USB input devices, and the Linux guest's cores and memory.
+- Settings > Power shows today's screen time and the most used app, and a
+  "Daily limit" button steps the reminder through off / 1 / 2 / 3 / 4 / 6 h
+  (it was only reachable with the `screentime` terminal command).
+- Spotlight "terminal theme" cycles the Terminal's colour schemes.
+- App Store: Bottles (Windows programs via Wine), File Roller (archives),
+  gitg (Git), Frog (text from pictures), Decoder (QR codes), Switcheroo and
+  HandBrake (picture and video conversion), Live Captions (offline) and
+  Alpaca (local AI assistant), all from Flathub.
+- Fixed: a spring animation only asked for frames 40 ms ahead, so on a
+  slow frame it stalled where it was (a Settings page could stay covered
+  by its fade-in); it now asks 400 ms ahead.
+- Fixed: the boot-image hash's finished job was never collected, which
+  kept the spare core marked busy; the live wallpaper collects it.
+- Settings > About and the system monitor show the Linux guest's real
+  memory (they showed the 32 MB test guest's).
+
+### Live wallpapers on big screens (November 2026)
+
+- The animated Silk wallpapers were switched off above about 1920x1200,
+  because warping the picture took over 100 ms a frame on the desktop's
+  own core and made the pointer stutter; the 2880x1800 laptop never saw
+  them move. Live frames are now rendered on a spare core into a fifth
+  screen buffer and swapped in when finished, so the desktop keeps
+  showing the last frame and the pointer never waits for one. Big panels
+  take a new frame at most every 50 ms. Without a spare core or the
+  memory for the back buffer, big panels keep the still picture.
+- One core is kept back from the Linux guest whenever three or more are
+  free (was five), so there is a core for this work.
+
+### Spotlight, shortcuts, motion and a steadier touchpad (November 2026)
+
+- Touchpad (PS/2 path): a fast swipe that overflowed a packet used to be
+  dropped, so the pointer stalled exactly when pushed harder; it is now
+  taken at full range. A gap of more than 8 ms between bytes restarts the
+  packet, so one lost byte can't leave later packets shifted (which sent
+  the pointer the wrong way). PS/2 motion gets the same screen-size gain as
+  USB mice plus gentle acceleration for quick swipes.
+- Super+Space Spotlight is now a command bar: arithmetic (+ - * / % ^ and
+  brackets; Enter copies the answer), system actions (lock, restart, shut
+  down, sleep, screenshot, Wi-Fi, Bluetooth, mute, battery saver, airplane
+  mode, Linux apps), apps, Settings pages, and a web search as the last
+  row. Each row says what it is; five rows fit above the dock. Ctrl+C/X/V
+  work in its field.
+- Shortcuts: Super+D desktop, Super+E Files, Super+I Settings, Super+B
+  browser, Super+T terminal, Super+A quick settings, Super+N notifications,
+  Super+S screenshot, Super+Up maximize, Super+Down minimize, Ctrl+W /
+  Ctrl+Q close the window, Ctrl+Shift+Esc Settings > About (alongside
+  Alt+Tab, Alt+F4, Super+L, Super+V, Print Screen).
+- Implicit spring animations (`motion::tween` / `entrance`): Settings
+  toggles slide with a squash and fade green, the Settings selection glides
+  between pages and each page rises and fades in, the Store, Files and
+  Notes views rise in when the tab, folder or view changes, and the feather
+  and gear spring up with a soft light under the pointer.
+- More motion: Files items, Store cards, Notes and Trash rows and found
+  Wi-Fi networks cascade in (each a beat after the one before) when a view
+  opens or changes; the Files and Notes selections and the Spotlight focus
+  ring glide between items; the lock screen clock rolls up each minute; a
+  soft ripple spreads from every click inside an app window.
+- Hover feedback without extra redraws: the element under the pointer is
+  tracked (`hover_target`) and only a change asks for a frame; Settings
+  pages, Files items, sidebar places and buttons light up, Store cards lift,
+  quick-settings buttons, power-menu pills and the setup Back/Next pills
+  brighten.
+- Alt+Tab: the chosen card swells on a spring and its indicator glides
+  between cards. Settings pages also rise in when the window opens.
+- Faster timings: boot splash 1.8 s (was 3.2 s), window open/close 300 ms
+  (was 420), setup slides 420 ms (was 620), search, panels and notification
+  stacking quicker.
+
+### Linux window controls, more cores and memory (November 2026)
+
+- Linux windows follow the new Figma design: no title bar, a light rounded
+  frame (drag it by its edge, resize from the bottom-right corner). Resting
+  the pointer in a window's top-right corner for half a second brings up
+  three white circles (minimize, maximize, close); the circle under the
+  pointer shows its symbol.
+- AerOS's own app windows (Settings, Files, Notes, Terminal, Browser...)
+  use the same controls: hidden until the pointer rests on them for half a
+  second, then white circles with the symbol on the hovered one; hidden
+  buttons don't take clicks.
+- Maximize fills the screen and hides the dock, the feather and the gear;
+  maximize again restores the old size. Minimized windows come back when
+  Linux apps are opened again.
+- The feather and the quick-settings gear now stay on screen while Linux
+  windows are shown (except over a full-screen window); new windows open
+  clear of them.
+- Up to 16 vCPUs for the guest (was 8): one per free core, so a 16-thread
+  Ryzen gives Linux 12. CPUID reports a matching core topology.
+- Guest memory goes up to 2 GiB when the host has a contiguous block (was
+  1 GiB).
+- The volume and brightness indicators only appear for the keyboard keys:
+  changing either (or muting) in Settings no longer brings them up.
+- Enlarged guest pictures (a maximized window, the zoomed Linux desktop)
+  are scaled through precomputed row/column maps instead of a divide per
+  pixel, and a maximized window takes the fast present path as well.
+
+### Native Linux windows (November 2026)
+
+- Each Linux window now has its own pixel buffer: the guest agent redirects
+  windows with XComposite, watches them with XDamage and copies only the
+  changed rectangle (through XShm) into a per-window buffer. AerOS draws each
+  window from its own buffer, so windows no longer show whatever sits on top
+  of them in the guest, and an unchanged window costs nothing.
+- The guest framebuffer region grows from 12 MiB to 80 MiB when the guest
+  has 512 MiB or more (`video=vesafb:vremap:80`); the buffers live in the
+  pool from 16 MiB in. Smaller guests keep the old screen-crop path.
+- Speed: the agent wakes on damage (at most every 8 ms) instead of polling
+  every 60 ms; the desktop checks windows up to 60 times a second instead of
+  15, compares frame counters instead of hashing pixels, and when only a
+  window's pixels changed it copies that window into the frame and presents
+  just its rectangle instead of redrawing the desktop. 1:1 blits are row
+  copies instead of per-pixel sampling.
+
 ### Smoother handover and full launcher glass (November 2026)
 
 - The Radeon's new screen gets a copy of the firmware screen before the

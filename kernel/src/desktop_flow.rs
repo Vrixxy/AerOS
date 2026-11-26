@@ -20,7 +20,7 @@ const INK_SOFT: Color = Color::rgb(150, 152, 158);
 const PANEL: Rgba = Rgba::new(21, 21, 21, 255);
 const HAIRLINE: Rgba = Rgba::new(255, 255, 255, 46);
 pub(super) const WELCOME_NS: u64 = 3_600_000_000;
-const SLIDE_NS: u64 = 620_000_000;
+const SLIDE_NS: u64 = 420_000_000;
 const KB_SCROLL_NS: u64 = 280_000_000;
 pub(super) const KB_ROW_PITCH: i32 = 52;
 pub(super) const KB_ROW_HEIGHT: i32 = 44;
@@ -82,15 +82,16 @@ fn chrome(
     back: bool,
     next: &str,
 ) {
-    let button = |painter: &mut Painter<'_>, bounds: Rect, label: &str| {
+    let button = |painter: &mut Painter<'_>, bounds: Rect, label: &str, index: usize| {
         field_pill(painter, layout, bounds);
+        hover_glow(painter, layout, 8, index, bounds, bounds.height / 2, 34);
         centered_text(painter, layout, font, bounds, label, 14, INK);
     };
     if back {
-        button(painter, BACK, "Back");
+        button(painter, BACK, "Back", 0);
     }
     if !next.is_empty() {
-        button(painter, NEXT, next);
+        button(painter, NEXT, next, 1);
     }
     centered_text(
         painter,

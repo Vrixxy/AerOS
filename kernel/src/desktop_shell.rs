@@ -393,6 +393,7 @@ pub(super) fn draw_power_menu(
             now,
             0xae70_0010 + index as u32,
         );
+        hover_glow(painter, layout, 7, index, bounds, bounds.height / 2, 40);
     }
     let button = power_button_rect();
     let button_pop =

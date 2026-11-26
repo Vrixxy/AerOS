@@ -963,3 +963,8 @@ pub fn initialize(
     save_log();
     (result == 0).then_some(report)
 }
+
+/// The resolution of the screen the display driver took over, if it did.
+pub fn display_mode() -> Option<(u32, u32)> {
+    DISPLAY.lock().map(|(_, width, height, _)| (width, height))
+}

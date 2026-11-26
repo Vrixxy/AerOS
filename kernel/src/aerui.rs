@@ -691,9 +691,56 @@ impl<'a> Painter<'a> {
         let Some(area) = fitted.intersect(self.clip) else {
             return;
         };
+        if fitted.width as usize == source_width
+            && fitted.height as usize == source_height
+            && area.x >= 0
+            && area.y >= 0
+        {
+            let offset = (area.y - fitted.y) as usize * source_stride + (area.x - fitted.x) as usize;
+            let copied = unsafe {
+                self.frame.copy_xrgb_rows(
+                    area.x as usize,
+                    area.y as usize,
+                    area.width as usize,
+                    area.height as usize,
+                    source.add(offset),
+                    source_stride,
+                )
+            };
+            if copied {
+                return;
+            }
+        }
         // Near 1:1 (or enlarging): plain sampling keeps text sharp; only a real
         // reduction needs the 2x2 average.
         let smooth = (fitted.width as usize) * 10 < source_width * 9;
+        const MAP: usize = 4096;
+        if !smooth && source_width <= 65_536 && source_height <= 65_536 && area.x >= 0 && area.y >= 0 && (area.width as usize) <= MAP && (area.height as usize) <= MAP {
+            let mut columns = [0u16; MAP];
+            let mut rows = [0u16; MAP];
+            let (width, height) = (area.width as usize, area.height as usize);
+            for (index, column) in columns[..width].iter_mut().enumerate() {
+                let x = (area.x - fitted.x) as usize + index;
+                *column = (x * source_width / fitted.width as usize).min(source_width - 1) as u16;
+            }
+            for (index, row) in rows[..height].iter_mut().enumerate() {
+                let y = (area.y - fitted.y) as usize + index;
+                *row = (y * source_height / fitted.height as usize).min(source_height - 1) as u16;
+            }
+            let copied = unsafe {
+                self.frame.copy_xrgb_mapped(
+                    area.x as usize,
+                    area.y as usize,
+                    source,
+                    source_stride,
+                    &columns[..width],
+                    &rows[..height],
+                )
+            };
+            if copied {
+                return;
+            }
+        }
         let read = |x: usize, y: usize| -> u32 {
             let x = x.min(source_width - 1);
             let y = y.min(source_height - 1);

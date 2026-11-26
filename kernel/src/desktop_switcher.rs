@@ -200,9 +200,12 @@ pub(super) fn draw_switcher(
     if pop < 800 {
         return;
     }
+    let now = crate::time::monotonic_nanoseconds();
     for (index, app) in list[..count].iter().enumerate() {
-        let card = switcher_card(full, index, count);
         let selected = index == state.switcher_index.min(count - 1);
+        // The chosen card swells a little; the others settle back.
+        let swell = motion::tween(motion::tween_key(14, index as u32), if selected { 1_000 } else { 0 }, motion::SNAPPY, now);
+        let card = switcher_card(full, index, count).expand(swell * 5 / 1_000);
         text(
             painter,
             layout,
@@ -236,18 +239,16 @@ pub(super) fn draw_switcher(
                 Color::rgb(0, 0, 0),
             ),
         }
-        if selected {
-            let pill = Rect::new(card.x + card.width / 2 - 11, card.bottom() + 8, 22, 7);
-            painter.fill_rounded_rect(
-                layout.rect(pill),
-                layout.radii(CornerRadii::all(3)),
-                Rgba::opaque(0, 0, 0),
-            );
-            painter.fill_rounded_rect(
-                layout.rect(pill.expand(-1)),
-                layout.radii(CornerRadii::all(3)),
-                Rgba::opaque(0xd9, 0xd9, 0xd9),
-            );
-        }
     }
+    // The indicator glides under the chosen card.
+    let chosen = switcher_card(full, state.switcher_index.min(count - 1), count);
+    let target = layout.rect(Rect::new(chosen.x + chosen.width / 2 - 11, chosen.bottom() + 13, 22, 7));
+    let x = motion::tween(motion::tween_key(14, 99), target.x, motion::QUICK, now);
+    let pill = Rect::new(x, target.y, target.width, target.height);
+    painter.fill_rounded_rect(pill, layout.radii(CornerRadii::all(3)), Rgba::opaque(0, 0, 0));
+    painter.fill_rounded_rect(
+        pill.expand(-layout.scale.logical(1).max(1)),
+        layout.radii(CornerRadii::all(3)),
+        Rgba::opaque(0xd9, 0xd9, 0xd9),
+    );
 }

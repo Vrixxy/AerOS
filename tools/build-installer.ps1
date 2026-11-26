@@ -46,8 +46,20 @@ $rootBytes = [int64][BitConverter]::ToUInt32($superblock, 4) * (1024 -shl [BitCo
 if ($rootBytes + [int64]$DataMiB * 1MB -ge 4GB) { throw "ROOTFS would not fit FAT32's 4 GiB file limit" }
 $dataImage = Join-Path $root "build\installer\data-area.img"
 $wslData = "/mnt/" + $dataImage.Substring(0, 1).ToLower() + ($dataImage.Substring(2) -replace '\\', '/')
-& wsl -d Debian -u root -- sh -c "rm -f '$wslData' && truncate -s ${DataMiB}M '$wslData' && mkfs.ext4 -q -F -m 0 -O ^has_journal -E lazy_itable_init=1 -L aeros-data '$wslData'"
-if ($LASTEXITCODE -ne 0) { throw "mkfs.ext4 for the data area failed" }
+$distros = (wsl -l -q) -replace "`0", "" | Where-Object { $_.Trim() }
+$distro = if ($distros -contains "Debian") { "Debian" } elseif ($distros -contains "Ubuntu") { "Ubuntu" } else { $null }
+$made = $false
+if ($distro) {
+    & wsl -d $distro -u root -- sh -c "truncate -s ${DataMiB}M '$wslData.new' && mkfs.ext4 -q -F -m 0 -O ^has_journal -E lazy_itable_init=1 -L aeros-data '$wslData.new' && mv -f '$wslData.new' '$wslData'"
+    $made = $LASTEXITCODE -eq 0
+}
+if (-not $made) {
+    if ((Test-Path -LiteralPath $dataImage) -and (Get-Item -LiteralPath $dataImage).Length -eq [int64]$DataMiB * 1MB) {
+        Write-Host "WSL mkfs.ext4 unavailable: reusing the empty data area in $dataImage"
+    } else {
+        throw "mkfs.ext4 for the data area failed and there is no $DataMiB MiB data-area.img to reuse"
+    }
+}
 
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -98,6 +110,9 @@ try {
         $switch = Join-Path $root "build\installer\AMDGPU.ON"
         Set-Content -LiteralPath $switch -Value "amdgpu may drive the Radeon; delete this file to turn it off" -Encoding ascii
         Add-Entry "AMDGPU.ON" @(, @($switch, -1))
+        $takeover = Join-Path $root "build\installer\AMDGPU.DC"
+        Set-Content -LiteralPath $takeover -Value "1" -Encoding ascii
+        Add-Entry "AMDGPU.DC" @(, @($takeover, -1))
     }
     Add-Entry "VMLINUZ" @(, @((Join-Path $esp "VMLINUZ"), -1))
     Add-Entry "INITRD" @(, @((Join-Path $esp "INITRD"), -1))

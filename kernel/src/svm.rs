@@ -386,6 +386,17 @@ impl GuestWindow {
 
 pub const GUEST_MAX_WINDOWS: usize = 16;
 
+/// One guest window's own pixels (XRGB8888), kept by the agent in the
+/// framebuffer region; `frame` moves on with every captured change.
+#[derive(Clone, Copy)]
+pub struct GuestSurface {
+    pub pixels: *const u32,
+    pub width: usize,
+    pub height: usize,
+    pub stride: usize,
+    pub frame: u32,
+}
+
 #[derive(Clone, Copy)]
 pub struct GuestWindows {
     pub count: usize,
@@ -414,6 +425,11 @@ pub fn linux_vcpu_core(argument: u64) {
     linux::run_vcpu_core(argument);
 }
 
+#[cfg(not(feature = "linux-guest"))]
+pub fn linux_vcpu_count() -> usize {
+    0
+}
+
 #[cfg(feature = "linux-guest")]
 pub fn linux_vcpu_count() -> usize {
     linux::vcpu_count()
@@ -437,7 +453,7 @@ pub fn linux_pump(budget_tsc: u64) -> bool {
 #[cfg(feature = "linux-guest")]
 #[allow(dead_code)]
 pub fn linux_memory_bytes() -> u64 {
-    GUEST_RAM_PAGES * PAGE_SIZE
+    linux::memory_bytes()
 }
 
 #[cfg(feature = "linux-guest")]
@@ -468,6 +484,11 @@ pub fn linux_framebuffer() -> Option<(*const u32, usize, usize, usize)> {
 #[cfg(feature = "linux-guest")]
 pub fn linux_windows() -> Option<GuestWindows> {
     linux::windows()
+}
+
+#[cfg(feature = "linux-guest")]
+pub fn linux_surface(id: u32) -> Option<GuestSurface> {
+    linux::surface(id)
 }
 
 /// Posts a command to the guest agent: 1 close(id), 2 focus(id), 3 spawn(text).
@@ -586,6 +607,11 @@ pub fn linux_windows() -> Option<GuestWindows> {
 }
 
 #[cfg(not(feature = "linux-guest"))]
+pub fn linux_surface(_id: u32) -> Option<GuestSurface> {
+    None
+}
+
+#[cfg(not(feature = "linux-guest"))]
 pub fn linux_command(_op: u32, _args: [u32; 4], _text: &[u8]) {}
 #[cfg(not(feature = "linux-guest"))]
 #[allow(dead_code)]
@@ -628,7 +654,7 @@ mod linux {
     use crate::fat;
 
     const MIB: u64 = 1024 * 1024;
-    const RAM_CANDIDATES: [u64; 9] = [1024, 768, 512, 384, 320, 288, 256, 224, 192];
+    const RAM_CANDIDATES: [u64; 11] = [2048, 1536, 1024, 768, 512, 384, 320, 288, 256, 224, 192];
 
     const PML4: u64 = 0x1000;
     const PDPT: u64 = 0x2000;
@@ -647,10 +673,10 @@ mod linux {
     /// cross-CPU TSC synchronisation test.
     #[cfg(feature = "linux-smp")]
     const CMDLINE_TEXT: &[u8] =
-        b"console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 keep_bootcon nokaslr no5lvl noapic acpi=off no_timer_check nmi_watchdog=0 tsc=reliable reboot=t panic=-1 debug ignore_loglevel root=/dev/vda ro rootwait\0";
+        b"console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 keep_bootcon nokaslr no5lvl noapic acpi=off no_timer_check nmi_watchdog=0 tsc=reliable reboot=t panic=-1 debug ignore_loglevel video=vesafb:vremap:80 root=/dev/vda ro rootwait\0";
     #[cfg(not(feature = "linux-smp"))]
     const CMDLINE_TEXT: &[u8] =
-        b"console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 keep_bootcon nokaslr no5lvl nolapic nosmp acpi=off no_timer_check nmi_watchdog=0 reboot=t panic=-1 debug ignore_loglevel root=/dev/vda ro rootwait\0";
+        b"console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 keep_bootcon nokaslr no5lvl nolapic nosmp acpi=off no_timer_check nmi_watchdog=0 reboot=t panic=-1 debug ignore_loglevel video=vesafb:vremap:80 root=/dev/vda ro rootwait\0";
     const SMP: bool = cfg!(feature = "linux-smp");
 
     const EFER_NXE: u64 = 1 << 11;
@@ -830,7 +856,12 @@ mod linux {
     // linear framebuffer, so the kernel's built-in vesafb/simplefb + fbcon
     // draw a real console there and the host just reads those bytes.
     const FB_BASE: u64 = 0x0900_0000;
-    const FB_RESERVED: u64 = 0xC0_0000;
+    /// 12 MiB holds the screen and the agent's mailboxes; with RAM to spare
+    /// the region grows to 80 MiB so the agent has a pool (from 16 MiB in)
+    /// for each window's own pixels.
+    fn fb_reserved(ram_bytes: u64) -> u64 {
+        if ram_bytes >= 512 * MIB { 0x500_0000 } else { 0xC0_0000 }
+    }
     const FB_WIDTH: u64 = 2048;
     const FB_HEIGHT: u64 = 1152;
     const FB_PITCH: u64 = FB_WIDTH * 4;
@@ -1334,6 +1365,71 @@ mod linux {
         None
     }
 
+    const SURFACE_OFFSET: u64 = 0xA6_0000;
+    const SURFACE_MAGIC: u32 = 0x4653_4541;
+    const SURFACE_POOL: u64 = 0x100_0000;
+
+    /// Window `id`'s own buffer from the agent's surface table (a seqlock
+    /// like the window table), checked to lie inside the pool.
+    pub fn surface(id: u32) -> Option<super::GuestSurface> {
+        let machine = guest()?;
+        let base = machine.ram + FB_BASE + SURFACE_OFFSET;
+        let word = |offset: u64| unsafe { core::ptr::read_volatile((base + offset) as *const u32) };
+        if word(0) != SURFACE_MAGIC {
+            return None;
+        }
+        let limit = fb_reserved(machine.ram_bytes);
+        for _ in 0..4 {
+            let before = word(4);
+            if before & 1 != 0 {
+                continue;
+            }
+            let count = (word(8) as usize).min(GUEST_MAX_WINDOWS);
+            let mut found = None;
+            for index in 0..count as u64 {
+                let at = 16 + index * 24;
+                if word(at) != id {
+                    continue;
+                }
+                let offset = word(at + 4) as u64;
+                let (width, height, stride) =
+                    (word(at + 8) as u64, word(at + 12) as u64, word(at + 16) as u64);
+                let end = stride
+                    .checked_mul(height)
+                    .and_then(|pixels| pixels.checked_mul(4))
+                    .and_then(|bytes| bytes.checked_add(offset));
+                if width == 0
+                    || height == 0
+                    || width > stride
+                    || offset < SURFACE_POOL
+                    || offset % 4 != 0
+                    || end.is_none_or(|end| end > limit)
+                {
+                    break;
+                }
+                static SEEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+                if !SEEN.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                    crate::serial::format(format_args!(
+                        "AEROS_VM_SURFACE first id={id:#x} {width}x{height} offset={offset:#x}
+"
+                    ));
+                }
+                found = Some(super::GuestSurface {
+                    pixels: (machine.ram + FB_BASE + offset) as *const u32,
+                    width: width as usize,
+                    height: height as usize,
+                    stride: stride as usize,
+                    frame: word(at + 20),
+                });
+                break;
+            }
+            if word(4) == before {
+                return found;
+            }
+        }
+        None
+    }
+
     /// Queues a command for the agent in the 16-slot ring: slot fields first,
     /// then the counter bump that publishes it. A full ring drops the new
     /// command (the agent drains it every ~60 ms).
@@ -1567,6 +1663,11 @@ mod linux {
     }
     pub fn is_ready() -> bool {
         guest().is_some_and(|machine| !machine.dead)
+    }
+
+    /// The guest's RAM as booted (0 before it is).
+    pub fn memory_bytes() -> u64 {
+        guest().map_or(0, |machine| machine.ram_bytes)
     }
 
     pub fn feed_scancode(code: u8) {
@@ -2069,8 +2170,9 @@ mod linux {
             put(0, 0x0009_fc00, 1);
             put(0x0009_fc00, 0x0006_0400, 2);
             put(0x0010_0000, FB_BASE - 0x0010_0000, 1);
-            put(FB_BASE, FB_RESERVED, 2);
-            put(FB_BASE + FB_RESERVED, ram_bytes - FB_BASE - FB_RESERVED, 1);
+            let reserved = fb_reserved(ram_bytes);
+            put(FB_BASE, reserved, 2);
+            put(FB_BASE + reserved, ram_bytes - FB_BASE - reserved, 1);
             write_u8(ram, ZERO_PAGE + 0x1e8, count as u8);
 
             // struct screen_info (boot_params offset 0): a VESA linear
@@ -2080,7 +2182,7 @@ mod linux {
             write_u16(ram, ZERO_PAGE + 0x14, FB_HEIGHT as u16);
             write_u16(ram, ZERO_PAGE + 0x16, 32);
             write_u32(ram, ZERO_PAGE + 0x18, FB_BASE as u32);
-            write_u32(ram, ZERO_PAGE + 0x1c, (FB_RESERVED / 0x1_0000) as u32);
+            write_u32(ram, ZERO_PAGE + 0x1c, (reserved / 0x1_0000) as u32);
             write_u16(ram, ZERO_PAGE + 0x24, FB_PITCH as u16);
             write_u8(ram, ZERO_PAGE + 0x26, 8);
             write_u8(ram, ZERO_PAGE + 0x27, 16);
@@ -2962,14 +3064,14 @@ mod linux {
                 // TSC-deadline timer is hidden (the guest uses the APIC timer
                 // this monitor emulates) and HTT is off.
                 0x1 if self.smp => {
-                    b = (b & 0x0000_ffff) | (vcpu_id << 24) | ((NUM_VCPUS as u32) << 16);
+                    b = (b & 0x0000_ffff) | (vcpu_id << 24) | ((active_vcpus() as u32) << 16);
                     c &= !(1 << 24);
                     d &= !(1 << 28);
                 }
                 0xb if self.smp => {
                     let (level_a, level_b, level_c) = match subleaf {
                         0 => (0, 1, 0x100),
-                        1 => (1, NUM_VCPUS as u32, 0x201),
+                        1 => (CORE_ID_BITS, active_vcpus() as u32, 0x201),
                         other => (0, 0, other & 0xff),
                     };
                     a = level_a;
@@ -2978,7 +3080,9 @@ mod linux {
                     d = vcpu_id;
                 }
                 0x8000_0001 if self.smp => c |= 1 << 1,
-                0x8000_0008 if self.smp => c = (c & !0xf0ff) | (1 << 12) | (NUM_VCPUS as u32 - 1),
+                0x8000_0008 if self.smp => {
+                    c = (c & !0xf0ff) | (CORE_ID_BITS << 12) | (active_vcpus() as u32 - 1)
+                }
                 0x8000_001e if self.smp => {
                     a = vcpu_id;
                     b = vcpu_id;

@@ -21,6 +21,13 @@
  *   CMD   @ 0xA01000: magic 'AEWC', seq_host, seq_ack, pad, then a ring of 16 x
  *                     {op, a0..a3, text[128]}; slot = counter % 16
  *                     ops: 1 close(id) 2 focus(id) 3 spawn(text) 4 move(id,x,y) 5 resize(id,w,h)
+ *   SURF  @ 0xA60000: magic 'AESF', seq (odd while writing), count, pad, then 16 x
+ *                     {id, offset, w, h, stride, frame}: each window's own pixels
+ *                     (XRGB8888, `stride` pixels a row) at `offset` in the
+ *                     framebuffer region, captured from its composite backing
+ *                     store whenever XDamage reports a change; `frame` counts
+ *                     captures. The pool starts at 16 MiB, so it only exists
+ *                     when the host gives vesafb more than its 12 MiB.
  */
 #include <ctype.h>
 #include <dirent.h>
@@ -30,7 +37,16 @@
 #include <time.h>
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/extensions/XShm.h>
+#include <X11/extensions/Xcomposite.h>
+#include <X11/extensions/Xdamage.h>
 #include <X11/extensions/Xfixes.h>
+#include <linux/fb.h>
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
@@ -60,6 +76,9 @@
 #define MAGIC_WEB_REQ 0x51574541u /* "AEWQ" */
 #define MAGIC_WEB_RES 0x53574541u /* "AEWS" */
 #define MAGIC_APPS 0x50414541u    /* "AEAP" */
+#define SURF_OFF 0xA60000u
+#define MAGIC_SURF 0x46534541u /* "AESF" */
+#define POOL_OFF 0x1000000u
 
 struct gwin {
     uint32_t id;
@@ -243,6 +262,253 @@ static void run_command(struct cmd *c) {
     }
 }
 
+/* ---- Window surfaces ----------------------------------------------------
+ * Every top-level window is redirected (XComposite, automatic: the server
+ * still draws the screen), so its pixels exist even where something covers
+ * it. XDamage says which part changed; that part is fetched through a shared
+ * memory XImage and copied into the window's own buffer in the pool, which
+ * the host shows directly instead of cropping the shared screen. */
+struct surf_ent {
+    uint32_t id, offset, w, h, stride, frame;
+};
+
+struct surf_tab {
+    uint32_t magic, seq, count, pad;
+    struct surf_ent s[MAX_WIN];
+};
+
+struct surface {
+    Window win, top;
+    Damage damage;
+    Visual *visual;
+    int depth;
+    uint32_t offset, w, h, frame;
+    int dx, dy; /* the window's offset inside `top` */
+    int x0, y0, x1, y1; /* pending damage, window coordinates; x1 == 0: none */
+};
+
+static struct surface surfs[MAX_WIN];
+static int nsurf;
+static int damage_event = -1;
+static int have_shm;
+static XShmSegmentInfo shm;
+static size_t shm_bytes;
+static uint8_t *fbmap;
+static size_t fb_len;
+static int surf_changed;
+
+static size_t surf_bytes(uint32_t w, uint32_t h) {
+    return ((size_t)w * h * 4 + 4095) & ~(size_t)4095;
+}
+
+/* First free stretch of the pool that `bytes` fits in (0: none). */
+static uint32_t pool_alloc(size_t bytes) {
+    size_t at = POOL_OFF;
+    for (int moved = 1; moved;) {
+        moved = 0;
+        for (int i = 0; i < nsurf; i++) {
+            struct surface *s = &surfs[i];
+            if (!s->offset) continue;
+            size_t end = s->offset + surf_bytes(s->w, s->h);
+            if (at < end && s->offset < at + bytes) {
+                at = end;
+                moved = 1;
+            }
+        }
+    }
+    return at + bytes <= fb_len ? (uint32_t)at : 0;
+}
+
+static void shm_drop(void) {
+    if (!shm_bytes) return;
+    XShmDetach(dpy, &shm);
+    XSync(dpy, False);
+    shmdt(shm.shmaddr);
+    shm_bytes = 0;
+}
+
+static int shm_reserve(size_t bytes) {
+    if (bytes <= shm_bytes) return 1;
+    shm_drop();
+    shm.shmid = shmget(IPC_PRIVATE, bytes, IPC_CREAT | 0600);
+    if (shm.shmid < 0) return 0;
+    shm.shmaddr = shmat(shm.shmid, NULL, 0);
+    shmctl(shm.shmid, IPC_RMID, NULL);
+    if (shm.shmaddr == (char *)-1) return 0;
+    shm.readOnly = False;
+    if (!XShmAttach(dpy, &shm)) {
+        shmdt(shm.shmaddr);
+        return 0;
+    }
+    XSync(dpy, False);
+    shm_bytes = bytes;
+    return 1;
+}
+
+static void surfaces_init(void) {
+    int event, error, major = 0, minor = 4;
+    if (!XCompositeQueryExtension(dpy, &event, &error) ||
+        !XCompositeQueryVersion(dpy, &major, &minor) || (major == 0 && minor < 2))
+        return;
+    XCompositeRedirectSubwindows(dpy, root, CompositeRedirectAutomatic);
+    if (XDamageQueryExtension(dpy, &event, &error)) damage_event = event + XDamageNotify;
+    have_shm = XShmQueryExtension(dpy);
+}
+
+static Window top_level(Window w) {
+    for (;;) {
+        Window r, parent, *kids = NULL;
+        unsigned int n;
+        if (!XQueryTree(dpy, w, &r, &parent, &kids, &n)) return w;
+        if (kids) XFree(kids);
+        if (parent == r || parent == 0) return w;
+        w = parent;
+    }
+}
+
+static void surf_damage_all(struct surface *s) {
+    s->x0 = 0;
+    s->y0 = 0;
+    s->x1 = (int)s->w;
+    s->y1 = (int)s->h;
+}
+
+static void surf_release(struct surface *s) {
+    if (s->damage) XDamageDestroy(dpy, s->damage);
+    *s = surfs[--nsurf];
+    surf_changed = 1;
+}
+
+/* Brings the surfaces in line with the published window list. */
+static void surfaces_sync(const struct gwin *wins, int count) {
+    if (fb_len <= POOL_OFF) return;
+    for (int i = 0; i < nsurf;) {
+        int alive = 0;
+        for (int k = 0; k < count; k++)
+            if ((Window)wins[k].id == surfs[i].win) alive = 1;
+        if (alive) i++;
+        else surf_release(&surfs[i]);
+    }
+    for (int k = 0; k < count; k++) {
+        const struct gwin *g = &wins[k];
+        struct surface *s = NULL;
+        for (int i = 0; i < nsurf; i++)
+            if (surfs[i].win == (Window)g->id) s = &surfs[i];
+        if (!s) {
+            if (nsurf == MAX_WIN) continue;
+            Window top = top_level((Window)g->id);
+            XWindowAttributes at;
+            if (!XGetWindowAttributes(dpy, top, &at) || (at.depth != 24 && at.depth != 32)) continue;
+            s = &surfs[nsurf++];
+            memset(s, 0, sizeof *s);
+            s->win = (Window)g->id;
+            s->visual = at.visual;
+            s->depth = at.depth;
+            s->top = top;
+            if (damage_event >= 0) s->damage = XDamageCreate(dpy, s->top, XDamageReportBoundingBox);
+        }
+        if (s->w != g->w || s->h != g->h || !s->offset) {
+            s->offset = 0;
+            s->w = g->w;
+            s->h = g->h;
+            s->offset = pool_alloc(surf_bytes(s->w, s->h));
+            surf_damage_all(s);
+            surf_changed = 1;
+        }
+        XWindowAttributes top;
+        if (XGetWindowAttributes(dpy, s->top, &top)) {
+            s->dx = g->x - top.x - top.border_width;
+            s->dy = g->y - top.y - top.border_width;
+        }
+        if (damage_event < 0) surf_damage_all(s);
+    }
+}
+
+/* A DamageNotify (area relative to the top-level window). */
+static void surface_damage(XDamageNotifyEvent *dn) {
+    for (int i = 0; i < nsurf; i++) {
+        struct surface *s = &surfs[i];
+        if (s->top != dn->drawable) continue;
+        int x0 = dn->area.x - s->dx, y0 = dn->area.y - s->dy;
+        int x1 = x0 + dn->area.width, y1 = y0 + dn->area.height;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > (int)s->w) x1 = (int)s->w;
+        if (y1 > (int)s->h) y1 = (int)s->h;
+        if (x1 <= x0 || y1 <= y0) continue;
+        if (s->x1 == 0) {
+            s->x0 = x0, s->y0 = y0, s->x1 = x1, s->y1 = y1;
+        } else {
+            if (x0 < s->x0) s->x0 = x0;
+            if (y0 < s->y0) s->y0 = y0;
+            if (x1 > s->x1) s->x1 = x1;
+            if (y1 > s->y1) s->y1 = y1;
+        }
+    }
+}
+
+/* Reads from the top-level's composite pixmap rather than the window: a
+ * window's GetImage fails (BadMatch) whenever any of it lies off screen. */
+static int capture(struct surface *s) {
+    int x = s->x0, y = s->y0, w = s->x1 - s->x0, h = s->y1 - s->y0;
+    Pixmap pix = XCompositeNameWindowPixmap(dpy, s->top);
+    XImage *img = NULL;
+    if (have_shm && shm_reserve((size_t)w * h * 4)) {
+        img = XShmCreateImage(dpy, s->visual, (unsigned)s->depth, ZPixmap, shm.shmaddr, &shm,
+                              (unsigned)w, (unsigned)h);
+        if (img && !XShmGetImage(dpy, pix, img, s->dx + x, s->dy + y, AllPlanes)) {
+            XDestroyImage(img);
+            img = NULL;
+        }
+    }
+    if (!img)
+        img = XGetImage(dpy, pix, s->dx + x, s->dy + y, (unsigned)w, (unsigned)h, AllPlanes, ZPixmap);
+    XFreePixmap(dpy, pix);
+    if (!img) return 0;
+    if (img->bits_per_pixel == 32) {
+        uint8_t *dst = fbmap + s->offset + ((size_t)y * s->w + x) * 4;
+        for (int row = 0; row < h; row++)
+            memcpy(dst + (size_t)row * s->w * 4, img->data + (size_t)row * img->bytes_per_line,
+                   (size_t)w * 4);
+    }
+    XDestroyImage(img);
+    return 1;
+}
+
+/* Copies every damaged window's changed rectangle into its buffer, then
+ * republishes the table if anything moved on. */
+static void surfaces_flush(volatile struct surf_tab *tab) {
+    for (int i = 0; i < nsurf; i++) {
+        struct surface *s = &surfs[i];
+        if (!s->offset || s->x1 == 0) continue;
+        if (s->damage) XDamageSubtract(dpy, s->damage, None, None);
+        if (capture(s)) {
+            s->frame++;
+            surf_changed = 1;
+        }
+        s->x1 = 0;
+    }
+    if (!surf_changed) return;
+    surf_changed = 0;
+    tab->seq++;
+    __sync_synchronize();
+    uint32_t n = 0;
+    for (int i = 0; i < nsurf; i++) {
+        struct surface *s = &surfs[i];
+        if (!s->offset || !s->frame) continue;
+        tab->s[n].id = (uint32_t)s->win;
+        tab->s[n].offset = s->offset;
+        tab->s[n].w = s->w;
+        tab->s[n].h = s->h;
+        tab->s[n].stride = s->w;
+        tab->s[n].frame = s->frame;
+        n++;
+    }
+    tab->count = n;
+    __sync_synchronize();
+    tab->seq++;
+}
+
 /* ---- Clipboard bridge -------------------------------------------------
  * Host -> guest: the text the host leaves in the IN mailbox is made the X
  * CLIPBOARD (and PRIMARY) selection, owned by a hidden window that answers
@@ -304,7 +570,9 @@ static void clipboard_poll(volatile struct clip_in *in, volatile struct clip_out
     while (XPending(dpy)) {
         XEvent ev;
         XNextEvent(dpy, &ev);
-        if (ev.type == SelectionRequest) {
+        if (damage_event >= 0 && ev.type == damage_event) {
+            surface_damage((XDamageNotifyEvent *)&ev);
+        } else if (ev.type == SelectionRequest) {
             serve_selection(&ev.xselectionrequest);
         } else if (ev.type == xfixes_base + XFixesSelectionNotify) {
             XFixesSelectionNotifyEvent *sn = (XFixesSelectionNotifyEvent *)&ev;
@@ -584,8 +852,12 @@ int main(void) {
 
     int fd = open("/dev/fb0", O_RDWR);
     if (fd < 0) return 2;
-    uint8_t *map = mmap(NULL, FB_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    struct fb_fix_screeninfo fix;
+    fb_len = FB_BYTES;
+    if (ioctl(fd, FBIOGET_FSCREENINFO, &fix) == 0 && fix.smem_len > FB_BYTES) fb_len = fix.smem_len;
+    uint8_t *map = mmap(NULL, fb_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED) return 3;
+    fbmap = map;
     volatile struct table *tab = (volatile struct table *)(map + TABLE_OFF);
     volatile struct cmdring *ring = (volatile struct cmdring *)(map + CMD_OFF);
     volatile struct clip_in *clip_in = (volatile struct clip_in *)(map + CLIP_IN_OFF);
@@ -599,6 +871,11 @@ int main(void) {
     clip_out->magic = MAGIC_CLIP_OUT;
     clip_out->seq = 0;
     clipboard_init();
+    volatile struct surf_tab *surf_tab = (volatile struct surf_tab *)(map + SURF_OFF);
+    surf_tab->seq = 0;
+    surf_tab->count = 0;
+    surf_tab->magic = MAGIC_SURF;
+    surfaces_init();
     volatile struct web_req *web_req = (volatile struct web_req *)(map + WEB_REQ_OFF);
     volatile struct web_res *web_res = (volatile struct web_res *)(map + WEB_RES_OFF);
     volatile struct apps_tab *apps_tab = (volatile struct apps_tab *)(map + APPS_OFF);
@@ -617,6 +894,7 @@ int main(void) {
     int nplaced = 0;
     struct gwin last[MAX_WIN];
     int last_count = -1;
+    long last_flush_ms = 0, last_scan_ms = 0;
 
     for (;;) {
         /* Drain the command ring; a host that got ahead by more than the ring
@@ -630,6 +908,22 @@ int main(void) {
             ring->seq_ack++;
         }
         clipboard_poll(clip_in, clip_out);
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        long now_ms = ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+        if (now_ms - last_flush_ms >= 8) {
+            surfaces_flush(surf_tab);
+            last_flush_ms = now_ms;
+        }
+        /* The window list, web and app polls need a dozen round trips each;
+         * 20 times a second is plenty for them. Damage wakes the loop early. */
+        if (now_ms - last_scan_ms < 50) {
+            XFlush(dpy);
+            struct pollfd pfd = {ConnectionNumber(dpy), POLLIN, 0};
+            if (!XPending(dpy)) poll(&pfd, 1, 8);
+            continue;
+        }
+        last_scan_ms = now_ms;
         web_poll(web_req, web_res);
         apps_poll(apps_tab);
 
@@ -738,7 +1032,7 @@ int main(void) {
             last_count = count;
         }
 
+        surfaces_sync(now, count);
         XFlush(dpy);
-        usleep(60000);
     }
 }

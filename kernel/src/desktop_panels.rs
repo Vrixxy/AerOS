@@ -155,7 +155,7 @@ fn quick_circle(index: usize) -> Rect {
     Rect::new(593, 100 + (index as i32 - 1) * 51, 46, 46)
 }
 
-fn quick_bounds(index: usize) -> Rect {
+pub(super) fn quick_bounds(index: usize) -> Rect {
     match index {
         0 => QUICK_WIFI,
         1..=3 => quick_circle(index),
@@ -412,6 +412,11 @@ pub(super) fn draw_quick(
         dark,
     );
     ring(painter, bounds, 4);
+    // The button under the pointer brightens.
+    for index in 0..5 {
+        let item = quick_bounds(index);
+        hover_glow(painter, layout, 6, index, item, item.height.min(item.width) / 2, 46);
+    }
     true
 }
 
@@ -473,7 +478,7 @@ impl DesktopState {
 
     /// The buttons: 0 Wi-Fi, 1 Bluetooth, 2 power menu, 3 battery saver,
     /// 4 airplane mode (which switches the radios off and back).
-    fn quick_toggle(&mut self, index: usize) {
+    pub(super) fn quick_toggle(&mut self, index: usize) {
         let now = crate::time::monotonic_nanoseconds();
         match index {
             0 => {
@@ -688,7 +693,7 @@ pub(super) const STACK_FRONT_Y: i32 = 62;
 pub(super) const STACK_PEEK: i32 = 22;
 /// The Do not disturb switch under the open notification stack.
 pub(super) const DND_PILL: Rect = Rect::new(TOAST_RECT.x + 38, STACK_FRONT_Y + 72, 150, 24);
-const NOTIFY_STACK_NS: u64 = 520_000_000;
+const NOTIFY_STACK_NS: u64 = 400_000_000;
 
 /// How much of `text` fits in `width` physical pixels: (byte length, cut).
 fn fit_line(font: RasterFont, text: &str, height: i32, width: i32) -> (usize, bool) {

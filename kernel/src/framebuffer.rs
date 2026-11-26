@@ -335,6 +335,114 @@ impl FrameBuffer {
         true
     }
 
+    /// `present_diff` limited to a `width` x `height` block at (`x`, `y`): the
+    /// rest of the screen is known not to have changed.
+    pub fn present_diff_region(
+        &mut self,
+        source: &Self,
+        shadow: &mut [u32],
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        let active_pixels = self.stride.saturating_mul(self.height);
+        if self.width != source.width
+            || self.height != source.height
+            || self.stride != source.stride
+            || active_pixels > self.pixels
+            || active_pixels > source.pixels
+            || active_pixels > shadow.len()
+            || x.saturating_add(width) > self.width
+            || y.saturating_add(height) > self.height
+        {
+            return false;
+        }
+        let percent = BRIGHTNESS.load(core::sync::atomic::Ordering::Relaxed);
+        if BRIGHTNESS_SHOWN.load(core::sync::atomic::Ordering::Relaxed) != percent {
+            return self.present_diff(source, shadow);
+        }
+        for row in y..y + height {
+            let start = row * self.stride + x;
+            for index in start..start + width {
+                let value = unsafe { core::ptr::read(source.address.add(index)) };
+                if shadow[index] != value {
+                    shadow[index] = value;
+                    unsafe {
+                        core::ptr::write_volatile(self.address.add(index), dim_pixel(value, percent));
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Nearest-neighbour scaled copy of XRGB8888 pixels: destination column
+    /// `i` takes source column `columns[i]`, row `j` source row `rows[j]`.
+    /// False (nothing written) unless pixels are stored as XRGB8888.
+    ///
+    /// # Safety
+    /// Every mapped source pixel must be readable.
+    pub unsafe fn copy_xrgb_mapped(
+        &mut self,
+        x: usize,
+        y: usize,
+        source: *const u32,
+        source_stride: usize,
+        columns: &[u16],
+        rows: &[u16],
+    ) -> bool {
+        let (width, height) = (columns.len(), rows.len());
+        if !matches!(self.format, PixelFormat::Bgr)
+            || x.saturating_add(width) > self.width
+            || y.saturating_add(height) > self.height
+            || (y + height).saturating_sub(1).saturating_mul(self.stride) + x + width > self.pixels
+        {
+            return false;
+        }
+        for (row, &source_row) in rows.iter().enumerate() {
+            let from = unsafe { source.add(source_row as usize * source_stride) };
+            let to = unsafe { self.address.add((y + row) * self.stride + x) };
+            for (column, &source_column) in columns.iter().enumerate() {
+                unsafe { *to.add(column) = *from.add(source_column as usize) };
+            }
+        }
+        true
+    }
+
+    /// Copies XRGB8888 rows in as they are, when this framebuffer stores
+    /// pixels that way (false otherwise, and nothing is written).
+    ///
+    /// # Safety
+    /// `source` must be readable for `height` rows of `source_stride` pixels.
+    pub unsafe fn copy_xrgb_rows(
+        &mut self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        source: *const u32,
+        source_stride: usize,
+    ) -> bool {
+        if !matches!(self.format, PixelFormat::Bgr)
+            || x.saturating_add(width) > self.width
+            || y.saturating_add(height) > self.height
+            || (y + height).saturating_sub(1).saturating_mul(self.stride) + x + width > self.pixels
+        {
+            return false;
+        }
+        for row in 0..height {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    source.add(row * source_stride),
+                    self.address.add((y + row) * self.stride + x),
+                    width,
+                );
+            }
+        }
+        true
+    }
+
     pub fn restore_region(&mut self, shadow: &[u32], x: i32, y: i32, width: usize, height: usize) {
         for row in 0..height as i32 {
             let py = y + row;

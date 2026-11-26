@@ -75,14 +75,14 @@ fn corners_fit(app: DesktopApp) -> bool {
 pub(super) fn corners_shown(state: &DesktopState, _sliding: Option<Overlay>) -> bool {
     state.screen == Screen::Desktop
         && corners_fit(state.app)
-        && !state.seamless.enabled
+        && !(state.seamless.enabled && state.seamless.fullscreen() != 0)
 }
 
 impl DesktopState {
     pub(super) fn corners_active(&self) -> bool {
         self.screen == Screen::Desktop
             && corners_fit(self.app)
-            && !self.seamless.enabled
+            && !(self.seamless.enabled && self.seamless.fullscreen() != 0)
             && !self.power_open
             && self.power_action == shellui::PowerAction::None
     }
@@ -242,26 +242,56 @@ impl DesktopState {
     }
 }
 
+/// Which corner button the pointer is over (0 none, 1 feather, 2 gear),
+/// kept by the desktop loop so a hover change can ask for a frame.
+pub(super) static CORNER_HOVER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Records which corner the pointer (logical) is over; true when it changed.
+pub(super) fn track_corner_hover(state: &DesktopState, point: Point) -> bool {
+    let over = if !state.corners_active() {
+        0
+    } else if FEATHER.contains(point) {
+        1
+    } else if GEAR.contains(point) {
+        2
+    } else {
+        0
+    };
+    CORNER_HOVER.swap(over, core::sync::atomic::Ordering::Relaxed) != over
+}
+
 pub(super) fn draw_corners(painter: &mut Painter<'_>, layout: Layout, state: &DesktopState) {
-    let lit = state.menu_open || state.parcel_open;
-    painter.draw_rgba_scaled_alpha(
-        layout.rect(FEATHER_ART),
-        desktop_icon(7),
-        DESKTOP_ICON_SIZE,
-        DESKTOP_ICON_SIZE,
-        if lit { 255 } else { 235 },
-    );
-    painter.draw_rgba_scaled_alpha(
-        layout.rect(GEAR_ART),
-        desktop_icon(8),
-        DESKTOP_ICON_SIZE,
-        DESKTOP_ICON_SIZE,
-        if state.overlay == Overlay::Quick {
-            255
-        } else {
-            235
-        },
-    );
+    let now = crate::time::monotonic_nanoseconds();
+    let hover = CORNER_HOVER.load(core::sync::atomic::Ordering::Relaxed);
+    let lit = [state.menu_open || state.parcel_open, state.overlay == Overlay::Quick];
+    for (index, (art, icon)) in [(FEATHER_ART, 7), (GEAR_ART, 8)].into_iter().enumerate() {
+        // Springs up a little under the pointer (or while its panel is open),
+        // with a soft light behind it.
+        let up = motion::tween(
+            motion::tween_key(4, index as u32),
+            if hover == index as u8 + 1 || lit[index] { 1_000 } else { 0 },
+            motion::SNAPPY,
+            now,
+        );
+        let base = layout.rect(art);
+        let grow = base.width * up / 9_000;
+        let rect = Rect::new(base.x - grow / 2, base.y - grow / 2, base.width + grow, base.height + grow);
+        if up > 0 {
+            let halo = rect.expand(layout.scale.logical(5));
+            painter.fill_rounded_rect(
+                halo,
+                CornerRadii::all(halo.height / 2),
+                Rgba::new(255, 255, 255, (up.clamp(0, 1_000) * 34 / 1_000) as u8),
+            );
+        }
+        painter.draw_rgba_scaled_alpha(
+            rect,
+            desktop_icon(icon),
+            DESKTOP_ICON_SIZE,
+            DESKTOP_ICON_SIZE,
+            if lit[index] || up > 500 { 255 } else { 235 },
+        );
+    }
 }
 /// The menu's dark glass: the wallpaper frosted under a 10% white fill.
 fn panel_glass(painter: &mut Painter<'_>, layout: Layout, panel: Rect, radius: i32) {

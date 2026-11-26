@@ -1318,9 +1318,9 @@ extern "efiapi" fn kernel_entry(image: Handle, table: *mut SystemTable) -> Statu
             }
         }
         // As many vCPUs as there are free cores (one kept back for AerOS's
-        // own programs once there are plenty), at least the two the guest
-        // has always had.
-        let wanted = if count > 4 { count - 1 } else { count };
+        // own work - programs, the live wallpaper - once there are three),
+        // at least the two the guest has always had.
+        let wanted = if count > 2 { count - 1 } else { count };
         svm::linux_set_vcpu_count(wanted.max(2));
         svm::boot_linux(&mut frames);
         let vcpus = svm::linux_vcpu_count();

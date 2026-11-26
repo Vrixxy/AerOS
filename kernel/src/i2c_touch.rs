@@ -510,3 +510,12 @@ pub fn describe(mut line: impl FnMut(&str)) {
         line(text);
     }
 }
+
+/// One word for Settings: "working", "starting" or "not found".
+pub fn status() -> &'static str {
+    match TOUCH.lock().phase {
+        Phase::Waiting => "starting",
+        Phase::Ready(_) => "working",
+        Phase::Off => "not found",
+    }
+}

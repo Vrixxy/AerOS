@@ -10,7 +10,9 @@
 // which is why no APIC MMIO page has to be decoded.
 
 /// The most vCPUs a guest can have; `active_vcpus` of them are offered to it.
-const NUM_VCPUS: usize = 8;
+const NUM_VCPUS: usize = 16;
+/// Bits of the APIC id that number the core (CPUID 0xb / 0x8000_0008).
+const CORE_ID_BITS: u32 = NUM_VCPUS.trailing_zeros();
 static ACTIVE_VCPUS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(2);
 
 fn active_vcpus() -> usize {

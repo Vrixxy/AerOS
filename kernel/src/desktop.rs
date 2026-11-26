@@ -107,7 +107,7 @@ fn linux_pan() -> (i32, i32) {
         LINUX_PAN_Y.load(core::sync::atomic::Ordering::Relaxed),
     )
 }
-const OVERLAY_TRANSITION_NS: u64 = 450_000_000;
+const OVERLAY_TRANSITION_NS: u64 = 340_000_000;
 /// Long enough for any spring motion to come to rest.
 const MOTION_SETTLE_NS: u64 = 1_200_000_000;
 const OVERLAY_SLIDE_PX: i32 = 350;
@@ -119,7 +119,7 @@ const DOCK_FALL_STAGGER_NS: u64 = 25_000_000;
 const DOCK_FALL_HEIGHT_PX: i32 = 60;
 const WINDOW_OPEN_NS: u64 = 150_000_000;
 /// How long a window takes to grow out of (or back into) its dock icon.
-const WINDOW_MORPH_NS: u64 = 420_000_000;
+const WINDOW_MORPH_NS: u64 = 300_000_000;
 const LOCK_LOGIN_SCROLL_NS: u64 = 320_000_000;
 const SCREEN_TRANSITION_NS: u64 = 220_000_000;
 const SCREEN_FADE_MAX_ALPHA: u32 = 130;
@@ -475,6 +475,9 @@ struct ScreenBuffers {
     shadow: AtomicUsize,
     wallpaper: AtomicUsize,
     panel: AtomicUsize,
+    /// The next live-wallpaper frame, rendered on a spare core (0 when there
+    /// was no memory for it: live frames are then rendered in place).
+    wallpaper_back: AtomicUsize,
     capacity: AtomicUsize,
 }
 
@@ -483,6 +486,7 @@ static SCREEN: ScreenBuffers = ScreenBuffers {
     shadow: AtomicUsize::new(0),
     wallpaper: AtomicUsize::new(0),
     panel: AtomicUsize::new(0),
+    wallpaper_back: AtomicUsize::new(0),
     capacity: AtomicUsize::new(0),
 };
 
@@ -506,6 +510,9 @@ pub fn allocate_screen_buffers(frames: &mut crate::memory::FrameAllocator, pixel
     SCREEN.shadow.store(addresses[1], Ordering::Release);
     SCREEN.wallpaper.store(addresses[2], Ordering::Release);
     SCREEN.panel.store(addresses[3], Ordering::Release);
+    if let Some(block) = frames.allocate_dma(pages, 1) {
+        SCREEN.wallpaper_back.store(block.address() as usize, Ordering::Release);
+    }
     SCREEN.capacity.store(pixels, Ordering::Release);
     true
 }
@@ -2263,6 +2270,7 @@ impl DesktopState {
                 self.set_overlay(Overlay::None);
                 self.set_app(DesktopApp::None);
                 self.seamless.enabled = true;
+                self.seamless.minimized = [0; SEAM_SLOTS];
             }
             DesktopKey::Power => self.open_power_menu(),
             DesktopKey::Notifications => self.toggle_notify_center(),
@@ -2482,6 +2490,13 @@ impl DesktopState {
             let base = window_base_rect(self.app);
             let (minimize, maximize, close) = window_control_rects(self.app, base);
             let tab = terminal_tab(base);
+            let shown = window_controls_shown(crate::time::monotonic_nanoseconds());
+            let (minimize, maximize, close) = if shown {
+                (minimize, maximize, close)
+            } else {
+                let none = Rect::new(-1000, -1000, 0, 0);
+                (none, none, none)
+            };
             if close.contains(point)
                 || self.app == DesktopApp::Terminal
                     && Rect::new(tab.right() - 24, tab.y, 24, tab.height).contains(point)
@@ -2943,6 +2958,7 @@ impl DesktopState {
         self.set_overlay(Overlay::None);
         self.set_app(DesktopApp::None);
         self.seamless.enabled = true;
+        self.seamless.minimized = [0; SEAM_SLOTS];
     }
 
     fn start_load(&mut self) {
@@ -3778,6 +3794,9 @@ impl DesktopState {
         if self.screen != Screen::Desktop {
             return None;
         }
+        if self.search_open {
+            return Some(ClipField::Search);
+        }
         match self.app {
             DesktopApp::Notes if self.notes_mode == NotesMode::Editing => Some(ClipField::Note),
             DesktopApp::Notes if self.notes_mode == NotesMode::Naming => Some(ClipField::Name),
@@ -3790,6 +3809,7 @@ impl DesktopState {
 
     fn clip_field_bytes(&self, field: ClipField) -> &[u8] {
         match field {
+            ClipField::Search => &self.search_input[..self.search_len],
             ClipField::Note => self.notes_content.as_str().as_bytes(),
             ClipField::Name => self.name_input.as_str().as_bytes(),
             ClipField::Terminal => &self.terminal_input[..self.terminal_input_len],
@@ -3799,6 +3819,7 @@ impl DesktopState {
 
     fn clip_field_clear(&mut self, field: ClipField) {
         match field {
+            ClipField::Search => self.search_len = 0,
             ClipField::Note => self.notes_content.clear(),
             ClipField::Name => self.name_input.clear(),
             ClipField::Terminal => {
@@ -3829,6 +3850,15 @@ impl DesktopState {
                 ClipField::Name => character.is_ascii() && self.push_name_byte(character as u8),
                 ClipField::Terminal => self.push_terminal_input_char(character),
                 ClipField::Url => character.is_ascii() && self.push_url_byte(character as u8),
+                ClipField::Search => {
+                    let fits = self.search_len < search::SEARCH_MAX && character.is_ascii() && !character.is_ascii_control();
+                    if fits {
+                        self.search_input[self.search_len] = character as u8;
+                        self.search_len += 1;
+                        self.search_focus = 0;
+                    }
+                    fits
+                }
             };
         }
         changed
@@ -4283,6 +4313,7 @@ enum DesktopKey {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ClipField {
+    Search,
     Note,
     Name,
     Terminal,
@@ -4720,6 +4751,7 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
     let mut setup_caret = true;
     let mut linux_screen_hash = 0u64;
     let mut linux_last_paint_ns = 0u64;
+    let mut seam_frames = SeamFrames::default();
     let mut guest_ptr = GuestPointer::new();
     let mut seam_generation_seen = 0u32;
     let mut last_web_paint_ns = 0u64;
@@ -4883,6 +4915,56 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 save_screenshot(frame);
                 continue;
             }
+            if state.screen == Screen::Desktop
+                && meta_down
+                && !released
+                && !was_extended
+                && scancode != 0xe0
+                && let Some(action) = super_shortcut(&mut state, code)
+            {
+                meta_used = true;
+                redraw |= action;
+                continue;
+            }
+            if state.screen == Screen::Desktop
+                && meta_down
+                && !released
+                && was_extended
+                && matches!(code, 0x48 | 0x50)
+                && state.app != DesktopApp::None
+            {
+                meta_used = true;
+                if code == 0x48 {
+                    state.toggle_maximize();
+                } else {
+                    state.set_app(DesktopApp::None);
+                }
+                redraw = true;
+                continue;
+            }
+            // Ctrl+W / Ctrl+Q close the window in front; Ctrl+Shift+Esc opens
+            // Settings > About (what's running and how busy the system is).
+            if state.screen == Screen::Desktop
+                && ctrl_down
+                && !released
+                && !was_extended
+                && scancode != 0xe0
+                && !guest_has_keyboard(&state)
+                && state.app != DesktopApp::Terminal
+            {
+                if matches!(code, 0x11 | 0x10) && state.app != DesktopApp::None {
+                    state.app_close();
+                    redraw = true;
+                    continue;
+                }
+                if code == 0x01 && shift_held {
+                    state.set_overlay(Overlay::None);
+                    state.set_app(DesktopApp::Settings);
+                    state.settings_show_page(settings_ui::PAGES.len() as u8 - 1);
+                    redraw = true;
+                    continue;
+                }
+            }
             if state.screen == Screen::Desktop {
                 // Super+Space: search.
                 if scancode != 0xe0 && code == 0x39 && !was_extended && !released && meta_down {
@@ -4972,6 +5054,22 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                         }
                         redraw = true;
                     }
+                    continue;
+                }
+            }
+            // Game mode: Shift+< latches Shift for the game (pressed once for
+            // it, released when unlatched); the real Shift's release is held
+            // back meanwhile.
+            if game_mode() && state.screen == Screen::Desktop && !was_extended && scancode != 0xe0 {
+                if code == 0x56 && !released && shift_held {
+                    let locked = !SHIFT_LOCK.load(Ordering::Relaxed);
+                    SHIFT_LOCK.store(locked, Ordering::Relaxed);
+                    crate::svm::linux_feed_scancode(if locked { 0x2a } else { 0xaa });
+                    crate::notify::push(1, if locked { "Shift locked" } else { "Shift released" }, "");
+                    redraw = true;
+                    continue;
+                }
+                if SHIFT_LOCK.load(Ordering::Relaxed) && matches!(scancode, 0xaa | 0xb6) {
                     continue;
                 }
             }
@@ -5493,6 +5591,12 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
         {
             redraw = true;
         }
+        {
+            let point = Layout::new(frame).to_logical(Point::new(pointer.x, pointer.y));
+            redraw |= track_window_controls(&state, point, now_ns);
+            redraw |= menu::track_corner_hover(&state, point);
+            redraw |= track_hover(&state, point);
+        }
         if state.app == DesktopApp::Linux && linux_zoomed() {
             let before = linux_pan();
             update_linux_pan(frame, &pointer);
@@ -5525,6 +5629,23 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
             if press_count < presses.len() {
                 presses[press_count] = point;
                 press_count += 1;
+            }
+            // A soft ripple answers every click inside an AerOS app window.
+            if state.screen == Screen::Desktop
+                && state.overlay == Overlay::None
+                && !matches!(state.app, DesktopApp::None | DesktopApp::Linux)
+            {
+                let layout = Layout::new(frame);
+                let logical = layout.to_logical(Point::new(point.0, point.1));
+                if window_base_rect(state.app).contains(logical) {
+                    let now = crate::time::monotonic_nanoseconds();
+                    RIPPLE_AT.store(
+                        ((point.0 as u32 as u64) << 32) | point.1 as u32 as u64,
+                        Ordering::Relaxed,
+                    );
+                    RIPPLE_NS.store(now, Ordering::Relaxed);
+                    motion::hold(now + RIPPLE_LENGTH_NS);
+                }
             }
         }
         if state.seamless.enabled {
@@ -5713,7 +5834,10 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
         #[cfg(feature = "screen-log")]
         crate::DESKTOP_HEARTBEAT.fetch_add(1, core::sync::atomic::Ordering::Release);
         crate::keymap::sync_guest();
-        let motion_animating_now = crate::time::monotonic_nanoseconds() < state.motion_until_ns;
+        let motion_animating_now = {
+            let now = crate::time::monotonic_nanoseconds();
+            now < state.motion_until_ns || motion::tweens_moving(now)
+        };
         if motion_animating_now || motion_animating {
             redraw = true;
         }
@@ -5943,8 +6067,21 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
             // second, so a busy console doesn't starve input handling.
             let now_ns = crate::time::monotonic_nanoseconds();
             let animating = loading_animating(&state);
-            let interval = if animating { 33_000_000 } else { 66_000_000 };
-            if now_ns.saturating_sub(linux_last_paint_ns) >= interval {
+            let interval = if animating {
+                33_000_000
+            } else if state.seamless.enabled {
+                16_000_000
+            } else {
+                66_000_000
+            };
+            if !animating
+                && now_ns.saturating_sub(linux_last_paint_ns) >= 8_000_000
+                && seamless_fast_present(frame, &state, now_ns, &mut seam_frames)
+            {
+                linux_last_paint_ns = now_ns;
+                cursor.erase(frame);
+                cursor.paint(frame, cursor_target(frame));
+            } else if now_ns.saturating_sub(linux_last_paint_ns) >= interval {
                 // The guest's screen only matters when it is shown; otherwise (the
                 // browser or the store is open and the guest just works in the
                 // background) its changes must not trigger repaints, which would
@@ -5958,9 +6095,14 @@ pub fn run(frame: &mut FrameBuffer, fonts: &FontCatalog, shell_info: shell::Syst
                 if animating {
                     signature ^= now_ns / 33_000_000;
                 }
+                // The window buttons appear after a rest, with no event to say so.
+                if state.seamless.controls_shown(state.seamless.hover, now_ns) {
+                    signature ^= 0x5eed_0000_0000 ^ state.seamless.hover as u64;
+                }
                 if signature != linux_screen_hash {
                     linux_screen_hash = signature;
                     linux_last_paint_ns = now_ns;
+                    seam_frames = seamless_frames();
                     present_desktop(frame, fonts, &state);
                     cursor.erase(frame);
                     cursor.paint(frame, cursor_target(frame));
@@ -6180,6 +6322,10 @@ const SEAM_SLOTS: usize = 16;
 #[derive(Clone, Copy)]
 struct SeamSlot {
     id: u32,
+    /// Filling the screen (dock and corners hidden); `restore` is the guest
+    /// size it had before.
+    max: bool,
+    restore: (u32, u32),
     /// Top-left of the AerOS frame, in logical desktop coordinates.
     x: i32,
     y: i32,
@@ -6203,13 +6349,26 @@ struct Seamless {
     resize: u32,
     resize_from: (i32, i32, u32, u32),
     resize_sent: (u32, u32, u64),
+    /// The window whose top-right control zone the pointer rests in, and
+    /// since when (the buttons appear after `SEAM_CONTROLS_DELAY_NS`).
+    hover: u32,
+    hover_since: u64,
+    minimized: [u32; SEAM_SLOTS],
+    /// The window shown picture-in-picture (small, above everything).
+    pip: u32,
 }
+
+const SEAM_CONTROLS_DELAY_NS: u64 = 500_000_000;
 
 impl Seamless {
     const fn new() -> Self {
         Self {
             enabled: false,
-            slots: [SeamSlot { id: 0, x: 0, y: 0 }; SEAM_SLOTS],
+            slots: [SeamSlot { id: 0, max: false, restore: (0, 0), x: 0, y: 0 }; SEAM_SLOTS],
+            hover: 0,
+            hover_since: 0,
+            minimized: [0; SEAM_SLOTS],
+            pip: 0,
             order: [0; SEAM_SLOTS],
             focus: 0,
             drag: 0,
@@ -6240,6 +6399,40 @@ impl Seamless {
         }
     }
 
+    fn controls_shown(&self, id: u32, now: u64) -> bool {
+        id != 0 && self.hover == id && now.saturating_sub(self.hover_since) >= SEAM_CONTROLS_DELAY_NS
+    }
+
+    fn is_minimized(&self, id: u32) -> bool {
+        id != 0 && self.minimized.contains(&id)
+    }
+
+    fn minimize(&mut self, id: u32) {
+        if !self.is_minimized(id)
+            && let Some(entry) = self.minimized.iter_mut().find(|entry| **entry == 0)
+        {
+            *entry = id;
+        }
+        if self.focus == id {
+            self.focus = 0;
+        }
+        self.hover = 0;
+    }
+
+    fn restore_window(&mut self, id: u32) {
+        for entry in self.minimized.iter_mut().filter(|entry| **entry == id) {
+            *entry = 0;
+        }
+    }
+
+    /// The maximized window, if any (it hides the dock and the corners).
+    fn fullscreen(&self) -> u32 {
+        self.slots
+            .iter()
+            .find(|slot| slot.id != 0 && slot.max && !self.is_minimized(slot.id))
+            .map_or(0, |slot| slot.id)
+    }
+
     fn raise(&mut self, id: u32) {
         self.remove_from_order(id);
         if let Some(entry) = self.order.iter_mut().find(|entry| **entry == 0) {
@@ -6267,6 +6460,13 @@ impl Seamless {
                     self.resize = 0;
                 }
                 self.slots[index].id = 0;
+                self.restore_window(id);
+                if self.pip == id {
+                    self.pip = 0;
+                }
+                if self.hover == id {
+                    self.hover = 0;
+                }
                 changed = true;
             }
         }
@@ -6279,10 +6479,12 @@ impl Seamless {
             // coordinates say nothing about where a window fits here.
             let used = self.slots.iter().filter(|slot| slot.id != 0).count() as i32;
             let step = used % 8;
-            let origin = Point::new(10 + step * 34, 14 + step * 28);
+            let origin = Point::new(58 + step * 34, 46 + step * 28);
             if let Some(free) = self.slots.iter_mut().find(|slot| slot.id == 0) {
                 *free = SeamSlot {
                     id: window.id,
+                    max: false,
+                    restore: (0, 0),
                     x: origin.x,
                     y: origin.y,
                 };
@@ -6298,44 +6500,53 @@ impl Seamless {
 struct SeamGeometry {
     chrome: Rect,
     content: Rect,
-    close: Rect,
+    /// Minimize, maximize, close.
+    buttons: [Rect; 3],
+    /// Where resting the pointer brings the buttons up.
+    controls: Rect,
     grip: Rect,
 }
 
 /// Physical-pixel layout of one guest window's AerOS frame. The content area
 /// is the guest window's own size, 1:1, so text stays sharp.
 fn seam_geometry(layout: Layout, slot: SeamSlot, window: &crate::svm::GuestWindow) -> SeamGeometry {
-    let margin = layout.scale.logical(6);
-    let title_height = layout.scale.logical(30);
-    let bottom = layout.scale.logical(12);
-    let origin = layout.point(Point::new(slot.x, slot.y));
     let (width, height) = (window.width as i32, window.height as i32);
-    let chrome = Rect::new(
-        origin.x,
-        origin.y,
-        width + 2 * margin,
-        height + title_height + bottom,
-    );
+    let (chrome, content) = if slot.max {
+        let screen = Rect::new(
+            0,
+            0,
+            layout.scale.logical(DESIGN_WIDTH) + 2 * layout.offset.x,
+            layout.scale.logical(DESIGN_HEIGHT) + 2 * layout.offset.y,
+        );
+        (screen, screen)
+    } else {
+        let margin = layout.scale.logical(6);
+        let origin = layout.point(Point::new(slot.x, slot.y));
+        (
+            Rect::new(origin.x, origin.y, width + 2 * margin, height + 2 * margin),
+            Rect::new(origin.x + margin, origin.y + margin, width, height),
+        )
+    };
+    let size = layout.scale.logical(12);
+    let gap = layout.scale.logical(5);
+    let top = content.y + layout.scale.logical(5);
+    let right = content.right() - layout.scale.logical(8);
+    let button = |index: i32| Rect::new(right - (3 - index) * size - (2 - index) * gap, top, size, size);
+    let zone_width = layout.scale.logical(88);
+    let corner = layout.scale.logical(18);
     SeamGeometry {
         chrome,
-        content: Rect::new(origin.x + margin, origin.y + title_height, width, height),
-        close: Rect::new(
-            chrome.right() - layout.scale.logical(26),
-            origin.y + layout.scale.logical(8),
-            layout.scale.logical(16),
-            layout.scale.logical(16),
-        ),
-        grip: Rect::new(
-            chrome.right() - layout.scale.logical(22),
-            chrome.bottom() - bottom - layout.scale.logical(4),
-            layout.scale.logical(22),
-            bottom + layout.scale.logical(4),
-        ),
+        content,
+        buttons: [button(0), button(1), button(2)],
+        controls: Rect::new(content.right() - zone_width, content.y, zone_width, layout.scale.logical(22)),
+        grip: Rect::new(chrome.right() - corner, chrome.bottom() - corner, corner, corner),
     }
 }
 
 #[derive(Clone, Copy)]
 enum SeamHit {
+    Minimize(u32),
+    Maximize(u32),
     Close(u32),
     Grip(u32),
     Title(u32),
@@ -6358,21 +6569,144 @@ fn seam_hit(
         ) else {
             continue;
         };
-        let geometry = seam_geometry(layout, slot, window);
-        if geometry.close.contains(point) {
-            return Some(SeamHit::Close(id));
+        if seam.is_minimized(id) || seam.pip == id {
+            continue;
         }
-        if geometry.grip.contains(point) && !geometry.content.contains(point) {
+        let geometry = seam_geometry(layout, slot, window);
+        if seam.controls_shown(id, crate::time::monotonic_nanoseconds()) {
+            let [minimize, maximize, close] = geometry.buttons;
+            if minimize.contains(point) {
+                return Some(SeamHit::Minimize(id));
+            }
+            if maximize.contains(point) {
+                return Some(SeamHit::Maximize(id));
+            }
+            if close.contains(point) {
+                return Some(SeamHit::Close(id));
+            }
+        }
+        if !slot.max && geometry.grip.contains(point) && !geometry.content.contains(point) {
             return Some(SeamHit::Grip(id));
         }
         if geometry.content.contains(point) {
             return Some(SeamHit::Content(id));
         }
-        if geometry.chrome.contains(point) {
+        if !slot.max && geometry.chrome.contains(point) {
             return Some(SeamHit::Title(id));
         }
     }
     None
+}
+
+/// Game mode: a crosshair in the middle of the screen, Do Not Disturb on,
+/// and Shift+< latching Shift for the focused game.
+static GAME_MODE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static GAME_DND_BEFORE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static SHIFT_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn game_mode() -> bool {
+    GAME_MODE.load(Ordering::Relaxed)
+}
+
+fn set_game_mode(on: bool) {
+    if GAME_MODE.swap(on, Ordering::Relaxed) == on {
+        return;
+    }
+    if on {
+        GAME_DND_BEFORE.store(crate::notify::do_not_disturb(), Ordering::Relaxed);
+        crate::notify::set_do_not_disturb(true);
+        crate::notify::push(1, "Game mode on", "Crosshair on, notifications held. Shift+< locks Shift.");
+    } else {
+        if SHIFT_LOCK.swap(false, Ordering::Relaxed) {
+            crate::svm::linux_feed_scancode(0xaa);
+        }
+        crate::notify::set_do_not_disturb(GAME_DND_BEFORE.load(Ordering::Relaxed));
+        crate::notify::push(1, "Game mode off", "Notifications are back.");
+    }
+}
+
+/// The crosshair's rectangle (physical pixels) on a `width` x `height` screen.
+fn crosshair_rect(width: i32, height: i32) -> Rect {
+    let size = (height / 40).max(16);
+    Rect::new(width / 2 - size / 2, height / 2 - size / 2, size, size)
+}
+
+/// A thin white cross with a dark rim, at the centre of the screen.
+fn draw_crosshair(frame: &mut FrameBuffer) {
+    if !game_mode() {
+        return;
+    }
+    let bounds = crosshair_rect(frame.width() as i32, frame.height() as i32);
+    let thick = (bounds.width / 9).max(2);
+    let mut painter = Painter::new(frame);
+    let centre = Point::new(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+    let arms = [
+        Rect::new(bounds.x, centre.y - thick / 2, bounds.width, thick),
+        Rect::new(centre.x - thick / 2, bounds.y, thick, bounds.height),
+    ];
+    for arm in arms {
+        painter.fill_rounded_rect(arm.expand(1), CornerRadii::all(1), Rgba::new(0, 0, 0, 170));
+    }
+    for arm in arms {
+        painter.fill_rounded_rect(arm, CornerRadii::all(1), Rgba::new(255, 255, 255, 235));
+    }
+}
+
+/// Super combinations (with Super held, a key just pressed). Returns whether
+/// the screen needs redrawing, or `None` when the key isn't a shortcut.
+///   D desktop (hide the window)   E Files   I Settings   A quick settings
+///   N notifications   B browser   T terminal   S screenshot
+/// (Super+Up / Super+Down maximize and minimize: see the extended keys.)
+fn super_shortcut(state: &mut DesktopState, code: u8) -> Option<bool> {
+    let open = |state: &mut DesktopState, app: DesktopApp| {
+        state.set_overlay(Overlay::None);
+        state.close_popups();
+        state.set_app(app);
+        true
+    };
+    Some(match code {
+        0x20 => {
+            if state.app != DesktopApp::None {
+                state.set_app(DesktopApp::None);
+            }
+            state.set_overlay(Overlay::None);
+            true
+        }
+        0x12 => open(state, DesktopApp::Files),
+        0x17 => open(state, DesktopApp::Settings),
+        0x30 => open(state, DesktopApp::Browser),
+        0x14 => open(state, DesktopApp::Terminal),
+        0x1e => {
+            let target = if state.overlay == Overlay::Quick { Overlay::None } else { Overlay::Quick };
+            state.set_overlay(target);
+            true
+        }
+        0x31 => {
+            state.toggle_notify_center();
+            true
+        }
+        0x1f => {
+            state.screenshot_at_ns = crate::time::monotonic_nanoseconds() + 150_000_000;
+            false
+        }
+        0x22 => {
+            set_game_mode(!game_mode());
+            true
+        }
+        0x19 if state.seamless.enabled => {
+            let seam = &mut state.seamless;
+            if seam.pip != 0 {
+                seam.focus = seam.pip;
+                seam.raise(seam.pip);
+                seam.pip = 0;
+            } else if seam.focus != 0 {
+                seam.pip = seam.focus;
+                seam.focus = 0;
+            }
+            true
+        }
+        _ => return None,
+    })
 }
 
 /// Whether keystrokes currently go to a Linux guest window.
@@ -6524,8 +6858,8 @@ const LOADING_FADE_NS: u64 = 400_000_000;
 static BOOT_SPLASH_START_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// How long the boot splash is on screen; the last part fades to dark, and
 /// the setup screen then fades in from dark.
-const BOOT_SPLASH_NS: u64 = 3_200_000_000;
-const BOOT_SPLASH_FADE_NS: u64 = 500_000_000;
+const BOOT_SPLASH_NS: u64 = 1_800_000_000;
+const BOOT_SPLASH_FADE_NS: u64 = 350_000_000;
 
 /// The boot splash for this frame, or `None` once it is over: the view
 /// (progress and timing) and how far it has faded to dark (0 = not at all).
@@ -6737,54 +7071,33 @@ fn draw_seamless(
         ) else {
             continue;
         };
+        if seam.is_minimized(id) || seam.pip == id {
+            continue;
+        }
         let geometry = seam_geometry(layout, slot, window);
-        let radii = layout.radii(CornerRadii::all(12));
-        painter.fill_rounded_rect(geometry.chrome, radii, Rgba::new(244, 246, 248, 248));
-        let border = if id == seam.focus {
-            Rgba::new(64, 140, 205, 255)
+        if slot.max {
+            painter.fill_rounded_rect(geometry.chrome, layout.radii(CornerRadii::all(0)), Rgba::opaque(0, 0, 0));
         } else {
-            Rgba::new(188, 197, 206, 230)
-        };
-        painter.stroke_rounded_rect(geometry.chrome, radii, 2, border);
-        let length = window.title.iter().position(|b| *b == 0).unwrap_or(64);
-        let title = core::str::from_utf8(&window.title[..length]).unwrap_or("");
-        let fit = (geometry.chrome.width / layout.scale.logical(8).max(1)).max(4) as usize;
-        let title = title
-            .get(..title.len().min(fit.saturating_sub(4)))
-            .unwrap_or(title);
-        text(
-            painter,
-            layout,
-            ui_font,
-            Point::new(slot.x + 14, slot.y + 8),
-            title,
-            13,
-            Color::rgb(18, 23, 26),
-        );
-        painter.fill_rounded_rect(
-            geometry.close,
-            layout.radii(CornerRadii::all(7)),
-            Rgba::opaque(198, 31, 18),
-        );
-        // Resize grip: two short diagonal ticks in the bottom-right corner.
-        for step in [4, 9] {
+            let radii = layout.radii(CornerRadii::all(20));
+            painter.fill_rounded_rect(geometry.chrome, radii, Rgba::opaque(217, 217, 217));
+            painter.stroke_rounded_rect(geometry.chrome, radii, 1, Rgba::new(0, 0, 0, 46));
             painter.fill_rounded_rect(
-                Rect::new(
-                    geometry.chrome.right() - layout.scale.logical(step + 4),
-                    geometry.chrome.bottom() - layout.scale.logical(4),
-                    layout.scale.logical(step),
-                    layout.scale.logical(2).max(1),
-                ),
+                geometry.content,
                 layout.radii(CornerRadii::all(0)),
-                Rgba::new(120, 132, 144, 220),
+                Rgba::opaque(0, 0, 0),
             );
         }
-        painter.fill_rounded_rect(
-            geometry.content,
-            layout.radii(CornerRadii::all(0)),
-            Rgba::opaque(0, 0, 0),
-        );
-        if let Some((pixels, screen_width, screen_height, stride)) = framebuffer {
+        if let Some(surface) = crate::svm::linux_surface(id) {
+            let width = surface.width.min(window.width as usize);
+            let height = surface.height.min(window.height as usize);
+            let dest = if slot.max {
+                geometry.content
+            } else {
+                Rect::new(geometry.content.x, geometry.content.y, width as i32, height as i32)
+            };
+            // SAFETY: `linux_surface` checked the buffer lies in the pool.
+            unsafe { painter.blit_scaled(dest, surface.pixels, width, height, surface.stride) };
+        } else if let Some((pixels, screen_width, screen_height, stride)) = framebuffer {
             let crop_x = window.x.clamp(0, screen_width as i32);
             let crop_y = window.y.clamp(0, screen_height as i32);
             let crop_w = (window.width as i32)
@@ -6809,16 +7122,95 @@ fn draw_seamless(
             }
         }
     }
-    if seam.focus == 0 {
+    let now = crate::time::monotonic_nanoseconds();
+    if seam.controls_shown(seam.hover, now)
+        && let (Some(slot), Some(window)) = (
+            seam.slot(seam.hover),
+            windows.windows[..windows.count].iter().find(|window| window.id == seam.hover),
+        )
+    {
+        draw_seam_controls(painter, layout, seam_geometry(layout, slot, window).buttons, {
+            let pointer = crate::mouse::state();
+            Point::new(pointer.x, pointer.y)
+        });
+    }
+    if seam.focus == 0 && seam.fullscreen() == 0 {
         text(
             painter,
             layout,
             ui_font,
-            Point::new(28, 4),
+            Point::new(60, 4),
             "Linux apps    X terminal    N NetSurf    F Firefox    K back    Super+V clipboard    click a window to type",
             11,
             Color::rgb(240, 244, 248),
         );
+    }
+}
+
+/// Where the picture-in-picture window sits (logical): bottom right, above
+/// the dock, 200 wide at the window's own proportions.
+fn pip_rect(width: u32, height: u32) -> Rect {
+    let w = 200;
+    let h = (w * height as i32 / width.max(1) as i32).clamp(60, 150);
+    Rect::new(DESIGN_WIDTH - w - 14, DOCK_RECT.y - h - 16, w, h)
+}
+
+fn draw_pip(painter: &mut Painter<'_>, layout: Layout, state: &DesktopState) {
+    let id = state.seamless.pip;
+    if id == 0 || state.screen != Screen::Desktop {
+        return;
+    }
+    let (Some(windows), Some(surface)) = (crate::svm::linux_windows(), crate::svm::linux_surface(id)) else {
+        return;
+    };
+    let Some(window) = windows.windows[..windows.count].iter().find(|window| window.id == id) else {
+        return;
+    };
+    let width = surface.width.min(window.width as usize);
+    let height = surface.height.min(window.height as usize);
+    let frame = pip_rect(width as u32, height as u32);
+    let outer = layout.rect(frame.expand(4));
+    painter.fill_rounded_rect(
+        outer.expand(layout.scale.logical(3)),
+        layout.radii(CornerRadii::all(16)),
+        Rgba::new(0, 0, 0, 70),
+    );
+    painter.fill_rounded_rect(outer, layout.radii(CornerRadii::all(14)), Rgba::opaque(217, 217, 217));
+    let inner = layout.rect(frame);
+    painter.fill_rounded_rect(inner, CornerRadii::all(0), Rgba::opaque(0, 0, 0));
+    // SAFETY: `linux_surface` checked the buffer lies in the pool.
+    unsafe { painter.blit_scaled(inner, surface.pixels, width, height, surface.stride) };
+}
+
+/// The three window buttons: plain white circles, the one under the pointer
+/// showing its symbol.
+fn draw_seam_controls(painter: &mut Painter<'_>, layout: Layout, buttons: [Rect; 3], pointer: Point) {
+    let ink = Rgba::new(40, 40, 44, 255);
+    for (index, button) in buttons.into_iter().enumerate() {
+        painter.fill_rounded_rect(button, layout.radii(CornerRadii::all(6)), Rgba::new(255, 255, 255, 240));
+        painter.stroke_rounded_rect(button, layout.radii(CornerRadii::all(6)), 1, Rgba::new(0, 0, 0, 40));
+        if !button.contains(pointer) {
+            continue;
+        }
+        let inset = button.width / 4;
+        let mark = Rect::new(button.x + inset, button.y + inset, button.width - 2 * inset, button.height - 2 * inset);
+        let thick = (button.width / 10).max(1);
+        match index {
+            0 => painter.fill_rounded_rect(
+                Rect::new(mark.x, mark.y + (mark.height - thick) / 2, mark.width, thick),
+                CornerRadii::all(0),
+                ink,
+            ),
+            1 => painter.stroke_rounded_rect(mark, CornerRadii::all(0), thick.min(255) as u8, ink),
+            _ => {
+                let span = mark.width;
+                for step in 0..span {
+                    for (x, y) in [(mark.x + step, mark.y + step), (mark.right() - 1 - step, mark.y + step)] {
+                        painter.fill_rounded_rect(Rect::new(x, y, thick, thick), CornerRadii::all(0), ink);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -6906,7 +7298,39 @@ fn seamless_pointer(
         outcome.redraw = true;
         return outcome;
     }
+    if press_edge && state.seamless.pip != 0 {
+        let id = state.seamless.pip;
+        if let Some(window) = windows.windows[..windows.count].iter().find(|window| window.id == id) {
+            let area = layout.rect(pip_rect(window.width, window.height).expand(4));
+            if area.contains(point) {
+                state.seamless.pip = 0;
+                state.seamless.raise(id);
+                state.seamless.focus = id;
+                outcome.consumed = true;
+                outcome.redraw = true;
+                return outcome;
+            }
+        }
+    }
     let hit = seam_hit(layout, &state.seamless, &windows, point);
+    let now = crate::time::monotonic_nanoseconds();
+    let zone = match hit {
+        Some(SeamHit::Content(id) | SeamHit::Minimize(id) | SeamHit::Maximize(id) | SeamHit::Close(id)) => {
+            state.seamless.slot(id).zip(windows.windows[..windows.count].iter().find(|window| window.id == id))
+                .filter(|(slot, window)| seam_geometry(layout, *slot, window).controls.contains(point))
+                .map_or(0, |_| id)
+        }
+        _ => 0,
+    };
+    if zone != state.seamless.hover {
+        let was_shown = state.seamless.controls_shown(state.seamless.hover, now);
+        state.seamless.hover = zone;
+        state.seamless.hover_since = now;
+        outcome.redraw |= was_shown;
+    } else if state.seamless.controls_shown(zone, now) {
+        // The symbol follows the pointer from circle to circle.
+        outcome.redraw = true;
+    }
     if press_edge {
         match hit {
             Some(SeamHit::Grip(id)) => {
@@ -6927,6 +7351,34 @@ fn seamless_pointer(
             Some(SeamHit::Close(id)) => {
                 crate::svm::linux_command(1, [id, 0, 0, 0], b"");
                 outcome.consumed = true;
+            }
+            Some(SeamHit::Minimize(id)) => {
+                state.seamless.minimize(id);
+                outcome.consumed = true;
+                outcome.redraw = true;
+            }
+            Some(SeamHit::Maximize(id)) => {
+                let screen = (windows.screen_width, windows.screen_height);
+                if let (Some(slot), Some(window)) = (
+                    state.seamless.slots.iter_mut().find(|slot| slot.id == id),
+                    windows.windows[..windows.count].iter().find(|window| window.id == id),
+                ) {
+                    if slot.max {
+                        slot.max = false;
+                        let (width, height) = slot.restore;
+                        crate::svm::linux_command(5, [id, width.max(120), height.max(80), 0], b"");
+                    } else {
+                        slot.max = true;
+                        slot.restore = (window.width, window.height);
+                        crate::svm::linux_command(4, [id, 0, 0, 0], b"");
+                        crate::svm::linux_command(5, [id, screen.0, screen.1, 0], b"");
+                    }
+                }
+                state.seamless.raise(id);
+                state.seamless.focus = id;
+                state.seamless.hover = 0;
+                outcome.consumed = true;
+                outcome.redraw = true;
             }
             Some(SeamHit::Title(id)) => {
                 state.seamless.raise(id);
@@ -6997,12 +7449,220 @@ fn tsc() -> u64 {
 /// only the pixels inside the guest windows are sampled - changes anywhere
 /// else on the (large) guest screen are invisible on the host anyway and must
 /// not trigger repaints.
+/// The window table generation and each window's surface frame as of the
+/// last time the seamless windows were painted.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct SeamFrames {
+    generation: u32,
+    frames: [(u32, u32); crate::svm::GUEST_MAX_WINDOWS],
+}
+
+fn seamless_frames() -> SeamFrames {
+    let mut seen = SeamFrames::default();
+    if let Some(windows) = crate::svm::linux_windows() {
+        seen.generation = windows.generation;
+        for (slot, window) in seen.frames.iter_mut().zip(&windows.windows[..windows.count]) {
+            let frame = crate::svm::linux_surface(window.id).map_or(0, |surface| surface.frame);
+            *slot = (window.id, frame);
+        }
+    }
+    seen
+}
+
+/// When only the pixels inside seamless windows changed and no part of the
+/// shell is drawn over them, copies just those windows into the composed
+/// frame and presents just their rectangles: a guest app animating then
+/// costs a copy of itself, not a repaint of the desktop. False means
+/// nothing was presented (unchanged, or a full repaint is needed).
+fn seamless_fast_present(
+    frame: &mut FrameBuffer,
+    state: &DesktopState,
+    now: u64,
+    seen: &mut SeamFrames,
+) -> bool {
+    let seam = &state.seamless;
+    if !seam.enabled
+        || state.screen != Screen::Desktop
+        || state.app != DesktopApp::None
+        || state.app_closing != DesktopApp::None && now.saturating_sub(state.app_close_at_ns) < WINDOW_MORPH_NS
+        || state.overlay != Overlay::None
+        || !state.overlay_motion.settled(now)
+        || state.power_visible(now)
+        || state.power_action != shellui::PowerAction::None
+        || state.top_layers_active(now)
+        || now < state.motion_until_ns
+        || state.osk_open
+        || state.music_visible(now)
+        || now < state.shield_until_ns
+        || seam.drag != 0
+        || seam.resize != 0
+    {
+        return false;
+    }
+    let current = seamless_frames();
+    if current.generation != seen.generation || current == *seen {
+        return false;
+    }
+    let Some(windows) = crate::svm::linux_windows() else {
+        return false;
+    };
+    let layout = Layout::new(frame);
+    let screen = Rect::new(0, 0, frame.width() as i32, frame.height() as i32);
+    let fullscreen = seam.fullscreen();
+    let hint = if seam.focus == 0 && fullscreen == 0 {
+        layout.rect(Rect::new(0, 0, DESIGN_WIDTH, 20))
+    } else {
+        Rect::new(0, 0, 0, 0)
+    };
+    let shell = if fullscreen != 0 {
+        [Rect::new(0, 0, 0, 0); 4]
+    } else {
+        [
+            layout.rect(Rect::new(8, 350, 736, 108)),
+            layout.rect(menu::FEATHER),
+            layout.rect(menu::GEAR),
+            hint,
+        ]
+    };
+    if seam.controls_shown(seam.hover, now) {
+        return false;
+    }
+    let mut dirty: [Option<(Rect, crate::svm::GuestSurface, usize, usize)>; crate::svm::GUEST_MAX_WINDOWS] =
+        [None; crate::svm::GUEST_MAX_WINDOWS];
+    for (index, &(id, frame_count)) in current.frames.iter().enumerate() {
+        if id == 0 || seen.frames.iter().any(|&(seen_id, seen_frame)| seen_id == id && seen_frame == frame_count) {
+            continue;
+        }
+        let (Some(slot), Some(window), Some(surface)) = (
+            seam.slot(id),
+            windows.windows[..windows.count].iter().find(|window| window.id == id),
+            crate::svm::linux_surface(id),
+        ) else {
+            return false;
+        };
+        if seam.is_minimized(id) {
+            continue;
+        }
+        if seam.pip == id {
+            return false;
+        }
+        let geometry = seam_geometry(layout, slot, window);
+        if slot.max {
+            if seam.fullscreen() != id {
+                return false;
+            }
+            // Scaled to fill the screen: redrawn whole, through the same blit.
+            let scaled = crate::svm::GuestSurface {
+                width: surface.width.min(window.width as usize),
+                height: surface.height.min(window.height as usize),
+                ..surface
+            };
+            dirty[index] = Some((geometry.content, scaled, usize::MAX, 0));
+            continue;
+        }
+        let width = surface.width.min(window.width as usize) as i32;
+        let height = surface.height.min(window.height as usize) as i32;
+        let whole = Rect::new(geometry.content.x, geometry.content.y, width, height);
+        let Some(content) = whole.intersect(screen) else {
+            continue;
+        };
+        let (sx, sy) = ((content.x - whole.x) as usize, (content.y - whole.y) as usize);
+        if shell.iter().any(|area| area.intersect(content).is_some()) {
+            return false;
+        }
+        // Anything stacked above it covers part of it.
+        let position = seam.order.iter().position(|&other| other == id);
+        let Some(position) = position else {
+            return false;
+        };
+        for &above in seam.order[position + 1..].iter().filter(|other| **other != 0 && !seam.is_minimized(**other)) {
+            if let (Some(above_slot), Some(above_window)) = (
+                seam.slot(above),
+                windows.windows[..windows.count].iter().find(|window| window.id == above),
+            ) && seam_geometry(layout, above_slot, above_window).chrome.intersect(content).is_some()
+            {
+                return false;
+            }
+        }
+        dirty[index] = Some((content, surface, sx, sy));
+    }
+    let info = frame.info();
+    let required = info.stride.saturating_mul(info.height);
+    if required > screen_capacity() {
+        return false;
+    }
+    let staging_info = FrameBufferInfo {
+        address: desktop_buffer().as_mut_ptr(),
+        size: required.saturating_mul(core::mem::size_of::<u32>()),
+        width: info.width,
+        height: info.height,
+        stride: info.stride,
+        format: info.format,
+    };
+    let mut staging = unsafe { FrameBuffer::new(staging_info) };
+    let shadow = &mut shadow_slice()[..required];
+    #[cfg(feature = "linux-drivers")]
+    crate::linux::wait_vblank();
+    for &(content, surface, sx, sy) in dirty.iter().flatten() {
+        let full = Rect::new(content.x, content.y, content.width, content.height);
+        {
+            let mut painter = Painter::new(&mut staging);
+            painter.set_clip(full);
+            // SAFETY: the offset and size stay inside the checked surface.
+            unsafe {
+                if sx == usize::MAX {
+                    painter.blit_scaled(full, surface.pixels, surface.width, surface.height, surface.stride);
+                } else {
+                    painter.blit_scaled(
+                        full,
+                        surface.pixels.add(sy * surface.stride + sx),
+                        content.width as usize,
+                        content.height as usize,
+                        surface.stride,
+                    );
+                }
+            }
+        }
+        if !frame.present_diff_region(
+            &staging,
+            shadow,
+            content.x as usize,
+            content.y as usize,
+            content.width as usize,
+            content.height as usize,
+        ) {
+            return false;
+        }
+    }
+    if game_mode() {
+        draw_crosshair(&mut staging);
+        let mark = crosshair_rect(info.width as i32, info.height as i32).expand(2);
+        let _ = frame.present_diff_region(
+            &staging,
+            shadow,
+            mark.x.max(0) as usize,
+            mark.y.max(0) as usize,
+            mark.width as usize,
+            mark.height as usize,
+        );
+    }
+    *seen = current;
+    static FAST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let count = FAST.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        crate::serial::format(format_args!("AEROS_SEAMLESS_FAST presents={count}
+"));
+    }
+    true
+}
+
 fn linux_screen_signature(seamless: bool) -> u64 {
     let Some((pixels, width, height, stride)) = crate::svm::linux_framebuffer() else {
         return 0;
     };
     let windows = crate::svm::linux_windows();
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut frames = 0u64;
     let mut sample = |x0: usize, y0: usize, x1: usize, y1: usize| {
         let mut y = y0;
         while y < y1.min(height) {
@@ -7018,6 +7678,11 @@ fn linux_screen_signature(seamless: bool) -> u64 {
     match (&windows, seamless) {
         (Some(windows), true) => {
             for window in &windows.windows[..windows.count] {
+                if let Some(surface) = crate::svm::linux_surface(window.id) {
+                    frames = (frames ^ ((window.id as u64) << 32 | surface.frame as u64))
+                        .wrapping_mul(0x0000_0100_0000_01b3);
+                    continue;
+                }
                 let x0 = window.x.max(0) as usize;
                 let y0 = window.y.max(0) as usize;
                 sample(
@@ -7033,7 +7698,7 @@ fn linux_screen_signature(seamless: bool) -> u64 {
     if let Some(windows) = windows {
         hash = (hash ^ windows.generation as u64).wrapping_mul(0x0000_0100_0000_01b3);
     }
-    hash
+    hash ^ frames.rotate_left(17)
 }
 
 fn present_desktop(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &DesktopState) -> bool {
@@ -7061,7 +7726,9 @@ fn present_desktop_mode(
         format: info.format,
     };
     let mut staging = unsafe { FrameBuffer::new(staging_info) };
-    if !draw_desktop(&mut staging, fonts, state) {
+    let drawn = draw_desktop(&mut staging, fonts, state);
+    draw_crosshair(&mut staging);
+    if !drawn {
         return false;
     }
     let shadow = &mut shadow_slice()[..required];
@@ -7072,6 +7739,135 @@ fn present_desktop_mode(
     } else {
         frame.present_diff(&staging, shadow)
     }
+}
+
+/// The element under the pointer (`hover_target`) and the one before it,
+/// which is still fading out.
+static HOVER_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static HOVER_PREV: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// What interactive element of the open app the pointer (logical) is over:
+/// kind << 16 | index, 0 for nothing. Only a change of this asks for a
+/// frame, so hover feedback never redraws on plain pointer motion.
+fn hover_target(state: &DesktopState, point: Point) -> u32 {
+    let id = |kind: u32, index: usize| kind << 16 | index as u32 + 1;
+    if !matches!(state.screen, Screen::Desktop | Screen::Lock | Screen::Login) {
+        return [flow::BACK, flow::NEXT]
+            .iter()
+            .position(|button| button.contains(point))
+            .map_or(0, |index| id(8, index));
+    }
+    if state.screen == Screen::Desktop && state.power_open {
+        return (0..shellui::POWER_PILLS.len())
+            .find(|&index| shellui::pill_rect(index).contains(point))
+            .map_or(0, |index| id(7, index));
+    }
+    if state.screen == Screen::Desktop && state.overlay == Overlay::Quick {
+        return (0..5)
+            .find(|&index| panels::quick_bounds(index).contains(point))
+            .map_or(0, |index| id(6, index));
+    }
+    if state.screen != Screen::Desktop || state.overlay != Overlay::None {
+        return 0;
+    }
+    match state.app {
+        DesktopApp::Settings => {
+            let base = window_base_rect(DesktopApp::Settings);
+            (0..settings_ui::PAGES.len())
+                .find(|&index| settings_ui::sidebar_row(base, index).contains(point))
+                .map_or(0, |index| id(1, index))
+        }
+        DesktopApp::Files => {
+            let outer = window_base_rect(DesktopApp::Files);
+            let parts = files_layout(outer);
+            if let Some(index) = (0..state.files_entry_count.min((FILES_GRID_COLUMNS * FILES_GRID_ROWS) as usize))
+                .find(|&index| files_cell(parts.grid, index).contains(point))
+            {
+                return id(2, index);
+            }
+            if let Some(index) = parts.buttons.iter().position(|button| button.contains(point)) {
+                return id(3, index);
+            }
+            files_sidebar_rows(outer)
+                .iter()
+                .position(|(bounds, _)| bounds.contains(point))
+                .map_or(0, |index| id(4, index))
+        }
+        DesktopApp::Store if crate::store::get().detail.is_none() => {
+            let base = window_base_rect(DesktopApp::Store);
+            let store = crate::store::get();
+            (0..crate::store::GRID_COLUMNS * crate::store::GRID_ROWS)
+                .find(|&slot| {
+                    let (column, row) = (slot % crate::store::GRID_COLUMNS, slot / crate::store::GRID_COLUMNS);
+                    store.shown_index((store.scroll + row) * crate::store::GRID_COLUMNS + column).is_some()
+                        && store_cell_rect(base, column, row).contains(point)
+                })
+                .map_or(0, |slot| id(5, slot))
+        }
+        _ => 0,
+    }
+}
+
+/// Records the hovered element; true when it changed.
+fn track_hover(state: &DesktopState, point: Point) -> bool {
+    let id = hover_target(state, point);
+    let old = HOVER_ID.swap(id, Ordering::Relaxed);
+    if old != id {
+        HOVER_PREV.store(old, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+/// How lit element `kind`/`index` is by hover, 0..=1000 (springs in and out).
+fn hover_amount(kind: u32, index: usize) -> i32 {
+    let id = kind << 16 | index as u32 + 1;
+    let (current, previous) = (HOVER_ID.load(Ordering::Relaxed), HOVER_PREV.load(Ordering::Relaxed));
+    if id != current && id != previous {
+        return 0;
+    }
+    motion::tween(
+        motion::tween_key(20, id),
+        if id == current { 1_000 } else { 0 },
+        motion::QUICK,
+        crate::time::monotonic_nanoseconds(),
+    )
+    .clamp(0, 1_000)
+}
+
+/// A soft white wash over `bounds` (logical) as it is hovered.
+fn hover_glow(painter: &mut Painter<'_>, layout: Layout, kind: u32, index: usize, bounds: Rect, radius: i32, alpha: i32) {
+    let amount = hover_amount(kind, index);
+    if amount > 0 {
+        painter.fill_rounded_rect(
+            layout.rect(bounds),
+            layout.radii(CornerRadii::all(radius)),
+            Rgba::new(255, 255, 255, (alpha * amount / 1_000) as u8),
+        );
+    }
+}
+
+/// The last click inside an app window (physical pixels) and when it was.
+static RIPPLE_AT: AtomicU64 = AtomicU64::new(0);
+static RIPPLE_NS: AtomicU64 = AtomicU64::new(0);
+const RIPPLE_LENGTH_NS: u64 = 420_000_000;
+
+/// The click ripple: a soft disc that spreads and fades from the pointer.
+fn draw_ripple(painter: &mut Painter<'_>, layout: Layout, now: u64) {
+    let at = RIPPLE_NS.load(Ordering::Relaxed);
+    if at == 0 || now >= at + RIPPLE_LENGTH_NS {
+        return;
+    }
+    let packed = RIPPLE_AT.load(Ordering::Relaxed);
+    let centre = Point::new((packed >> 32) as u32 as i32, packed as u32 as i32);
+    let t = ease_out_milli(progress_of(now, at, RIPPLE_LENGTH_NS)) as i32;
+    let radius = layout.scale.logical(6 + 22 * t / 1_000);
+    let alpha = (70 * (1_000 - t) / 1_000).clamp(0, 255) as u8;
+    painter.fill_rounded_rect(
+        Rect::new(centre.x - radius, centre.y - radius, radius * 2, radius * 2),
+        CornerRadii::all(radius),
+        Rgba::new(255, 255, 255, alpha),
+    );
 }
 
 fn draw_desktop(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &DesktopState) -> bool {
@@ -7366,6 +8162,9 @@ fn draw_desktop_base(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &Deskt
             true,
         );
     }
+    if state.app != DesktopApp::None {
+        draw_ripple(&mut painter, layout, now);
+    }
     prof_add(PROF_WINDOW, t_window);
     let t_panels = crate::time::monotonic_nanoseconds();
     // Background and content share one shifted layout (glass + icons move
@@ -7437,7 +8236,9 @@ fn draw_desktop_base(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &Deskt
         ^ ((state.hover_index.wrapping_add(1) as u64) << 34);
     let cache = unsafe { &mut *DOCK_CACHE.0.get() };
     let cache_len = (dock_region.width.max(0) as usize) * (dock_region.height.max(0) as usize);
-    let (dock, controls) = if dock_cacheable
+    let (dock, controls) = if state.seamless.enabled && state.seamless.fullscreen() != 0 {
+        (true, true)
+    } else if dock_cacheable
         && cache_len <= cache.len()
         && DOCK_CACHE_KEY.load(Ordering::Acquire) == dock_key
         && painter.write_region(dock_region, &cache[..cache_len])
@@ -7463,6 +8264,9 @@ fn draw_desktop_base(frame: &mut FrameBuffer, fonts: &FontCatalog, state: &Deskt
         result
     };
     prof_add(PROF_DOCK, t_dock);
+    if state.seamless.enabled {
+        draw_pip(&mut painter, layout, state);
+    }
     if menu::corners_shown(state, sliding_overlay) {
         menu::draw_corners(&mut painter, layout, state);
     }
@@ -8559,55 +9363,97 @@ fn window_titlebar_color(app: DesktopApp) -> Rgba {
     }
 }
 
-/// Minimize, maximize and close, as in the design: green, yellow and red
-/// circles with a dark rim, holding a dash, a square and a cross.
+/// When the pointer came to rest over the open window's controls (0: it
+/// isn't there), and where it is (logical), for the hover symbol.
+static WINDOW_CONTROLS_SINCE: AtomicU64 = AtomicU64::new(0);
+static WINDOW_CONTROLS_POINTER: AtomicU64 = AtomicU64::new(0);
+static WINDOW_CONTROLS_DRAWN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn window_controls_zone(app: DesktopApp) -> Rect {
+    let (minimize, _, close) = window_control_rects(app, window_base_rect(app));
+    Rect::new(minimize.x - 10, minimize.y - 6, close.right() - minimize.x + 20, close.height + 12)
+}
+
+fn window_controls_shown(now: u64) -> bool {
+    let since = WINDOW_CONTROLS_SINCE.load(Ordering::Relaxed);
+    since != 0 && now.saturating_sub(since) >= SEAM_CONTROLS_DELAY_NS
+}
+
+/// Tracks the pointer (logical) against the open window's controls; true
+/// when what they show changed.
+fn track_window_controls(state: &DesktopState, point: Point, now: u64) -> bool {
+    let inside = state.screen == Screen::Desktop
+        && state.app != DesktopApp::None
+        && state.overlay == Overlay::None
+        && window_controls_zone(state.app).contains(point);
+    let shown = window_controls_shown(now);
+    let packed = ((point.x as u32 as u64) << 32) | point.y as u32 as u64;
+    let moved = WINDOW_CONTROLS_POINTER.swap(packed, Ordering::Relaxed) != packed;
+    match (inside, WINDOW_CONTROLS_SINCE.load(Ordering::Relaxed)) {
+        (true, 0) => {
+            WINDOW_CONTROLS_SINCE.store(now.max(1), Ordering::Relaxed);
+            WINDOW_CONTROLS_DRAWN.store(false, Ordering::Relaxed);
+            false
+        }
+        (false, since) if since != 0 => {
+            WINDOW_CONTROLS_SINCE.store(0, Ordering::Relaxed);
+            shown
+        }
+        (true, _) => {
+            // Due but not drawn yet, or the symbol moves between circles.
+            shown && (moved || !WINDOW_CONTROLS_DRAWN.load(Ordering::Relaxed))
+        }
+        _ => false,
+    }
+}
+
+/// Minimize, maximize and close, as in the design: hidden until the pointer
+/// rests on them for half a second, then three white circles; the one under
+/// the pointer shows its dash, square or cross.
 fn draw_window_controls(painter: &mut Painter<'_>, layout: Layout, app: DesktopApp, window: Rect) {
-    let ink = Rgba::opaque(20, 20, 20);
+    if !window_controls_shown(crate::time::monotonic_nanoseconds()) {
+        return;
+    }
+    WINDOW_CONTROLS_DRAWN.store(true, Ordering::Relaxed);
+    let packed = WINDOW_CONTROLS_POINTER.load(Ordering::Relaxed);
+    let pointer = Point::new((packed >> 32) as u32 as i32, packed as u32 as i32);
+    let ink = Rgba::opaque(40, 40, 44);
     let (close_x, centre_y, spacing) = window_controls_anchor(app, window);
     let round = |value: i32| layout.radii(CornerRadii::all(value));
-    let circle = |painter: &mut Painter<'_>, centre_x: i32, fill: Rgba| {
-        painter.fill_rounded_rect(
-            layout.rect(Rect::new(centre_x - 8, centre_y - 8, 16, 16)),
-            round(8),
-            ink,
-        );
-        painter.fill_rounded_rect(
-            layout.rect(Rect::new(centre_x - 7, centre_y - 7, 14, 14)),
-            round(7),
-            fill,
-        );
-    };
-    let minimize_x = close_x - spacing * 2;
-    circle(painter, minimize_x, Rgba::opaque(40, 220, 40));
-    painter.fill_rounded_rect(
-        layout.rect(Rect::new(minimize_x - 4, centre_y - 1, 8, 3)),
-        round(1),
-        ink,
-    );
-    let maximize_x = close_x - spacing;
-    circle(painter, maximize_x, Rgba::opaque(240, 222, 30));
-    painter.stroke_rounded_rect(
-        layout.rect(Rect::new(maximize_x - 4, centre_y - 4, 8, 8)),
-        round(2),
-        layout.scale.logical(2).max(1) as u8,
-        ink,
-    );
-    circle(painter, close_x, Rgba::opaque(232, 40, 40));
-    for step in -3..=3 {
-        for sign in [1, -1] {
-            painter.fill_rounded_rect(
-                layout.rect(Rect::new(
-                    close_x + step - 1,
-                    centre_y + sign * step - 1,
-                    3,
-                    3,
-                )),
+    for (index, centre_x) in [close_x - spacing * 2, close_x - spacing, close_x].into_iter().enumerate() {
+        let circle = Rect::new(centre_x - 7, centre_y - 7, 14, 14);
+        painter.fill_rounded_rect(layout.rect(circle), round(7), Rgba::new(255, 255, 255, 240));
+        painter.stroke_rounded_rect(layout.rect(circle), round(7), 1, Rgba::new(0, 0, 0, 40));
+        if !circle.expand(3).contains(pointer) {
+            continue;
+        }
+        match index {
+            0 => painter.fill_rounded_rect(
+                layout.rect(Rect::new(centre_x - 4, centre_y - 1, 8, 2)),
                 round(1),
                 ink,
-            );
+            ),
+            1 => painter.stroke_rounded_rect(
+                layout.rect(Rect::new(centre_x - 3, centre_y - 3, 7, 7)),
+                round(1),
+                layout.scale.logical(1).max(1) as u8,
+                ink,
+            ),
+            _ => {
+                for step in -3..=3 {
+                    for sign in [1, -1] {
+                        painter.fill_rounded_rect(
+                            layout.rect(Rect::new(centre_x + step, centre_y + sign * step, 1, 1)).expand(1),
+                            round(1),
+                            ink,
+                        );
+                    }
+                }
+            }
         }
     }
 }
+
 fn draw_window(
     painter: &mut Painter<'_>,
     layout: Layout,
@@ -8731,6 +9577,18 @@ fn draw_window(
         Color::rgb(18, 23, 26),
     );
     draw_window_controls(painter, layout, state.app, outer);
+    // A new view (store tab or app page, folder, note list or editor) rises
+    // into place instead of cutting in.
+    let view = match state.app {
+        DesktopApp::Store => {
+            let store = crate::store::get();
+            store.detail.map_or(-1, |index| index as i32)
+        }
+        DesktopApp::Notes => state.notes_mode as i32,
+        _ => 0,
+    };
+    let entering = motion::entrance(motion::tween_key(5, state.app as u32), view, now_ns);
+    let layout = shift_layout_y(layout, (1_000 - entering) * 9 / 1_000);
     if state.app == DesktopApp::Store {
         draw_store(painter, layout, ui_font, mono_font, state);
         return captured;
@@ -10183,13 +11041,40 @@ fn draw_store(
         );
         return;
     }
+    // The grid cascades in whenever the tab, the page or the search changes.
+    let view = (store.tab as i32) << 24
+        ^ (store.scroll as i32) << 16
+        ^ store
+            .query()
+            .bytes()
+            .fold(0x811c_9dc5u32, |hash, byte| (hash ^ byte as u32).wrapping_mul(0x0100_0193)) as i32
+            & 0xffff;
+    let arriving = motion::entrance(
+        motion::tween_key(8, 0),
+        view ^ _state.window_open_at_ns as i32,
+        crate::time::monotonic_nanoseconds(),
+    );
     for slot in 0..GRID_COLUMNS * GRID_ROWS {
         let (column, row) = (slot % GRID_COLUMNS, slot / GRID_COLUMNS);
         let position = (store.scroll + row) * GRID_COLUMNS + column;
         let Some(index) = store.shown_index(position) else {
             break;
         };
-        let cell = store_cell_rect(base, column, row);
+        let shown = motion::stagger(arriving, slot);
+        if shown == 0 {
+            continue;
+        }
+        let mut cell = store_cell_rect(base, column, row);
+        cell.y += (1_000 - shown) * 14 / 1_000;
+        let lift = hover_amount(5, slot);
+        cell.y -= lift * 3 / 1_000;
+        if lift > 0 {
+            painter.fill_rounded_rect(
+                layout.rect(cell),
+                layout.radii(CornerRadii::all(12)),
+                Rgba::new(255, 255, 255, (lift * 70 / 1_000) as u8),
+            );
+        }
         let (name, sub) = match store.tab {
             StoreTab::Installed => {
                 let app = store.app(index);
@@ -10736,10 +11621,11 @@ fn draw_files(
     );
 
     let rows = files_sidebar_rows(outer);
-    for (bounds, place) in rows {
+    for (row_index, (bounds, place)) in rows.into_iter().enumerate() {
         if !files_place_shown(state, place) {
             continue;
         }
+        hover_glow(painter, layout, 4, row_index, bounds, 8, 22);
         let target = match place {
             FilesPlace::Recent(slot) => state.files_recent[slot].as_str(),
             other => files_place_path(other),
@@ -10793,22 +11679,40 @@ fn draw_files(
     let clip = layout.rect(parts.grid);
     let previous_clip = painter.clip();
     painter.set_clip(clip);
+    let now = crate::time::monotonic_nanoseconds();
+    // A folder's items cascade in; the selection glides from item to item.
+    let folder = state
+        .files_path
+        .as_str()
+        .bytes()
+        .fold(0x811c_9dc5u32, |hash, byte| (hash ^ byte as u32).wrapping_mul(0x0100_0193));
+    let arriving = motion::entrance(motion::tween_key(6, 0), folder as i32 ^ state.window_open_at_ns as i32, now);
+    if state.files_selected < state.files_entry_count {
+        let target = layout.rect(files_cell(parts.grid, state.files_selected));
+        let x = motion::tween(motion::tween_key(7, 0), target.x, motion::QUICK, now);
+        let y = motion::tween(motion::tween_key(7, 1), target.y, motion::QUICK, now);
+        painter.fill_rounded_rect(
+            Rect::new(x, y, target.width, target.height),
+            layout.radii(CornerRadii::all(10)),
+            Rgba::new(255, 255, 255, 34),
+        );
+    }
     for index in 0..state.files_entry_count {
         let row = state.files_entries[index];
-        let bounds = files_cell(parts.grid, index);
-        if index == state.files_selected {
-            painter.fill_rounded_rect(
-                layout.rect(bounds),
-                layout.radii(CornerRadii::all(10)),
-                Rgba::new(255, 255, 255, 34),
-            );
+        let shown = motion::stagger(arriving, index);
+        if shown == 0 {
+            continue;
         }
+        let mut bounds = files_cell(parts.grid, index);
+        bounds.y += (1_000 - shown) * 12 / 1_000;
+        hover_glow(painter, layout, 2, index, bounds, 10, 18);
         if row.is_dir {
-            painter.draw_rgba_scaled(
+            painter.draw_rgba_scaled_alpha(
                 layout.rect(Rect::new(bounds.x + bounds.width / 2 - 16, bounds.y + 4, 32, 32)),
                 desktop_icon(25),
                 DESKTOP_ICON_SIZE,
                 DESKTOP_ICON_SIZE,
+                (shown * 255 / 1_000) as u8,
             );
         } else {
             draw_entry_icon_large(
@@ -10878,12 +11782,13 @@ fn draw_files(
         11,
         Color::rgb(170, 170, 170),
     );
-    for (bounds, label) in parts.buttons.iter().zip(FILES_BUTTONS) {
+    for (index, (bounds, label)) in parts.buttons.iter().zip(FILES_BUTTONS).enumerate() {
         painter.fill_rounded_rect(
             layout.rect(*bounds),
             layout.radii(CornerRadii::all(10)),
             Rgba::opaque(58, 58, 60),
         );
+        hover_glow(painter, layout, 3, index, *bounds, 10, 40);
         centered_text(painter, layout, ui_font, *bounds, label, 11, white);
     }
 }
@@ -11043,10 +11948,35 @@ fn draw_notes(
     let list_clip = layout.rect(list_bounds);
     let previous_clip = painter.clip();
     painter.set_clip(list_clip);
+    let now = crate::time::monotonic_nanoseconds();
+    let arriving = motion::entrance(
+        motion::tween_key(10, 0),
+        state.notes_mode as i32 ^ state.window_open_at_ns as i32,
+        now,
+    );
+    if state.notes_selected < state.notes_entry_count {
+        let target = layout.rect(Rect::new(
+            content_x,
+            list_top + state.notes_selected as i32 * row_height,
+            content_right - content_x,
+            row_height - 6,
+        ));
+        let y = motion::tween(motion::tween_key(10, 1), target.y, motion::QUICK, now);
+        painter.stroke_rounded_rect(
+            Rect::new(target.x, y, target.width, target.height).expand(layout.scale.logical(2)),
+            layout.radii(CornerRadii::new(5, 11, 11, 5)),
+            2,
+            Rgba::new(46, 120, 232, 255),
+        );
+    }
     for index in 0..state.notes_entry_count {
         let row = state.notes_entries[index];
+        let shown = motion::stagger(arriving, index);
+        if shown == 0 {
+            continue;
+        }
         let bounds = Rect::new(
-            content_x,
+            content_x + (1_000 - shown) * 18 / 1_000,
             list_top + index as i32 * row_height,
             content_right - content_x,
             row_height - 6,
@@ -11061,14 +11991,6 @@ fn draw_notes(
             layout.radii(CornerRadii::new(4, 0, 0, 4)),
             Rgba::new(224, 168, 60, 230),
         );
-        if index == state.notes_selected {
-            painter.stroke_rounded_rect(
-                layout.rect(bounds),
-                layout.radii(CornerRadii::new(4, 10, 10, 4)),
-                2,
-                Rgba::new(46, 120, 232, 255),
-            );
-        }
         text(
             painter,
             layout,
@@ -11191,10 +12113,19 @@ fn draw_trash(
     let list_clip = layout.rect(list_bounds);
     let previous_clip = painter.clip();
     painter.set_clip(list_clip);
+    let arriving = motion::entrance(
+        motion::tween_key(13, 0),
+        state.trash_entry_count as i32 ^ state.window_open_at_ns as i32,
+        crate::time::monotonic_nanoseconds(),
+    );
     for index in 0..state.trash_entry_count {
         let row = state.trash_entries[index];
+        let shown = motion::stagger(arriving, index);
+        if shown == 0 {
+            continue;
+        }
         let bounds = Rect::new(
-            content_x,
+            content_x + (1_000 - shown) * 18 / 1_000,
             list_top + index as i32 * row_height,
             content_right - content_x,
             row_height - 4,
@@ -12167,12 +13098,18 @@ fn draw_wallpaper(frame: &mut FrameBuffer, region: Option<Rect>) {
             ^ info.stride as u64
             ^ (wallpaper::frame_generation() << 52)
             ^ 1;
-        let cache = wallpaper_buffer();
         let was_cached = WALLPAPER_CACHE_KEY.load(Ordering::Acquire) == key;
         if !was_cached {
-            render_wallpaper_into(frame, &mut cache[..required]);
-            WALLPAPER_CACHE_KEY.store(key, Ordering::Release);
+            match live_background(frame, key) {
+                LiveFrame::Ready(shown) => WALLPAPER_CACHE_KEY.store(shown, Ordering::Release),
+                LiveFrame::Pending => {}
+                LiveFrame::InPlace => {
+                    render_wallpaper_into(frame, &mut wallpaper_buffer()[..required]);
+                    WALLPAPER_CACHE_KEY.store(key, Ordering::Release);
+                }
+            }
         }
+        let cache = wallpaper_buffer();
         if was_cached && let Some(clip) = region {
             let screen = Rect::new(0, 0, info.width as i32, info.height as i32);
             if let Some(area) = screen.intersect(clip) {
@@ -12234,6 +13171,126 @@ fn render_wallpaper_into(frame: &FrameBuffer, cache: &mut [u32]) {
             cache[index] = frame.pack_color(sample_wallpaper(&source, source_x, source_y));
         }
     }
+}
+
+/// Live wallpaper frames on a spare core: the desktop keeps showing the last
+/// finished frame (and the pointer keeps moving) while the next one renders.
+enum LiveFrame {
+    /// A new frame was swapped in; it shows the wallpaper for this key.
+    Ready(u64),
+    /// One is being rendered: keep the last.
+    Pending,
+    /// Not a live frame, or no core / memory to spare: render it here.
+    InPlace,
+}
+
+type LiveInput = (FrameBufferInfo, wallpaper::Warp, (&'static [u8], usize, usize), bool, (u64, u64, u64, u64, u64, u64));
+
+struct LiveJobInput(core::cell::UnsafeCell<Option<LiveInput>>);
+// SAFETY: written by the desktop only while no job runs (state 0), read by
+// the job only while it runs (state 1).
+unsafe impl Sync for LiveJobInput {}
+
+static LIVE_JOB_INPUT: LiveJobInput = LiveJobInput(core::cell::UnsafeCell::new(None));
+/// 0 idle, 1 rendering, 2 finished (the back buffer holds `LIVE_JOB_KEY`).
+static LIVE_JOB_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static LIVE_JOB_KEY: AtomicU64 = AtomicU64::new(0);
+static LIVE_JOB_CPU: AtomicUsize = AtomicUsize::new(0);
+static LIVE_JOB_STARTED_NS: AtomicU64 = AtomicU64::new(0);
+
+fn live_job(_: u64) {
+    // SAFETY: see `LiveJobInput`.
+    if let Some((info, warp, picture, halved, projection)) = unsafe { *LIVE_JOB_INPUT.0.get() } {
+        let back = screen_slice(&SCREEN.wallpaper_back);
+        let required = info.stride * info.height;
+        if back.len() >= required {
+            let target = FrameBufferInfo {
+                address: back.as_mut_ptr(),
+                size: required * core::mem::size_of::<u32>(),
+                ..info
+            };
+            let frame = unsafe { FrameBuffer::new(target) };
+            render_live_wallpaper(&frame, &mut back[..required], warp, picture, halved, projection);
+        }
+    }
+    LIVE_JOB_STATE.store(2, Ordering::Release);
+}
+
+fn live_background(frame: &FrameBuffer, key: u64) -> LiveFrame {
+    let source = wallpaper::source();
+    let (Some(warp), &wallpaper::Source::Picture(rgba, width, height)) = (wallpaper::warp(&source), &source) else {
+        return if LIVE_JOB_STATE.load(Ordering::Acquire) == 1 { LiveFrame::Pending } else { LiveFrame::InPlace };
+    };
+    if SCREEN.wallpaper_back.load(Ordering::Acquire) == 0 || frame.width() / LIVE_STEP + 2 > wallpaper::LIVE_COLUMNS {
+        return LiveFrame::InPlace;
+    }
+    match LIVE_JOB_STATE.load(Ordering::Acquire) {
+        1 => return LiveFrame::Pending,
+        2 => {
+            // Show the finished frame: swap it with the one on screen.
+            let _ = crate::smp::reap_job(LIVE_JOB_CPU.load(Ordering::Relaxed));
+            let front = SCREEN.wallpaper.load(Ordering::Acquire);
+            let back = SCREEN.wallpaper_back.swap(front, Ordering::AcqRel);
+            SCREEN.wallpaper.store(back, Ordering::Release);
+            let shown = LIVE_JOB_KEY.load(Ordering::Acquire);
+            LIVE_JOB_STATE.store(0, Ordering::Release);
+            static FIRST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+            if FIRST.swap(false, Ordering::Relaxed) {
+                serial::format(format_args!(
+                    "AEROS_LIVE_WALLPAPER background cpu={}
+",
+                    LIVE_JOB_CPU.load(Ordering::Relaxed)
+                ));
+            }
+            return LiveFrame::Ready(shown);
+        }
+        _ => {}
+    }
+    let now = crate::time::monotonic_nanoseconds();
+    // Big panels take a frame every 50 ms at most, which leaves the desktop
+    // core most of its time for input and the pointer.
+    let big = frame.width() * frame.height() > 2_400_000;
+    if big && now.saturating_sub(LIVE_JOB_STARTED_NS.load(Ordering::Relaxed)) < 50_000_000 {
+        return LiveFrame::Pending;
+    }
+    let info = frame.info();
+    let (picture, halved) = match wallpaper::half_picture() {
+        Some(half) => (half, true),
+        None => ((rgba, width, height), false),
+    };
+    let projection = wallpaper_projection(&source, info.width, info.height);
+    // SAFETY: no job is running (state 0).
+    unsafe { *LIVE_JOB_INPUT.0.get() = Some((info, warp, picture, halved, projection)) };
+    LIVE_JOB_KEY.store(key, Ordering::Release);
+    LIVE_JOB_STATE.store(1, Ordering::Release);
+    let online = crate::smp::online_mask();
+    let remembered = LIVE_JOB_CPU.load(Ordering::Relaxed);
+    let started = (remembered != 0 && crate::smp::start_job(remembered, live_job, 0))
+        || (2..64).rev().filter(|cpu| online & (1 << cpu) != 0 && *cpu != remembered).any(|cpu| {
+            // A finished job nobody collected (the boot-image hash) still
+            // holds its processor's slot.
+            let _ = crate::smp::reap_job(cpu);
+            let ok = crate::smp::start_job(cpu, live_job, 0);
+            if ok {
+                LIVE_JOB_CPU.store(cpu, Ordering::Relaxed);
+            }
+            ok
+        });
+    if !started {
+        static TOLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if !TOLD.swap(true, Ordering::Relaxed) {
+            serial::line("AEROS_LIVE_WALLPAPER no spare core");
+        }
+        LIVE_JOB_STATE.store(0, Ordering::Release);
+        return if big { LiveFrame::Pending } else { LiveFrame::InPlace };
+    }
+    LIVE_JOB_STARTED_NS.store(now, Ordering::Relaxed);
+    LiveFrame::Pending
+}
+
+/// A finished background frame is waiting to be shown.
+fn live_frame_waiting() -> bool {
+    LIVE_JOB_STATE.load(Ordering::Acquire) == 2
 }
 
 const LIVE_STEP: usize = 8;
@@ -12412,9 +13469,11 @@ fn live_wallpaper_tick(frame: &FrameBuffer, state: &mut DesktopState) -> bool {
         ((px << 17) / width) - 65_536,
         ((py << 17) / height) - 65_536,
     );
-    // Above about 1920x1200 the CPU warp costs over 100 ms a frame and makes
-    // the pointer stutter, so big panels keep the still picture.
-    let affordable = info.width * info.height <= 2_400_000 || crate::virtio_gpu::cursor_active();
+    // Big panels render the warp on a spare core (`live_background`); without
+    // one they keep the still picture, as the warp would stall the pointer.
+    let affordable = info.width * info.height <= 2_400_000
+        || crate::virtio_gpu::cursor_active()
+        || SCREEN.wallpaper_back.load(Ordering::Acquire) != 0;
     let active = affordable
         && state.screen == Screen::Desktop
         && state.app == DesktopApp::None
@@ -12426,7 +13485,7 @@ fn live_wallpaper_tick(frame: &FrameBuffer, state: &mut DesktopState) -> bool {
     if moved {
         state.motion_until_ns = state.motion_until_ns.max(now + 120_000_000);
     }
-    moved
+    moved || live_frame_waiting()
 }
 
 fn wallpaper_size(source: &wallpaper::Source) -> (usize, usize) {
@@ -13467,6 +14526,15 @@ impl DesktopState {
         self.motion_until_ns = self.motion_until_ns.max(self.volume_hud_until_ns);
     }
 
+    /// Mute from Settings: the on-screen indicator is only for the keys.
+    fn toggle_mute_quietly(&mut self) {
+        let now = crate::time::monotonic_nanoseconds();
+        self.volume_prev = self.shown_volume(now);
+        self.muted = !self.muted;
+        self.apply_volume();
+        self.volume_event_ns = now;
+    }
+
     fn toggle_mute(&mut self) {
         let now = crate::time::monotonic_nanoseconds();
         self.volume_prev = self.shown_volume(now);
@@ -13794,15 +14862,22 @@ fn draw_lock(
     let entered = now.saturating_sub(state.screen_transition_at_ns);
     let rise = 1000 - ease_out_milli(progress_of(entered, 0, 700_000_000)) as i32;
     let clock = time_text();
+    let current = crate::rtc::local_date_time();
+    // A new minute rolls up into place.
+    let minute = current.hour as i32 * 60 + current.minute as i32;
+    let roll = motion::entrance(motion::tween_key(11, 0), minute, now);
+    let slot = Rect::new(LOGIN_CARD.x, 31 + rise * 26 / 1000, LOGIN_CARD.width, 152);
+    let previous_clip = painter.clip();
+    painter.set_clip(layout.rect(Rect::new(slot.x, slot.y - 10, slot.width, slot.height + 30)));
     glass_centered_text(
         painter,
         layout,
         crate::font::clock_font().unwrap_or(font),
-        Rect::new(LOGIN_CARD.x, 31 + rise * 26 / 1000, LOGIN_CARD.width, 152),
+        Rect::new(slot.x, slot.y + (1_000 - roll) * 60 / 1_000, slot.width, slot.height),
         clock.as_str(),
         152,
     );
-    let current = crate::rtc::local_date_time();
+    painter.set_clip(previous_clip);
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];

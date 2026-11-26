@@ -1,6 +1,6 @@
 use super::*;
 
-const PAGES: [&str; 8] = [
+pub(super) const PAGES: [&str; 8] = [
     "Network", "Display", "Sound", "Keyboard", "Time", "Power", "Account", "About",
 ];
 const PAGE_NETWORK: u8 = 0;
@@ -31,7 +31,7 @@ fn sidebar(base: Rect) -> Rect {
     Rect::new(base.x + 15, base.y + 23, 102, 286)
 }
 
-fn sidebar_row(base: Rect, index: usize) -> Rect {
+pub(super) fn sidebar_row(base: Rect, index: usize) -> Rect {
     Rect::new(base.x + 25, base.y + 30 + index as i32 * 3526 / 100, 82, 24)
 }
 
@@ -170,6 +170,13 @@ fn list_row(pane: Rect, page: u8, slot: usize) -> Rect {
     )
 }
 
+/// Settings > Power: the screen-time daily limit (click to step it).
+fn screen_limit_button(pane: Rect) -> Rect {
+    Rect::new(pane.x + SETTING_ROW.width + 24, pane.y + 168, INFO_BOX.width, SETTING_ROW.height)
+}
+
+const SCREEN_LIMIT_STEPS: [u64; 6] = [0, 60, 120, 180, 240, 360];
+
 fn power_button(pane: Rect, index: usize) -> Rect {
     Rect::new(
         pane.x,
@@ -220,7 +227,7 @@ impl DesktopState {
         }
     }
 
-    fn settings_show_page(&mut self, page: u8) {
+    pub(super) fn settings_show_page(&mut self, page: u8) {
         self.settings_page = page % PAGES.len() as u8;
         self.settings_cursor = list_selected(self.settings_page);
         self.settings_scroll = 0;
@@ -298,7 +305,7 @@ impl DesktopState {
                     return Some(DesktopAction::Redraw);
                 }
                 if toggle_rect(pane, below(SLIDER_ROW.height)).contains(point) {
-                    self.toggle_mute();
+                    self.toggle_mute_quietly();
                     return Some(DesktopAction::Redraw);
                 }
             }
@@ -318,6 +325,16 @@ impl DesktopState {
                 }
             }
             PAGE_POWER => {
+                if screen_limit_button(pane).contains(point) {
+                    let now = SCREEN_LIMIT_MINUTES.load(core::sync::atomic::Ordering::Relaxed);
+                    let next = SCREEN_LIMIT_STEPS
+                        .iter()
+                        .position(|&step| step == now)
+                        .map_or(0, |index| (index + 1) % SCREEN_LIMIT_STEPS.len());
+                    SCREEN_LIMIT_MINUTES.store(SCREEN_LIMIT_STEPS[next], core::sync::atomic::Ordering::Relaxed);
+                    SCREEN_LIMIT_WARNED.store(false, core::sync::atomic::Ordering::Relaxed);
+                    return Some(DesktopAction::Redraw);
+                }
                 for index in 0..4 {
                     if power_button(pane, index).contains(point) {
                         match index {
@@ -366,9 +383,10 @@ impl DesktopState {
                 let step = if key == DesktopKey::Right { 5 } else { -5 };
                 match page {
                     PAGE_DISPLAY => {
-                        self.brightness_step(step);
+                        let now = crate::time::monotonic_nanoseconds();
+                        self.set_brightness((self.brightness as i32 + step).clamp(8, 100) as u8, now);
                     }
-                    PAGE_SOUND => self.volume_step(step),
+                    PAGE_SOUND => self.set_volume_to((self.volume as i32 + step).clamp(0, 100) as u8),
                     _ => {
                         let next = if key == DesktopKey::Right {
                             page + 1
@@ -407,7 +425,7 @@ impl DesktopState {
                             self.airplane = false;
                         }
                     }
-                    PAGE_SOUND => self.toggle_mute(),
+                    PAGE_SOUND => self.toggle_mute_quietly(),
                     PAGE_KEYBOARD | PAGE_TIME => {
                         let index = self.settings_cursor;
                         if index < list_len(page) {
@@ -438,15 +456,23 @@ fn draw_toggle_row(
         OUTLINE,
     );
     let switch = Rect::new(bounds.right() - 69, bounds.y + 5, 65, 27);
+    // Slides across with a little squash at speed, the track fading green.
+    let key = label
+        .bytes()
+        .fold(0x811c_9dc5u32, |hash, byte| (hash ^ byte as u32).wrapping_mul(0x0100_0193));
+    let t = motion::tween_bool(motion::tween_key(1, key ^ (bounds.y as u32) << 20), on, crate::time::monotonic_nanoseconds());
+    let off = Rgba::new(80, 80, 80, 255);
+    let mix = |a: u8, b: u8| lerp_i32(a as i32, b as i32, t.clamp(0, 1_000)) as u8;
     painter.fill_rounded_rect(
         layout.rect(switch),
         layout.radii(CornerRadii::all(switch.height / 2)),
-        if on { ON } else { Rgba::new(80, 80, 80, 255) },
+        Rgba::new(mix(off.red, ON.red), mix(off.green, ON.green), mix(off.blue, ON.blue), 255),
     );
+    let stretch = 6 * (500 - (t.clamp(0, 1_000) - 500).abs()) / 500;
     let knob = Rect::new(
-        if on { switch.x + 32 } else { switch.x + 3 },
+        switch.x + 3 + 29 * t / 1_000 - stretch * t.clamp(0, 1_000) / 1_000,
         switch.y + 3,
-        30,
+        30 + stretch,
         21,
     );
     painter.fill_rounded_rect(
@@ -627,17 +653,24 @@ pub(super) fn draw_settings(
         Rgba::new(58, 58, 58, 255),
     );
     let page = state.settings_page;
+    let now = crate::time::monotonic_nanoseconds();
+    for index in 0..PAGES.len() {
+        let row = sidebar_row(base, index);
+        painter.fill_rounded_rect(layout.rect(row), layout.radii(CornerRadii::all(row.height / 2)), PILL);
+    }
+    // The white selection glides to the chosen page.
+    let chosen = layout.rect(sidebar_row(base, page as usize % PAGES.len()));
+    let glide_y = motion::tween(motion::tween_key(2, 0), chosen.y, motion::QUICK, now);
+    painter.fill_rounded_rect(
+        Rect::new(chosen.x, glide_y, chosen.width, chosen.height),
+        layout.radii(CornerRadii::all(sidebar_row(base, 0).height / 2)),
+        Rgba::new(255, 255, 255, 255),
+    );
     for (index, label) in PAGES.iter().enumerate() {
         let row = sidebar_row(base, index);
-        painter.fill_rounded_rect(
-            layout.rect(row),
-            layout.radii(CornerRadii::all(row.height / 2)),
-            if index as u8 == page {
-                Rgba::new(255, 255, 255, 255)
-            } else {
-                PILL
-            },
-        );
+        if index as u8 != page {
+            hover_glow(painter, layout, 1, index, row, row.height / 2, 110);
+        }
         draw_page_icon(painter, layout, index, row);
         centered_text(
             painter,
@@ -656,6 +689,8 @@ pub(super) fn draw_settings(
         Rgba::new(235, 235, 235, 255),
     );
     let pane = pane(base);
+    let entering = motion::entrance(motion::tween_key(3, 0), page as i32 ^ state.window_open_at_ns as i32, now);
+    let layout = shift_layout_y(layout, (1_000 - entering) * 14 / 1_000);
     text(
         painter,
         layout,
@@ -851,6 +886,48 @@ pub(super) fn draw_settings(
                     ("Saver", if state.battery_saver { "On" } else { "Off" }),
                 ],
             );
+            // Screen time: today's use, the app used most, and the daily limit.
+            let mut today = ClockBuffer56::new();
+            push_duration(&mut today, screen_time_total_ms());
+            let mut most = ClockBuffer56::new();
+            let top = SCREEN_TIME_APPS
+                .iter()
+                .map(|&(app, name)| (SCREEN_TIME_MS[app as usize % SCREEN_TIME_MS.len()].load(core::sync::atomic::Ordering::Relaxed), name))
+                .max_by_key(|&(used, _)| used)
+                .filter(|&(used, _)| used >= 60_000);
+            match top {
+                Some((used, name)) => {
+                    let _ = write!(most, "{name}, ");
+                    push_duration(&mut most, used);
+                }
+                None => {
+                    let _ = most.write_str("-");
+                }
+            }
+            draw_info_box(
+                painter,
+                layout,
+                font,
+                Rect::new(pane.x + SETTING_ROW.width + 24, pane.y + 84, INFO_BOX.width, 72),
+                &[("Screen time", today.as_str()), ("Most used", most.as_str())],
+            );
+            let limit_button = screen_limit_button(pane);
+            painter.stroke_rounded_rect(
+                layout.rect(limit_button),
+                layout.radii(CornerRadii::all(limit_button.height / 2)),
+                1,
+                OUTLINE,
+            );
+            let mut limit_label = ClockBuffer56::new();
+            match SCREEN_LIMIT_MINUTES.load(core::sync::atomic::Ordering::Relaxed) {
+                0 => {
+                    let _ = limit_label.write_str("Daily limit: off");
+                }
+                minutes => {
+                    let _ = write!(limit_label, "Daily limit: {} h", minutes / 60);
+                }
+            }
+            centered_text(painter, layout, font, limit_button, limit_label.as_str(), 12, INK);
             for (index, label) in ["Lock", "Sleep", "Restart", "Shut down"].iter().enumerate() {
                 let button = power_button(pane, index);
                 painter.stroke_rounded_rect(
@@ -930,7 +1007,17 @@ pub(super) fn draw_settings(
                     ("Account", state.username_str()),
                 ],
             );
+            draw_hardware(painter, layout, font, Rect::new(pane.x, pane.y + 135, pane.width, 120));
         }
+    }
+    if entering < 1_000 {
+        // Fades in from the window body as it rises into place.
+        let cover = Rect::new(pane.x - 4, pane.y - 40, pane.width + 8, pane.height + 60);
+        painter.fill_rounded_rect(
+            layout.rect(cover),
+            CornerRadii::all(0),
+            Rgba::new(0, 0, 0, ((1_000 - entering) * 255 / 1_000) as u8),
+        );
     }
 }
 
@@ -1512,8 +1599,19 @@ fn draw_wifi(
             INK_SOFT,
         );
     }
+    // Found networks cascade in as a scan delivers them.
+    let arriving = motion::entrance(
+        motion::tween_key(12, 0),
+        state.wifi_row_count as i32,
+        crate::time::monotonic_nanoseconds(),
+    );
     for (slot, network) in state.wifi_rows[..state.wifi_row_count].iter().enumerate() {
-        let row = wifi_row(pane, slot);
+        let shown = motion::stagger(arriving, slot);
+        if shown == 0 {
+            continue;
+        }
+        let mut row = wifi_row(pane, slot);
+        row.x += (1_000 - shown) * 16 / 1_000;
         let radii = layout.radii(CornerRadii::all(row.height / 2));
         let joined = wifi_joined(&status, network);
         let saved = !joined && wifi_saved(network).is_some();
@@ -1568,4 +1666,89 @@ fn draw_wifi(
             network.bars(),
         );
     }
+}
+
+/// What AerOS found and how it is doing: a quick hardware check.
+fn draw_hardware(painter: &mut Painter<'_>, layout: Layout, font: RasterFont, bounds: Rect) {
+    let mut graphics = ClockBuffer56::new();
+    #[cfg(feature = "linux-drivers")]
+    let mode = crate::linux::display_mode();
+    #[cfg(not(feature = "linux-drivers"))]
+    let mode: Option<(u32, u32)> = None;
+    match mode {
+        Some((width, height)) => {
+            let _ = write!(graphics, "Radeon (amdgpu), {width}x{height}");
+        }
+        None => {
+            let _ = graphics.write_str("Firmware screen (no GPU driver)");
+        }
+    }
+    let mut storage = ClockBuffer56::new();
+    let nvme = crate::nvme::sectors() * crate::nvme::sector_bytes() as u64;
+    if nvme > 0 {
+        let _ = write!(storage, "NVMe SSD, {} GB", nvme / 1_000_000_000);
+    } else if crate::ahci::disk_count() > 0 {
+        let _ = write!(storage, "{} SATA disk(s)", crate::ahci::disk_count());
+    } else {
+        let _ = storage.write_str("No internal disk found");
+    }
+    let usb = crate::xhci::storage_sectors();
+    if usb > 0 {
+        let _ = write!(storage, ", USB drive {} GB", usb * 512 / 1_000_000_000);
+    }
+    let wifi = if crate::mt7921::present() { "MediaTek MT7921 / MT7961" } else { "No supported card found" };
+    let mut battery = ClockBuffer56::new();
+    match crate::battery::level(crate::time::monotonic_nanoseconds()) {
+        Some(level) => {
+            let _ = write!(battery, "{}%", level.percent);
+            if let Some(health) = level.health {
+                let _ = write!(battery, ", health {health}%");
+            }
+            if let Some(cycles) = level.cycles {
+                let _ = write!(battery, ", {cycles} cycles");
+            }
+            if health_warning(level.health) {
+                let _ = battery.write_str(" (worn)");
+            }
+        }
+        None => {
+            let _ = battery.write_str("None (desktop power)");
+        }
+    }
+    let mut linux = ClockBuffer56::new();
+    if crate::svm::linux_ready() {
+        let _ = write!(
+            linux,
+            "{} cores, {} MB",
+            crate::svm::linux_vcpu_count(),
+            crate::svm::linux_memory_bytes() / (1024 * 1024)
+        );
+    } else {
+        let _ = linux.write_str("Not started");
+    }
+    let mut input = ClockBuffer56::new();
+    let _ = write!(
+        input,
+        "Touchscreen {}, {} USB input device(s)",
+        crate::i2c_touch::status(),
+        crate::xhci::input_devices()
+    );
+    draw_info_box(
+        painter,
+        layout,
+        font,
+        bounds,
+        &[
+            ("Graphics", graphics.as_str()),
+            ("Storage", storage.as_str()),
+            ("Wi-Fi", wifi),
+            ("Battery", battery.as_str()),
+            ("Input", input.as_str()),
+            ("Linux", linux.as_str()),
+        ],
+    );
+}
+
+fn health_warning(health: Option<u8>) -> bool {
+    health.is_some_and(|health| health < 50)
 }

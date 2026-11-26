@@ -1,25 +1,264 @@
 use super::*;
 
 pub(super) const SEARCH_MAX: usize = 24;
-const OPEN_NS: u64 = 380_000_000;
+const OPEN_NS: u64 = 300_000_000;
 const CLOSE_NS: u64 = 240_000_000;
-pub(super) const SEARCH_PILL: Rect = Rect::new(166, 146, 420, 69);
-const ROW_HEIGHT: i32 = 40;
+pub(super) const SEARCH_PILL: Rect = Rect::new(166, 64, 420, 60);
+const ROW_HEIGHT: i32 = 34;
 
-/// Launcher entries whose name contains the typed text (the first eight).
-fn matches(state: &DesktopState, out: &mut [usize; 8]) -> usize {
+/// One Spotlight result.
+#[derive(Clone, Copy)]
+enum Hit {
+    /// The typed text is arithmetic; the value in millionths.
+    Calc(i64),
+    Action(usize),
+    App(usize),
+    Setting(u8),
+    Web,
+}
+
+/// System actions Spotlight can run: the label (off, on) and the words that
+/// find it.
+const ACTIONS: [(&str, &str, &str); 13] = [
+    ("Lock screen", "Lock screen", "lock"),
+    ("Restart", "Restart", "restart reboot"),
+    ("Shut down", "Shut down", "shut down shutdown power off turn off"),
+    ("Sleep", "Sleep", "sleep suspend"),
+    ("Take a screenshot", "Take a screenshot", "screenshot screen shot capture print"),
+    ("Turn Wi-Fi on", "Turn Wi-Fi off", "wifi wi-fi wireless internet network"),
+    ("Turn Bluetooth on", "Turn Bluetooth off", "bluetooth"),
+    ("Mute", "Unmute", "mute unmute sound volume audio"),
+    ("Turn on battery saver", "Turn off battery saver", "battery saver power save"),
+    ("Turn on airplane mode", "Turn off airplane mode", "airplane flight mode"),
+    ("Show Linux apps", "Show Linux apps", "linux apps debian"),
+    ("Turn on game mode", "Turn off game mode", "game mode gaming crosshair play"),
+    ("Next terminal theme", "Next terminal theme", "terminal theme colours colors style look"),
+];
+
+fn action_on(state: &DesktopState, index: usize) -> bool {
+    match index {
+        5 => state.wifi,
+        6 => state.bluetooth,
+        7 => state.muted,
+        8 => state.battery_saver,
+        9 => state.airplane,
+        11 => game_mode(),
+        _ => false,
+    }
+}
+
+fn action_label(state: &DesktopState, index: usize) -> &'static str {
+    let (off, on, _) = ACTIONS[index];
+    if action_on(state, index) { on } else { off }
+}
+
+/// Whether `needle` starts a word of `haystack` or appears in `label`.
+fn finds(needle: &[u8], label: &str, words: &str) -> bool {
+    let contains = |text: &str| {
+        text.as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+    };
+    contains(label)
+        || words.split(' ').any(|word| {
+            word.len() >= needle.len() && word.as_bytes()[..needle.len()].eq_ignore_ascii_case(needle)
+        })
+}
+
+// ---- calculator: + - * / % ^ and parentheses over millionths ----
+
+const ONE: i64 = 1_000_000;
+
+struct Calc<'a> {
+    text: &'a [u8],
+    at: usize,
+}
+
+impl Calc<'_> {
+    fn skip(&mut self) {
+        while self.text.get(self.at) == Some(&b' ') {
+            self.at += 1;
+        }
+    }
+
+    fn peek(&mut self) -> Option<u8> {
+        self.skip();
+        self.text.get(self.at).copied()
+    }
+
+    fn sum(&mut self) -> Option<i64> {
+        let mut value = self.product()?;
+        loop {
+            match self.peek() {
+                Some(b'+') => {
+                    self.at += 1;
+                    value = value.checked_add(self.product()?)?;
+                }
+                Some(b'-') => {
+                    self.at += 1;
+                    value = value.checked_sub(self.product()?)?;
+                }
+                _ => return Some(value),
+            }
+        }
+    }
+
+    fn product(&mut self) -> Option<i64> {
+        let mut value = self.power()?;
+        loop {
+            match self.peek() {
+                Some(b'*' | b'x') => {
+                    self.at += 1;
+                    let right = self.power()?;
+                    value = (value as i128 * right as i128 / ONE as i128).try_into().ok()?;
+                }
+                Some(b'/') => {
+                    self.at += 1;
+                    let right = self.power()?;
+                    if right == 0 {
+                        return None;
+                    }
+                    value = (value as i128 * ONE as i128 / right as i128).try_into().ok()?;
+                }
+                Some(b'%') => {
+                    self.at += 1;
+                    let right = self.power()?;
+                    if right == 0 {
+                        return None;
+                    }
+                    value %= right;
+                }
+                _ => return Some(value),
+            }
+        }
+    }
+
+    fn power(&mut self) -> Option<i64> {
+        let base = self.unary()?;
+        if self.peek() == Some(b'^') {
+            self.at += 1;
+            let exponent = self.power()?;
+            if exponent % ONE != 0 || !(0..=64 * ONE).contains(&exponent) {
+                return None;
+            }
+            let mut value = ONE;
+            for _ in 0..exponent / ONE {
+                value = (value as i128 * base as i128 / ONE as i128).try_into().ok()?;
+            }
+            return Some(value);
+        }
+        Some(base)
+    }
+
+    fn unary(&mut self) -> Option<i64> {
+        match self.peek()? {
+            b'-' => {
+                self.at += 1;
+                Some(-self.unary()?)
+            }
+            b'(' => {
+                self.at += 1;
+                let value = self.sum()?;
+                (self.peek() == Some(b')')).then(|| self.at += 1)?;
+                Some(value)
+            }
+            _ => self.number(),
+        }
+    }
+
+    fn number(&mut self) -> Option<i64> {
+        self.skip();
+        let (mut whole, mut fraction, mut scale, mut digits) = (0i64, 0i64, ONE, 0);
+        let mut dot = false;
+        while let Some(&byte) = self.text.get(self.at) {
+            match byte {
+                b'0'..=b'9' if !dot => whole = whole.checked_mul(10)?.checked_add((byte - b'0') as i64)?,
+                b'0'..=b'9' => {
+                    if scale > 1 {
+                        scale /= 10;
+                        fraction += (byte - b'0') as i64 * scale;
+                    }
+                }
+                b'.' | b',' if !dot => dot = true,
+                _ => break,
+            }
+            digits += 1;
+            self.at += 1;
+        }
+        if digits == 0 {
+            return None;
+        }
+        whole.checked_mul(ONE)?.checked_add(fraction)
+    }
+}
+
+/// The value of `text` when it is arithmetic with at least one operator.
+fn calculate(text: &[u8]) -> Option<i64> {
+    let operator = text.iter().skip(1).any(|byte| b"+-*/%^x(".contains(byte));
+    if !operator || !text.iter().any(u8::is_ascii_digit) {
+        return None;
+    }
+    let mut calc = Calc { text, at: 0 };
+    let value = calc.sum()?;
+    calc.skip();
+    (calc.at == text.len()).then_some(value)
+}
+
+fn format_number(value: i64, out: &mut ClockBuffer) {
+    let negative = value < 0;
+    let magnitude = value.unsigned_abs();
+    let whole = magnitude / ONE as u64;
+    let mut fraction = magnitude % ONE as u64;
+    let _ = write!(out, "{}{}", if negative { "-" } else { "" }, whole);
+    if fraction != 0 {
+        let mut digits = 6;
+        while fraction % 10 == 0 {
+            fraction /= 10;
+            digits -= 1;
+        }
+        let _ = write!(out, ".{:0width$}", fraction, width = digits);
+    }
+}
+
+/// Everything the typed text finds, best first: the sum, matching actions,
+/// apps, settings pages, then a web search.
+fn results(state: &DesktopState, out: &mut [Hit; 8]) -> usize {
     let needle = &state.search_input[..state.search_len];
     let mut count = 0;
-    for index in 0..launcher_len() {
-        let hit = needle.is_empty()
-            || launcher_name(index)
-                .as_bytes()
-                .windows(needle.len())
-                .any(|window| window.eq_ignore_ascii_case(needle));
-        if hit && count < out.len() {
-            out[count] = index;
-            count += 1;
+    let mut add = |hit: Hit, count: &mut usize| {
+        if *count < out.len() {
+            out[*count] = hit;
+            *count += 1;
         }
+    };
+    if let Some(value) = calculate(needle) {
+        add(Hit::Calc(value), &mut count);
+    }
+    if needle.len() >= 2 {
+        for index in 0..ACTIONS.len() {
+            if finds(needle, action_label(state, index), ACTIONS[index].2) {
+                add(Hit::Action(index), &mut count);
+            }
+        }
+    }
+    for index in 0..launcher_len() {
+        let name = launcher_name(index);
+        if needle.is_empty() || finds(needle, name, "") {
+            add(Hit::App(index), &mut count);
+        }
+    }
+    if needle.len() >= 2 {
+        for (page, name) in settings_ui::PAGES.iter().enumerate() {
+            if finds(needle, name, "settings") {
+                add(Hit::Setting(page as u8), &mut count);
+            }
+        }
+    }
+    if !needle.is_empty() && calculate(needle).is_none() {
+        if count == 8 {
+            count -= 1;
+        }
+        add(Hit::Web, &mut count);
     }
     count
 }
@@ -67,17 +306,79 @@ impl DesktopState {
         self.motion_until_ns = self.motion_until_ns.max(now + CLOSE_NS + 60_000_000);
     }
 
-    fn search_launch(&mut self, entry: usize) {
+    fn search_run(&mut self, hit: Hit) {
         self.close_search();
-        self.launch_entry(entry);
+        let now = crate::time::monotonic_nanoseconds();
+        match hit {
+            Hit::Calc(value) => {
+                let mut answer = ClockBuffer::new();
+                format_number(value, &mut answer);
+                crate::clipboard::get().push(answer.as_str().as_bytes());
+                crate::notify::push(1, "Copied", answer.as_str());
+            }
+            Hit::App(entry) => self.launch_entry(entry),
+            Hit::Setting(page) => {
+                self.set_overlay(Overlay::None);
+                self.set_app(DesktopApp::Settings);
+                self.settings_show_page(page);
+            }
+            Hit::Web => {
+                let mut url = [0u8; MAX_URL];
+                let prefix = b"https://lite.duckduckgo.com/lite/?q=";
+                url[..prefix.len()].copy_from_slice(prefix);
+                let mut len = prefix.len();
+                for &byte in &self.search_input[..self.search_len] {
+                    let encoded: &[u8] = match byte {
+                        b' ' => b"+",
+                        b'&' => b"%26",
+                        b'#' => b"%23",
+                        b'+' => b"%2B",
+                        b'?' => b"%3F",
+                        _ => core::slice::from_ref(&byte),
+                    };
+                    if len + encoded.len() > MAX_URL {
+                        break;
+                    }
+                    url[len..len + encoded.len()].copy_from_slice(encoded);
+                    len += encoded.len();
+                }
+                self.url_input[..len].copy_from_slice(&url[..len]);
+                self.url_len = len;
+                self.set_overlay(Overlay::None);
+                self.set_app(DesktopApp::Browser);
+                self.url_active = false;
+                self.start_load();
+            }
+            Hit::Action(index) => match index {
+                0 => {
+                    self.lock_session();
+                }
+                1 => self.start_power_action(shellui::PowerAction::Restart),
+                2 => self.start_power_action(shellui::PowerAction::Shutdown),
+                3 => self.start_power_action(shellui::PowerAction::Sleep),
+                4 => self.screenshot_at_ns = now + 450_000_000,
+                5 => self.quick_toggle(0),
+                6 => self.quick_toggle(1),
+                7 => self.toggle_mute(),
+                8 => self.set_battery_saver(!self.battery_saver),
+                9 => self.quick_toggle(4),
+                11 => set_game_mode(!game_mode()),
+                12 => {
+                    let next = (TERMINAL_THEME.load(Ordering::Relaxed) + 1) % TERMINAL_THEMES.len();
+                    TERMINAL_THEME.store(next, Ordering::Relaxed);
+                    crate::notify::push(1, "Terminal theme", TERMINAL_THEMES[next].name);
+                }
+                _ => self.show_linux_apps(),
+            },
+        }
     }
 
     pub(super) fn search_key(&mut self, key: DesktopKey) -> Option<DesktopAction> {
         if !self.search_open {
             return None;
         }
-        let mut hits = [0usize; 8];
-        let count = matches(self, &mut hits);
+        let mut hits = [Hit::Web; 8];
+        let count = results(self, &mut hits);
         match key {
             DesktopKey::Escape => self.close_search(),
             DesktopKey::Backspace => {
@@ -102,7 +403,7 @@ impl DesktopState {
                 self.search_focus = (self.search_focus + count - 1) % count;
             }
             DesktopKey::Activate if count > 0 => {
-                self.search_launch(hits[self.search_focus.min(count - 1)]);
+                self.search_run(hits[self.search_focus.min(count - 1)]);
             }
             _ => {}
         }
@@ -113,11 +414,11 @@ impl DesktopState {
         if !self.search_open {
             return None;
         }
-        let mut hits = [0usize; 8];
-        let count = matches(self, &mut hits);
+        let mut hits = [Hit::Web; 8];
+        let count = results(self, &mut hits);
         for (slot, &hit) in hits.iter().enumerate().take(count.min(rows_that_fit())) {
             if row_rect(slot).contains(point) {
-                self.search_launch(hit);
+                self.search_run(hit);
                 return Some(DesktopAction::Redraw);
             }
         }
@@ -197,8 +498,8 @@ pub(super) fn draw_search(
     if progress < 700 {
         return;
     }
-    let mut hits = [0usize; 8];
-    let count = matches(state, &mut hits);
+    let mut hits = [Hit::Web; 8];
+    let count = results(state, &mut hits);
     let age = if state.search_open {
         now.saturating_sub(state.search_at_ns)
     } else {
@@ -230,22 +531,61 @@ pub(super) fn draw_search(
             1,
             Rgba::new(255, 255, 255, (arrive * 120 / 1000) as u8),
         );
-        if focused {
-            painter.stroke_rounded_rect(
-                layout.rect(row.expand(2)),
-                layout.radii(CornerRadii::all(ROW_HEIGHT / 2 + 2)),
-                2,
-                Rgba::new(255, 255, 255, 190),
-            );
-        }
-        centered_text(
+        let mut label = ClockBuffer::new();
+        let kind = match hit {
+            Hit::Calc(value) => {
+                let _ = label.write_str("= ");
+                format_number(value, &mut label);
+                "Enter copies"
+            }
+            Hit::Action(index) => {
+                let _ = label.write_str(action_label(state, index));
+                "Action"
+            }
+            Hit::App(index) => {
+                let _ = label.write_str(launcher_name(index));
+                "App"
+            }
+            Hit::Setting(page) => {
+                let _ = label.write_str(settings_ui::PAGES[page as usize]);
+                "Settings"
+            }
+            Hit::Web => {
+                let _ = label.write_str("Search the web for \"");
+                let query = core::str::from_utf8(&state.search_input[..state.search_len]).unwrap_or("");
+                let _ = label.write_str(query.get(..query.len().min(24)).unwrap_or(""));
+                let _ = label.write_str("\"");
+                "Web"
+            }
+        };
+        text(
             painter,
             layout,
             font,
-            row,
-            launcher_name(hit),
+            Point::new(row.x + 18, row.y + ROW_HEIGHT / 2 - 7),
+            label.as_str(),
             14,
             Color::rgb(14, 22, 28),
+        );
+        text(
+            painter,
+            layout,
+            font,
+            Point::new(row.right() - 96, row.y + ROW_HEIGHT / 2 - 5),
+            kind,
+            10,
+            Color::rgb(36, 44, 52),
+        );
+    }
+    if count > 0 && state.search_open {
+        // The focus ring glides between rows.
+        let target = layout.rect(row_rect(state.search_focus.min(count.min(rows_that_fit()) - 1)).expand(2));
+        let y = motion::tween(motion::tween_key(9, 0), target.y, motion::QUICK, now);
+        painter.stroke_rounded_rect(
+            Rect::new(target.x, y, target.width, target.height),
+            layout.radii(CornerRadii::all(ROW_HEIGHT / 2 + 2)),
+            2,
+            Rgba::new(255, 255, 255, 190),
         );
     }
     if count == 0 {

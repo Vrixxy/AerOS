@@ -223,10 +223,22 @@ pub fn handle_interrupt() {
     }
 }
 
+static LAST_BYTE_NS: AtomicU64 = AtomicU64::new(0);
+static PS2_REMAINDER_X: AtomicI32 = AtomicI32::new(0);
+static PS2_REMAINDER_Y: AtomicI32 = AtomicI32::new(0);
+
 pub fn feed_byte(byte: u8) {
     if ABSOLUTE.load(Ordering::Acquire) {
         drain_vmmouse();
         return;
+    }
+    // The three bytes of a packet arrive within a millisecond or so; after a
+    // longer gap a byte must start a new packet, so one lost byte can't leave
+    // every later packet shifted (a delta read as flags sends the pointer
+    // the wrong way).
+    let now = crate::time::monotonic_nanoseconds();
+    if now.saturating_sub(LAST_BYTE_NS.swap(now, Ordering::Relaxed)) > 8_000_000 {
+        PACKET_INDEX.store(0, Ordering::Relaxed);
     }
     let index = PACKET_INDEX.load(Ordering::Relaxed) as usize;
     if index == 0 && byte & 0x08 == 0 {
@@ -243,13 +255,25 @@ pub fn feed_byte(byte: u8) {
     let flags = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(PACKET[0])) };
     let raw_x = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(PACKET[1])) };
     let raw_y = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(PACKET[2])) };
-    if flags & 0xc0 != 0 {
-        return;
-    }
-    let delta_x = sign_extend(raw_x, flags & 0x10 != 0);
-    let delta_y = sign_extend(raw_y, flags & 0x20 != 0);
+    // An overflowed axis is a very fast swipe: take it at full range rather
+    // than dropping the packet (which stalled the pointer mid-flick).
+    let axis = |raw: u8, negative: bool, overflow: bool| {
+        if overflow {
+            if negative { -255 } else { 255 }
+        } else {
+            sign_extend(raw, negative)
+        }
+    };
+    let delta_x = axis(raw_x, flags & 0x10 != 0, flags & 0x40 != 0);
+    let delta_y = axis(raw_y, flags & 0x20 != 0, flags & 0x80 != 0);
+    // Each PS/2 packet is one sample, so its size is the finger's speed:
+    // slow moves stay precise, quick ones cover the screen.
+    let speed = delta_x.abs().max(delta_y.abs());
+    let gain = gain(delta_x, delta_y) * (256 + ((speed - 2).max(0) * 28).min(384)) / 256;
+    let x = scaled(delta_x, gain, &PS2_REMAINDER_X);
     // PS/2 reports "up" as positive; the pointer math below wants "down".
-    inject_motion(flags & 0x07, delta_x, -delta_y, 0);
+    let y = scaled(-delta_y, gain, &PS2_REMAINDER_Y);
+    inject_motion(flags & 0x07, x, y, 0);
 }
 
 /// One relative pointer report (PS/2 or USB HID): `buttons` bit 0 = left,

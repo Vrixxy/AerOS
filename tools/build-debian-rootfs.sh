@@ -52,7 +52,7 @@ umount -R "$WORK/proc" "$WORK/sys" "$WORK/dev" 2>/dev/null || true
 rm -rf "$WORK"
 mkdir -p "$WORK"
 
-BASE=busybox-static,kmod,xserver-xorg-core,xserver-xorg-video-fbdev,xserver-xorg-input-libinput,xinit,x11-xserver-utils,x11-xkb-utils,xkb-data,xauth,fontconfig,xfonts-base,fonts-dejavu-core,openbox,xterm,dbus-x11
+BASE=busybox-static,libxcomposite1,libxdamage1,libxext6,kmod,xserver-xorg-core,xserver-xorg-video-fbdev,xserver-xorg-input-libinput,xinit,x11-xserver-utils,x11-xkb-utils,xkb-data,xauth,fontconfig,xfonts-base,fonts-dejavu-core,openbox,xterm,dbus-x11
 debootstrap --variant=minbase --arch=amd64 --include="$BASE" trixie "$WORK" http://deb.debian.org/debian
 
 mount -t proc proc "$WORK/proc"
@@ -132,7 +132,7 @@ chmod 755 "$WORK/usr/share/udhcpc/default.script"
 # The seamless-window agent (guest half of the host's per-app windows): built
 # here against the host's libX11 headers, run against the guest's libX11.so.6
 # (same Debian release).
-dpkg -s libx11-dev libxfixes-dev >/dev/null 2>&1 || apt-get install -y -qq libx11-dev libxfixes-dev
+dpkg -s libx11-dev libxfixes-dev libxcomposite-dev libxdamage-dev libxext-dev >/dev/null 2>&1 || apt-get install -y -qq libx11-dev libxfixes-dev libxcomposite-dev libxdamage-dev libxext-dev
 mkdir -p "$WORK/usr/local/bin"
 cat > "$WORK/usr/local/bin/aeros-firefox" <<'FFOX'
 #!/bin/sh
@@ -240,7 +240,7 @@ flathub:*)
 esac
 INSTALL
 chmod 755 "$WORK/usr/local/bin/aeros-install"
-gcc -O2 -Wall -o "$WORK/usr/local/bin/aeros-agent" "$WIN/tools/aeros-agent.c" -lX11 -lXfixes
+gcc -O2 -Wall -o "$WORK/usr/local/bin/aeros-agent" "$WIN/tools/aeros-agent.c" -lX11 -lXfixes -lXcomposite -lXdamage -lXext
 gcc -O2 -Wall -o "$WORK/usr/local/bin/aeros-mmap-test" "$WIN/tools/mmap-test.c"
 
 # Openbox without window decorations: in seamless mode AerOS draws each
@@ -488,7 +488,7 @@ if [ -z "$WEBKIT" ]; then
   rm -rf "$LIBDIR/dri"
 fi
 rm -f "$LIBDIR"/libgs.so*
-for b in usr/lib/xorg/Xorg usr/bin/xterm usr/bin/openbox usr/bin/netsurf-gtk usr/bin/xinit $( [ -n "${FULL:-}" ] && echo usr/lib/firefox-esr/firefox-esr ) $( [ -n "$WEBKIT" ] && echo usr/bin/cog ); do
+for b in usr/local/bin/aeros-agent usr/lib/xorg/Xorg usr/bin/xterm usr/bin/openbox usr/bin/netsurf-gtk usr/bin/xinit $( [ -n "${FULL:-}" ] && echo usr/lib/firefox-esr/firefox-esr ) $( [ -n "$WEBKIT" ] && echo usr/bin/cog ); do
   chroot "$WORK" ldd "/$b" 2>&1 | grep 'not found' | sed "s|^|MISSING for $b: |" || true
 done
 
